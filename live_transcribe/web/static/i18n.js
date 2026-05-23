@@ -63,7 +63,6 @@ window.VM_I18N = {
     "Start a session": "Begin 'n sessie",
     "Three ways in. Pick the one that fits the moment.":
       "Drie maniere in. Kies die een wat by die oomblik pas.",
-    "Most common": "Mees algemeen",
     "Start a live meeting": "Begin 'n lewendige vergadering",
     "Begin": "Begin",
     "Transcribe what you and others are saying right now, on this computer. Optionally record the audio too.":
@@ -77,6 +76,13 @@ window.VM_I18N = {
     "For machines that cannot keep up live. Volksmond records the audio cleanly, and you transcribe it when you are back at a desk.":
       "Vir masjiene wat nie lewendig kan byhou nie. Volksmond neem die klank skoon op, en jy transkribeer dit wanneer jy terug by 'n lessenaar is.",
     "Have a recording already?": "Het jy reeds 'n opname?",
+    // Import setup (context before transcribing a file)
+    "Before we transcribe": "Voor ons transkribeer",
+    "Add context": "Voeg konteks by",
+    "Names and jargon help accuracy, especially for Afrikaans and the mix. All optional.":
+      "Name en vakterme help akkuraatheid, veral vir Afrikaans en die mengsel. Alles opsioneel.",
+    "Title": "Titel",
+    "Transcribe": "Transkribeer",
     "Up to several hours. The file stays on this computer. It is never uploaded.":
       "Tot etlike ure. Die lêer bly op hierdie rekenaar. Dit word nooit opgelaai nie.",
     "Browse": "Blaai",

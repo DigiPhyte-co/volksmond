@@ -436,7 +436,9 @@ def transcribe_file(req: TranscribeFileRequest):
         topic = req.topic or Path(files[0]).stem
         output_path = _build_output_path(topic)
         try:
-            engine = transcribe.Engine(tier=tier, language=language, initial_prompt=prompt)
+            # adaptive=False: a file is not real-time, so never downgrade the model
+            # or cut the beam to "keep up" — keep the chosen quality and take longer.
+            engine = transcribe.Engine(tier=tier, language=language, initial_prompt=prompt, adaptive=False)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Could not load model ({tier}): {e}")
         md_sink = sinks.MarkdownSink(output_path)
@@ -476,7 +478,10 @@ def transcribe_file(req: TranscribeFileRequest):
                     aborting = STATE.stopping
                 if aborting:
                     break
-                engine.on_chunk(src, window, t_start)
+                # block=True: wait for the transcriber instead of dropping. The
+                # queue holds 32; a long file would otherwise lose everything past
+                # the first ~32 chunks (the hour-file truncation bug).
+                engine.on_chunk(src, window, t_start, block=True)
         except Exception as e:
             print(f"[transcribe-file] error: {e}", flush=True)
         finally:
