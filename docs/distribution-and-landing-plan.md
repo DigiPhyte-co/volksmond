@@ -153,6 +153,16 @@ and the hosted SERVICE, not the weights.
      struggles with mid-sentence switches), the differentiator. Verdict: probably not worth
      the ToS friction when the open SA models are free, unlimited, and purpose-built for
      Afrikaans. Mirror this in SA-ASR-Model/corpus-strategy.md when next in that project.
+  4. RADIO / BROADCAST (RSG, Jacaranda FM, community stations): real Afrikaans + genuine
+     code-switching, BUT copyright-encumbered. Free-to-air is NOT free-to-use; SA has fair
+     dealing, not fair use, and the Copyright Amendment Bill's text-and-data-mining exception
+     is not settled law. Default = infringement at the copying step, regardless of the model
+     being open. Off-brand to scrape for a public, privacy-first company (asymmetric reputational
+     risk). CLEAN PATH: email the station for permission/licence, framed as an open
+     non-commercial Afrikaans language-preservation project (community stations + RSG may be
+     allies, with credit). Also broadcast-domain (compressed, presenter-style) not meeting-domain,
+     and unlabeled (must transcribe + strip music). Verdict: secondary, ONLY if licensed; email
+     the stations, do not just record. NOT legal advice, get SA IP advice before relying on this.
 
 ## Day-two feature backlog (post-launch, not launch-critical)
 Ideas parked for after the beta; add to this list as they come up.
