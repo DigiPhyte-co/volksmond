@@ -273,6 +273,8 @@ window.VM_I18N = {
     "Pro covers only what needs an online connection. Everything that runs on this computer stays free. Perpetual: you own this version forever.":
       "Pro dek net wat 'n aanlyn-verbinding nodig het. Alles wat op hierdie rekenaar loop, bly gratis. Ewigdurend: jy besit hierdie weergawe vir altyd.",
     "Already bought": "Reeds gekoop",
+    "Opens the Volksmond website in your browser. You get a licence key by email after purchase, and activation is fully offline.":
+      "Maak die Volksmond-webwerf in jou blaaier oop. Jy kry 'n lisensiesleutel per e-pos ná aankoop, en aktivering is heeltemal vanlyn.",
     "Activate": "Aktiveer",
     "Your key is checked on this computer, never on a server. No account, no phone-home.":
       "Jou sleutel word op hierdie rekenaar nagegaan, nooit op 'n bediener nie. Geen rekening, geen tuisbel nie.",

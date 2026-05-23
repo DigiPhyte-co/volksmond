@@ -12,6 +12,9 @@
 // Where "Report a bug or request a feature" sends. Privacy-first mailto: it
 // only carries the app version and OS, never logs or transcripts.
 var FEEDBACK_EMAIL = "volksmond@digiphyte.com";
+// Where "Buy Pro" sends the user. The purchase/pricing page on the site (not sold during
+// early access; this is the forward-looking link). Change when the page is live.
+var PRO_URL = "https://volksmond.digiphyte.com/pro";
 
 var APP = document.getElementById("app");
 
@@ -525,8 +528,12 @@ function summaryInstalled() { return S.models && S.models.summary_installed; }
 // Use it to open external links and native pickers; the browser build falls back.
 function inDesktop() { return !!(window.pywebview && window.pywebview.api); }
 function openExternal(url) {
-  if (inDesktop() && window.pywebview.api.open_external) { window.pywebview.api.open_external(url); }
-  else { window.location.href = url; }
+  // Native shell: hand it to the OS (system browser / mail client).
+  if (inDesktop() && window.pywebview.api.open_external) { window.pywebview.api.open_external(url); return; }
+  // Browser: mailto via location (page stays); web links in a new tab (never navigate
+  // the app away).
+  if (url.slice(0, 7) === "mailto:") { window.location.href = url; }
+  else { window.open(url, "_blank", "noopener"); }
 }
 function reportBug() {
   // No phone-home: the app never sends anything. It either hands a prefilled draft to
@@ -1243,8 +1250,8 @@ function upgradeView() {
     el("p", { class: "ink-2", text: "Free is the real thing: unlimited live transcription and local summaries, on this machine, forever. Pro adds the few features that actually need to reach the internet." }),
     el("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" } }, [freeCard(), proCard()]),
     el("div", { class: "card", style: { padding: "20px" } }, [
-      el("button", { class: "btn primary tall", onclick: function () { openExternal("mailto:" + FEEDBACK_EMAIL + "?subject=" + encodeURIComponent("Buy Volksmond Pro")); } }, "Buy Pro for R 599"),
-      el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "8px" }, text: "Opens your email so we can send you a licence key. Activation is fully offline." }),
+      el("button", { class: "btn primary tall", onclick: function () { openExternal(PRO_URL); } }, "Buy Pro for R 599"),
+      el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "8px" }, text: "Opens the Volksmond website in your browser. You get a licence key by email after purchase, and activation is fully offline." }),
       el("div", { class: "divider-label", text: "Already bought" }),
       el("div", { class: "row gap-8" }, [
         el("input", { class: "field mono", style: { outline: "2px solid " + ring, outlineOffset: "-1px" }, placeholder: "Paste your licence key, e.g. VM1-XXXX-XXXX-XXXX-XXXX", value: S.upgrade.value, oninput: function (e) { S.upgrade.value = e.target.value; } }),
