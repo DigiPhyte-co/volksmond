@@ -283,5 +283,11 @@ window.VM_I18N = {
     "No native file dialog is available here. Paste the full path on this computer.":
       "Geen inheemse lêer-dialoog is hier beskikbaar nie. Plak die volle pad op hierdie rekenaar.",
     "Use this path": "Gebruik hierdie pad",
+
+    // About / credit
+    "by DigiPhyte": "deur DigiPhyte",
+    "About": "Oor",
+    "A DigiPhyte product, built in South Africa. All transcription happens on this machine unless you explicitly opt in.":
+      "'n DigiPhyte-produk, gebou in Suid-Afrika. Alle transkripsie gebeur op hierdie masjien tensy jy uitdruklik inteken.",
   },
 };
