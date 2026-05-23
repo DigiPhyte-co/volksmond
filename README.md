@@ -141,7 +141,7 @@ The plan that drove V0 is at [`~/.claude/plans/1-i-need-a-pure-planet.md`](../..
 ## 8. Out of scope
 
 - **Meeting bot that joins Teams/Zoom directly.** This is a desktop-side tool that listens to whatever audio plays on the machine. It does not join meetings as a participant. That's a much harder architecture (cross-platform OAuth, bot management, scaling) and not needed for the primary use case.
-- **Commercial product (Volksmond).** The downstream commercial product idea was discussed 2026-05-20. Leading name: **Volksmond** (Afrikaans for "vernacular / the common parlance", it transcribes how people actually speak, not textbook Afrikaans; chosen over the earlier "Notule" candidate on 2026-05-21). This project is the internal tool, not the commercial product. If V2 stabilises and Sean wants to commercialise, that's a separate engagement with its own product spec, pricing, deployment, and support. **Anchor customer candidate:** SubTropico Limited (holding company of existing DigiPhyte client Vleissentraal), Afrikaans-medium business, has capital, identified 2026-05-20. See `Cowork/SA-ASR-Model/README.md` §4b for partnership considerations.
+- **Commercial product (Volksmond).** The downstream commercial product idea was discussed 2026-05-20. Leading name: **Volksmond** (Afrikaans for "vernacular / the common parlance", it transcribes how people actually speak, not textbook Afrikaans; chosen over the earlier "Notule" candidate on 2026-05-21). This project is the internal tool, not the commercial product. If V2 stabilises and Sean wants to commercialise, that's a separate engagement with its own product spec, pricing, deployment, and support.
 - **Cross-platform.** Windows-first. Mac and Linux only if there's demand from a second user.
 
 ---
