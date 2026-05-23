@@ -70,6 +70,10 @@
   .tagline { font-size: 14.5px; font-weight: 600; color: var(--accent); }
   .chip { font-size: 10.5px; letter-spacing: 0.10em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; border: 1px solid var(--line); border-radius: 999px; padding: 4px 9px; }
   .ftag { color: var(--ink-3); font-size: 12.5px; }
+  .pron { display: inline-flex; align-items: center; gap: 10px; margin-top: 18px; font-size: 14px; color: var(--ink-2); }
+  .pron strong { color: var(--ink); font-weight: 600; }
+  .playbtn { width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--line-2); background: var(--surface); color: var(--accent); display: none; align-items: center; justify-content: center; cursor: pointer; flex: 0 0 auto; padding: 0; }
+  .playbtn:hover { background: var(--accent-soft); }
 
   /* Header */
   header { position: sticky; top: 0; z-index: 10; background: color-mix(in oklch, var(--bg) 88%, transparent); backdrop-filter: blur(10px); border-bottom: 1px solid var(--line); }
@@ -172,6 +176,14 @@
       <p class="sub"
          data-en="Volksmond transcribes your meetings on your machine. Your audio never leaves it, nothing is sent to the cloud, and it is built for Afrikaans and the way we actually mix it with English."
          data-af="Volksmond transkribeer jou vergaderings op jou masjien. Jou klank verlaat dit nooit nie, niks word na die wolk gestuur nie, en dit is gebou vir Afrikaans en die manier waarop ons dit werklik met Engels meng.">Volksmond transcribes your meetings on your machine. Your audio never leaves it, nothing is sent to the cloud, and it is built for Afrikaans and the way we actually mix it with English.</p>
+
+      <div class="pron">
+        <button class="playbtn" id="playbtn" type="button" aria-label="Play how to say Volksmond" onclick="playName()">
+          <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>
+        </button>
+        <span>Volksmond · <strong>FOLKS-mont</strong></span>
+      </div>
+      <audio id="say" src="volksmond.mp3" preload="auto"></audio>
 
       <form class="form" id="get" onsubmit="return submitForm(event)">
         <input type="email" required data-en-ph="you@example.com" data-af-ph="jy@voorbeeld.co.za" placeholder="you@example.com" aria-label="Email" />
@@ -310,6 +322,20 @@
     try { e.target.reset(); } catch (x) {}
     return false;
   }
+
+  function playName() {
+    var a = document.getElementById("say");
+    if (a) { try { a.currentTime = 0; } catch (x) {} a.play().catch(function () {}); }
+  }
+  (function () {
+    // Show the play button only once volksmond.mp3 is actually available, so it is
+    // never a broken control. Drop a real Afrikaans recording at landing/volksmond.mp3.
+    var a = document.getElementById("say"), b = document.getElementById("playbtn");
+    if (a && b) {
+      a.addEventListener("canplaythrough", function () { b.style.display = "inline-flex"; });
+      a.addEventListener("error", function () { b.style.display = "none"; });
+    }
+  })();
 
   (function () {
     var lang = "en";
