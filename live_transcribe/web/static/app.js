@@ -193,8 +193,9 @@ function fmtBytes(n) {
 function baseName(p) { return (p || "").split(/[\\/]/).pop() || ""; }
 function topicFromName(name) {
   var stem = name.replace(/\.md$/, "");
-  var m = /^(\d{4}-\d{2}-\d{2})-(\d{4})-(.*)$/.exec(stem);
-  if (m) return (m[3] || "").replace(/-/g, " ") || "session";
+  // Mirrors the backend YYYY-MM-DD-HHMMSS (or older HHMM) prefix.
+  var m = /^\d{4}-\d{2}-\d{2}-\d{4}(?:\d{2})?-(.*)$/.exec(stem);
+  if (m) return (m[1] || "").replace(/-/g, " ") || "session";
   return stem;
 }
 function toast(msg, isErr) {
@@ -940,7 +941,7 @@ function finishView() {
   return el("div", { class: "screen center" }, el("div", { class: "screen-inner col-mid stack", style: { gap: "16px" } }, [
     el("div", { class: "row gap-12" }, [
       el("div", { class: "tone-tile ok", style: { width: "40px", height: "40px" } }, icon("check", 20)),
-      el("div", {}, [el("h1", { style: { fontSize: "24px" }, text: S.finish.sinkError ? "Saved, with a warning" : "Saved." }),
+      el("div", {}, [el("h1", { style: { fontSize: "24px" }, text: S.finish.sinkError ? "Finished, with a warning" : "Saved." }),
         S.finish.outputPath ? el("div", { class: "ink-3 mono", style: { fontSize: "12px", marginTop: "4px" } }, raw(S.finish.outputPath)) : null]),
     ]),
     S.finish.sinkError ? el("div", { class: "card", style: { padding: "14px 16px", borderColor: "var(--warn)", display: "flex", gap: "12px", alignItems: "flex-start" } }, [

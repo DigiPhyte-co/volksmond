@@ -24,9 +24,10 @@ from live_transcribe import licensing
 from live_transcribe.web import app as webapp
 from live_transcribe.web.app import CSRF_TOKEN, app
 
-# The real UI always sends the CSRF token (app.js reads it from the page); mirror
-# that here so the existing POST tests exercise the endpoints, not the guard.
-client = TestClient(app)
+# The real UI always sends the CSRF token (app.js reads it from the page) and is
+# served on loopback; mirror both so the existing tests exercise the endpoints,
+# not the Host/CSRF guards (TestClient's default Host "testserver" would 400).
+client = TestClient(app, base_url="http://localhost")
 client.headers.update({"X-Volksmond-CSRF": CSRF_TOKEN})
 
 
@@ -77,7 +78,7 @@ def test_static_assets_served():
 def test_csrf_blocks_unsafe_requests():
     # A page without the token (e.g. a random site firing a simple cross-origin
     # POST at localhost) must be rejected on any state-changing method.
-    bare = TestClient(app)
+    bare = TestClient(app, base_url="http://localhost")
     r = bare.post("/api/stop?what=all")
     assert r.status_code == 403, f"unsafe POST without CSRF token should be 403, got {r.status_code}"
     # GETs are safe and must still work without the token.
@@ -104,8 +105,8 @@ def test_unique_transcript_filenames():
 
 
 def test_filename_allow_list():
-    bad = ["../secret.md", "a/b.md", "a\\b.md", "CON.md", "report.txt",
-           "stream.md:hidden", "", "..", "trans\x00.md"]
+    bad = ["../secret.md", "a/b.md", "a\\b.md", "CON.md", "CON.foo.md", "COM1.report.md",
+           "report.txt", "stream.md:hidden", "", "..", "trans\x00.md"]
     for name in bad:
         try:
             webapp._validate_session_filename(name)
@@ -139,6 +140,17 @@ def test_license_pubkey_precedence():
     print("  OK  licence pubkey: baked-in wins; env override only when none baked")
 
 
+def test_host_rebinding_blocked():
+    # DNS-rebinding defence: a non-loopback Host is rejected before anything is
+    # served, including the page that carries the CSRF token.
+    evil = TestClient(app, base_url="http://attacker.example:8765")
+    assert evil.get("/api/app-info").status_code == 400, "non-loopback Host not rejected"
+    assert evil.get("/").status_code == 400, "token page served to a non-loopback Host"
+    # Loopback Host is served normally (the shared client uses http://localhost).
+    assert client.get("/api/app-info").status_code == 200
+    print("  OK  non-loopback Host rejected (DNS-rebinding defence); loopback served")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_app_info,
@@ -147,6 +159,7 @@ if __name__ == "__main__":
                test_settings_never_leak_secret,
                test_static_assets_served,
                test_csrf_blocks_unsafe_requests,
+               test_host_rebinding_blocked,
                test_unique_transcript_filenames,
                test_filename_allow_list,
                test_license_pubkey_precedence):
