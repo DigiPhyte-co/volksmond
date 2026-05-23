@@ -289,6 +289,14 @@ window.VM_I18N = {
     "About": "Oor",
     "Said FOLKS-mont. Afrikaans for the way people actually speak.":
       "Uitgespreek FOLKS-mont. Afrikaans vir hoe mense werklik praat.",
+
+    // Report a bug
+    "Nothing is sent automatically. The app never phones home, you send this yourself.":
+      "Niks word outomaties gestuur nie. Die program bel nooit huis toe nie, jy stuur dit self.",
+    "Send it to": "Stuur dit na",
+    "Copy report": "Kopieer verslag",
+    "Open email": "Maak e-pos oop",
+    "Close": "Maak toe",
     "A DigiPhyte product, built in South Africa. All transcription happens on this machine unless you explicitly opt in.":
       "'n DigiPhyte-produk, gebou in Suid-Afrika. Alle transkripsie gebeur op hierdie masjien tensy jy uitdruklik inteken.",
   },
