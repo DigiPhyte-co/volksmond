@@ -13,6 +13,9 @@ free early-access download.
 - "Volksmond, by DigiPhyte" (name provisional).
 - Voice: calm, plain, confident. No hype, no exclamation marks, no dashes. SA English.
 - Bilingual: every piece of copy exists in English and Afrikaans (see toggle below).
+- Tagline: "Speak freely · Praat vrylik" (shown in BOTH languages always, the brand
+  signature; not toggled). Carries the privacy promise and demonstrates the bilingual
+  product. Echoes Sean's tospeakfreely handle.
 
 ## Key messages (priority order)
 1. Private by design. Runs entirely on your computer; your audio and transcripts never

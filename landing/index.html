@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Volksmond, by DigiPhyte</title>
+<title>Volksmond · Speak freely, praat vrylik</title>
 <meta name="description" content="Private, on-device meeting transcription for Afrikaans and English. Runs fully offline, never phones home." />
 <!--
   Volksmond landing page (early access). Self-contained, no external requests:
@@ -66,6 +66,10 @@
   p { margin: 0; }
   .muted { color: var(--ink-2); }
   .eyebrow { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; }
+  .kicker { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .tagline { font-size: 14.5px; font-weight: 600; color: var(--accent); }
+  .chip { font-size: 10.5px; letter-spacing: 0.10em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; border: 1px solid var(--line); border-radius: 999px; padding: 4px 9px; }
+  .ftag { color: var(--ink-3); font-size: 12.5px; }
 
   /* Header */
   header { position: sticky; top: 0; z-index: 10; background: color-mix(in oklch, var(--bg) 88%, transparent); backdrop-filter: blur(10px); border-bottom: 1px solid var(--line); }
@@ -159,7 +163,10 @@
   <!-- Hero -->
   <section class="hero">
     <div class="wrap lede">
-      <div class="eyebrow" data-en="Early access" data-af="Vroeë toegang">Early access</div>
+      <div class="kicker">
+        <span class="tagline">Speak freely · Praat vrylik</span>
+        <span class="chip" data-en="Early access" data-af="Vroeë toegang">Early access</span>
+      </div>
       <h1 data-en="A private transcript of any meeting, on your own computer."
           data-af="'n Private transkripsie van enige vergadering, op jou eie rekenaar.">A private transcript of any meeting, on your own computer.</h1>
       <p class="sub"
@@ -268,6 +275,7 @@
   <div class="wrap">
     <div class="row">
       <span class="wordmark" style="font-size:14px"><span class="mark" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 22 22" fill="none"><path d="M3 12.5 C 6 16.5, 16 16.5, 19 12.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M7.5 8.5 L 7.5 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M11 8.5 L 11 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M14.5 8.5 L 14.5 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></span>Volksmond</span>
+      <span class="ftag">Speak freely · Praat vrylik</span>
       <span class="spacer"></span>
       <span><span data-en="A DigiPhyte product." data-af="'n DigiPhyte-produk.">A DigiPhyte product.</span> <a href="https://digiphyte.com" target="_blank" rel="noopener">digiphyte.com</a></span>
     </div>
