@@ -123,7 +123,7 @@ V0 is implemented. See [SETUP.md](./SETUP.md) for one-time install (CUDA/cuDNN f
 .\start-meeting.ps1 -Topic "smoketest" -Tier cpu-strong
 
 # Seed entity context, names, jargon, client terms
-.\start-meeting.ps1 -Topic "Vleissentraal Q2" -Prompt "Vleissentraal, SubTropico, Hennie, vleisbedryf"
+.\start-meeting.ps1 -Topic "Acme Q2" -Prompt "Acme Corp, Thabo, EBITDA, logistics"
 ```
 
 Ctrl+C stops the session and flushes the Markdown file to `sessions/`. The browser UI streams segments live and shows the saved file path on stop.
