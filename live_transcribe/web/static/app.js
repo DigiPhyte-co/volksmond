@@ -1201,7 +1201,14 @@ function dataCard(st) {
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("folder", 18)),
       el("div", { class: "body" }, [el("div", { class: "t", text: "Save transcripts and recordings to" }),
-        el("div", { class: "s mono", style: { fontSize: "11.5px" }, text: st.save_location || (S.appInfo && S.appInfo.save_dir) || "default folder" })]),
+        el("div", { class: "s mono", style: { fontSize: "11.5px" }, text: st.save_location || (S.appInfo && S.appInfo.save_dir) || "default folder" }),
+        (S.appInfo && S.appInfo.save_dir_cloud) ? el("div", { class: "row gap-6", style: { marginTop: "6px", alignItems: "flex-start" } }, [
+          el("span", { style: { display: "inline-flex", flex: "0 0 auto", marginTop: "1px", color: "var(--warn)" } }, icon("alert", 13)),
+          el("div", {}, [
+            el("div", { style: { fontWeight: "600", fontSize: "12px", color: "var(--warn)" } }, ["Saved to a cloud folder", " (", raw(S.appInfo.save_dir_cloud), ")"]),
+            el("div", { class: "s", style: { fontSize: "11.5px", marginTop: "1px" }, text: "Your transcripts sync to this cloud service, not only this computer. They are never sent anywhere for processing. Pick a local folder to keep them on this machine only." }),
+          ]),
+        ]) : null]),
       el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: pickSaveFolder }, "Change")),
     ]),
     el("div", { class: "set-row" }, [

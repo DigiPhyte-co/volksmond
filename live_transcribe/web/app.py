@@ -764,16 +764,38 @@ def models_status():
     }
 
 
+def _cloud_sync_label(path: str) -> Optional[str]:
+    """Name the third-party cloud service a folder syncs to, or None. Heuristic by
+    path; covers the common desktop sync clients. Used only for a non-blocking
+    heads-up: saving there is the user's call and never affects processing, which
+    is always on-device. Drive-letter mounts (e.g. Google Drive on G:) can't be
+    detected from the path, so this is best-effort, not a guarantee."""
+    p = (path or "").replace("\\", "/").lower()
+    for needle, label in (
+        ("onedrive", "OneDrive"),
+        ("dropbox", "Dropbox"),
+        ("google drive", "Google Drive"),
+        ("googledrive", "Google Drive"),
+        ("icloud", "iCloud"),
+    ):
+        if needle in p:
+            return label
+    return None
+
+
 @app.get("/api/app-info")
 def app_info():
     """Light, non-sensitive facts for the footer and the bug-report mailto: the
-    display name, version, OS string, and where files are saved. Nothing here
-    leaves the machine unless the user chooses to send a bug report."""
+    display name, version, OS string, where files are saved, and whether that
+    folder syncs to a cloud (for an at-rest heads-up). Nothing here leaves the
+    machine unless the user chooses to send a bug report."""
+    sdir = str(_sessions_dir())
     return {
         "name": "Volksmond",
         "version": licensing.APP_VERSION,
         "platform": platform.platform(),
-        "save_dir": str(_sessions_dir()),
+        "save_dir": sdir,
+        "save_dir_cloud": _cloud_sync_label(sdir),
     }
 
 
