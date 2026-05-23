@@ -11,7 +11,7 @@
 
 // Where "Report a bug or request a feature" sends. Privacy-first mailto: it
 // only carries the app version and OS, never logs or transcripts.
-var FEEDBACK_EMAIL = "sean@digiphyte.com";
+var FEEDBACK_EMAIL = "feedback@digiphyte.com";
 
 var APP = document.getElementById("app");
 
@@ -529,17 +529,41 @@ function openExternal(url) {
   else { window.location.href = url; }
 }
 function reportBug() {
+  // No phone-home: the app never sends anything. It either hands a prefilled draft to
+  // the user's default mail app (mailto), or copies a report to the clipboard for them
+  // to paste into webmail. The send always happens outside the app.
   var info = S.appInfo || {};
   var version = info.version || "?", plat = info.platform || "?";
+  var af = LANG === "af";
   var subject = "Volksmond feedback (v" + version + ")";
   var body =
-    "Describe the bug or the feature you would like:\n\n\n" +
-    "----------------------------------------\n" +
-    "Volksmond version " + version + "\n" +
-    plat + "\n" +
-    "(No logs or transcripts are attached. Add anything helpful yourself.)\n";
-  openExternal("mailto:" + FEEDBACK_EMAIL +
-    "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body));
+    (af ? "Beskryf die fout of die funksie wat jy graag wil hê:" : "Describe the bug or the feature you would like:") +
+    "\n\n\n----------------------------------------\n" +
+    "Volksmond version " + version + "\n" + plat + "\n" +
+    (af ? "(Geen logs of transkripsies is aangeheg nie. Voeg self enigiets nuttig by.)"
+        : "(No logs or transcripts are attached. Add anything helpful yourself.)") + "\n";
+  var mailto = "mailto:" + FEEDBACK_EMAIL + "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
+  var reportText = "To: " + FEEDBACK_EMAIL + "\nSubject: " + subject + "\n\n" + body;
+
+  var modal = el("div", { class: "modal-backdrop", onclick: function (e) { if (e.target === modal) modal.remove(); } }, [
+    el("div", { class: "modal" }, [
+      el("h2", { text: "Report a bug or idea" }),
+      el("p", { class: "ink-3", style: { margin: "8px 0 14px", fontSize: "13px" }, text: "Nothing is sent automatically. The app never phones home, you send this yourself." }),
+      el("div", { style: { display: "flex", alignItems: "center", gap: "10px", padding: "10px 12px", background: "var(--surface-2)", borderRadius: "8px", marginBottom: "16px" } }, [
+        el("span", { style: { color: "var(--ink-3)", display: "inline-flex" } }, icon("bug", 16)),
+        el("div", {}, [
+          el("div", { style: { fontSize: "12px", color: "var(--ink-3)" }, text: "Send it to" }),
+          el("div", { class: "mono", style: { fontSize: "13.5px" }, text: FEEDBACK_EMAIL }),
+        ]),
+      ]),
+      el("div", { class: "row gap-8", style: { justifyContent: "flex-end", flexWrap: "wrap" } }, [
+        el("button", { class: "btn ghost", onclick: function () { modal.remove(); } }, "Close"),
+        el("button", { class: "btn ghost", onclick: function () { copyText(reportText); } }, [icon("copy", 14), "Copy report"]),
+        el("button", { class: "btn primary", onclick: function () { openExternal(mailto); modal.remove(); } }, [icon("note", 14), "Open email"]),
+      ]),
+    ]),
+  ]);
+  APP.appendChild(modal);
 }
 
 /* ═══════════════════════════════════════════════════════════
