@@ -210,7 +210,14 @@ def _sessions_dir() -> Path:
                 return p
         except Exception:
             pass  # fall through to the default
-    p = PROJECT_ROOT / "sessions"
+    # Default save location: the project sessions/ folder in dev. When frozen,
+    # PROJECT_ROOT points INSIDE the PyInstaller bundle, so use a persistent,
+    # non-synced user folder (same base as settings/models) instead - otherwise
+    # transcripts bury inside the app and vanish on reinstall.
+    if getattr(sys, "frozen", False):
+        p = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "sa-live-transcribe" / "sessions"
+    else:
+        p = PROJECT_ROOT / "sessions"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
