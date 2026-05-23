@@ -92,7 +92,10 @@ def test_blocking_feed_drops_nothing():
     engine.start()
     n = 80  # well over the 32-slot queue
     for i in range(n):
-        engine.on_chunk("FILE", i, float(i), block=True)
+        # Bounded wait (mirrors production's timeout): a drain regression should
+        # fail this test fast, not hang it on a never-draining queue.
+        assert engine.on_chunk("FILE", i, float(i), block=True, timeout=10), \
+            "blocking feed timed out enqueueing (worker not draining?)"
     engine.stop(drain=True, timeout=60)
     assert engine._dropped == 0, f"blocking feed dropped {engine._dropped} chunks"
     assert len(collected) == n, f"blocking feed lost chunks: {len(collected)}/{n}"

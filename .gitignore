@@ -38,6 +38,7 @@ Thumbs.db
 build/
 dist/
 *.log
+*.zip
 
 # Local agent / tooling state
 .claude/
