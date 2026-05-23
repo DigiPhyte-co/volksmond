@@ -287,6 +287,8 @@ window.VM_I18N = {
     // About / credit
     "by DigiPhyte": "deur DigiPhyte",
     "About": "Oor",
+    "Said FOLKS-mont. Afrikaans for the way people actually speak.":
+      "Uitgespreek FOLKS-mont. Afrikaans vir hoe mense werklik praat.",
     "A DigiPhyte product, built in South Africa. All transcription happens on this machine unless you explicitly opt in.":
       "'n DigiPhyte-produk, gebou in Suid-Afrika. Alle transkripsie gebeur op hierdie masjien tensy jy uitdruklik inteken.",
   },

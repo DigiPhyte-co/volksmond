@@ -1049,6 +1049,7 @@ function aboutCard() {
       el("div", { class: "ic" }, markSvg(20)),
       el("div", { class: "body" }, [
         el("div", { class: "t" }, [el("span", { text: "Volksmond" }), el("span", { class: "chip", text: "Version " + version })]),
+        el("div", { class: "s", text: "Said FOLKS-mont. Afrikaans for the way people actually speak." }),
         el("div", { class: "s", text: "A DigiPhyte product, built in South Africa. All transcription happens on this machine unless you explicitly opt in." }),
       ]),
       el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: function () { openExternal("https://digiphyte.com"); } }, "digiphyte.com")),
