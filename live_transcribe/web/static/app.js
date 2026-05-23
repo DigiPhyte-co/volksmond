@@ -1140,7 +1140,7 @@ function transcriptionCard(st) {
     el("div", { class: "set-row", style: { display: "block" } }, [
       el("div", { class: "t", style: { marginBottom: "4px" }, text: "Default context, names and jargon" }),
       el("div", { class: "s", style: { marginBottom: "8px" }, text: "Applied to every meeting to help accuracy. Stored on this computer only." }),
-      el("textarea", { class: "field", value: ctxVal, placeholder: "e.g. Chenelle, Vleissentraal, EBITDA. Or a sentence guiding the recogniser.", oninput: function (e) { S.settingsDraft = S.settingsDraft || {}; S.settingsDraft.default_context = e.target.value; } }),
+      el("textarea", { class: "field", value: ctxVal, placeholder: "e.g. Thabo, Acme Corp, EBITDA. Or a sentence guiding the recogniser.", oninput: function (e) { S.settingsDraft = S.settingsDraft || {}; S.settingsDraft.default_context = e.target.value; } }),
       el("div", { class: "row", style: { marginTop: "8px", justifyContent: "flex-end" } },
         el("button", { class: "btn sm", onclick: function () { saveSettings({ default_context: (S.settingsDraft && S.settingsDraft.default_context) || "" }); } }, "Save context")),
     ]),

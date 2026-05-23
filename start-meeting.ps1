@@ -4,7 +4,7 @@
 #   .\start-meeting.ps1
 #   .\start-meeting.ps1 -Topic "Acme discovery"
 #   .\start-meeting.ps1 -Topic "Acme discovery" -Tier cpu-strong
-#   .\start-meeting.ps1 -Topic "Vleissentraal Q2" -Prompt "Vleissentraal, SubTropico, Hennie"
+#   .\start-meeting.ps1 -Topic "Acme Q2" -Prompt "Acme Corp, Thabo, EBITDA"
 #
 # Press Ctrl+C inside the running process to stop. Transcript flushes cleanly.
 

@@ -56,7 +56,7 @@ The live transcript is a real-time *preview*, fast, but it can drop chunks under
 & "$env:LOCALAPPDATA\mms-env\Scripts\python.exe" retranscribe.py sessions\2026-05-22-1012-acme
 ```
 
-It writes `<stem>-canonical.md` and `.srt`: WhisperX large-v3 at beam 10, with per-speaker labels (a single-voice mic stream collapses to "Me"; remote voices become Speaker 1, 2, …), the two streams merged by time. Useful flags: `--me-label "Sean"`, `--prompt "Vleissentraal, Hennie, ..."`, `--max-speakers 4`, `--no-diarise`.
+It writes `<stem>-canonical.md` and `.srt`: WhisperX large-v3 at beam 10, with per-speaker labels (a single-voice mic stream collapses to "Me"; remote voices become Speaker 1, 2, …), the two streams merged by time. Useful flags: `--me-label "Sean"`, `--prompt "Acme Corp, Thabo, ..."`, `--max-speakers 4`, `--no-diarise`.
 
 Diarisation needs a Hugging Face token once (after accepting the terms at [huggingface.co/pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)): `& "$env:LOCALAPPDATA\mms-env\Scripts\hf.exe" auth login`. Without a token it still produces a transcript, just without speaker labels.
 
