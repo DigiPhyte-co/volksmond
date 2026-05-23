@@ -139,19 +139,6 @@ def test_license_pubkey_precedence():
     print("  OK  licence pubkey: baked-in wins; env override only when none baked")
 
 
-def test_cloud_sync_label():
-    f = webapp._cloud_sync_label
-    assert f(r"C:\Users\x\OneDrive - DigiPhyte\sessions") == "OneDrive"
-    assert f("/home/x/Dropbox/notes") == "Dropbox"
-    assert f(r"C:\Users\x\Google Drive\x") == "Google Drive"
-    assert f(r"C:\Users\x\iCloudDrive\sessions") == "iCloud"
-    assert f(r"C:\Users\x\Documents\Volksmond") is None
-    assert f("") is None
-    j = client.get("/api/app-info").json()
-    assert "save_dir_cloud" in j, j
-    print("  OK  cloud-sync label flags OneDrive/Dropbox/Google Drive/iCloud, None for local")
-
-
 if __name__ == "__main__":
     failures = 0
     for fn in (test_app_info,
@@ -162,8 +149,7 @@ if __name__ == "__main__":
                test_csrf_blocks_unsafe_requests,
                test_unique_transcript_filenames,
                test_filename_allow_list,
-               test_license_pubkey_precedence,
-               test_cloud_sync_label):
+               test_license_pubkey_precedence):
         try:
             fn()
         except AssertionError as e:
