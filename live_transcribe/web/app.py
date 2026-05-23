@@ -21,6 +21,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
@@ -46,13 +47,23 @@ app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
 # neither read it (same-origin policy) nor guess it.
 CSRF_TOKEN = secrets.token_urlsafe(32)
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+# We only ever serve ourselves on loopback. Any other Host means a remote page
+# rebound its name to 127.0.0.1 (DNS rebinding) so the browser treats it as
+# same-origin and can read transcripts. Reject it before serving anything,
+# including the CSRF token, which a same-origin rebinding page would otherwise read.
+_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 @app.middleware("http")
 async def _csrf_and_security_headers(request: Request, call_next):
+    if (request.url.hostname or "").lower() not in _ALLOWED_HOSTS:
+        return JSONResponse({"detail": "Bad host"}, status_code=400)
     if request.method not in _SAFE_METHODS:
         if request.headers.get("x-volksmond-csrf") != CSRF_TOKEN:
             return JSONResponse({"detail": "Bad or missing CSRF token"}, status_code=403)
+        origin = request.headers.get("origin")
+        if origin and (urlparse(origin).hostname or "").lower() not in _ALLOWED_HOSTS:
+            return JSONResponse({"detail": "Bad origin"}, status_code=403)
     response = await call_next(request)
     # Defence in depth: never let this localhost UI be framed by another page.
     response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
@@ -178,7 +189,7 @@ def _validate_session_filename(name: str) -> None:
             or "/" in name or "\\" in name or ":" in name or "\x00" in name
             or name != Path(name).name
             or not name.lower().endswith(".md")
-            or Path(name).stem.upper() in _RESERVED_NAMES):
+            or name.split(".", 1)[0].upper() in _RESERVED_NAMES):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
 
@@ -557,12 +568,29 @@ def stop(what: str = "all"):
                 except Exception:
                     pass
                 err = md_sink.last_error if md_sink else None
+                cap_to_stop = None
                 with STATE.lock:
                     STATE.engine = None
                     STATE.md_sink = None
-                    STATE.stopping = False  # recording carries on; session still running
                     if err:
                         STATE.sink_error = err
+                    if STATE.recording:
+                        STATE.stopping = False  # recording carries on; session still running
+                    else:
+                        # Recording was also stopped while we were draining: nothing
+                        # is left running, so finalise. Stop capture OUTSIDE the lock
+                        # (it can block), then reset the session.
+                        cap_to_stop = STATE.capture
+                        STATE.capture = None
+                if cap_to_stop is not None:
+                    try:
+                        cap_to_stop.stop()
+                    except Exception:
+                        pass
+                    with STATE.lock:
+                        saved_err = STATE.sink_error
+                        STATE.reset()
+                        STATE.sink_error = saved_err
 
             threading.Thread(target=_drain_transcription, daemon=True, name="stop-transcription").start()
             return {"stopped": "transcription", "stopping": True, "pending": pending,
