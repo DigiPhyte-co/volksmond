@@ -249,9 +249,8 @@ window.VM_I18N = {
       "Sien die transkripsies en enige modelle wat op hierdie rekenaar gestoor is.",
     "Data and privacy": "Data en privaatheid",
     "Save transcripts and recordings to": "Stoor transkripsies en opnames na",
-    "Saved to a cloud folder": "Gestoor na 'n wolkvouer",
-    "Your transcripts sync to this cloud service, not only this computer. They are never sent anywhere for processing. Pick a local folder to keep them on this machine only.":
-      "Jou transkripsies sinkroniseer na hierdie wolkdiens, nie net hierdie rekenaar nie. Hulle word nooit êrens heen gestuur vir verwerking nie. Kies 'n plaaslike vouer om hulle net op hierdie masjien te hou.",
+    "For maximum privacy, choose a folder that a cloud provider does not sync (OneDrive, Google Drive, Dropbox, and the like).":
+      "Vir maksimum privaatheid, kies 'n vouer wat 'n wolkverskaffer nie sinkroniseer nie (OneDrive, Google Drive, Dropbox, en dies meer).",
     "Audio is off by default": "Klank is standaard af",
     "Recording is only kept when you switch it on for a meeting. The privacy promise holds otherwise.":
       "Opname word net gehou wanneer jy dit vir 'n vergadering aanskakel. Andersins geld die privaatheidsbelofte.",
