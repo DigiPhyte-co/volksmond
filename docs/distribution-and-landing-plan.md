@@ -12,9 +12,17 @@ LEANING:
 - Capture EMAIL ONLY (name optional). No phone, no company: it is a privacy tool, so
   minimal data is on-brand, converts better, and is less POPIA surface. Enrich later.
 - Static page on Cloudflare Pages (same pattern as the BiaD client sites), CNAME the
-  subdomain from AfriHost. Form posts to a small CF Pages Function that stores the
-  email and returns/emails the download link. Download hosted on R2 or a public GitHub
-  release.
+  subdomain from AfriHost. Form posts to a small CF Pages Function that stores the email
+  and returns/emails the download link.
+- DOWNLOAD HOSTING (decided 2026-05-23): a dedicated PUBLIC GitHub repo for releases (e.g.
+  DigiPhyte-co/volksmond-releases), installers as release assets. Free, reliable CDN,
+  versioned, public links; the source stays in the private repo. NOT off Sean's PC
+  (reliability + security), NOT SharePoint as primary (anonymous-download throttling, not
+  a CDN). Cloudflare R2 is the upgrade for a branded dl. domain later. The email gate is
+  the lead capture, so a public release URL is fine.
+- CODE-SIGNING: an unsigned Windows installer triggers SmartScreen "unknown publisher".
+  Early access: ship with a "More info, then Run anyway" instruction. Before the wider v1
+  push: get an OV/EV code-signing certificate to remove the warning.
 - Content: one-line value prop, the privacy promise as the hero, 4 feature bullets
   (live transcription; Afrikaans/English/code-switch; optional local summaries; fully
   offline), who it is for, email form + POPIA consent, "by DigiPhyte" credit.
@@ -101,6 +109,29 @@ LOCKED (2026-05-23): both come after Windows. Mac is a proper phase, not a quick
 - Strategic fit: privacy-conscious and technical users skew Linux, exactly the source-
   available + offline-only segment. Stated order is Mac then Linux, but since Linux is the
   lighter lift, the order could flip cheaply if a Linux user lands first.
+
+## 6. The fine-tuned Afrikaans model: open or closed
+LEANING (recommendation; decide when the model actually exists): OPEN-SOURCE the model,
+monetize the PRODUCT and the hosted SERVICE, not the weights.
+- The training data is community-donated. Open-sourcing the result is what makes the
+  donation ask credible and generous; closing a model built on donated meeting audio would
+  poison the well. Matches Sean's "betterment of humanity" instinct.
+- The weights are a WEAK moat anyway: Whisper fine-tuning is commoditised, anyone with data
+  can replicate it. The durable moats are the privacy-first local app (UX + trust + the
+  offline-only build), the hosted Afrikaans transcription service on the VPS (convenience,
+  scale, integrations), the brand and first-mover position in SA Afrikaans ASR, and the
+  ongoing data pipeline. Open model + paid product/service is a standard, healthy model.
+- Upside: large goodwill and PR, positioning as THE name in SA Afrikaans speech AI; an open
+  Afrikaans ASR model is a genuine public good for an under-served language.
+- Tradeoff: you cannot sell or exclusively control the weights, and competitors could use
+  them. But that is a weak revenue line and a weak moat; product + service + brand win.
+- Licence if open: permissive/Apache or CC-BY (attribution, maximum goodwill) vs CC-BY-NC
+  (free for community/research, commercial use reserved to Sean, a mild hedge but weaker
+  goodwill and hard to enforce). Lean CC-BY/attribution; CC-BY-NC only if a hedge is wanted.
+- ACTIONABLE NOW (the real urgency, the rest is future): make the data-donation CONSENT
+  broad enough to permit BOTH training AND model release under any licence, so the
+  open/closed choice stays open and is not foreclosed by narrow consent. Align with
+  SA-ASR-Model/corpus-strategy.md.
 
 ## Day-two feature backlog (post-launch, not launch-critical)
 Ideas parked for after the beta; add to this list as they come up.
