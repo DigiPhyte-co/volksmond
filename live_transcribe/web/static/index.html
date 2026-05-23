@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en-ZA">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Volksmond</title>
+  <link rel="stylesheet" href="/assets/styles.css" />
+</head>
+<body>
+  <div id="app" class="vm" data-palette="clinical" data-dark="false"></div>
+  <script>
+    // Apply the saved theme immediately so dark mode never flashes light.
+    (function () {
+      try {
+        var t = localStorage.getItem("vm_theme") || "system";
+        var dark = t === "dark" || (t === "system" &&
+          window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+        document.getElementById("app").setAttribute("data-dark", dark ? "true" : "false");
+      } catch (e) {}
+    })();
+  </script>
+  <script src="/assets/i18n.js"></script>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

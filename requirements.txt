@@ -1,0 +1,50 @@
+# SA-Live-Transcribe V0, pinned dependencies
+#
+# Tested with Python 3.12 on Windows 11. ctranslate2 wheels do not yet ship
+# for Python 3.13/3.14, use `py -3.12 -m venv .venv`.
+#
+# ctranslate2 4.7.x bundles cuDNN 9 directly in the wheel, no separate
+# cuDNN install needed. CUDA 12 runtime/driver is still required for GPU.
+# CPU-only users: just `pip install -r requirements.txt`.
+
+faster-whisper==1.2.1
+ctranslate2==4.7.2
+
+# Audio capture: PyAudio fork with WASAPI loopback support. `sounddevice`
+# doesn't expose loopback; `soundcard` advertises it but returns silence on
+# many Windows audio configurations (confirmed on Sean's Realtek setup).
+PyAudioWPatch==0.2.12.8
+
+# 48k/44.1k -> 16k resampling (polyphase filter, alias-safe)
+scipy==1.13.1
+numpy==1.26.4
+
+# Tier auto-detect reads total RAM as a fallback when no CUDA device is found
+psutil==5.9.8
+
+# Browser UI (FastAPI + uvicorn). Optional, only needed if you use the web UI.
+fastapi==0.136.1
+uvicorn[standard]==0.47.0
+
+# Note: torch is NOT required. CUDA presence is detected via
+# ctranslate2.get_cuda_device_count(), already a transitive dep.
+
+# Optional: Outlook calendar attendee-seeding (--seed-from-calendar). MSAL device-
+# code auth + Graph REST. requests comes in transitively but is pinned for repro.
+# Imported lazily, so the tool runs without these unless the flag is used.
+msal==1.36.0
+requests==2.34.2
+
+# Offline licence signing/verification (live_transcribe/licensing.py): Ed25519 via
+# cryptography. Already present transitively via msal, pinned here for repro.
+cryptography==48.0.0
+
+# Optional: native desktop-app shell (python -m live_transcribe.desktop), the
+# basis for the packaged installer. Browser UI works without it. Pulls pythonnet.
+pywebview==6.2.1
+
+# Optional: local AI summaries (live_transcribe/summarise.py). Runs a GGUF model
+# in-process via llama.cpp, no daemon. On Windows install the prebuilt CPU wheel:
+#   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+# Imported lazily, so the tool runs without it unless summaries are used.
+llama-cpp-python==0.3.23
