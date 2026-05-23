@@ -1,13 +1,13 @@
 """Frozen-app entry point for SA-Live-Transcribe (PyInstaller).
 
-Defaults to browser mode: starts the local server, opens the browser, and keeps a
-console window the user can close to stop. `--server-only` runs headless (used for
-build smoke-tests). The native pywebview window is a later packaging step; this
-frozen build deliberately avoids it so it doesn't have to bundle pythonnet.
+Defaults to the native pywebview window (the shipped experience): starts the local
+server and shows the UI in an app window. `--browser` opens a browser tab instead;
+`--server-only` runs headless (build smoke-tests). pywebview + pythonnet are bundled
+by sa-live-transcribe.spec, so the native window works in the frozen app.
 """
 import sys
 
 from live_transcribe.desktop import main
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:] or ["--browser"]))
+    sys.exit(main(sys.argv[1:]))
