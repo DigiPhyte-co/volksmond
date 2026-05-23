@@ -11,7 +11,7 @@
 
 // Where "Report a bug or request a feature" sends. Privacy-first mailto: it
 // only carries the app version and OS, never logs or transcripts.
-var FEEDBACK_EMAIL = "feedback@digiphyte.com";
+var FEEDBACK_EMAIL = "volksmond@digiphyte.com";
 
 var APP = document.getElementById("app");
 
