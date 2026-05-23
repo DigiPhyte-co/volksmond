@@ -172,6 +172,8 @@ window.VM_I18N = {
 
     // Finish + summarise
     "Saved.": "Gestoor.",
+    "Saved, with a warning": "Gestoor, met 'n waarskuwing",
+    "Saving may not have completed": "Stoor het dalk nie voltooi nie",
     "Open folder": "Maak vouer oop",
     "Open transcript": "Maak transkripsie oop",
     "Copy": "Kopieer",

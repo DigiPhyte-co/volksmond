@@ -33,8 +33,9 @@ from pathlib import Path
 from typing import Optional
 
 # Replace with YOUR public key: run `keygen`, keep the private key secret, paste
-# the public hex here. Overridable at runtime with SA_LIVE_LICENSE_PUBKEY, which
-# is what tests and ops use so the shipped constant stays clean.
+# the public hex here. While this is empty (dev/test) the SA_LIVE_LICENSE_PUBKEY
+# env var supplies the key; once a real key is baked in here it takes precedence
+# and the env var is ignored, so a shipped build can't be pointed at another key.
 _PUBLIC_KEY_HEX = ""
 
 # The package major version a licence is checked against. Bump on a paid major
@@ -67,7 +68,10 @@ def _b64d(s: str) -> bytes:
 
 
 def _pubkey_hex() -> str:
-    return os.environ.get("SA_LIVE_LICENSE_PUBKEY", "").strip() or _PUBLIC_KEY_HEX
+    # A baked-in key always wins; the env override only applies when no key is
+    # shipped (dev/test), so a released build can't be pointed at another key to
+    # self-sign Pro.
+    return _PUBLIC_KEY_HEX or os.environ.get("SA_LIVE_LICENSE_PUBKEY", "").strip()
 
 
 @dataclass(frozen=True)

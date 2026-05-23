@@ -14,6 +14,7 @@ import os
 import platform
 import queue
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -21,8 +22,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -36,6 +37,27 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 # Serve styles.css / app.js (and any future assets) from the static folder.
 # Localhost-only server; these are the app's own files, no user data.
 app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
+
+# Per-process CSRF token. The server listens on localhost, so any web page the
+# user happens to visit can fire a *simple* cross-origin POST at it (e.g.
+# /api/stop?what=all, /api/open-folder, /api/pick) and interrupt a meeting or
+# spawn native dialogs. We mint a fresh token each launch, embed it in the served
+# page, and require it on every state-changing request; a third-party page can
+# neither read it (same-origin policy) nor guess it.
+CSRF_TOKEN = secrets.token_urlsafe(32)
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+@app.middleware("http")
+async def _csrf_and_security_headers(request: Request, call_next):
+    if request.method not in _SAFE_METHODS:
+        if request.headers.get("x-volksmond-csrf") != CSRF_TOKEN:
+            return JSONResponse({"detail": "Bad or missing CSRF token"}, status_code=403)
+    response = await call_next(request)
+    # Defence in depth: never let this localhost UI be framed by another page.
+    response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 class BrowserSink:
@@ -93,6 +115,10 @@ class _State:
         self.transcribing: bool = False
         self.source_kind: Optional[str] = None   # "live" | "file"
         self.stopping: bool = False  # True while draining the backlog after Stop
+        # Sticky transcript/recording write error, surfaced via /api/status. Set
+        # during finalisation and kept across reset() so the UI can show it after
+        # the session ends; cleared when the next session starts.
+        self.sink_error: Optional[str] = None
 
     def reset(self):
         self.engine = None
@@ -114,6 +140,10 @@ class _State:
 
 STATE = _State()
 
+# Only one native file dialog (tkinter) at a time: concurrent Tk roots on worker
+# threads can hang or trip Tk's thread assumptions. A second pick returns 409.
+_PICK_LOCK = threading.Lock()
+
 
 class StartRequest(BaseModel):
     topic: str = ""
@@ -130,6 +160,26 @@ def _slugify(s: str) -> str:
     s = s.strip().lower()
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
     return s or "session"
+
+
+# Windows reserved device names, rejected as transcript filenames.
+_RESERVED_NAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def _validate_session_filename(name: str) -> None:
+    """Reject anything that is not a plain `*.md` basename. resolve()+relative_to()
+    at the call site already blocks traversal; this adds a strict allow-list for
+    Windows oddities (alternate data streams via ':', NUL, reserved device names)."""
+    if (not name
+            or "/" in name or "\\" in name or ":" in name or "\x00" in name
+            or name != Path(name).name
+            or not name.lower().endswith(".md")
+            or Path(name).stem.upper() in _RESERVED_NAMES):
+        raise HTTPException(status_code=400, detail="Invalid filename")
 
 
 def _sessions_dir() -> Path:
@@ -155,20 +205,33 @@ def _sessions_dir() -> Path:
 
 
 def _build_output_path(topic: str) -> Path:
-    ts = datetime.now().strftime("%Y-%m-%d-%H%M")
-    return _sessions_dir() / f"{ts}-{_slugify(topic)}.md"
+    """A unique transcript path. Seconds plus a dedup suffix guarantee that two
+    meetings with the same topic in the same minute never share a file, because
+    MarkdownSink opens in append mode and a collision would merge two separate
+    (possibly confidential) transcripts."""
+    stem = f"{datetime.now():%Y-%m-%d-%H%M%S}-{_slugify(topic)}"
+    sdir = _sessions_dir()
+    for i in range(1, 1000):
+        cand = sdir / (f"{stem}.md" if i == 1 else f"{stem}-{i}.md")
+        if not cand.exists():
+            return cand
+    raise HTTPException(status_code=500, detail="Could not allocate a unique transcript filename")
 
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    # Hand the page the CSRF token so app.js can echo it on unsafe requests.
+    tag = f'<meta name="vm-csrf" content="{CSRF_TOKEN}" />'
+    return html.replace("</head>", f"  {tag}\n</head>", 1)
 
 
 @app.get("/api/status")
 def status():
     with STATE.lock:
         if not STATE.running:
-            return {"running": False, "stopping": False}
+            return {"running": False, "stopping": False, "sink_error": STATE.sink_error}
+        live_err = STATE.md_sink.last_error if STATE.md_sink else None
         resp = {
             "running": True,
             "stopping": STATE.stopping,
@@ -180,6 +243,7 @@ def status():
             "language": STATE.language,
             "output_path": str(STATE.output_path) if STATE.output_path else None,
             "started_at": STATE.started_at.isoformat() if STATE.started_at else None,
+            "sink_error": live_err or STATE.sink_error,
         }
         if STATE.stopping and STATE.engine is not None:
             resp["pending"] = STATE.engine.pending()
@@ -245,6 +309,7 @@ def start(req: StartRequest):
     with STATE.lock:
         if STATE.running:
             raise HTTPException(status_code=409, detail="Session already running")
+        STATE.sink_error = None  # fresh session: clear any prior write error
 
         transcribe_on = bool(req.transcribe)
         record_on = bool(req.record)
@@ -354,6 +419,7 @@ def transcribe_file(req: TranscribeFileRequest):
     with STATE.lock:
         if STATE.running:
             raise HTTPException(status_code=409, detail="A session is already running")
+        STATE.sink_error = None  # fresh session: clear any prior write error
         tier, language, prompt = _resolve_tier_lang_prompt(req)
         chunk_seconds = default_chunk_seconds(tier)
         topic = req.topic or Path(files[0]).stem
@@ -411,8 +477,10 @@ def transcribe_file(req: TranscribeFileRequest):
                 md_sink.close()
             except Exception:
                 pass
+            err = md_sink.last_error if md_sink else None
             with STATE.lock:
                 STATE.reset()
+                STATE.sink_error = err
 
     threading.Thread(target=_run, daemon=True, name="file-transcribe").start()
     return {
@@ -443,22 +511,29 @@ def stop(what: str = "all"):
             STATE.stopping = True
             return {"stopping": True, "output_path": out}
 
-        # Narrow a partial stop to "all" when it would leave nothing running.
+        # Stopping the recorder must take effect immediately, even while
+        # transcription is still draining, otherwise audio keeps recording until
+        # the ASR backlog clears.
+        if what == "recording":
+            if STATE.recording:
+                STATE.recording = False
+                rec, STATE.recorder = STATE.recorder, None
+                if rec is not None:
+                    try:
+                        rec.close()
+                    except Exception:
+                        pass
+                    if rec.last_error:
+                        STATE.sink_error = rec.last_error
+            if STATE.transcribing or STATE.stopping:
+                return {"stopped": "recording", "recording": False,
+                        "transcribing": STATE.transcribing, "stopping": STATE.stopping,
+                        "output_path": out}
+            what = "all"  # nothing left running: fall through to finalise
+
+        # Narrow "stop transcription" to a full stop when nothing else is running.
         if what == "transcription" and not STATE.recording:
             what = "all"
-        elif what == "recording" and not STATE.transcribing:
-            what = "all"
-
-        if what == "recording":
-            STATE.recording = False
-            rec, STATE.recorder = STATE.recorder, None
-            if rec is not None:
-                try:
-                    rec.close()
-                except Exception:
-                    pass
-            return {"stopped": "recording", "recording": False,
-                    "transcribing": STATE.transcribing, "output_path": out}
 
         if what == "transcription":
             if STATE.stopping:
@@ -481,10 +556,13 @@ def stop(what: str = "all"):
                         md_sink.close()
                 except Exception:
                     pass
+                err = md_sink.last_error if md_sink else None
                 with STATE.lock:
                     STATE.engine = None
                     STATE.md_sink = None
                     STATE.stopping = False  # recording carries on; session still running
+                    if err:
+                        STATE.sink_error = err
 
             threading.Thread(target=_drain_transcription, daemon=True, name="stop-transcription").start()
             return {"stopped": "transcription", "stopping": True, "pending": pending,
@@ -526,22 +604,25 @@ def stop(what: str = "all"):
                 rec.close()
         except Exception:
             pass
+        err = (md_sink.last_error if md_sink else None) or (rec.last_error if rec else None)
         with STATE.lock:
             STATE.reset()
+            STATE.sink_error = err
 
     threading.Thread(target=_drain_and_close, daemon=True, name="stop-drain").start()
     return {"stopping": True, "pending": pending, "output_path": out}
 
 
 def _parse_session_filename(name: str) -> dict:
-    """Extract a display-friendly topic from `2026-05-20-1430-topic-slug.md`."""
+    """Extract date/time/topic from `YYYY-MM-DD-HHMMSS-topic-slug.md`
+    (older files use HHMM, so the seconds group is optional)."""
     stem = name[:-3] if name.endswith(".md") else name
-    m = re.match(r"^(\d{4}-\d{2}-\d{2})-(\d{4})-(.*)$", stem)
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})-(\d{2})(\d{2})(?:\d{2})?-(.*)$", stem)
     if m:
-        date_part, time_part, topic = m.group(1), m.group(2), m.group(3)
+        date_part, hh, mm, topic = m.group(1), m.group(2), m.group(3), m.group(4)
         return {
             "date": date_part,
-            "time": f"{time_part[:2]}:{time_part[2:]}",
+            "time": f"{hh}:{mm}",
             "topic": topic.replace("-", " ") or "(session)",
         }
     return {"date": "", "time": "", "topic": stem}
@@ -571,8 +652,7 @@ def sessions_list():
 @app.get("/sessions/{filename}", response_class=PlainTextResponse)
 def session_content(filename: str):
     """Serve a session file as plain text. Path-traversal-safe."""
-    if "/" in filename or "\\" in filename or filename.startswith(".."):
-        raise HTTPException(status_code=400, detail="Invalid filename")
+    _validate_session_filename(filename)
     sdir = _sessions_dir()
     target = (sdir / filename).resolve()
     try:
@@ -707,31 +787,43 @@ def pick_path(kind: str = "file"):
     so headless or test environments that never call this pay nothing. The UI falls
     back to a paste-a-path field if no dialog is available.
 
-    Returns {"path": <absolute path> | None}; None when the user cancels.
+    Serialised: only one dialog at a time (409 otherwise), and the Tk root is
+    always destroyed. Returns {"path": <absolute path> | None}; None on cancel.
     """
+    if not _PICK_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="A file dialog is already open.")
     try:
-        import tkinter as tk
-        from tkinter import filedialog
-    except Exception as e:
-        raise HTTPException(status_code=501, detail=f"No native file dialog on this machine: {e}")
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        if kind == "folder":
-            chosen = filedialog.askdirectory(title="Choose a folder")
-        else:
-            chosen = filedialog.askopenfilename(
-                title="Choose a recording to transcribe",
-                filetypes=[
-                    ("Audio and video", "*.mp3 *.m4a *.wav *.mp4 *.mov *.ogg *.flac *.aac *.webm *.mkv *.avi"),
-                    ("All files", "*.*"),
-                ],
-            )
-        root.destroy()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not open the file dialog: {e}")
-    return {"path": chosen or None}
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except Exception as e:
+            raise HTTPException(status_code=501, detail=f"No native file dialog on this machine: {e}")
+        root = None
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            if kind == "folder":
+                chosen = filedialog.askdirectory(title="Choose a folder")
+            else:
+                chosen = filedialog.askopenfilename(
+                    title="Choose a recording to transcribe",
+                    filetypes=[
+                        ("Audio and video", "*.mp3 *.m4a *.wav *.mp4 *.mov *.ogg *.flac *.aac *.webm *.mkv *.avi"),
+                        ("All files", "*.*"),
+                    ],
+                )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not open the file dialog: {e}")
+        finally:
+            if root is not None:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+        return {"path": chosen or None}
+    finally:
+        _PICK_LOCK.release()
 
 
 class SummariseRequest(BaseModel):
@@ -752,8 +844,7 @@ def summarise_endpoint(req: SummariseRequest):
             )
 
     fn = req.file
-    if "/" in fn or "\\" in fn or fn.startswith(".."):
-        raise HTTPException(status_code=400, detail="Invalid filename")
+    _validate_session_filename(fn)
     sdir = _sessions_dir()
     target = (sdir / fn).resolve()
     try:
