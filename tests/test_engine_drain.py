@@ -84,12 +84,28 @@ def test_no_new_audio_accepted_during_shutdown():
     print("  OK  on_chunk rejects new audio once shutdown has begun")
 
 
+def test_blocking_feed_drops_nothing():
+    # File import feeds the whole file as fast as possible into the small (32-slot)
+    # queue. With block=True the producer waits for the transcriber instead of
+    # dropping, so a long file is transcribed in full (the hour-file truncation fix).
+    engine, collected = _make_engine()
+    engine.start()
+    n = 80  # well over the 32-slot queue
+    for i in range(n):
+        engine.on_chunk("FILE", i, float(i), block=True)
+    engine.stop(drain=True, timeout=60)
+    assert engine._dropped == 0, f"blocking feed dropped {engine._dropped} chunks"
+    assert len(collected) == n, f"blocking feed lost chunks: {len(collected)}/{n}"
+    print(f"  OK  blocking feed transcribed all {n} chunks with a 32-slot queue (no drops)")
+
+
 if __name__ == "__main__":
     transcribe.WhisperModel = _FakeModel       # patch before any Engine is built
     failures = 0
     for fn in (test_drain_processes_whole_backlog,
                test_abort_drops_backlog,
-               test_no_new_audio_accepted_during_shutdown):
+               test_no_new_audio_accepted_during_shutdown,
+               test_blocking_feed_drops_nothing):
         try:
             fn()
         except AssertionError as e:

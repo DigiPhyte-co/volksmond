@@ -322,7 +322,7 @@ async function startRecordOnly() {
   } catch (e) { toast(e.message || "Could not start recording.", true); }
 }
 async function startImport(arg) {
-  var body = { topic: arg.topic || "", tier: S.form.tier, language: S.form.language, prompt: "" };
+  var body = { topic: arg.topic || "", tier: S.form.tier, language: S.form.language, prompt: (S.form.terms || []).join(", ") };
   if (arg.path) body.paths = [arg.path];
   if (arg.stem) body.stem = arg.stem;
   try {
@@ -379,7 +379,12 @@ function pastePathModal(kind) {
 }
 async function importFromPicker() {
   var p = await pickFile("file");
-  if (p) startImport({ path: p });
+  if (!p) return;
+  // Go through the context screen first (title, language, names and jargon),
+  // then transcribe - same as a live meeting gets its pre-meeting setup.
+  S.importPath = p; S.importStem = null; S.importName = baseName(p);
+  S.form.title = ""; S.form.terms = [];
+  go("importpre");
 }
 
 async function doStop(what) {
@@ -597,6 +602,7 @@ function render() {
     case "setup": view = setupView(); break;
     case "home": view = shell("home", homeView()); break;
     case "pre": view = shell("home", preView()); break;
+    case "importpre": view = shell("home", importPreView()); break;
     case "live": view = liveView(); break;
     case "recordonly": view = recordOnlyView(); break;
     case "importing": view = importingView(); break;
@@ -713,7 +719,7 @@ function homeView() {
       el("p", { class: "sub", text: "Three ways in. Pick the one that fits the moment." }),
     ])),
     el("div", { class: "entry-grid" }, [
-      entry({ primary: true, badge: "Most common", ic: "mic", title: "Start a live meeting", cta: "Begin",
+      entry({ primary: true, ic: "mic", title: "Start a live meeting", cta: "Begin",
         body: "Transcribe what you and others are saying right now, on this computer. Optionally record the audio too.",
         onclick: function () { go("pre"); } }),
       entry({ ic: "upload", title: "Upload a recording to transcribe", cta: "Choose a file",
@@ -815,6 +821,40 @@ function termsBox() {
   return box;
 }
 
+/* ── import setup (context before transcribing a file) ──────── */
+function importPreView() {
+  var langSeg = segmented([["af", "Afrikaans"], ["en", "English"], ["", "Auto-detect"]], S.form.language, function (v) { S.form.language = v; render(); });
+  var tierSeg = segmented([["auto", "Auto"], ["cpu-mid", "Fast"], ["cpu-strong", "Balanced"], ["gpu", "Best"]], S.form.tier, function (v) { S.form.tier = v; render(); });
+  var fileLabel = S.importName || "the recording";
+  function begin() { startImport({ path: S.importPath, stem: S.importStem, topic: S.form.title }); }
+  return el("div", { class: "screen" }, el("div", { class: "screen-inner col-mid" }, [
+    el("div", { class: "screen-head" }, [
+      el("div", {}, [
+        el("div", { class: "eyebrow", text: "Before we transcribe" }),
+        el("h1", { text: "Add context" }),
+        el("p", { class: "sub", text: "Names and jargon help accuracy, especially for Afrikaans and the mix. All optional." }),
+      ]),
+      el("span", { class: "chip ok" }, [icon("check", 12), "On this machine"]),
+    ]),
+    el("div", { class: "card", style: { padding: "13px 16px", display: "flex", gap: "12px", alignItems: "center", marginBottom: "18px" } }, [
+      el("div", { class: "tone-tile accent", style: { width: "34px", height: "34px", flex: "0 0 auto" } }, icon("upload", 17)),
+      el("div", { class: "mono", style: { fontSize: "13px", fontWeight: "600", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: "0" } }, raw(fileLabel)),
+    ]),
+    formField("Title", el("span", { class: "label-muted", text: " (optional)" }),
+      el("input", { class: "field tall", value: S.form.title, placeholder: "e.g. Physio discovery call", oninput: function (e) { S.form.title = e.target.value; } })),
+    el("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" } }, [
+      formField("Language", null, langSeg, true),
+      formField("Quality", null, tierSeg, true),
+    ]),
+    formField("Names and jargon", el("span", { class: "label-muted", text: " (optional, helps accuracy)" }), termsBox()),
+    el("p", { class: "hint", style: { marginTop: "-8px", marginBottom: "16px" }, text: "Your saved default context is applied automatically. Add anything specific to this meeting here." }),
+    el("div", { class: "row gap-16", style: { marginTop: "8px" } }, [
+      el("button", { class: "btn primary big", onclick: begin }, [icon("note", 15), "Transcribe"]),
+      el("button", { class: "btn ghost", onclick: function () { go("home"); } }, "Back"),
+    ]),
+  ]));
+}
+
 /* ── live screen ──────────────────────────────────────────── */
 function liveView() {
   var statusChip;
@@ -900,7 +940,7 @@ function recordOnlyView() {
       ]),
       el("p", { class: "ink-2", style: { fontSize: "13px" }, text: "Volksmond will read the file and write it out. Slower than live, but more accurate. You can keep working while it runs. Stays on this computer." }),
       el("div", { class: "row gap-8", style: { marginTop: "16px" } }, [
-        el("button", { class: "btn primary", onclick: function () { if (stem) startImport({ stem: stem, topic: S.live.title }); else toast("Recording path missing.", true); } }, "Transcribe this recording now"),
+        el("button", { class: "btn primary", onclick: function () { if (stem) { S.importStem = stem; S.importPath = null; S.importName = baseName(stem) + ".wav"; S.form.title = S.live.title || ""; go("importpre"); } else { toast("Recording path missing.", true); } } }, "Transcribe this recording now"),
         el("button", { class: "btn ghost", onclick: function () { go("home"); } }, "Transcribe later"),
       ]),
     ]),
@@ -1413,6 +1453,7 @@ function adoptRunning(status) {
 document.addEventListener("keydown", function (e) {
   if (e.key === "Escape" && S.stopMenuOpen) { S.stopMenuOpen = false; render(); return; }
   if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && S.route === "pre") { e.preventDefault(); startLive(); return; }
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && S.route === "importpre") { e.preventDefault(); startImport({ path: S.importPath, stem: S.importStem, topic: S.form.title }); return; }
   if ((e.key === "k" || e.key === "K") && (e.metaKey || e.ctrlKey) && S.route === "history") {
     e.preventDefault();
     var s = document.querySelector('.screen input[placeholder^="Search"]');

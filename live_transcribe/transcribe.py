@@ -124,12 +124,16 @@ class Segment:
 
 
 class Engine:
-    def __init__(self, tier, language="af", initial_prompt=None, cpu_threads=8, beam_size=5):
+    def __init__(self, tier, language="af", initial_prompt=None, cpu_threads=8, beam_size=5, adaptive=True):
         if tier not in TIER_CONFIG:
             raise ValueError(f"Unknown tier {tier!r}; choose from {list(TIER_CONFIG)}")
         self.tier = tier
         self.language = language
         self.beam_size = beam_size
+        # adaptive=True (live): cut beam + downgrade the model under backlog to keep
+        # up with real time. adaptive=False (file import): not real time, so never
+        # trade quality for speed - keep the chosen model and full beam size.
+        self.adaptive = adaptive
 
         # Apply the Afrikaans anchor when transcribing in af. User prompt (if any)
         # follows the anchor so client-specific terms still bias the model.
@@ -189,10 +193,19 @@ class Engine:
             n += 1
         return n
 
-    def on_chunk(self, source, audio, t_start):
-        """Called by AudioCapture. Drops if backpressured rather than blocking capture."""
+    def on_chunk(self, source, audio, t_start, block=False):
+        """Enqueue a chunk for transcription.
+
+        block=False (live capture): drop if the backlog is full rather than stall
+        the real-time audio thread. block=True (file import): wait for space so
+        nothing is dropped, because the file is not real-time and every chunk
+        matters; this paces the producer to the transcriber.
+        """
         if self._stop.is_set():
             return  # shutting down, don't accept new audio while we drain the backlog
+        if block:
+            self._queue.put((source, audio, t_start))  # waits for space; never drops
+            return
         try:
             self._queue.put((source, audio, t_start), block=False)
         except queue.Full:
@@ -240,7 +253,7 @@ class Engine:
         oscillation. The new (smaller) model also chews through the queued
         backlog faster, which is how the session catches back up.
         """
-        if not self._is_cpu or len(self._rtf) < self._rtf.maxlen:
+        if not self.adaptive or not self._is_cpu or len(self._rtf) < self._rtf.maxlen:
             return
         avg = sum(self._rtf) / len(self._rtf)
         if avg <= DOWNGRADE_RTF:
@@ -291,7 +304,7 @@ class Engine:
 
             # Adaptive quality: under backlog pressure, drop to beam_size=1 to
             # transcribe faster and catch up. Best-effort quality when keeping up.
-            beam = 1 if self.pending() > BACKPRESSURE_BEAM_THRESHOLD else self.beam_size
+            beam = 1 if (self.adaptive and self.pending() > BACKPRESSURE_BEAM_THRESHOLD) else self.beam_size
 
             self._busy = True
             try:
