@@ -333,7 +333,12 @@ function startElapsed() {
   }, 1000);
 }
 async function pickFile(kind) {
-  // Native picker on this machine; falls back to a paste-a-path modal.
+  // In the desktop shell use pywebview's native dialog; in the browser build hit
+  // /api/pick (server-side tkinter); fall back to a paste-a-path modal.
+  if (inDesktop() && window.pywebview.api.pick_path) {
+    try { var pd = await window.pywebview.api.pick_path(kind || "file"); return pd || null; }
+    catch (e) { /* fall through to the server picker */ }
+  }
   try {
     var r = await api.post("/api/pick?kind=" + (kind || "file"));
     return r.path || null;
@@ -515,7 +520,14 @@ async function deactivateLicence() {
 function isPro() { return S.license && S.license.status === "ok" && S.license.tier === "pro"; }
 function summaryInstalled() { return S.models && S.models.summary_installed; }
 
-/* ── bug report ───────────────────────────────────────────── */
+/* ── desktop bridge + bug report ──────────────────────────── */
+// In the native pywebview shell, window.pywebview.api is injected after load.
+// Use it to open external links and native pickers; the browser build falls back.
+function inDesktop() { return !!(window.pywebview && window.pywebview.api); }
+function openExternal(url) {
+  if (inDesktop() && window.pywebview.api.open_external) { window.pywebview.api.open_external(url); }
+  else { window.location.href = url; }
+}
 function reportBug() {
   var info = S.appInfo || {};
   var version = info.version || "?", plat = info.platform || "?";
@@ -526,8 +538,8 @@ function reportBug() {
     "Volksmond version " + version + "\n" +
     plat + "\n" +
     "(No logs or transcripts are attached. Add anything helpful yourself.)\n";
-  window.location.href = "mailto:" + FEEDBACK_EMAIL +
-    "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
+  openExternal("mailto:" + FEEDBACK_EMAIL +
+    "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body));
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -1190,7 +1202,7 @@ function upgradeView() {
     el("p", { class: "ink-2", text: "Free is the real thing: unlimited live transcription and local summaries, on this machine, forever. Pro adds the few features that actually need to reach the internet." }),
     el("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" } }, [freeCard(), proCard()]),
     el("div", { class: "card", style: { padding: "20px" } }, [
-      el("button", { class: "btn primary tall", onclick: function () { window.location.href = "mailto:" + FEEDBACK_EMAIL + "?subject=" + encodeURIComponent("Buy Volksmond Pro"); } }, "Buy Pro for R 599"),
+      el("button", { class: "btn primary tall", onclick: function () { openExternal("mailto:" + FEEDBACK_EMAIL + "?subject=" + encodeURIComponent("Buy Volksmond Pro")); } }, "Buy Pro for R 599"),
       el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "8px" }, text: "Opens your email so we can send you a licence key. Activation is fully offline." }),
       el("div", { class: "divider-label", text: "Already bought" }),
       el("div", { class: "row gap-8" }, [
