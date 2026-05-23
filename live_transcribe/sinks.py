@@ -37,6 +37,7 @@ class MarkdownSink:
         self.fh = open(self.path, "a", encoding="utf-8", buffering=1)
         self._lock = threading.Lock()
         self._closed = False
+        self.last_error = None      # human-readable write/close failure, surfaced in the UI
         self._write_header()
         atexit.register(self.close)
 
@@ -58,6 +59,7 @@ class MarkdownSink:
                 self.fh.write(line)
                 self.fh.flush()
             except Exception as e:
+                self.last_error = f"Could not write the transcript to {self.path.name}: {e}"
                 print(f"[markdown-sink] write error: {e}", flush=True)
 
     def close(self):
@@ -69,8 +71,9 @@ class MarkdownSink:
                 self.fh.write("\n---\n\n_End of session._\n")
                 self.fh.flush()
                 self.fh.close()
-            except Exception:
-                pass
+            except Exception as e:
+                self.last_error = f"Could not finalise the transcript {self.path.name}: {e}"
+                print(f"[markdown-sink] close error: {e}", flush=True)
 
 
 class AudioRecorder:
@@ -92,6 +95,7 @@ class AudioRecorder:
         self._writers = {}     # source -> wave.Wave_write
         self._lock = threading.Lock()
         self._closed = False
+        self.last_error = None      # human-readable write/close failure, surfaced in the UI
         atexit.register(self.close)
 
     def on_chunk(self, source, audio, t_start):
@@ -111,6 +115,7 @@ class AudioRecorder:
             try:
                 w.writeframes(pcm16)
             except Exception as e:
+                self.last_error = f"Could not write audio ({source}): {e}"
                 print(f"[recorder] write error ({source}): {e}", flush=True)
 
     def close(self):
@@ -121,5 +126,6 @@ class AudioRecorder:
             for w in self._writers.values():
                 try:
                     w.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.last_error = f"Could not finalise the recording: {e}"
+                    print(f"[recorder] close error: {e}", flush=True)

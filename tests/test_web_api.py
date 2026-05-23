@@ -17,12 +17,17 @@ import sys
 # Make `import live_transcribe` work when run as a plain script.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from live_transcribe import licensing
-from live_transcribe.web.app import app
+from live_transcribe.web import app as webapp
+from live_transcribe.web.app import CSRF_TOKEN, app
 
+# The real UI always sends the CSRF token (app.js reads it from the page); mirror
+# that here so the existing POST tests exercise the endpoints, not the guard.
 client = TestClient(app)
+client.headers.update({"X-Volksmond-CSRF": CSRF_TOKEN})
 
 
 def test_app_info():
@@ -69,13 +74,82 @@ def test_static_assets_served():
     print("  OK  index + /assets/app.js + /assets/styles.css all serve")
 
 
+def test_csrf_blocks_unsafe_requests():
+    # A page without the token (e.g. a random site firing a simple cross-origin
+    # POST at localhost) must be rejected on any state-changing method.
+    bare = TestClient(app)
+    r = bare.post("/api/stop?what=all")
+    assert r.status_code == 403, f"unsafe POST without CSRF token should be 403, got {r.status_code}"
+    # GETs are safe and must still work without the token.
+    assert bare.get("/api/app-info").status_code == 200, "GET should not require the CSRF token"
+    # The token is handed to the page so the real UI can echo it.
+    assert 'name="vm-csrf"' in client.get("/").text, "index does not embed the CSRF token"
+    print("  OK  CSRF: unsafe POST blocked without token; GET open; token embedded in page")
+
+
+def test_unique_transcript_filenames():
+    import tempfile, pathlib
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    orig = webapp._sessions_dir
+    webapp._sessions_dir = lambda: tmp
+    try:
+        p1 = webapp._build_output_path("Collision Test")
+        p1.write_text("first meeting", encoding="utf-8")   # meeting A is on disk
+        p2 = webapp._build_output_path("Collision Test")
+        assert p2 != p1, "second transcript reused the first path (meetings would merge)"
+        assert not p2.exists(), "second path already exists on disk"
+    finally:
+        webapp._sessions_dir = orig
+    print("  OK  two same-topic sessions never share a transcript file")
+
+
+def test_filename_allow_list():
+    bad = ["../secret.md", "a/b.md", "a\\b.md", "CON.md", "report.txt",
+           "stream.md:hidden", "", "..", "trans\x00.md"]
+    for name in bad:
+        try:
+            webapp._validate_session_filename(name)
+            assert False, f"accepted invalid filename: {name!r}"
+        except HTTPException as e:
+            assert e.status_code == 400, (name, e.status_code)
+    webapp._validate_session_filename("2026-05-23-120000-weekly-standup.md")  # a normal name passes
+    # The summarise endpoint rejects traversal with 400 (not 404/500).
+    r = client.post("/api/summarise", json={"file": "../secret.md"})
+    assert r.status_code == 400, f"summarise should 400 on a bad filename, got {r.status_code}"
+    print("  OK  filename allow-list rejects traversal, ADS, reserved names, non-.md")
+
+
+def test_license_pubkey_precedence():
+    # A baked-in key must win, so a shipped build can't be pointed at another key
+    # via SA_LIVE_LICENSE_PUBKEY to self-sign Pro.
+    orig_baked = licensing._PUBLIC_KEY_HEX
+    orig_env = os.environ.get("SA_LIVE_LICENSE_PUBKEY")
+    try:
+        licensing._PUBLIC_KEY_HEX = "baked"
+        os.environ["SA_LIVE_LICENSE_PUBKEY"] = "attacker"
+        assert licensing._pubkey_hex() == "baked", "env var overrode a baked-in key"
+        licensing._PUBLIC_KEY_HEX = ""        # dev/test: no key shipped
+        assert licensing._pubkey_hex() == "attacker", "env var ignored when nothing baked"
+    finally:
+        licensing._PUBLIC_KEY_HEX = orig_baked
+        if orig_env is None:
+            os.environ.pop("SA_LIVE_LICENSE_PUBKEY", None)
+        else:
+            os.environ["SA_LIVE_LICENSE_PUBKEY"] = orig_env
+    print("  OK  licence pubkey: baked-in wins; env override only when none baked")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_app_info,
                test_summaries_are_free,
                test_summarise_not_pro_gated,
                test_settings_never_leak_secret,
-               test_static_assets_served):
+               test_static_assets_served,
+               test_csrf_blocks_unsafe_requests,
+               test_unique_transcript_filenames,
+               test_filename_allow_list,
+               test_license_pubkey_precedence):
         try:
             fn()
         except AssertionError as e:

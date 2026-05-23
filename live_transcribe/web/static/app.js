@@ -17,6 +17,10 @@ var FEEDBACK_EMAIL = "volksmond@digiphyte.com";
 var PRO_URL = "https://volksmond.digiphyte.com/pro";
 
 var APP = document.getElementById("app");
+// CSRF token handed to the page by the server (app.py). Echoed on every
+// state-changing request so a third-party web page can't drive this localhost
+// server; the same-origin policy stops other pages from reading it.
+var CSRF = (document.querySelector('meta[name="vm-csrf"]') || {}).content || "";
 
 /* ── tiny DOM helper ──────────────────────────────────────── */
 function el(tag, attrs, children) {
@@ -46,11 +50,15 @@ function append(n, c) {
   n.appendChild(document.createTextNode(tr(String(c))));
 }
 function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
+// Wrap dynamic/user content (transcript text, names, paths) so it bypasses tr().
+// el({text}) and string children auto-translate UI labels; data must never be
+// "translated", even when it happens to equal a UI label like "Stop" or "Open".
+function raw(s) { return document.createTextNode(s == null ? "" : String(s)); }
 
 /* ── i18n (interface language) ────────────────────────────── */
 // Translations live in i18n.js (window.VM_I18N), keyed by the English string.
-// tr() leaves anything not in the active map unchanged, so dynamic content
-// (transcript text, names, file paths) is never altered.
+// tr() only changes strings present in the active map, so most dynamic content
+// is unaffected; pass genuinely dynamic values through raw() (above) to be safe.
 var VM_AF = (window.VM_I18N && window.VM_I18N.af) || {};
 var LANG = "en";
 function afLang(s) { return (s && /^af/i.test(s.interface_language || "")) ? "af" : "en"; }
@@ -132,7 +140,7 @@ var S = {
   live: freshLive(),
   form: { title: "", language: "af", tier: "auto", terms: [], record: false, mic: null, loopback: null },
   setup: { stage: "welcome", choice: "transcribe" },
-  finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null },
+  finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null },
   reader: { name: "", title: "", text: "", summarising: false, summary: null },
   upgrade: { keyState: "empty", value: "", msg: "" },
   settingsDraft: null,
@@ -155,12 +163,12 @@ var api = {
   post: async function (p, body) {
     var r = await fetch(p, {
       method: "POST",
-      headers: body ? { "Content-Type": "application/json" } : {},
+      headers: Object.assign({ "X-Volksmond-CSRF": CSRF }, body ? { "Content-Type": "application/json" } : {}),
       body: body ? JSON.stringify(body) : undefined,
     });
     if (!r.ok) throw await errOf(r); return r.json();
   },
-  del: async function (p) { var r = await fetch(p, { method: "DELETE" }); if (!r.ok) throw await errOf(r); return r.json(); },
+  del: async function (p) { var r = await fetch(p, { method: "DELETE", headers: { "X-Volksmond-CSRF": CSRF } }); if (!r.ok) throw await errOf(r); return r.json(); },
   text: async function (p) { var r = await fetch(p); if (!r.ok) throw await errOf(r); return r.text(); },
 };
 
@@ -264,7 +272,7 @@ function segRow(seg) {
   var cls = src === "MIC" ? "mic" : (src === "SYS" ? "sys" : "file");
   return el("div", { class: "row" }, [
     el("div", { class: "t", text: fmtTs(seg.t_start) }),
-    el("div", {}, [el("span", { class: "src " + cls, text: "[" + src + "]" }), seg.text || ""]),
+    el("div", {}, [el("span", { class: "src " + cls, text: "[" + src + "]" }), raw(seg.text || "")]),
   ]);
 }
 
@@ -386,7 +394,7 @@ async function doStop(what) {
         function (st) { return !st.running || (!st.stopping && !st.transcribing); },
         function (st) {
           S.live.stopping = false;
-          if (!st.running) { gotoFinish(resp.output_path); }
+          if (!st.running) { gotoFinish(resp.output_path, st && st.sink_error); }
           else { S.live.recording = true; go("recordonly"); }
         }
       );
@@ -396,7 +404,7 @@ async function doStop(what) {
     S.live.stopping = true; render();
     pollStatus(
       function (st) { return !st.running; },
-      function () { gotoFinish(resp.output_path); },
+      function (st) { gotoFinish(resp.output_path, st && st.sink_error); },
       function (st) {
         if (st.running && st.stopping && elapsedEl) {
           var n = typeof st.pending === "number" ? st.pending : 0;
@@ -407,14 +415,16 @@ async function doStop(what) {
     );
   } catch (e) { toast(e.message || "Could not stop.", true); }
 }
-function gotoFinish(outputPath) {
+function gotoFinish(outputPath, sinkError) {
   teardownLive();
   S.finish.outputPath = outputPath || S.live.outputPath;
   S.finish.title = S.live.title || topicFromName(baseName(S.finish.outputPath));
   S.finish.recordingStem = S.live.recording ? S.live.audioStem : null;
   S.finish.summary = null; S.finish.savedAs = null; S.finish.summarising = false;
+  S.finish.sinkError = sinkError || null;
   S.live.running = false;
   refreshSessions();
+  if (S.finish.sinkError) toast(S.finish.sinkError, true);
   go("finish");
 }
 async function stopRecordOnly() {
@@ -422,11 +432,13 @@ async function stopRecordOnly() {
     var resp = await api.post("/api/stop?what=all");
     var stem = S.live.audioStem;
     S.live.stopping = true; render();
-    pollStatus(function (st) { return !st.running; }, function () {
+    pollStatus(function (st) { return !st.running; }, function (st) {
       teardownLive();
       S.live.running = false; S.live.stopping = false;
       S.finish.recordingStem = stem;
       S.finish.outputPath = resp.output_path;
+      S.finish.sinkError = (st && st.sink_error) || null;
+      if (S.finish.sinkError) toast(S.finish.sinkError, true);
       go("recordonly"); // now renders the "stopped" handoff
     });
   } catch (e) { toast(e.message || "Could not stop recording.", true); }
@@ -453,7 +465,7 @@ function renderMarkdown(md) {
     var parts = text.split(/(\*\*[^*]+\*\*)/g), out = [];
     for (var i = 0; i < parts.length; i++) {
       var m = /^\*\*([^*]+)\*\*$/.exec(parts[i]);
-      if (m) out.push(el("strong", { text: m[1] }));
+      if (m) out.push(el("strong", {}, raw(m[1])));
       else if (parts[i]) out.push(document.createTextNode(parts[i]));
     }
     return out;
@@ -814,7 +826,7 @@ function liveView() {
 
   var header = el("div", { class: "live-header" }, [
     el("div", { style: { minWidth: "0" } }, [
-      el("div", { class: "ttl", text: S.live.title || "Live meeting" }),
+      el("div", { class: "ttl" }, [S.live.title ? raw(S.live.title) : "Live meeting"]),
       el("div", { class: "meta" }, [elapsedEl, el("span", { text: "·" }), el("span", { text: langLabel }), el("span", { text: "·" }), el("span", { text: "Local only" })]),
     ]),
     el("div", { class: "right" }, [
@@ -854,7 +866,7 @@ function recordOnlyView() {
     recTimerEl = el("div", { class: "rec-timer", text: fmtElapsed(S.live.startedAt) });
     var header = el("div", { class: "live-header" }, [
       el("div", {}, [
-        el("div", { class: "ttl", text: S.live.title || "Recording" }),
+        el("div", { class: "ttl" }, [S.live.title ? raw(S.live.title) : "Recording"]),
         el("div", { class: "meta" }, [el("span", { text: "Recording only, not transcribing yet" }), el("span", { text: "·" }), el("span", { text: "Local only" })]),
       ]),
       el("div", { class: "right" }, el("span", { class: "chip live" }, [el("span", { class: "dot" }), "Recording"])),
@@ -928,11 +940,18 @@ function finishView() {
   return el("div", { class: "screen center" }, el("div", { class: "screen-inner col-mid stack", style: { gap: "16px" } }, [
     el("div", { class: "row gap-12" }, [
       el("div", { class: "tone-tile ok", style: { width: "40px", height: "40px" } }, icon("check", 20)),
-      el("div", {}, [el("h1", { style: { fontSize: "24px" }, text: "Saved." }),
-        S.finish.outputPath ? el("div", { class: "ink-3 mono", style: { fontSize: "12px", marginTop: "4px" }, text: S.finish.outputPath }) : null]),
+      el("div", {}, [el("h1", { style: { fontSize: "24px" }, text: S.finish.sinkError ? "Saved, with a warning" : "Saved." }),
+        S.finish.outputPath ? el("div", { class: "ink-3 mono", style: { fontSize: "12px", marginTop: "4px" } }, raw(S.finish.outputPath)) : null]),
     ]),
+    S.finish.sinkError ? el("div", { class: "card", style: { padding: "14px 16px", borderColor: "var(--warn)", display: "flex", gap: "12px", alignItems: "flex-start" } }, [
+      el("span", { style: { color: "var(--warn)", display: "inline-flex", flex: "0 0 auto", marginTop: "1px" } }, icon("alert", 18)),
+      el("div", {}, [
+        el("div", { style: { fontWeight: "600" }, text: "Saving may not have completed" }),
+        el("div", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "2px" } }, raw(S.finish.sinkError)),
+      ]),
+    ]) : null,
     el("div", { class: "card", style: { padding: "18px" } }, [
-      el("div", { style: { fontWeight: "600" }, text: S.finish.title || topicFromName(name) }),
+      el("div", { style: { fontWeight: "600" } }, raw(S.finish.title || topicFromName(name))),
       el("div", { class: "row gap-8", style: { marginTop: "14px" } }, [
         el("button", { class: "btn", onclick: function () { api.post("/api/open-folder").catch(function (e) { toast(e.message, true); }); } }, [icon("folder", 15), "Open folder"]),
         el("button", { class: "btn", onclick: function () { openReader(name); } }, [icon("note", 15), "Open transcript"]),
@@ -1012,7 +1031,7 @@ function historyView() {
       var openIt = function () { openReader(f.name); };
       return el("div", { class: "hist-row", role: "button", tabindex: "0", onclick: openIt, onkeydown: keyActivate(openIt) }, [
         el("div", { class: "when", text: f.date ? f.date + " · " + f.time : "" }),
-        el("div", { class: "topic", text: f.topic || topicFromName(f.name) }),
+        el("div", { class: "topic" }, raw(f.topic || topicFromName(f.name))),
         el("div", { class: "right" }, [
           el("span", { class: "ink-3", style: { fontSize: "11.5px" }, text: fmtBytes(f.size) }),
           el("button", { class: "btn ghost sm", onclick: function (e) { e.stopPropagation(); openReader(f.name); } }, "Open"),
@@ -1047,14 +1066,14 @@ function readerView() {
   return el("div", { class: "screen" }, el("div", { class: "screen-inner col-mid stack", style: { gap: "16px" } }, [
     el("button", { class: "btn ghost sm", style: { alignSelf: "flex-start" }, onclick: function () { go("history"); } }, [icon("back", 14), "Back to history"]),
     el("div", { class: "row gap-12" }, [
-      el("h2", { text: S.reader.title }),
+      el("h2", {}, raw(S.reader.title)),
       el("span", { class: "grow" }),
       el("button", { class: "btn ghost sm", onclick: function () { copyText(S.reader.text); } }, [icon("copy", 13), "Copy"]),
       el("button", { class: "btn ghost sm", onclick: function () { api.post("/api/open-folder").catch(function () {}); } }, [icon("folder", 13), "Folder"]),
     ]),
     summariseCard(S.reader.name, "reader"),
     el("div", { class: "card", style: { padding: "20px 22px" } },
-      el("div", { class: "doc", style: { maxWidth: "none", fontSize: "15px", whiteSpace: "pre-wrap", fontFamily: "var(--font-transcript)" }, text: S.reader.text })),
+      el("div", { class: "doc", style: { maxWidth: "none", fontSize: "15px", whiteSpace: "pre-wrap", fontFamily: "var(--font-transcript)" } }, raw(S.reader.text))),
   ]));
 }
 
@@ -1320,7 +1339,7 @@ function deviceField(label, list, value, defaultIdx, onChange) {
     control = el("div", { class: "row gap-6", style: { color: "var(--warn)", fontSize: "12px", padding: "7px 0" } }, [icon("alert", 14), "not detected"]);
   } else {
     var sel = el("select", { class: "field", onchange: function (e) { onChange(e.target.value); } },
-      list.map(function (d) { return el("option", { value: String(d.index), text: d.name }); }));
+      list.map(function (d) { return el("option", { value: String(d.index) }, raw(d.name)); }));
     sel.value = value != null ? value : (defaultIdx != null ? String(defaultIdx) : String(list[0].index));
     control = sel;
   }
