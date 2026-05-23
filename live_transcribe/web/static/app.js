@@ -138,7 +138,7 @@ var S = {
   settings: null, features: null, models: null, appInfo: null, license: null, devices: null,
   sessions: [], sessionsFolder: "",
   live: freshLive(),
-  form: { title: "", language: "af", tier: "auto", terms: [], record: false, mic: null, loopback: null },
+  form: { title: "", language: "af", tier: "auto", participants: [], terms: [], record: false, mic: null, loopback: null },
   setup: { stage: "welcome", choice: "transcribe" },
   finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null },
   reader: { name: "", title: "", text: "", summarising: false, summary: null },
@@ -295,7 +295,7 @@ async function startLive() {
   var body = {
     topic: S.form.title || "",
     tier: S.form.tier, language: S.form.language,
-    prompt: S.form.terms.join(", "),
+    prompt: S.form.participants.concat(S.form.terms).join(", "),
     record: !!S.form.record, transcribe: true,
     mic_device: S.form.mic, loopback_device: S.form.loopback,
   };
@@ -322,7 +322,7 @@ async function startRecordOnly() {
   } catch (e) { toast(e.message || "Could not start recording.", true); }
 }
 async function startImport(arg) {
-  var body = { topic: arg.topic || "", tier: S.form.tier, language: S.form.language, prompt: (S.form.terms || []).join(", ") };
+  var body = { topic: arg.topic || "", tier: S.form.tier, language: S.form.language, prompt: (S.form.participants || []).concat(S.form.terms || []).join(", ") };
   if (arg.path) body.paths = [arg.path];
   if (arg.stem) body.stem = arg.stem;
   try {
@@ -383,7 +383,7 @@ async function importFromPicker() {
   // Go through the context screen first (title, language, names and jargon),
   // then transcribe - same as a live meeting gets its pre-meeting setup.
   S.importPath = p; S.importStem = null; S.importName = baseName(p);
-  S.form.title = ""; S.form.terms = [];
+  S.form.title = ""; S.form.participants = []; S.form.terms = [];
   go("importpre");
 }
 
@@ -770,8 +770,9 @@ function preView() {
       formField("Language", null, langSeg, true),
       formField("Quality", null, tierSeg, true),
     ]),
-    formField("Names and jargon", el("span", { class: "label-muted", text: " (optional, helps accuracy)" }), termsBox()),
-    el("p", { class: "hint", style: { marginTop: "-8px", marginBottom: "16px" }, text: "Your saved default context is applied automatically. Add anything specific to this meeting here." }),
+    formField("Participants", el("span", { class: "label-muted", text: " (optional, helps accuracy)" }), termsBox(S.form.participants, "Add a name")),
+    formField("Jargon and terms", el("span", { class: "label-muted", text: " (optional)" }), termsBox(S.form.terms, "Add a term")),
+    defaultContextNote(),
     recordCard,
   ]);
 
@@ -808,17 +809,29 @@ function preView() {
     ]),
   ]));
 }
-function termsBox() {
+function termsBox(list, placeholder) {
   var box = el("div", { class: "chipbox" });
-  S.form.terms.forEach(function (t, i) {
-    box.appendChild(el("span", { class: "tag" }, [el("span", { text: t }),
-      el("button", { onclick: function () { S.form.terms.splice(i, 1); render(); } }, icon("x", 12))]));
+  list.forEach(function (t, i) {
+    box.appendChild(el("span", { class: "tag" }, [el("span", {}, raw(t)),
+      el("button", { onclick: function () { list.splice(i, 1); render(); } }, icon("x", 12))]));
   });
-  var inp = el("input", { placeholder: "Add a term", onkeydown: function (e) {
-    if (e.key === "Enter") { e.preventDefault(); var v = e.target.value.trim(); if (v) { S.form.terms.push(v); render(); } }
+  var inp = el("input", { placeholder: placeholder || "Add a term", onkeydown: function (e) {
+    if (e.key === "Enter") { e.preventDefault(); var v = e.target.value.trim(); if (v) { list.push(v); render(); } }
   } });
   box.appendChild(inp);
   return box;
+}
+function defaultContextNote() {
+  // Show the saved default context so it's visible on the setup screen, not hidden
+  // behind "applied automatically". It's edited in Settings, read-only here.
+  var dc = ((S.settings && S.settings.default_context) || "").trim();
+  if (!dc) {
+    return el("p", { class: "hint", style: { marginTop: "-4px", marginBottom: "16px" }, text: "Tip: save company names and jargon in Settings and they apply to every transcription automatically." });
+  }
+  return el("div", { class: "card", style: { padding: "10px 12px", marginBottom: "16px" } }, [
+    el("div", { class: "section-label", style: { marginBottom: "4px" }, text: "Always applied (from Settings)" }),
+    el("div", { class: "ink-2", style: { fontSize: "12px" } }, raw(dc)),
+  ]);
 }
 
 /* ── import setup (context before transcribing a file) ──────── */
@@ -846,8 +859,9 @@ function importPreView() {
       formField("Language", null, langSeg, true),
       formField("Quality", null, tierSeg, true),
     ]),
-    formField("Names and jargon", el("span", { class: "label-muted", text: " (optional, helps accuracy)" }), termsBox()),
-    el("p", { class: "hint", style: { marginTop: "-8px", marginBottom: "16px" }, text: "Your saved default context is applied automatically. Add anything specific to this meeting here." }),
+    formField("Participants", el("span", { class: "label-muted", text: " (optional, helps accuracy)" }), termsBox(S.form.participants, "Add a name")),
+    formField("Jargon and terms", el("span", { class: "label-muted", text: " (optional)" }), termsBox(S.form.terms, "Add a term")),
+    defaultContextNote(),
     el("div", { class: "row gap-16", style: { marginTop: "8px" } }, [
       el("button", { class: "btn primary big", onclick: begin }, [icon("note", 15), "Transcribe"]),
       el("button", { class: "btn ghost", onclick: function () { go("home"); } }, "Back"),

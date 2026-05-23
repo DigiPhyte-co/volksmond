@@ -473,15 +473,27 @@ def transcribe_file(req: TranscribeFileRequest):
                 for i in range(0, len(audio), win):
                     items.append((i / 16000.0, src, audio[i:i + win]))
             items.sort(key=lambda x: x[0])
+            aborted = False
             for t_start, src, window in items:
                 with STATE.lock:
-                    aborting = STATE.stopping
-                if aborting:
+                    if STATE.stopping:
+                        aborted = True
+                        break
+                # Wait for the transcriber instead of dropping (the 32-slot queue
+                # would otherwise lose everything past the first ~32 chunks - the
+                # hour-file truncation bug). Retry in short waits, re-checking the
+                # stop flag and worker health, so a stalled or dead worker can never
+                # wedge the import on a full queue.
+                while not engine.on_chunk(src, window, t_start, block=True, timeout=0.5):
+                    with STATE.lock:
+                        if STATE.stopping:
+                            aborted = True
+                            break
+                    if not engine.is_alive():
+                        aborted = True
+                        break
+                if aborted:
                     break
-                # block=True: wait for the transcriber instead of dropping. The
-                # queue holds 32; a long file would otherwise lose everything past
-                # the first ~32 chunks (the hour-file truncation bug).
-                engine.on_chunk(src, window, t_start, block=True)
         except Exception as e:
             print(f"[transcribe-file] error: {e}", flush=True)
         finally:
