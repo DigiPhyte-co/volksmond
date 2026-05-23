@@ -137,6 +137,22 @@ and the hosted SERVICE, not the weights.
   post once there is momentum and a model to point at, NOT the launch (do not stack too
   many asks at once). Standing offer to publicise: bring a clean, consented Afrikaans or
   mixed dataset and Sean will fine-tune on his GPU and release the model open-source (CC-BY).
+- TRAINING DATA SOURCES, tiered (settling the synthetic/ElevenLabs question Sean keeps
+  revisiting):
+  1. PRIMARY: real donated meeting audio (consented, clean). The only source that captures
+     real acoustics, accents, far-field, disfluencies, and code-switching.
+  2. SECONDARY (free, no ToS): the open SA Afrikaans TTS models (Simba-TTS-afr, the SA VITS
+     model, Piper Afrikaans, ttslab/ZA_LEX) for synthetic LEXICAL coverage (names, jargon,
+     Afrikaans words), heavily augmented (noise/reverb/far-field), small fraction only; plus
+     free real Afrikaans corpora (NCHLT/SADiLaR Afrikaans, Common Voice Afrikaans) for real
+     read-speech.
+  3. MAYBE / third-tier: ElevenLabs synthetic. ONLY if (a) the ToS permits training on
+     outputs (UNVERIFIED, assume restricted until checked) AND (b) a native-ear test confirms
+     its Afrikaans is genuinely good. Anglicised TTS is actively HARMFUL (teaches wrong
+     pronunciation). Even if good, it likely will not capture real code-switching (TTS
+     struggles with mid-sentence switches), the differentiator. Verdict: probably not worth
+     the ToS friction when the open SA models are free, unlimited, and purpose-built for
+     Afrikaans. Mirror this in SA-ASR-Model/corpus-strategy.md when next in that project.
 
 ## Day-two feature backlog (post-launch, not launch-critical)
 Ideas parked for after the beta; add to this list as they come up.
