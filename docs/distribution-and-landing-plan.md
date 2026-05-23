@@ -87,6 +87,24 @@ OPEN: defer; it is a proper phase, not a quick port.
 - User: Chanel (works for Sean) is on Mac, so there is a real internal user eventually.
   The wife (primary, counselling) is Windows, so Windows-first is correct.
 
+## Day-two feature backlog (post-beta, not launch-critical)
+Ideas parked for after the beta; add to this list as they come up.
+- **Remembered participants, local autocomplete (FREE, privacy-first).** Every term/name
+  used in a meeting is saved locally (count + last-used), and the "Names and jargon"
+  field autocompletes from that history, so recurring collaborators are one tap away.
+  This is the local, offline alternative to the Outlook calendar pull (which stays the
+  Pro/online feature), and is a better default for most users and for the wife's
+  counselling use (recurring client names, no calendar/Outlook). Design notes:
+  - SUGGEST, do not auto-apply. Whisper's initial_prompt is short (~224 tokens), so
+    stuffing every name ever used would HURT accuracy. Only the names selected for THIS
+    meeting go into the prompt; history is for suggestions only. (Distinct from
+    `default_context`, which is the always-applied standing context.)
+  - Rank suggestions by frequency then recency; optional "add usual participants" one-tap.
+  - Privacy: stored locally only, never synced or sent; include a "clear remembered
+    names" control (names are personal info; on-device only, same class as transcripts).
+  - Small build: a persisted list (config.py key or a tiny endpoint) + record-on-use +
+    autocomplete on the existing chipbox.
+
 ## Decisions snapshot
 - LOCKED: native pywebview shell as the product (built); DigiPhyte credit in-app (built);
   local AI summaries are free, not Pro (built).
