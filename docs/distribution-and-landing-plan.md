@@ -24,7 +24,7 @@ STRATEGIC FIT: a free Volksmond download is another DigiPhyte lead magnet alongs
 Founder's Checklist and the free Website Review; the email list feeds the pipeline.
 
 ## 2. Source visibility
-LEANING: SOURCE-AVAILABLE, not full open source.
+LOCKED (2026-05-23): SOURCE-AVAILABLE, not full open source.
 - The goal is the TRUST benefit (a privacy tool; let people read the code and confirm
   it never phones home), not giving away the right to fork and sell.
 - Source-available licence = read and build allowed, redistribution and commercial use
@@ -36,7 +36,8 @@ LEANING: SOURCE-AVAILABLE, not full open source.
   niche commercial privacy tool.
 
 ## 3. Two build profiles (one codebase)
-LEANING: ship two builds from ONE codebase via a build flag, decided at packaging time.
+LOCKED (2026-05-23): ship two builds ("two apps") from ONE codebase via a build flag.
+(Split mechanics decided at packaging time.)
 - OFFLINE-ONLY build: the online modules (outlook.py / calendar, any cloud paths, any
   update check) are compiled OUT. It provably cannot phone home. This is the
   high-assurance flagship for counselling/legal/paranoid users, and what Sean's wife
@@ -49,27 +50,29 @@ LEANING: ship two builds from ONE codebase via a build flag, decided at packagin
 - Pairs with source-available: "read the code, or run the build with no network code at
   all."
 
-## 4. Beta positioning
-LEANING: launch as a free BETA, graduate to V1 after gathering real-world issues.
-- It is probably good enough for V1, but shipping as beta surfaces bugs first and sets
-  expectations (users report instead of silently churning). Matches the calm,
-  no-overpromising voice; on a privacy tool, "beta" reads as honest and careful.
-- Free during beta; the value exchange is "free tool for your feedback", which also
-  justifies the email capture. Do not sell Pro during beta (or only an early-bird).
-- In-app: a subtle "Beta" tag by the version (reuse the existing "working name"
-  treatment). Landing page: "Free beta / early access".
-- Feedback channel: the bug-report mailto already built; add "this is a beta, tell us
-  what breaks" microcopy.
-- Version: display 0.9.x (beta); keep APP_MAJOR = 1 for forward licence compatibility.
-  (licensing.APP_VERSION is currently "1.0.0".)
-- GRADUATION CRITERIA (define to avoid perpetual beta): e.g. several weeks of real use
-  with no data-loss bugs, top accuracy/crash issues fixed, installer solid, wife plus a
-  handful of beta users happy.
-- Tradeoff: "beta" slightly lowers perceived polish, but on a free privacy tool it is
-  net positive.
+## 4. Early access positioning
+LOCKED (2026-05-23): launch as "Early access", NOT "beta". No beta language anywhere.
+- "Early access" feels exclusive and confident (you got in early); "beta" reads as
+  unfinished. Same practical benefit (gather real issues, set expectations, invite
+  feedback) with a positive frame that matches the calm, no-overpromising voice.
+- The landing-page email capture IS the early-access mechanism: "request early access"
+  -> email -> we send the download link. Captures the lead and feels exclusive in one
+  move. Keep it genuine (deliver promptly); no fake countdowns or manipulative scarcity.
+- Free during early access; the exchange is "free tool for your feedback". Do not sell
+  Pro yet. EXCLUSIVITY LEVER: early-access members get founder pricing on Pro at V1.
+- In-app: a subtle "Early access" tag by the version (reuse the "working name"
+  treatment). Feedback channel: the bug-report mailto already built; light "tell us what
+  could be better" microcopy (not "what's broken").
+- Version: 0.9.x is fine internally; keep APP_MAJOR = 1 for forward licence compatibility
+  (licensing.APP_VERSION is "1.0.0" now). No "beta" string anywhere.
+- GRADUATION CRITERIA to V1 (avoid perpetual early-access): several weeks of real use with
+  no data-loss bugs, top accuracy/crash issues fixed, installer solid, wife plus a handful
+  of early-access users happy.
 
-## 5. macOS (later phase, not a port)
-OPEN: defer; it is a proper phase, not a quick port.
+## 5. Other platforms: macOS and Linux (later)
+LOCKED (2026-05-23): both come after Windows. Mac is a proper phase, not a quick port.
+
+### macOS
 - Ports for free: the pywebview UI (WKWebView on Mac) and the transcription/summary
   engine are platform-agnostic and already done.
 - The hard part is SYSTEM-AUDIO capture. macOS has no built-in loopback. Options:
@@ -87,7 +90,19 @@ OPEN: defer; it is a proper phase, not a quick port.
 - User: Chanel (works for Sean) is on Mac, so there is a real internal user eventually.
   The wife (primary, counselling) is Windows, so Windows-first is correct.
 
-## Day-two feature backlog (post-beta, not launch-critical)
+### Linux (also later; technically EASIER than Mac)
+- System audio: Linux (PulseAudio/PipeWire) exposes a "monitor" source for the default
+  sink, so capturing system audio is native, NO driver install and NO native helper.
+  Easier than Mac.
+- GPU: CUDA works on Linux (NVIDIA), so the GPU tier works (unlike Mac).
+- Packaging: AppImage (single file, no install) or Flatpak; NO codesigning/notarization
+  fees (unlike Apple's ~$99/yr). UI: pywebview works (GTK/Qt webview).
+- Cost: testing/support across distros; the webview backend can be finicky.
+- Strategic fit: privacy-conscious and technical users skew Linux, exactly the source-
+  available + offline-only segment. Stated order is Mac then Linux, but since Linux is the
+  lighter lift, the order could flip cheaply if a Linux user lands first.
+
+## Day-two feature backlog (post-launch, not launch-critical)
 Ideas parked for after the beta; add to this list as they come up.
 - **Remembered participants, local autocomplete (FREE, privacy-first).** Every term/name
   used in a meeting is saved locally (count + last-used), and the "Names and jargon"
@@ -107,11 +122,14 @@ Ideas parked for after the beta; add to this list as they come up.
 
 ## Decisions snapshot
 - LOCKED: native pywebview shell as the product (built); DigiPhyte credit in-app (built);
-  local AI summaries are free, not Pro (built).
-- LEANING (cheap, reversible): subdomain over .com; email-only capture; source-available;
-  free-beta launch; two build profiles.
-- OPEN (decide at packaging / later): exact source-available licence; offline-only vs
-  connected split mechanics; macOS approach and timing; graduation-to-V1 criteria.
+  local AI summaries are free, not Pro (built); SOURCE-AVAILABLE (not open source); TWO
+  build profiles ("two apps": offline-only + connected); "EARLY ACCESS" launch (no beta
+  language); macOS and Linux are later platforms.
+- LEANING (cheap, reversible): subdomain over .com; email-only capture (now framed as
+  "request early access").
+- OPEN (decide at packaging / later): exact source-available licence wording; offline-only
+  vs connected split mechanics; macOS + Linux approach and timing; graduation-to-V1
+  criteria.
 
 ## Build and launch order (current best guess)
 1. Codex review of PR #1 + Sean tests the native window.
@@ -120,5 +138,5 @@ Ideas parked for after the beta; add to this list as they come up.
    native, Inno Setup installer, first-run model-download UX.
 4. Decide the source-available licence + the offline-only build flag.
 5. Landing page (subdomain, email capture) goes live with the installer download.
-6. Free beta to a small group (including the wife); gather issues.
+6. Early access to a small group (including the wife); gather issues.
 7. Graduate to V1; introduce Pro.
