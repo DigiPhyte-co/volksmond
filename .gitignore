@@ -41,3 +41,4 @@ dist/
 
 # Local agent / tooling state
 .claude/
+.codex-review*.txt
