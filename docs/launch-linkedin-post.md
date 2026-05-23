@@ -8,9 +8,12 @@ Recommended posting: one bilingual post, Afrikaans first then English, with a di
 between. It demonstrates the product (Afrikaans + English) and speaks to a SA audience.
 Alternative: two separate posts if you want maximum English reach.
 
-Deliberately left OUT of the announcement (keep it clean): the future cloud / read.ai-
-style VPS product, and the maybe-open-source-the-model idea. Save those for later. A
-soft optional line is at the bottom if you decide you want it.
+The model is confirmed open-source (CC-BY), so the data ask now says so, it strengthens
+the ask (donate data, the model is free for everyone). Deliberately left OUT to keep it
+clean: the future cloud / read.ai-style VPS product, and any ask for donated COMPUTE.
+The compute ask lands far better as a FOLLOW-UP once there is momentum and a model to
+point at ("the response was huge, here is the model, now I need compute for v2, who is
+in"), so save it. A soft optional future-product line is at the bottom if you want it.
 
 ---
 
@@ -40,9 +43,11 @@ that is genuinely usable and completely private, where most tools just hand you 
 I am giving it away free in early access. Use it, and tell me what is good and what is
 not, so we can make it better together.
 
-One more ask. I want to push the Afrikaans further, and for that I need real Afrikaans,
-or mixed Afrikaans and English, meeting audio to fine-tune on, which I will run on my own
-GPU. If you have recordings you have the right to share, I would be very grateful.
+One more thing. I want to push the Afrikaans further, and I will put my own GPU to work
+on it. If you have a few hours of real Afrikaans, or mixed Afrikaans and English, meeting
+audio that is clean and that you have permission to share, send it my way. I will
+fine-tune on it and release the improved model open-source, free and attributed, so the
+whole Afrikaans community benefits.
 
 Link in the comments. Let me know what you think.
 
@@ -74,10 +79,11 @@ werklik bruikbaar en heeltemal privaat is, waar die meeste programme jou net ons
 Ek gee dit gratis weg in vroeë toegang. Gebruik dit, en laat weet my wat goed is en wat
 nie, sodat ons dit saam beter kan maak.
 
-Nog een versoek. Ek wil die Afrikaans verder stoot, en daarvoor het ek regte Afrikaanse,
-of gemengde Afrikaans en Engelse, vergadering-klank nodig om op af te rig, wat ek op my eie
-GPU sal hardloop. As jy opnames het wat jy die reg het om te deel, sal ek dit baie
-waardeer.
+Nog iets. Ek wil die Afrikaans verder stoot, en ek sal my eie GPU daarvoor inspan. As jy
+'n paar uur se regte Afrikaanse, of gemengde Afrikaans en Engelse, vergadering-klank het
+wat skoon is en wat jy toestemming het om te deel, stuur dit my kant toe. Ek sal daarop
+afrig en die verbeterde model oopbron vrystel, gratis en met erkenning, sodat die hele
+Afrikaanse gemeenskap baat.
 
 Skakel in die kommentaar. Laat weet my wat jy dink.
 

@@ -111,8 +111,8 @@ LOCKED (2026-05-23): both come after Windows. Mac is a proper phase, not a quick
   lighter lift, the order could flip cheaply if a Linux user lands first.
 
 ## 6. The fine-tuned Afrikaans model: open or closed
-LEANING (recommendation; decide when the model actually exists): OPEN-SOURCE the model,
-monetize the PRODUCT and the hosted SERVICE, not the weights.
+LOCKED (2026-05-23): OPEN-SOURCE the model under CC-BY (attribution). Monetize the PRODUCT
+and the hosted SERVICE, not the weights.
 - The training data is community-donated. Open-sourcing the result is what makes the
   donation ask credible and generous; closing a model built on donated meeting audio would
   poison the well. Matches Sean's "betterment of humanity" instinct.
@@ -128,10 +128,15 @@ monetize the PRODUCT and the hosted SERVICE, not the weights.
 - Licence if open: permissive/Apache or CC-BY (attribution, maximum goodwill) vs CC-BY-NC
   (free for community/research, commercial use reserved to Sean, a mild hedge but weaker
   goodwill and hard to enforce). Lean CC-BY/attribution; CC-BY-NC only if a hedge is wanted.
-- ACTIONABLE NOW (the real urgency, the rest is future): make the data-donation CONSENT
-  broad enough to permit BOTH training AND model release under any licence, so the
-  open/closed choice stays open and is not foreclosed by narrow consent. Align with
-  SA-ASR-Model/corpus-strategy.md.
+- ACTIONABLE NOW: the model is open (CC-BY), so the data-donation consent must permit
+  training AND release of an open model. Make the consent clause say exactly that. Align
+  with SA-ASR-Model/corpus-strategy.md.
+- COMPUTE as a community lever (Sean's instinct, confirmed): Sean provides the GPU for
+  fine-tuning; if more is ever needed, asking the community for donated compute is very
+  likely to work (strong Afrikaans-language pride). Save the compute ask for a FOLLOW-UP
+  post once there is momentum and a model to point at, NOT the launch (do not stack too
+  many asks at once). Standing offer to publicise: bring a clean, consented Afrikaans or
+  mixed dataset and Sean will fine-tune on his GPU and release the model open-source (CC-BY).
 
 ## Day-two feature backlog (post-launch, not launch-critical)
 Ideas parked for after the beta; add to this list as they come up.
