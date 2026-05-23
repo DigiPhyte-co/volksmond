@@ -83,6 +83,12 @@ window.VM_I18N = {
       "Name en vakterme help akkuraatheid, veral vir Afrikaans en die mengsel. Alles opsioneel.",
     "Title": "Titel",
     "Transcribe": "Transkribeer",
+    "Participants": "Deelnemers",
+    "Jargon and terms": "Vakterme en jargon",
+    "Add a name": "Voeg 'n naam by",
+    "Always applied (from Settings)": "Altyd toegepas (van Instellings)",
+    "Tip: save company names and jargon in Settings and they apply to every transcription automatically.":
+      "Wenk: stoor maatskappyname en vakterme in Instellings en hulle word outomaties op elke transkripsie toegepas.",
     "Up to several hours. The file stays on this computer. It is never uploaded.":
       "Tot etlike ure. Die lêer bly op hierdie rekenaar. Dit word nooit opgelaai nie.",
     "Browse": "Blaai",

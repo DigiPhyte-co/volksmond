@@ -193,28 +193,33 @@ class Engine:
             n += 1
         return n
 
-    def on_chunk(self, source, audio, t_start, block=False):
-        """Enqueue a chunk for transcription.
+    def is_alive(self):
+        """True while the transcription worker thread is running."""
+        return self._worker.is_alive()
+
+    def on_chunk(self, source, audio, t_start, block=False, timeout=None):
+        """Enqueue a chunk for transcription. Returns True if it was enqueued.
 
         block=False (live capture): drop if the backlog is full rather than stall
-        the real-time audio thread. block=True (file import): wait for space so
-        nothing is dropped, because the file is not real-time and every chunk
-        matters; this paces the producer to the transcriber.
+        the real-time audio thread; returns False on a drop. block=True with a
+        timeout (file import): wait up to `timeout` seconds for space and return
+        False if it could not enqueue, so the caller can re-check abort + worker
+        health and retry. That way a stalled or dead worker never wedges the import.
         """
         if self._stop.is_set():
-            return  # shutting down, don't accept new audio while we drain the backlog
-        if block:
-            self._queue.put((source, audio, t_start))  # waits for space; never drops
-            return
+            return False  # shutting down, don't accept new audio while we drain
         try:
-            self._queue.put((source, audio, t_start), block=False)
+            self._queue.put((source, audio, t_start), block=block, timeout=timeout)
+            return True
         except queue.Full:
-            # Backlog is full (transcription can't keep up). Drop, but make it
-            # VISIBLE: a real gap in the transcript beats a silent lie. The
-            # marker is emitted from the worker once it next runs (see _run).
-            self._dropped += 1
-            print(f"[engine] queue full, dropping {source} chunk @ t={t_start:.1f}s "
-                  f"(total dropped: {self._dropped})", flush=True)
+            if not block:
+                # Live backpressure: drop, but make it VISIBLE - a real gap in the
+                # transcript beats a silent lie. The marker is emitted from the
+                # worker once it next runs (see _run).
+                self._dropped += 1
+                print(f"[engine] queue full, dropping {source} chunk @ t={t_start:.1f}s "
+                      f"(total dropped: {self._dropped})", flush=True)
+            return False
 
     def set_initial_prompt(self, prompt):
         """Replace the live prompt mid-session (growing glossary support).
