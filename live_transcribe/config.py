@@ -30,7 +30,7 @@ DEFAULTS = {
     "interface_language": "en-ZA",    # language of the app's own UI (i18n later)
     "transcription_language": "af",   # default spoken language; "" == auto-detect
     "tier": "auto",                   # default hardware tier
-    "save_location": "",              # "" == the project sessions/ folder
+    "save_location": "",              # "" == default folder (project sessions/ in dev, per-user app-data when frozen)
     "default_context": "",            # standing names/jargon seeded every session
     "ai_backend": "local",            # "local" | "cloud" (cloud is a paid add-on)
     "ai_instructions": [],            # [{"id","name","prompt"}] saved system prompts
