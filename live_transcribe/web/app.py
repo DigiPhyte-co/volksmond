@@ -196,8 +196,9 @@ def _validate_session_filename(name: str) -> None:
 def _sessions_dir() -> Path:
     """Where transcripts and recordings are saved.
 
-    User-configurable via the save_location setting. Falls back to the project
-    sessions/ folder if unset or invalid. Validates the configured path is a real,
+    User-configurable via the save_location setting. Falls back when unset or
+    invalid to the project sessions/ folder in dev, or a per-user app-data folder
+    when frozen (see below). Validates the configured path is a real,
     writable directory before trusting it (defence against a typo'd or read-only
     location silently losing a meeting's transcript).
     """
