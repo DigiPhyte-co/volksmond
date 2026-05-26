@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Volksmond, Quick Start</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Serif:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+/* ── Volksmond clinical palette (OKLCH tokens from the app's styles.css) ── */
+:root{
+  --bg: oklch(0.985 0 0);
+  --surface: oklch(1 0 0);
+  --surface-2: oklch(0.975 0 0);
+  --surface-3: oklch(0.945 0 0);
+  --ink: oklch(0.20 0 0);
+  --ink-2: oklch(0.43 0 0);
+  --ink-3: oklch(0.62 0 0);
+  --line: oklch(0.91 0 0);
+  --line-2: oklch(0.83 0 0);
+  --accent: oklch(0.45 0.07 250);
+  --accent-soft: oklch(0.955 0.022 245);
+  --accent-line: oklch(0.86 0.04 245);
+  --ok: oklch(0.50 0.10 155);
+  --ok-soft: oklch(0.955 0.03 155);
+  --record: oklch(0.56 0.18 25);
+  --record-soft: oklch(0.96 0.03 25);
+  --radius: 10px;
+  --radius-lg: 14px;
+  --font-sans: 'IBM Plex Sans', system-ui, 'Segoe UI', sans-serif;
+  --font-serif: 'IBM Plex Serif', Georgia, serif;
+  --font-mono: 'IBM Plex Mono', Consolas, monospace;
+}
+
+*{ box-sizing:border-box; margin:0; padding:0; }
+
+@page{ size:A4; margin:0; }
+
+html{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+body{
+  font-family:var(--font-sans);
+  color:var(--ink-2);
+  background:var(--bg);
+  font-size:10.2pt;
+  line-height:1.5;
+  font-weight:400;
+}
+
+.page{
+  position:relative;
+  width:210mm;
+  min-height:297mm;
+  padding:17mm 17mm 14mm;
+  background:var(--bg);
+  page-break-after:always;
+  overflow:hidden;
+}
+.page:last-child{ page-break-after:auto; }
+
+/* ── typography ── */
+h1,h2,h3{ color:var(--ink); font-weight:600; letter-spacing:-0.01em; }
+.serif{ font-family:var(--font-serif); }
+.mono{ font-family:var(--font-mono); }
+strong{ color:var(--ink); font-weight:600; }
+p{ margin:0; }
+
+/* ── cover ── */
+.brandbar{ display:flex; align-items:center; justify-content:space-between; margin-bottom:30mm; }
+.wordmark{ display:flex; align-items:center; gap:9px; }
+.wordmark .name{ font-size:16pt; font-weight:600; color:var(--ink); letter-spacing:-0.01em; }
+.mark{ color:var(--accent); display:inline-flex; }
+.tag-pill{
+  font-size:8pt; font-weight:600; letter-spacing:0.04em; text-transform:uppercase;
+  color:var(--accent); background:var(--accent-soft);
+  border:1px solid var(--accent-line); border-radius:999px; padding:4px 11px;
+}
+
+.cover-h1{ font-family:var(--font-serif); font-size:33pt; line-height:1.08; color:var(--ink); font-weight:500; letter-spacing:-0.015em; max-width:150mm; }
+.cover-sub{ font-size:13pt; color:var(--ink-2); margin-top:14px; max-width:140mm; line-height:1.45; }
+
+.tagline{ margin-top:20px; font-size:11pt; color:var(--ink-3); display:flex; align-items:center; gap:9px; }
+.tagline .dot{ width:3px; height:3px; border-radius:50%; background:var(--ink-4, var(--ink-3)); display:inline-block; opacity:.5; }
+.byline{ margin-top:5px; font-size:9.5pt; color:var(--ink-3); }
+
+/* ── cards & callouts ── */
+.callout{
+  display:flex; gap:13px; align-items:flex-start;
+  background:var(--accent-soft); border:1px solid var(--accent-line);
+  border-radius:var(--radius-lg); padding:15px 17px;
+}
+.callout.ok{ background:var(--ok-soft); border-color:oklch(0.83 0.05 155); }
+.callout .ic{ color:var(--accent); flex:0 0 auto; margin-top:1px; }
+.callout.ok .ic{ color:var(--ok); }
+.callout .t{ font-weight:600; color:var(--ink); font-size:10.5pt; }
+.callout .b{ font-size:9.6pt; color:var(--ink-2); margin-top:2px; line-height:1.45; }
+
+.section-label{
+  font-size:8.5pt; font-weight:600; letter-spacing:0.06em; text-transform:uppercase;
+  color:var(--ink-3); display:flex; align-items:center; gap:8px;
+}
+.section-label .ln{ height:1px; background:var(--line); flex:1; }
+
+.part-head{ display:flex; align-items:baseline; gap:12px; }
+.part-num{ font-family:var(--font-serif); font-size:13pt; color:var(--accent); font-weight:600; }
+.part-title{ font-family:var(--font-serif); font-size:20pt; color:var(--ink); font-weight:500; letter-spacing:-0.01em; }
+.part-intro{ font-size:10pt; color:var(--ink-2); margin-top:5px; max-width:155mm; }
+
+/* ── numbered steps ── */
+.steps{ display:flex; flex-direction:column; gap:11px; }
+.step{
+  display:flex; gap:14px; align-items:flex-start;
+  background:var(--surface); border:1px solid var(--line);
+  border-radius:var(--radius-lg); padding:14px 16px;
+}
+.step .n{
+  flex:0 0 auto; width:26px; height:26px; border-radius:50%;
+  background:var(--ink); color:var(--bg);
+  font-size:11pt; font-weight:600; font-family:var(--font-serif);
+  display:flex; align-items:center; justify-content:center; margin-top:1px;
+}
+.step .body{ flex:1; }
+.step .body .t{ font-weight:600; color:var(--ink); font-size:11pt; }
+.step .body .d{ font-size:9.7pt; color:var(--ink-2); margin-top:3px; line-height:1.5; }
+.kbd{
+  font-family:var(--font-mono); font-size:8.6pt; color:var(--ink);
+  background:var(--surface-3); border:1px solid var(--line-2);
+  border-radius:5px; padding:1px 6px; white-space:nowrap;
+}
+
+/* ── feature / way cards ── */
+.grid-3{ display:grid; grid-template-columns:1fr 1fr 1fr; gap:11px; }
+.grid-2{ display:grid; grid-template-columns:1fr 1fr; gap:11px; }
+.fcard{ background:var(--surface); border:1px solid var(--line); border-radius:var(--radius-lg); padding:14px; }
+.fcard.primary{ border-color:var(--accent-line); background:var(--accent-soft); }
+.tile{
+  width:34px; height:34px; border-radius:9px; display:flex; align-items:center; justify-content:center;
+  background:var(--surface-3); color:var(--ink); margin-bottom:9px;
+}
+.fcard.primary .tile{ background:var(--accent); color:var(--bg); }
+.fcard .ft{ font-weight:600; color:var(--ink); font-size:10.4pt; }
+.fcard .fb{ font-size:9.2pt; color:var(--ink-2); margin-top:4px; line-height:1.45; }
+
+/* ── the mini app sketch ── */
+.sketch{ border:1px solid var(--line-2); border-radius:var(--radius-lg); overflow:hidden; background:var(--surface); }
+.sketch-bar{ height:9mm; background:var(--surface-3); border-bottom:1px solid var(--line); display:flex; align-items:center; padding:0 10px; gap:6px; }
+.sketch-bar .b{ width:8px; height:8px; border-radius:50%; background:var(--line-2); }
+.sketch-bar .ttl{ margin-left:6px; font-size:8.4pt; color:var(--ink-3); font-weight:500; }
+.sketch-body{ display:flex; min-height:34mm; }
+.sketch-side{ width:30mm; border-right:1px solid var(--line); padding:10px 9px; background:var(--surface-2); }
+.sketch-nav{ display:flex; align-items:center; gap:7px; font-size:8.6pt; color:var(--ink-2); padding:5px 7px; border-radius:7px; margin-bottom:3px; }
+.sketch-nav.on{ background:var(--surface); color:var(--ink); font-weight:600; border:1px solid var(--line); }
+.sketch-nav .ic{ color:var(--ink-3); display:inline-flex; }
+.sketch-nav.on .ic{ color:var(--accent); }
+.sketch-pill{ display:flex; align-items:center; gap:6px; font-size:7.6pt; color:var(--ok); margin-top:8px; padding:4px 7px; border:1px solid oklch(0.83 0.05 155); background:var(--ok-soft); border-radius:999px; }
+.sketch-main{ flex:1; padding:11px 13px; }
+.sketch-eyebrow{ font-size:7.4pt; letter-spacing:0.05em; text-transform:uppercase; color:var(--ink-3); font-weight:600; }
+.sketch-h{ font-family:var(--font-serif); font-size:13pt; color:var(--ink); margin-top:3px; font-weight:500; }
+.sketch-cards{ display:grid; grid-template-columns:1fr 1fr 1fr; gap:7px; margin-top:9px; }
+.sketch-card{ border:1px solid var(--line); border-radius:9px; padding:8px; background:var(--surface); }
+.sketch-card.on{ border-color:var(--accent-line); background:var(--accent-soft); }
+.sketch-card .ci{ width:22px; height:22px; border-radius:6px; background:var(--surface-3); color:var(--ink-2); display:flex; align-items:center; justify-content:center; }
+.sketch-card.on .ci{ background:var(--accent); color:var(--bg); }
+.sketch-card .ct{ font-size:7.8pt; font-weight:600; color:var(--ink); margin-top:6px; line-height:1.25; }
+.sketch-card .cbtn{ margin-top:7px; font-size:7pt; font-weight:600; text-align:center; padding:4px; border-radius:6px; background:var(--surface-3); color:var(--ink-2); }
+.sketch-card.on .cbtn{ background:var(--accent); color:var(--bg); }
+
+/* ── transcript mini ── */
+.tx{ font-family:var(--font-sans); font-size:8.6pt; }
+.tx .ln{ display:flex; gap:8px; margin-bottom:5px; }
+.tx .ts{ font-family:var(--font-mono); font-size:7.6pt; color:var(--ink-3); flex:0 0 auto; padding-top:1px; }
+.tx .src{ font-family:var(--font-mono); font-size:7.2pt; font-weight:600; padding:0 4px; border-radius:4px; margin-right:5px; }
+.tx .src.mic{ color:var(--accent); background:var(--accent-soft); }
+.tx .src.sys{ color:var(--ink-3); background:var(--surface-3); }
+.tx .said{ color:var(--ink); }
+
+/* ── definition rows ── */
+.deflist{ display:flex; flex-direction:column; gap:9px; }
+.defrow{ display:flex; gap:13px; align-items:flex-start; }
+.defrow .di{ width:30px; height:30px; border-radius:8px; background:var(--surface-3); color:var(--ink-2); display:flex; align-items:center; justify-content:center; flex:0 0 auto; }
+.defrow .dt{ font-weight:600; color:var(--ink); font-size:10pt; }
+.defrow .dd{ font-size:9.4pt; color:var(--ink-2); line-height:1.45; }
+.defrow .dd .mono{ font-size:8.8pt; color:var(--ink); }
+
+/* ── footer ── */
+.foot{ position:absolute; left:17mm; right:17mm; bottom:9mm; display:flex; justify-content:space-between; align-items:center; font-size:8pt; color:var(--ink-3); border-top:1px solid var(--line); padding-top:6px; }
+.foot .l{ display:flex; align-items:center; gap:6px; }
+
+.spacer-lg{ height:14px; }
+.spacer-md{ height:10px; }
+.spacer-sm{ height:7px; }
+
+.help{ background:var(--surface); border:1px solid var(--line); border-radius:var(--radius-lg); padding:16px 18px; }
+.help .hr{ display:flex; gap:12px; align-items:center; }
+.help .hr + .hr{ margin-top:11px; padding-top:11px; border-top:1px solid var(--line); }
+.help .hi{ color:var(--accent); flex:0 0 auto; }
+.help .ht{ font-weight:600; color:var(--ink); font-size:9.8pt; }
+.help .hd{ font-size:9.2pt; color:var(--ink-2); }
+.help .hd .mono{ color:var(--accent); font-size:9pt; }
+</style>
+</head>
+<body>
+
+<!-- ════════════════ PAGE 1 · COVER ════════════════ -->
+<div class="page">
+  <div class="brandbar">
+    <div class="wordmark">
+      <span class="mark">
+        <svg width="26" height="26" viewBox="0 0 22 22" fill="none">
+          <path d="M3 12.5 C 6 16.5, 16 16.5, 19 12.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          <path d="M7.5 8.5 L 7.5 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          <path d="M11 8.5 L 11 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          <path d="M14.5 8.5 L 14.5 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+        </svg>
+      </span>
+      <span class="name">Volksmond</span>
+    </div>
+    <span class="tag-pill">Early access</span>
+  </div>
+
+  <div class="cover-h1">A private transcript of any meeting,<br>on your own computer.</div>
+  <div class="cover-sub">This short guide shows you how to install Volksmond and how to use it day to day. Built for Afrikaans, English, and the way people actually switch between them.</div>
+
+  <div class="tagline">
+    <span>Speak freely</span><span class="dot"></span><span>Praat vrylik</span>
+  </div>
+  <div class="byline">by DigiPhyte</div>
+
+  <div class="spacer-lg"></div><div class="spacer-md"></div>
+
+  <div class="callout">
+    <span class="ic">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+    </span>
+    <div>
+      <div class="t">Everything happens on your computer.</div>
+      <div class="b">Your audio and your transcripts are never uploaded. Volksmond does not phone home. Once the models are downloaded, you can use it completely offline.</div>
+    </div>
+  </div>
+
+  <div class="spacer-lg"></div>
+
+  <div class="section-label"><span>In this guide</span><span class="ln"></span></div>
+  <div class="spacer-md"></div>
+  <div class="grid-2">
+    <div class="fcard">
+      <div class="tile">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15.5V4M7.5 8.5 12 4l4.5 4.5"/><path d="M5 15.5V19a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 19v-3.5"/></svg>
+      </div>
+      <div class="ft">Part 1, Install it once</div>
+      <div class="fb">Unzip the folder, open the app, and get past the one Windows warning. Takes a few minutes, the first time only.</div>
+    </div>
+    <div class="fcard">
+      <div class="tile">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/></svg>
+      </div>
+      <div class="ft">Part 2, Use it</div>
+      <div class="fb">Transcribe a live meeting, a recording you already have, or record now and transcribe later. Summarise on your machine.</div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <div class="l">
+      <span class="mark" style="color:var(--ink-3)"><svg width="13" height="13" viewBox="0 0 22 22" fill="none"><path d="M3 12.5 C 6 16.5, 16 16.5, 19 12.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M7.5 8.5 L 7.5 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M11 8.5 L 11 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M14.5 8.5 L 14.5 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></span>
+      <span>Volksmond, by DigiPhyte</span>
+    </div>
+    <span>Quick start guide</span>
+  </div>
+</div>
+
+<!-- ════════════════ PAGE 2 · INSTALL ════════════════ -->
+<div class="page">
+  <div class="part-head">
+    <span class="part-num">Part 1</span>
+    <span class="part-title serif">Install it once</span>
+  </div>
+  <div class="part-intro">You were sent a single file named <span class="mono">Volksmond.zip</span>. There is nothing to install in the usual sense. You unzip it, then run the app straight from the folder.</div>
+
+  <div class="spacer-lg"></div>
+
+  <div class="steps">
+    <div class="step">
+      <div class="n">1</div>
+      <div class="body">
+        <div class="t">Unzip the folder</div>
+        <div class="d">Right-click <span class="mono">Volksmond.zip</span> and choose <strong>Extract All</strong>. Pick a normal place to keep it, like your Documents folder. Open the folder it creates. Run the app from there, not from inside the zip preview.</div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="n">2</div>
+      <div class="body">
+        <div class="t">Open the app</div>
+        <div class="d">In the unzipped folder, double-click <span class="mono">Volksmond.exe</span>. The Volksmond window opens on its own. The other files next to it are part of the app, you can leave them alone.</div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="n">3</div>
+      <div class="body">
+        <div class="t">If Windows shows a blue warning</div>
+        <div class="d">You may see <strong>Windows protected your PC</strong>. Click <span class="kbd">More info</span>, then <span class="kbd">Run anyway</span>. This appears only because the app is new and not yet signed by a certificate. It is the same file you were sent, and it is safe. You will not see this again on this computer.</div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="n">4</div>
+      <div class="body">
+        <div class="t">Answer the short setup</div>
+        <div class="d">A welcome screen greets you, then asks one question: do you want to <strong>just transcribe</strong>, or also <strong>summarise</strong> on your machine. For summaries, pick a model size and Volksmond downloads it for you in one click. You can skip this and turn summaries on later in Settings.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="spacer-lg"></div>
+
+  <div class="callout">
+    <span class="ic">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.6 2.6 14.4 0 17M12 3.5c-2.6 2.6-2.6 14.4 0 17"/></svg>
+    </span>
+    <div>
+      <div class="t">One thing needs the internet, once.</div>
+      <div class="b">The first time you transcribe, Volksmond downloads the speech model it runs on (this is a one-time download and it needs an internet connection that one time). After that, transcription and summaries run entirely on your computer, offline.</div>
+    </div>
+  </div>
+
+  <div class="spacer-md"></div>
+
+  <div class="callout ok">
+    <span class="ic">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5 10 17.5 19 6.5"/></svg>
+    </span>
+    <div>
+      <div class="t">Choosing a summary model</div>
+      <div class="b">Two sizes, both free and both run on your machine. <strong>Gemma 4 (2 billion)</strong> is lighter and faster, and works well on most computers. <strong>Gemma 4 (4 billion)</strong> is a little more polished and needs more memory. If unsure, start with the 2 billion.</div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <div class="l"><span>Volksmond, by DigiPhyte</span></div>
+    <span>Part 1 of 2 · Install</span>
+  </div>
+</div>
+
+<!-- ════════════════ PAGE 3 · USE IT ════════════════ -->
+<div class="page">
+  <div class="part-head">
+    <span class="part-num">Part 2</span>
+    <span class="part-title serif">Use it</span>
+  </div>
+  <div class="part-intro">When the app opens you land on the <strong>Meeting</strong> screen. This is where every session starts. There are three ways in, pick the one that fits the moment.</div>
+
+  <div class="spacer-md"></div>
+
+  <!-- mini app sketch -->
+  <div class="sketch">
+    <div class="sketch-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="ttl">Volksmond</span></div>
+    <div class="sketch-body">
+      <div class="sketch-side">
+        <div class="sketch-nav on"><span class="ic"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/></svg></span><span>Meeting</span></div>
+        <div class="sketch-nav"><span class="ic"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3.2 1.9"/></svg></span><span>History</span></div>
+        <div class="sketch-nav"><span class="ic"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg></span><span>Settings</span></div>
+        <div class="sketch-pill"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span>Local only, no internet</span></div>
+      </div>
+      <div class="sketch-main">
+        <div class="sketch-eyebrow">Ready when you are</div>
+        <div class="sketch-h">Start a session</div>
+        <div class="sketch-cards">
+          <div class="sketch-card on">
+            <div class="ci"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/></svg></div>
+            <div class="ct">Start a live meeting</div>
+            <div class="cbtn">Begin</div>
+          </div>
+          <div class="sketch-card">
+            <div class="ci"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15.5V4M7.5 8.5 12 4l4.5 4.5"/><path d="M5 15.5V19a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 19v-3.5"/></svg></div>
+            <div class="ct">Upload a recording</div>
+            <div class="cbtn">Choose a file</div>
+          </div>
+          <div class="sketch-card">
+            <div class="ci"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h11l3 3v13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M8 4v5h7V4"/><rect x="8" y="13" width="8" height="6.5"/></svg></div>
+            <div class="ct">Record only</div>
+            <div class="cbtn">Start</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="spacer-lg"></div>
+
+  <div class="grid-3">
+    <div class="fcard primary">
+      <div class="tile"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/></svg></div>
+      <div class="ft">Start a live meeting</div>
+      <div class="fb">Transcribe what you and others are saying right now. Optionally record the audio too. This is the main use.</div>
+    </div>
+    <div class="fcard">
+      <div class="tile"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15.5V4M7.5 8.5 12 4l4.5 4.5"/><path d="M5 15.5V19a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 19v-3.5"/></svg></div>
+      <div class="ft">Upload a recording</div>
+      <div class="fb">Pick an audio or video file you already have. Volksmond transcribes it locally, just like a live meeting.</div>
+    </div>
+    <div class="fcard">
+      <div class="tile"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h11l3 3v13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M8 4v5h7V4"/><rect x="8" y="13" width="8" height="6.5"/></svg></div>
+      <div class="ft">Record only, later</div>
+      <div class="fb">For machines that cannot keep up live. Record the audio cleanly now, then transcribe it when you are back at a desk.</div>
+    </div>
+  </div>
+
+  <div class="spacer-lg"></div>
+
+  <div class="section-label"><span>Running a live meeting</span><span class="ln"></span></div>
+  <div class="spacer-md"></div>
+
+  <div class="deflist">
+    <div class="defrow">
+      <div class="di"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v12.5a.5.5 0 0 1-.5.5h-11a.5.5 0 0 1-.5-.5V4a.5.5 0 0 1 .5-.5z"/><path d="M13 3.5V8h5"/></svg></div>
+      <div>
+        <div class="dt">Set it up, then press Begin</div>
+        <div class="dd">Give the meeting a title, choose the language (Afrikaans, English, or Auto-detect) and a quality level. Adding the <strong>names and jargon</strong> you expect to hear genuinely improves accuracy, especially for Afrikaans and the mix. All of this is optional.</div>
+      </div>
+    </div>
+    <div class="defrow">
+      <div class="di"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4z"/><path d="M16 9a4 4 0 0 1 0 6"/><path d="M19 6.5a8 8 0 0 1 0 11"/></svg></div>
+      <div>
+        <div class="dt">Two audio sources</div>
+        <div class="dd"><strong>Your microphone</strong> picks up your voice. <strong>System audio</strong> picks up everyone else, the sound coming out of your computer. So Volksmond captures both sides of a Teams, Zoom, or Meet call you have joined as a guest.</div>
+      </div>
+    </div>
+    <div class="defrow">
+      <div class="di"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="6" fill="currentColor" stroke="none"/></svg></div>
+      <div>
+        <div class="dt">Watch it, then stop and save</div>
+        <div class="dd">The transcript appears live as people talk. When you are done, press <strong>Stop and save</strong>. If you were also recording the audio, a small menu lets you stop the recording, the transcript, or both.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <div class="l"><span>Volksmond, by DigiPhyte</span></div>
+    <span>Part 2 of 2 · Use</span>
+  </div>
+</div>
+
+<!-- ════════════════ PAGE 4 · AFTER, SETTINGS, PRIVACY, HELP ════════════════ -->
+<div class="page">
+  <div class="section-label"><span>After a meeting</span><span class="ln"></span></div>
+  <div class="spacer-md"></div>
+
+  <div class="grid-2" style="align-items:start">
+    <div class="deflist">
+      <div class="defrow">
+        <div class="di"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
+        <div>
+          <div class="dt">Open, read, or copy it</div>
+          <div class="dd">The transcript is saved as a plain text file. From the finished screen you can open the folder, open the transcript to read it, or copy it all to paste elsewhere.</div>
+        </div>
+      </div>
+      <div class="defrow">
+        <div class="di"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.8 5.6L19.5 10.5l-5.7 1.9L12 18l-1.8-5.6L4.5 10.5l5.7-1.9z" fill="currentColor" stroke="none"/></svg></div>
+        <div>
+          <div class="dt">Summarise it, on your machine</div>
+          <div class="dd">If you turned summaries on, press <strong>Summarise</strong> for the decisions, the to-dos, and what stayed open. Choose the summary in <strong>English or Afrikaans</strong>. It runs locally and saves next to the transcript.</div>
+        </div>
+      </div>
+      <div class="defrow">
+        <div class="di"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3.2 1.9"/></svg></div>
+        <div>
+          <div class="dt">Find it again in History</div>
+          <div class="dd">The <strong>History</strong> tab lists every past meeting. Search it, open any transcript to re-read or summarise, and re-transcribe any recording you kept.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- transcript mini -->
+    <div class="sketch">
+      <div class="sketch-bar"><span class="ttl" style="margin-left:0">Strategy review · 04:18 · Listening</span></div>
+      <div style="padding:12px 13px">
+        <div class="tx">
+          <div class="ln"><span class="ts">00:02</span><span><span class="src mic">MIC</span><span class="said">So as ek dink aan die nuwe plan,</span></span></div>
+          <div class="ln"><span class="ts">00:09</span><span><span class="src sys">SYS</span><span class="said">Yes, and the budget side of it too.</span></span></div>
+          <div class="ln"><span class="ts">00:15</span><span><span class="src mic">MIC</span><span class="said">Ons kan dit volgende kwartaal begin.</span></span></div>
+          <div class="ln"><span class="ts">00:21</span><span><span class="src sys">SYS</span><span class="said">Agreed. I will pull the numbers.</span></span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="spacer-lg"></div>
+
+  <div class="section-label"><span>Settings worth knowing</span><span class="ln"></span></div>
+  <div class="spacer-md"></div>
+
+  <div class="grid-2">
+    <div class="fcard">
+      <div class="ft">Make it yours</div>
+      <div class="fb"><strong>Appearance</strong>: light, dark, or follow Windows. <strong>Interface language</strong>: switch the whole app between English and Afrikaans. <strong>Default context</strong>: save the names and jargon you use often, applied to every meeting.</div>
+    </div>
+    <div class="fcard">
+      <div class="ft">Where your files live</div>
+      <div class="fb">Under <strong>Data and privacy</strong> you can change the folder transcripts save to. For maximum privacy, pick a folder that a cloud service (OneDrive, Google Drive, Dropbox) does not sync. Audio recording stays off unless you switch it on for a meeting.</div>
+    </div>
+  </div>
+
+  <div class="spacer-lg"></div>
+
+  <div class="callout">
+    <span class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5a16 16 0 0 1 4-2.4M21 8.5a16 16 0 0 0-7.5-3.8M6.5 12.5a10 10 0 0 1 3-1.8M17.5 12.5a10 10 0 0 0-3.7-2.1M9.5 16a5 5 0 0 1 5 0"/><path d="M12 19.5h.01M3.5 3.5l17 17"/></svg></span>
+    <div>
+      <div class="t">Your privacy, in plain terms</div>
+      <div class="b">Nothing you say or transcribe is ever sent off your computer. Volksmond has no accounts and no telemetry, and the offline edition has no way to reach the internet once the models are in place. The source code is available so anyone can confirm it never phones home.</div>
+    </div>
+  </div>
+
+  <div class="spacer-lg"></div>
+
+  <div class="section-label"><span>Need a hand</span><span class="ln"></span></div>
+  <div class="spacer-md"></div>
+
+  <div class="help">
+    <div class="hr">
+      <span class="hi"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8.5" width="8" height="11" rx="4"/><path d="M8 12.5H4M16 12.5h4M8 16H4M16 16h4M9 8.5 7.2 5.5M15 8.5l1.8-3M12 19.5v-9"/></svg></span>
+      <div>
+        <div class="ht">Report a bug or an idea</div>
+        <div class="hd">Use <strong>Report a bug or idea</strong> at the bottom of the side menu. It opens a pre-filled email, nothing is sent automatically. Write to <span class="mono">volksmond@digiphyte.com</span>.</div>
+      </div>
+    </div>
+    <div class="hr">
+      <span class="hi"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 5h5v5M19 5l-7 7M12 5H6a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-6"/></svg></span>
+      <div>
+        <div class="ht">About Volksmond</div>
+        <div class="hd">Said <em>Fawlks-mawnt</em>, Afrikaans for the way people actually speak. A DigiPhyte product, built in South Africa. <span class="mono">digiphyte.com</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <div class="l">
+      <span class="mark" style="color:var(--ink-3)"><svg width="13" height="13" viewBox="0 0 22 22" fill="none"><path d="M3 12.5 C 6 16.5, 16 16.5, 19 12.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M7.5 8.5 L 7.5 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M11 8.5 L 11 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M14.5 8.5 L 14.5 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></span>
+      <span>Speak freely · Praat vrylik</span>
+    </div>
+    <span>by DigiPhyte</span>
+  </div>
+</div>
+
+</body>
+</html>

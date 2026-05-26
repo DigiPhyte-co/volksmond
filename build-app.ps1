@@ -2,7 +2,7 @@
 # PyInstaller, then zip it into one file to copy to another PC.
 #
 # Output goes OUTSIDE OneDrive (to %LOCALAPPDATA%\sa-live-transcribe\app-build): a
-# one-folder app + SA-Live-Transcribe.zip. OneDrive locks files mid-build (it broke
+# one-folder app + Volksmond.zip. OneDrive locks files mid-build (it broke
 # PyInstaller's clean step) and would needlessly sync the ~400 MB result, so we
 # build there instead. Run the .exe -> native window. The Whisper model is NOT
 # bundled (multi-GB) - it downloads on first transcription.
@@ -40,15 +40,15 @@ try {
 }
 if ($rc -ne 0) { Write-Host "  Build failed (rc=$rc)." -ForegroundColor Red; exit $rc }
 
-$dist = Join-Path $distRoot "SA-Live-Transcribe"
+$dist = Join-Path $distRoot "Volksmond"
 $mb = [math]::Round((Get-ChildItem $dist -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB, 0)
 Write-Host ""
 Write-Host "  Built: $dist  ($mb MB)" -ForegroundColor Green
 
 # Zip the one-folder app into a single file to copy to another PC.
-$zip = Join-Path $out "SA-Live-Transcribe.zip"
+$zip = Join-Path $out "Volksmond.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
 Compress-Archive -Path (Join-Path $dist "*") -DestinationPath $zip
 $zmb = [math]::Round((Get-Item $zip).Length / 1MB, 0)
 Write-Host "  Zipped: $zip  ($zmb MB)" -ForegroundColor Green
-Write-Host "  Copy the zip to the other PC, unzip, run SA-Live-Transcribe.exe (opens the app window)." -ForegroundColor Green
+Write-Host "  Copy the zip to the other PC, unzip, run Volksmond.exe (opens the app window)." -ForegroundColor Green

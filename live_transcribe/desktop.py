@@ -64,7 +64,7 @@ def _keep_alive(server, url, open_browser):
     if open_browser:
         import webbrowser
         webbrowser.open(url)
-    print(f"SA-Live-Transcribe is running at {url}", flush=True)
+    print(f"Volksmond is running at {url}", flush=True)
     print("Leave this window open while you use it. Close it (or Ctrl+C) to stop.", flush=True)
     try:
         while not server.should_exit:
