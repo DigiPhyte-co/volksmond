@@ -43,10 +43,10 @@ class MarkdownSink:
 
     def _write_header(self):
         from datetime import datetime
-        self.fh.write("# SA-Live-Transcribe session\n\n")
+        self.fh.write("# Volksmond session\n\n")
         self.fh.write(f"- Started: {datetime.now().isoformat(timespec='seconds')}\n")
         self.fh.write(f"- File: `{self.path.name}`\n")
-        self.fh.write("- Format: `[mm:ss] [SOURCE] text`, SOURCE is `MIC` (Sean) or `SYS` (remote participants via WASAPI loopback)\n\n")
+        self.fh.write("- Format: `[mm:ss] [SOURCE] text`, where `MIC` is your microphone and `SYS` is everyone else (your computer's audio)\n\n")
         self.fh.write("---\n\n")
         self.fh.flush()
 

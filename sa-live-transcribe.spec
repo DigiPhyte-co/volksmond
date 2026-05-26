@@ -2,7 +2,7 @@
 # PyInstaller spec for SA-Live-Transcribe (CPU-only NATIVE desktop build).
 # Build from the project root:  pyinstaller --noconfirm sa-live-transcribe.spec
 #
-# Produces a one-folder app under dist/SA-Live-Transcribe/. The native pywebview
+# Produces a one-folder app under dist/Volksmond/. The native pywebview
 # window is the shipped shell, so pywebview + pythonnet (clr) are bundled. Local
 # AI summaries (llama-cpp-python) are bundled too. The Whisper model is NOT
 # bundled (multi-GB); it downloads on first transcription.
@@ -49,5 +49,5 @@ pyz = PYZ(a.pure)
 # console=True for this test build: if the native window fails to appear, the
 # console shows why. A polished release would set console=False.
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True,
-          name="SA-Live-Transcribe", console=True)
-coll = COLLECT(exe, a.binaries, a.datas, name="SA-Live-Transcribe")
+          name="Volksmond", console=True)
+coll = COLLECT(exe, a.binaries, a.datas, name="Volksmond")
