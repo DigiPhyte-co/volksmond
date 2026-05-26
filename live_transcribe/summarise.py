@@ -1,6 +1,7 @@
 r"""Local, offline summarisation via llama-cpp-python (a GGUF model, in-process).
 
-The summary model is an OPTIONAL Pro download, a single .gguf file. llama.cpp runs
+The summary model is an optional, free, on-device extra: a single .gguf file the
+user downloads in one click from Settings (see modeldl.py). llama.cpp runs
 it in-process with no daemon, applies the model's own chat template, and supports
 the Gemma 4 architecture (including the KV-sharing that ctranslate2 4.7.2 cannot
 yet convert). CPU by default, which is what the target machines have; long
@@ -13,6 +14,23 @@ DEFAULT_INSTRUCTION = (
     "Produce concise meeting minutes from this transcript: a short overview, the "
     "main points, any decisions, and any action items. Do not invent anything that "
     "is not supported by the text."
+)
+
+# Always-on guidance about the transcript itself, added regardless of the user's
+# chosen instruction. The transcript is raw speech recognition output: the blocklist
+# in transcribe.py removes most hallucination artifacts, but older transcripts and
+# edge cases can still carry junk, mis-recognised words, and Afrikaans/English code-
+# switching. This keeps junk out of the summary and tells the model how to read messy
+# SA speech without inventing content.
+TRANSCRIPT_NOTE = (
+    "This transcript was produced by automatic speech recognition, so it is imperfect. "
+    "Ignore obvious transcription artifacts and never treat them as something that was "
+    "said: for example subtitle credits like 'Amara.org' or 'Ondertitels', "
+    "'thank you for watching', 'please subscribe', and isolated repeated filler. "
+    "The speakers mix Afrikaans and English in one conversation; treat both as the same "
+    "discussion. Where a word is clearly mis-recognised, infer the intended meaning from "
+    "context, but never invent names, numbers, decisions, or action items the text does "
+    "not support."
 )
 
 
@@ -56,21 +74,26 @@ class Summariser:
             chunks.append("".join(cur))
         return chunks
 
-    def summarise(self, transcript, instruction=None, chunk_tokens=3000,
+    def summarise(self, transcript, instruction=None, language=None, chunk_tokens=3000,
                   max_output_tokens=512):
         instruction = (instruction or DEFAULT_INSTRUCTION).strip()
+        if language:
+            lang_name = {"af": "Afrikaans", "en": "English"}.get(language)
+            if lang_name:
+                instruction += ("\n\nWrite the summary in " + lang_name +
+                                ", regardless of the language spoken in the transcript.")
         transcript = transcript.strip()
         if not transcript:
             return ""
         if self._ntokens(transcript) <= chunk_tokens:
-            return self._generate(f"{instruction}\n\nTRANSCRIPT:\n{transcript}", max_output_tokens)
+            return self._generate(f"{instruction}\n\n{TRANSCRIPT_NOTE}\n\nTRANSCRIPT:\n{transcript}", max_output_tokens)
         # map: summarise each part on its own
         chunks = self._split_by_tokens(transcript, chunk_tokens)
         partials = []
         for i, ch in enumerate(chunks, 1):
             p = self._generate(
                 f"This is part {i} of {len(chunks)} of a meeting transcript. Summarise the "
-                f"key points, decisions, and action items in this part only.\n\nTRANSCRIPT:\n{ch}",
+                f"key points, decisions, and action items in this part only.\n\n{TRANSCRIPT_NOTE}\n\nTRANSCRIPT:\n{ch}",
                 max_output_tokens,
             )
             partials.append(f"[Part {i}]\n{p}")

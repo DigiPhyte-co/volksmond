@@ -102,13 +102,37 @@ def test_blocking_feed_drops_nothing():
     print(f"  OK  blocking feed transcribed all {n} chunks with a 32-slot queue (no drops)")
 
 
+def test_hallucination_filter():
+    # Drops memorised junk (Amara credit), the anchor-prompt leak, and whole-segment
+    # video end-cards, but must NOT drop real speech that merely contains those words.
+    h = transcribe._is_hallucination
+    drop = [
+        "Ondertitels ingediend door die Amara.org gemeenschap",
+        "Algemene woorde, baie, nogal, lekker, sjoe, eish",
+        "please subscribe",
+        "Thanks for watching!",
+    ]
+    keep = [
+        "We should subscribe to the new tool next quarter.",
+        "Thanks for watching the demo, any questions?",
+        "Ek het a passion as het kom by taal",
+        "Lekker boys, soos baie van julle weet",
+    ]
+    for t in drop:
+        assert h(t), f"should have dropped: {t!r}"
+    for t in keep:
+        assert not h(t), f"should have kept: {t!r}"
+    print("  OK  hallucination filter drops junk and whole-segment end-cards, keeps real speech")
+
+
 if __name__ == "__main__":
     transcribe.WhisperModel = _FakeModel       # patch before any Engine is built
     failures = 0
     for fn in (test_drain_processes_whole_backlog,
                test_abort_drops_backlog,
                test_no_new_audio_accepted_during_shutdown,
-               test_blocking_feed_drops_nothing):
+               test_blocking_feed_drops_nothing,
+               test_hallucination_filter):
         try:
             fn()
         except AssertionError as e:

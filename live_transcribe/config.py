@@ -18,10 +18,16 @@ import base64
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 _DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "sa-live-transcribe"
 _SETTINGS_PATH = _DIR / "settings.json"
+
+# settings.json is written from more than one thread (the request thread and the
+# model-download thread). Serialise every read-modify-write so a long download
+# finishing mid-edit cannot clobber another write. Reentrant because update() -> save().
+_WRITE_LOCK = threading.RLock()
 
 # DEFAULTS is the source of truth for the settings schema. load() merges the
 # saved file over these, so a file written by an older build simply picks up any
@@ -64,20 +70,22 @@ def load() -> dict:
 
 def save(settings: dict) -> dict:
     """Persist the known settings keys. Any secret blob already on disk is kept."""
-    raw = _read_raw()
-    for k in DEFAULTS:
-        if k in settings:
-            raw[k] = settings[k]
-    _write_raw(raw)
-    return load()
+    with _WRITE_LOCK:
+        raw = _read_raw()
+        for k in DEFAULTS:
+            if k in settings:
+                raw[k] = settings[k]
+        _write_raw(raw)
+        return load()
 
 
 def update(patch: dict) -> dict:
-    s = load()
-    for k, v in patch.items():
-        if k in DEFAULTS:
-            s[k] = v
-    return save(s)
+    with _WRITE_LOCK:
+        s = load()
+        for k, v in patch.items():
+            if k in DEFAULTS:
+                s[k] = v
+        return save(s)
 
 
 def public_view() -> dict:
@@ -113,6 +121,19 @@ def summary_model_path():
     return str(cand) if cand.is_file() else None
 
 
+def models_dir(create: bool = False) -> Path:
+    """Folder for downloadable local models (summary GGUFs).
+
+    summary_model_path() resolves a bare filename here, so a model downloaded
+    into this folder is found by storing just its filename in settings. Pass
+    create=True only when about to write; a status read must not create the folder.
+    """
+    d = _DIR / "models"
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 # --- secrets ---------------------------------------------------------------
 
 def _dpapi(data: bytes, decrypt: bool) -> bytes:
@@ -145,16 +166,17 @@ def _dpapi(data: bytes, decrypt: bool) -> bytes:
 
 def set_cloud_api_key(key) -> None:
     """Store (encrypted) or, when key is falsy, clear the cloud API key."""
-    raw = _read_raw()
-    if not key:
-        raw.pop("cloud_api_key", None)
-    elif sys.platform == "win32":
-        enc = _dpapi(key.encode("utf-8"), decrypt=False)
-        raw["cloud_api_key"] = {"dpapi": base64.b64encode(enc).decode("ascii")}
-    else:
-        # Not real protection; replaced with the Keychain when macOS lands.
-        raw["cloud_api_key"] = {"b64": base64.b64encode(key.encode("utf-8")).decode("ascii")}
-    _write_raw(raw)
+    with _WRITE_LOCK:
+        raw = _read_raw()
+        if not key:
+            raw.pop("cloud_api_key", None)
+        elif sys.platform == "win32":
+            enc = _dpapi(key.encode("utf-8"), decrypt=False)
+            raw["cloud_api_key"] = {"dpapi": base64.b64encode(enc).decode("ascii")}
+        else:
+            # Not real protection; replaced with the Keychain when macOS lands.
+            raw["cloud_api_key"] = {"b64": base64.b64encode(key.encode("utf-8")).decode("ascii")}
+        _write_raw(raw)
 
 
 def get_cloud_api_key():

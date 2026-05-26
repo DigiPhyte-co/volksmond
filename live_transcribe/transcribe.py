@@ -115,6 +115,48 @@ def _collapse_repetition(text, max_run=3):
     return " ".join(out)
 
 
+# Whisper's training data is saturated with YouTube subtitle credits and video
+# end-cards. On silence or noise it reproduces these verbatim and CONFIDENTLY, so
+# the decoder confidence thresholds (which only catch low-confidence guessing) miss
+# them entirely. This is a precise blocklist of phrases that are never real meeting
+# speech. The big offender in SA testing is the Amara.org subtitle credit (often in
+# Dutch-flavoured spelling, e.g. "Ondertitels ingediend door die Amara.org gemeenskap").
+#
+# It also catches the AF_ANCHOR_PROMPT regurgitating itself: on silence Whisper can
+# emit the initial_prompt verbatim, which showed up on the silent mic channel as the
+# "Algemene woorde: baie, nogal, lekker, ..." word list. If you change the anchor's
+# word list, keep the two anchor-leak patterns below in sync with it.
+_HALLUCINATION_RE = re.compile(
+    r"amara\.org"
+    r"|\bondertitel\w*\b.*\b(gemeenskap|gemeenschap|amara)"
+    r"|\buntertitel\w*\b.*amara"
+    r"|\balgemene woorde[:,]"           # AF_ANCHOR_PROMPT list header leaking
+    r"|\bbaie,\s*nogal,\s*lekker",      # AF_ANCHOR_PROMPT word-list leaking
+    re.IGNORECASE,
+)
+
+# Video end-cards. Their words DO appear in real speech ("our subscribe page",
+# "thanks for watching the demo"), so they are junk only when they ARE the whole
+# segment (compared after stripping punctuation). Bare "subscribe" in a sentence is
+# left alone.
+_ENDCARD_PHRASES = frozenset({
+    "thanks for watching", "thank you for watching",
+    "please subscribe", "like and subscribe", "dont forget to subscribe",
+    "subscribe to my channel", "subscribe to the channel",
+    "dankie vir die kyk", "bedankt voor het kijken",
+})
+
+
+def _is_hallucination(text):
+    """True for known Whisper junk (subtitle credits, the anchor-prompt leak, and
+    video end-cards). These slip past the confidence thresholds because the model emits
+    them confidently, so they need explicit phrase matching rather than a threshold."""
+    if _HALLUCINATION_RE.search(text):
+        return True
+    bare = re.sub(r"[^\w\s]", "", text).strip().lower()
+    return bare in _ENDCARD_PHRASES
+
+
 @dataclass
 class Segment:
     source: str       # "MIC" or "SYS"
@@ -328,6 +370,12 @@ class Engine:
                 for seg in seg_list:
                     text = _collapse_repetition((seg.text or "").strip())
                     if not text:
+                        continue
+                    if _is_hallucination(text):
+                        continue
+                    # Residual silence hallucination the window-level no_speech guard
+                    # let through: drop a segment the model is very sure is non-speech.
+                    if getattr(seg, "no_speech_prob", 0.0) > 0.85:
                         continue
                     out = Segment(
                         source=source,

@@ -30,8 +30,8 @@ window.VM_I18N = {
     "Volksmond listens to your microphone and the audio coming out of your computer, and writes it down as people talk. Built for Afrikaans, English, and the way people actually switch between them.":
       "Volksmond luister na jou mikrofoon en die klank wat uit jou rekenaar kom, en skryf dit neer terwyl mense praat. Gebou vir Afrikaans, Engels, en die manier waarop mense werklik tussen die twee wissel.",
     "Your audio never leaves this computer.": "Jou klank verlaat nooit hierdie rekenaar nie.",
-    "No cloud, no third-party servers, no telemetry. Everything is transcribed locally, on your machine. You can use Volksmond completely offline.":
-      "Geen wolk, geen derdeparty-bedieners, geen telemetrie nie. Alles word plaaslik getranskribeer, op jou masjien. Jy kan Volksmond heeltemal vanlyn gebruik.",
+    "No telemetry and no accounts. Your audio and transcripts are never uploaded; everything is transcribed and summarised on your own machine. Once the models are downloaded, you can use Volksmond completely offline.":
+      "Geen telemetrie en geen rekeninge nie. Jou klank en transkripsies word nooit opgelaai nie; alles word op jou eie masjien getranskribeer en opgesom. Sodra die modelle afgelaai is, kan jy Volksmond heeltemal vanlyn gebruik.",
     "Get started": "Kom ons begin",
     "The language model for transcription is installed with the app. Summaries are an optional extra you can turn on next.":
       "Die taalmodel vir transkripsie word saam met die program geïnstalleer. Opsommings is 'n opsionele ekstra wat jy volgende kan aanskakel.",
@@ -73,6 +73,11 @@ window.VM_I18N = {
       "Kies 'n klank- of videolêer wat jy reeds het. Volksmond transkribeer dit plaaslik, net soos 'n lewendige vergadering.",
     "Record only, transcribe later": "Neem net op, transkribeer later",
     "Start recording": "Begin opneem",
+    "Record only": "Slegs opname",
+    "Name this recording": "Benoem hierdie opname",
+    "Volksmond records the audio cleanly on this computer. No transcript is made while recording. You can transcribe it later.":
+      "Volksmond neem die klank skoon op hierdie rekenaar op. Geen transkripsie word tydens opname gemaak nie. Jy kan dit later transkribeer.",
+    "Recording name": "Opname se naam",
     "For machines that cannot keep up live. Volksmond records the audio cleanly, and you transcribe it when you are back at a desk.":
       "Vir masjiene wat nie lewendig kan byhou nie. Volksmond neem die klank skoon op, en jy transkribeer dit wanneer jy terug by 'n lessenaar is.",
     "Have a recording already?": "Het jy reeds 'n opname?",
@@ -256,6 +261,32 @@ window.VM_I18N = {
     "Change": "Verander",
     "Choose model": "Kies model",
     "Installed": "Geïnstalleer",
+    "Turn on summaries": "Skakel opsommings aan",
+    "Summaries run on this computer and are free. You can switch model below any time.":
+      "Opsommings loop op hierdie rekenaar en is gratis. Jy kan enige tyd hieronder van model wissel.",
+    "Summary in": "Opsomming in",
+    "Download a small model and Volksmond can summarise a finished transcript on this computer. Pick a size, we download it for you.":
+      "Laai 'n klein model af en Volksmond kan 'n voltooide transkripsie op hierdie rekenaar opsom. Kies 'n grootte, ons laai dit vir jou af.",
+    "Choose a summary model to download": "Kies 'n opsommingsmodel om af te laai",
+    "Gemma 4 (2 billion)": "Gemma 4 (2 miljard)",
+    "Gemma 4 (4 billion)": "Gemma 4 (4 miljard)",
+    "Smaller and faster, light on memory. Works well on most machines.":
+      "Kleiner en vinniger, lig op geheue. Werk goed op die meeste masjiene.",
+    "Larger and more polished. Needs more memory and a little more time.":
+      "Groter en meer gepoleer. Benodig meer geheue en 'n bietjie meer tyd.",
+    "Download": "Laai af",
+    "Downloading": "Besig om af te laai",
+    "Use": "Gebruik",
+    "Could not load model options. Restart Volksmond and try again.":
+      "Kon nie die modelopsies laai nie. Herbegin Volksmond en probeer weer.",
+    "Try again": "Probeer weer",
+    "It downloads in the background. You can continue, it keeps going, and summaries switch on when it is ready.":
+      "Dit laai in die agtergrond af. Jy kan voortgaan, dit hou aan, en opsommings skakel aan wanneer dit gereed is.",
+    "Choose a model size below and we download it for you. One click, no file hunting.":
+      "Kies hieronder 'n modelgrootte en ons laai dit vir jou af. Een klik, geen lêersoektog nie.",
+    "Loading model options...": "Laai modelopsies...",
+    "Summary model ready. Summaries are on.": "Opsommingsmodel gereed. Opsommings is aan.",
+    "Could not start the download.": "Kon nie die aflaai begin nie.",
     "Open data folder": "Maak data-vouer oop",
     "See the transcripts and any models stored on this computer.":
       "Sien die transkripsies en enige modelle wat op hierdie rekenaar gestoor is.",
@@ -305,8 +336,8 @@ window.VM_I18N = {
     // About / credit
     "by DigiPhyte": "deur DigiPhyte",
     "About": "Oor",
-    "Said FOLKS-mont. Afrikaans for the way people actually speak.":
-      "Uitgespreek FOLKS-mont. Afrikaans vir hoe mense werklik praat.",
+    "Said Fawlks-mawnt. Afrikaans for the way people actually speak.":
+      "Uitgespreek Fawlks-mawnt. Afrikaans vir hoe mense werklik praat.",
 
     // Report a bug
     "Nothing is sent automatically. The app never phones home, you send this yourself.":
