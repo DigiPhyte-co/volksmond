@@ -20,7 +20,7 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
@@ -742,7 +742,9 @@ class SettingsPatch(BaseModel):
     ai_backend: Optional[str] = None
     ai_instructions: Optional[list] = None
     active_instruction_id: Optional[str] = None
-    summary_model: Optional[str] = None
+    # summary_model is intentionally NOT settable here: only the verified downloader
+    # (modeldl.py) sets it, to a pinned catalogue filename, so an arbitrary or
+    # unverified path cannot be made the active summary model via the settings API.
     cloud_api_key: Optional[str] = None  # write-only; never returned by GET
 
 
@@ -817,6 +819,36 @@ def models_status():
     }
 
 
+class ModelDownloadRequest(BaseModel):
+    key: str
+
+
+@app.get("/api/summary-models")
+def summary_models():
+    """Catalogue of downloadable summary models plus live download progress, so
+    the UI can offer a one-click download instead of a manual file picker."""
+    from .. import modeldl
+    return {
+        "models": modeldl.catalogue_public(),
+        "progress": modeldl.progress(),
+        "installed": config.summary_model_path() is not None,
+    }
+
+
+@app.post("/api/summary-model/download")
+def summary_model_download(req: ModelDownloadRequest):
+    """Start downloading a summary model to this machine (background). Returns the
+    current progress snapshot; the UI polls /api/summary-models for updates."""
+    from .. import modeldl
+    try:
+        modeldl.start_download(req.key)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return modeldl.progress()
+
+
 @app.get("/api/app-info")
 def app_info():
     """Light, non-sensitive facts for the footer and the bug-report mailto: the
@@ -827,6 +859,11 @@ def app_info():
         "version": licensing.APP_VERSION,
         "platform": platform.platform(),
         "save_dir": str(_sessions_dir()),
+        # Edition flag. The offline-only build (default) hides the online-feature UI:
+        # the cloud-key danger zone and the in-app Pro pricing page. A future connected
+        # build sets SA_LIVE_CONNECTED=1 to surface them. The actual cloud paths are not
+        # built either way, so this only governs which UI the user can reach.
+        "connected": os.environ.get("SA_LIVE_CONNECTED") == "1",
     }
 
 
@@ -882,6 +919,7 @@ def pick_path(kind: str = "file"):
 class SummariseRequest(BaseModel):
     file: str                      # session filename within the save location
     instruction: Optional[str] = None
+    language: Optional[Literal["af", "en"]] = None  # output language for the summary
 
 
 @app.post("/api/summarise")
@@ -916,7 +954,7 @@ def summarise_endpoint(req: SummariseRequest):
     from .. import summarise as _summarise
     try:
         s = _summarise.Summariser(model_path)
-        summary = s.summarise(transcript, instruction=instruction)
+        summary = s.summarise(transcript, instruction=instruction, language=req.language)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Summarise failed: {e}")
 

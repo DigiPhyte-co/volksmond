@@ -43,3 +43,6 @@ dist/
 # Local agent / tooling state
 .claude/
 .codex-review*.txt
+
+# Local dev launcher (bare CLI; not part of the shipped app)
+transcribe-cli.bat

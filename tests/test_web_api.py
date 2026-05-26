@@ -61,6 +61,34 @@ def test_summarise_not_pro_gated():
     print("  OK  /api/summarise is not Pro-gated (bogus file -> 404, not 403)")
 
 
+def test_summary_model_download_api():
+    # One-click summary-model download: the catalogue lists the two pinned models,
+    # a bad key is rejected, and the download endpoint is CSRF-protected. No real
+    # download is triggered (a bad key with the token, and a good key without it,
+    # are both refused before any bytes move).
+    j = client.get("/api/summary-models").json()
+    keys = [m["key"] for m in j["models"]]
+    assert keys == ["gemma-4-e2b", "gemma-4-e4b"], keys
+    assert all(m["approx_bytes"] > 0 for m in j["models"]), j
+    r = client.post("/api/summary-model/download", json={"key": "nope"})
+    assert r.status_code == 400, f"bad model key should 400, got {r.status_code}"
+    bare = TestClient(app, base_url="http://localhost")
+    r2 = bare.post("/api/summary-model/download", json={"key": "gemma-4-e2b"})
+    assert r2.status_code == 403, f"download endpoint not CSRF-protected: {r2.status_code}"
+    assert client.get("/api/summary-models").json()["progress"]["state"] in ("idle", "done"), \
+        "a rejected request still started a download"
+    print("  OK  summary-model download: catalogue listed, bad key 400, CSRF-protected, no stray download")
+
+
+def test_summary_language_validated():
+    # The summary output language is constrained to af/en; junk is a 422 (not silently ignored).
+    bad = client.post("/api/summarise", json={"file": "no-such.md", "language": "fr"})
+    assert bad.status_code == 422, f"invalid language should 422, got {bad.status_code}"
+    ok = client.post("/api/summarise", json={"file": "no-such.md", "language": "af"})
+    assert ok.status_code == 404, f"valid language should pass validation (404 on missing file), got {ok.status_code}"
+    print("  OK  summary language validated (af/en only; junk -> 422)")
+
+
 def test_settings_never_leak_secret():
     j = client.get("/api/settings").json()
     assert "cloud_api_key" not in j, "secret cloud_api_key leaked in GET /api/settings"
@@ -156,6 +184,8 @@ if __name__ == "__main__":
     for fn in (test_app_info,
                test_summaries_are_free,
                test_summarise_not_pro_gated,
+               test_summary_model_download_api,
+               test_summary_language_validated,
                test_settings_never_leak_secret,
                test_static_assets_served,
                test_csrf_blocks_unsafe_requests,

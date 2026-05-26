@@ -1,11 +1,11 @@
 /* Volksmond (SA-Live-Transcribe) browser UI.
  *
- * Vanilla JS, no framework, no CDN: the product works offline, so nothing is
- * fetched from the network. The Volksmond design is rebuilt here with the .vm
- * design system in styles.css. Every screen is wired to the real FastAPI
- * endpoints; nothing is faked. Where the design showed a feature that is not
- * built yet (clean second pass, in-app model download, calendar in the start
- * flow), it is left out rather than mocked.
+ * Vanilla JS, no framework, no CDN. Audio and transcripts are never uploaded; the
+ * only network use is downloading the local models. The Volksmond design is rebuilt
+ * here with the .vm design system in styles.css. Every screen is wired to the real
+ * FastAPI endpoints; nothing is faked. Where the design showed a feature that is not
+ * built yet (clean second pass, calendar in the start flow), it is left out rather
+ * than mocked.
  */
 "use strict";
 
@@ -321,6 +321,31 @@ async function startRecordOnly() {
     go("recordonly"); startElapsed();
   } catch (e) { toast(e.message || "Could not start recording.", true); }
 }
+
+/* ── pre-record (name a record-only session before it starts) ─ */
+function recordPreView() {
+  var dev = S.devices || {};
+  return el("div", { class: "screen" }, el("div", { class: "screen-inner col-mid" }, [
+    el("div", { class: "screen-head" }, el("div", {}, [
+      el("div", { class: "eyebrow", text: "Record only" }),
+      el("h1", { text: "Name this recording" }),
+      el("p", { class: "sub", text: "Volksmond records the audio cleanly on this computer. No transcript is made while recording. You can transcribe it later." }),
+    ])),
+    el("div", { class: "stack", style: { gap: "16px" } }, [
+      formField("Recording name", el("span", { class: "label-muted", text: " (optional)" }),
+        el("input", { class: "field tall", value: S.form.title, placeholder: "e.g. Toets met Jonathan", oninput: function (e) { S.form.title = e.target.value; } })),
+      el("div", { class: "card", style: { padding: "16px" } }, [
+        el("div", { class: "section-label", style: { marginBottom: "10px" }, text: "Audio sources" }),
+        deviceField("Your microphone", dev.mics, S.form.mic, dev.default_mic_index, function (v) { S.form.mic = v; }),
+        deviceField("System audio (everyone else)", dev.loopbacks, S.form.loopback, dev.default_loopback_index, function (v) { S.form.loopback = v; }),
+      ]),
+      el("div", { class: "row gap-8", style: { justifyContent: "flex-end" } }, [
+        el("button", { class: "btn ghost", onclick: function () { go("home"); } }, "Back"),
+        el("button", { class: "btn primary tall", onclick: startRecordOnly }, [icon("dot", 14), "Start recording"]),
+      ]),
+    ]),
+  ]));
+}
 async function startImport(arg) {
   var body = { topic: arg.topic || "", tier: S.form.tier, language: S.form.language, prompt: (S.form.participants || []).concat(S.form.terms || []).join(", ") };
   if (arg.path) body.paths = [arg.path];
@@ -455,7 +480,7 @@ async function doSummarise(fileName, scope) {
   var target = scope === "reader" ? S.reader : S.finish;
   target.summarising = true; render();
   try {
-    var resp = await api.post("/api/summarise", { file: fileName });
+    var resp = await api.post("/api/summarise", { file: fileName, language: target.sumLang || "en" });
     target.summary = resp.summary; target.savedAs = resp.saved; target.summarising = false;
     render();
   } catch (e) {
@@ -545,6 +570,7 @@ function summaryInstalled() { return S.models && S.models.summary_installed; }
 // In the native pywebview shell, window.pywebview.api is injected after load.
 // Use it to open external links and native pickers; the browser build falls back.
 function inDesktop() { return !!(window.pywebview && window.pywebview.api); }
+function connected() { return !!(S.appInfo && S.appInfo.connected); }  // online (paid) edition; the offline build hides online-feature UI
 function openExternal(url) {
   // Native shell: hand it to the OS (system browser / mail client).
   if (inDesktop() && window.pywebview.api.open_external) { window.pywebview.api.open_external(url); return; }
@@ -594,7 +620,13 @@ function reportBug() {
 /* ═══════════════════════════════════════════════════════════
  * RENDER
  * ═══════════════════════════════════════════════════════════ */
+var _renderedRoute = null;
 function render() {
+  // Preserve scroll across a same-route re-render (e.g. the 1s download poll on
+  // Settings) so the page does not snap to the top. A route change still resets.
+  var keepScroll = (S.route === _renderedRoute);
+  var prevScroller = keepScroll ? APP.querySelector(".screen, .solo, .live-body") : null;
+  var prevScrollTop = prevScroller ? prevScroller.scrollTop : 0;
   liveDocEl = liveBodyEl = elapsedEl = recTimerEl = null;
   clear(APP);
   var view;
@@ -603,6 +635,7 @@ function render() {
     case "home": view = shell("home", homeView()); break;
     case "pre": view = shell("home", preView()); break;
     case "importpre": view = shell("home", importPreView()); break;
+    case "recordpre": view = shell("home", recordPreView()); break;
     case "live": view = liveView(); break;
     case "recordonly": view = recordOnlyView(); break;
     case "importing": view = importingView(); break;
@@ -617,6 +650,11 @@ function render() {
   if (S.stopMenuOpen) APP.appendChild(stopMenuLayer());
   if (S.toast) {
     APP.appendChild(el("div", { class: "toast-wrap" }, el("div", { class: "toast" + (S.toast.err ? " err" : ""), text: S.toast.msg })));
+  }
+  _renderedRoute = S.route;
+  if (prevScrollTop) {
+    var ns = APP.querySelector(".screen, .solo, .live-body");
+    if (ns) ns.scrollTop = prevScrollTop;
   }
 }
 
@@ -660,7 +698,7 @@ function setupView() {
         el("div", { class: "tone-tile accent", style: { width: "40px", height: "40px", flex: "0 0 auto" } }, icon("lock", 20)),
         el("div", {}, [
           el("div", { style: { fontWeight: "600", marginBottom: "4px" }, text: "Your audio never leaves this computer." }),
-          el("p", { class: "ink-2", style: { fontSize: "12.5px" }, text: "No cloud, no third-party servers, no telemetry. Everything is transcribed locally, on your machine. You can use Volksmond completely offline." }),
+          el("p", { class: "ink-2", style: { fontSize: "12.5px" }, text: "No telemetry and no accounts. Your audio and transcripts are never uploaded; everything is transcribed and summarised on your own machine. Once the models are downloaded, you can use Volksmond completely offline." }),
         ]),
       ]),
       el("div", { class: "row gap-10" }, [
@@ -670,13 +708,19 @@ function setupView() {
     ]);
   } else if (stage === "summaries") {
     var installed = summaryInstalled();
+    var wantsSummaries = S.setup.choice === "summarise";
     inner = el("div", { class: "col-narrow stack", style: { gap: "18px" } }, [
       el("div", { class: "eyebrow", text: "Setup, summaries" }),
       el("h1", { text: "Do you want to just transcribe, or also summarise on your machine?" }),
       el("p", { class: "ink-2", text: "Summaries condense a finished transcript into the decisions, the to-dos, and what stayed unresolved. They run on a small model on your machine, separate from the one that does the transcribing. Off by default." }),
       choiceCard("transcribe", "mic", "Just transcribe", "The original promise. Live transcripts, history, all of it. No extra model, no extra RAM.", "Default. You can turn summaries on later in Settings."),
       choiceCard("summarise", "note", "Transcribe and summarise", "Adds a Summarise button at the end of every meeting, run entirely on this machine.",
-        installed ? "A summary model is already installed on this machine." : "Needs a summary model file in your models folder. You can set this up in Settings."),
+        installed ? "A summary model is already installed on this machine." : "Choose a model size below and we download it for you. One click, no file hunting."),
+      (wantsSummaries && !installed) ? el("div", { class: "stack", style: { gap: "10px" } }, [
+        el("div", { class: "section-label", text: "Choose a summary model to download" }),
+        summaryDownloadPanel(),
+        el("p", { class: "ink-3", style: { fontSize: "11.5px" }, text: "It downloads in the background. You can continue, it keeps going, and summaries switch on when it is ready." }),
+      ]) : null,
       el("div", { class: "row gap-8", style: { justifyContent: "flex-end", marginTop: "4px" } }, [
         el("button", { class: "btn ghost", onclick: finishSetup }, "Skip for now"),
         el("button", { class: "btn primary tall", onclick: finishSetup }, "Continue"),
@@ -728,15 +772,7 @@ function homeView() {
         onclick: importFromPicker }),
       entry({ ic: "disk", title: "Record only, transcribe later", cta: "Start recording",
         body: "For machines that cannot keep up live. Volksmond records the audio cleanly, and you transcribe it when you are back at a desk.",
-        onclick: startRecordOnly }),
-    ]),
-    el("div", { class: "dropzone" }, [
-      el("div", { class: "tile" }, icon("upload", 18)),
-      el("div", { class: "grow" }, [
-        el("div", { style: { fontWeight: "500", fontSize: "13.5px" }, text: "Have a recording already?" }),
-        el("div", { class: "ink-3", style: { fontSize: "12px", marginTop: "2px" }, text: "Up to several hours. The file stays on this computer. It is never uploaded." }),
-      ]),
-      el("button", { class: "btn", onclick: importFromPicker }, "Browse"),
+        onclick: function () { S.form.title = ""; go("recordpre"); } }),
     ]),
   ]));
 }
@@ -1047,10 +1083,15 @@ function summariseCard(fileName, scope) {
       el("div", { style: { fontWeight: "600" }, text: "Summarise this transcript" }),
       el("p", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "4px" }, text: "Runs on this computer using your installed model. Produces decisions, action items, and open questions." }),
     ]),
-    el("button", { class: "btn primary", onclick: function () { doSummarise(fileName, scope); } }, [icon("sparkle", 14), "Summarise"]),
+    el("div", { class: "row gap-8", style: { alignItems: "center" } }, [
+      el("span", { class: "ink-3", style: { fontSize: "11.5px" }, text: "Summary in" }),
+      selectEl([["en", "English"], ["af", "Afrikaans"]], (target.sumLang || "en"), function (v) { target.sumLang = v; render(); }),
+      el("button", { class: "btn primary", onclick: function () { doSummarise(fileName, scope); } }, [icon("sparkle", 14), "Summarise"]),
+    ]),
   ]);
 }
 function summaryResult(summary, savedAs, fileName, scope) {
+  var target = scope === "reader" ? S.reader : S.finish;
   var card = el("div", { class: "card sum-card" }, [
     el("div", { class: "head" }, [
       el("div", { class: "tile" }, icon("sparkle", 15)),
@@ -1059,7 +1100,8 @@ function summaryResult(summary, savedAs, fileName, scope) {
         el("div", { class: "ink-3", style: { fontSize: "11.5px" }, text: "Ran on this computer, saved next to the transcript" }),
       ]),
       el("button", { class: "btn ghost sm", onclick: function () { copyText(summary); } }, [icon("copy", 13), "Copy"]),
-      el("button", { class: "btn ghost sm", onclick: function () { (scope === "reader" ? S.reader : S.finish).summary = null; doSummarise(fileName, scope); } }, "Regenerate"),
+      selectEl([["en", "English"], ["af", "Afrikaans"]], (target.sumLang || "en"), function (v) { target.sumLang = v; render(); }),
+      el("button", { class: "btn ghost sm", onclick: function () { target.summary = null; doSummarise(fileName, scope); } }, "Regenerate"),
     ]),
     el("div", { class: "sum-body" }, renderMarkdown(summary)),
     savedAs ? el("div", { class: "saved-strip" }, [icon("check", 14), el("span", {}, ["Saved as ", el("span", { class: "mono", text: baseName(savedAs) }), ", next to the transcript. Nothing was sent off this computer."])]) : null,
@@ -1142,7 +1184,7 @@ function settingsView() {
     transcriptionCard(st),
     summariesCard(),
     dataCard(st),
-    dangerCard(st),
+    connected() ? dangerCard(st) : null,
     aboutCard(),
   ]));
 }
@@ -1154,7 +1196,7 @@ function aboutCard() {
       el("div", { class: "ic" }, markSvg(20)),
       el("div", { class: "body" }, [
         el("div", { class: "t" }, [el("span", { text: "Volksmond" }), el("span", { class: "chip", text: "Version " + version })]),
-        el("div", { class: "s", text: "Said FOLKS-mont. Afrikaans for the way people actually speak." }),
+        el("div", { class: "s", text: "Said Fawlks-mawnt. Afrikaans for the way people actually speak." }),
         el("div", { class: "s", text: "A DigiPhyte product, built in South Africa. All transcription happens on this machine unless you explicitly opt in." }),
       ]),
       el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: function () { openExternal("https://digiphyte.com"); } }, "digiphyte.com")),
@@ -1174,7 +1216,7 @@ function licenceCard() {
       ]),
       pro
         ? el("button", { class: "btn ghost", onclick: deactivateLicence }, "Deactivate")
-        : el("button", { class: "btn primary", onclick: function () { S.upgrade = { keyState: "empty", value: "", msg: "" }; go("upgrade"); } }, "Upgrade"),
+        : el("button", { class: "btn primary", onclick: function () { if (connected()) { S.upgrade = { keyState: "empty", value: "", msg: "" }; go("upgrade"); } else { openExternal(PRO_URL); } } }, "Upgrade"),
     ]),
   ]);
 }
@@ -1220,21 +1262,97 @@ function transcriptionCard(st) {
     ]),
   ]);
 }
+/* ── summary model download (one-click, shared by setup and settings) ─── */
+var SUMMARY_LABELS = {
+  "gemma-4-e2b": { title: "Gemma 4 (2 billion)", note: "Smaller and faster, light on memory. Works well on most machines." },
+  "gemma-4-e4b": { title: "Gemma 4 (4 billion)", note: "Larger and more polished. Needs more memory and a little more time." },
+};
+function fmtGB(bytes) { var g = (bytes || 0) / 1e9; return (g < 1 ? g.toFixed(2) : g.toFixed(1)) + " GB"; }
+var _dlTimer = null;
+function startModelDownload(key) {
+  api.post("/api/summary-model/download", { key: key })
+    .then(function () { pollModelDownload(); render(); })
+    .catch(function (e) { toast(e.message || "Could not start the download.", true); });
+}
+function pollModelDownload() {
+  if (_dlTimer) return;
+  _dlTimer = setInterval(function () {
+    api.get("/api/summary-models").then(function (d) {
+      S.summaryModels = d;
+      var p = (d && d.progress) || {};
+      if (p.state === "downloading") {
+        // Update the bar in place. A full render() each second would rebuild the
+        // DOM, closing any open dropdown and fighting the scroll position.
+        updateDownloadProgress(p);
+        return;
+      }
+      clearInterval(_dlTimer); _dlTimer = null;
+      if (p.state === "done") { api.get("/api/models").then(function (mm) { S.models = mm; render(); }); toast("Summary model ready. Summaries are on."); }
+      else if (p.state === "error") { toast("Download failed: " + (p.error || ""), true); }
+      render();
+    }).catch(function () {});
+  }, 1000);
+}
+function updateDownloadProgress(p) {
+  var pct = p.total ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0;
+  var bar = document.getElementById("vm-dl-bar");
+  if (bar) bar.style.width = pct + "%";
+  var txt = document.getElementById("vm-dl-text");
+  if (txt) txt.textContent = fmtGB(p.downloaded) + " of " + fmtGB(p.total) + "  (" + pct + "%)";
+}
+function progressBar(pct) {
+  return el("div", { style: { height: "8px", borderRadius: "999px", background: "var(--line)", overflow: "hidden", marginTop: "10px" } },
+    el("div", { id: "vm-dl-bar", style: { height: "100%", width: pct + "%", background: "var(--accent)", transition: "width .3s ease" } }));
+}
+function loadSummaryModels() {
+  S._loadingSM = true; S._smError = false;
+  api.get("/api/summary-models")
+    .then(function (d) { S.summaryModels = d; S._loadingSM = false; render(); })
+    .catch(function () { S._loadingSM = false; S._smError = true; render(); });
+}
+function summaryDownloadPanel() {
+  if (!S.summaryModels) {
+    if (S._smError) {
+      return el("div", { class: "stack", style: { gap: "6px" } }, [
+        el("div", { class: "ink-3", style: { fontSize: "12px" }, text: "Could not load model options. Restart Volksmond and try again." }),
+        el("span", { class: "link", style: { fontSize: "12px" }, onclick: function () { loadSummaryModels(); } }, "Try again"),
+      ]);
+    }
+    if (!S._loadingSM) { loadSummaryModels(); }
+    return el("div", { class: "ink-3", style: { fontSize: "12px" }, text: "Loading model options..." });
+  }
+  var d = S.summaryModels; var models = d.models || []; var p = d.progress || {};
+  var downloading = p.state === "downloading";
+  return el("div", { class: "stack", style: { gap: "10px" } }, models.map(function (m) {
+    var meta = SUMMARY_LABELS[m.key] || { title: m.params + " model", note: "" };
+    var isThis = downloading && p.key === m.key;
+    var pct = (isThis && p.total) ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0;
+    return el("div", { class: "card", style: { padding: "14px" } }, [
+      el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "flex-start", gap: "12px" } }, [
+        el("div", { class: "grow" }, [
+          el("div", { style: { fontWeight: "600" } }, [el("span", { text: meta.title }), el("span", { class: "chip", style: { marginLeft: "8px" } }, raw(fmtGB(m.approx_bytes)))]),
+          el("div", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "2px" }, text: meta.note }),
+        ]),
+        m.active
+          ? el("span", { class: "chip ok" }, [icon("check", 12), "Installed"])
+          : el("button", { class: "btn", onclick: function () { if (downloading) return; startModelDownload(m.key); } }, isThis ? "Downloading" : (m.present ? "Use" : "Download")),
+      ]),
+      isThis ? progressBar(pct) : null,
+      isThis ? el("div", { id: "vm-dl-text", class: "ink-3", style: { fontSize: "11.5px", marginTop: "4px" } }, raw(fmtGB(p.downloaded) + " of " + fmtGB(p.total) + "  (" + pct + "%)")) : null,
+    ]);
+  }));
+}
 function summariesCard() {
-  var m = S.models || {};
-  var installed = m.summary_installed;
+  var d = S.summaryModels || {};
+  var anyActive = (d.installed != null) ? d.installed : !!(S.models && S.models.summary_installed);
   return el("div", { class: "card settings-card" }, [
     el("div", { class: "card-title section-label", text: "Summaries, run on this machine" }),
-    el("div", { class: "set-row" }, [
-      el("div", { class: "ic" }, icon("cpu", 18)),
-      el("div", { class: "body" }, [
-        el("div", { class: "t", text: "Summary model" }),
-        el("div", { class: "s", text: installed ? ("Installed: " + (m.summary_model || "a local model") + ". Summaries are free and stay on this computer.") : "None yet. Point Volksmond at a GGUF model file to turn summaries on." }),
-      ]),
-      el("div", { class: "ctl row gap-8" }, [
-        installed ? el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]) : null,
-        el("button", { class: "btn ghost", onclick: pickSummaryModel }, installed ? "Change" : "Choose model"),
-      ]),
+    el("div", { class: "set-row", style: { display: "block" } }, [
+      el("div", { class: "t", style: { marginBottom: "4px" }, text: anyActive ? "Summary model" : "Turn on summaries" }),
+      el("div", { class: "s", style: { marginBottom: "10px" }, text: anyActive
+        ? "Summaries run on this computer and are free. You can switch model below any time."
+        : "Download a small model and Volksmond can summarise a finished transcript on this computer. Pick a size, we download it for you." }),
+      summaryDownloadPanel(),
     ]),
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("folder", 18)),
@@ -1242,13 +1360,6 @@ function summariesCard() {
       el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: function () { api.post("/api/open-folder").catch(function () {}); } }, "Open")),
     ]),
   ]);
-}
-async function pickSummaryModel() {
-  var p = await pickFile("file");
-  if (!p) return;
-  if (!/\.gguf$/i.test(p)) { toast("Choose a .gguf model file.", true); return; }
-  try { await api.post("/api/settings", { summary_model: p }); S.models = await api.get("/api/models"); toast("Summary model set."); render(); }
-  catch (e) { toast(e.message || "Could not set model.", true); }
 }
 function dataCard(st) {
   return el("div", { class: "card settings-card" }, [
@@ -1412,9 +1523,12 @@ async function boot() {
     api.get("/api/app-info").catch(function () { return null; }),
     api.get("/api/license").catch(function () { return null; }),
     api.get("/api/devices").catch(function () { return null; }),
+    api.get("/api/summary-models").catch(function () { return null; }),
   ]);
   S.settings = results[0]; S.features = results[1]; S.models = results[2];
   S.appInfo = results[3]; S.license = results[4]; S.devices = results[5];
+  S.summaryModels = results[6];
+  if (S.summaryModels && S.summaryModels.progress && S.summaryModels.progress.state === "downloading") pollModelDownload();
   LANG = afLang(S.settings);
   if (S.settings) {
     S.form.language = S.settings.transcription_language != null ? S.settings.transcription_language : "af";
@@ -1468,6 +1582,7 @@ document.addEventListener("keydown", function (e) {
   if (e.key === "Escape" && S.stopMenuOpen) { S.stopMenuOpen = false; render(); return; }
   if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && S.route === "pre") { e.preventDefault(); startLive(); return; }
   if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && S.route === "importpre") { e.preventDefault(); startImport({ path: S.importPath, stem: S.importStem, topic: S.form.title }); return; }
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && S.route === "recordpre") { e.preventDefault(); startRecordOnly(); return; }
   if ((e.key === "k" || e.key === "K") && (e.metaKey || e.ctrlKey) && S.route === "history") {
     e.preventDefault();
     var s = document.querySelector('.screen input[placeholder^="Search"]');
