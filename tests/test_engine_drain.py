@@ -109,6 +109,7 @@ def test_hallucination_filter():
     drop = [
         "Ondertitels ingediend door die Amara.org gemeenschap",
         "Algemene woorde, baie, nogal, lekker, sjoe, eish",
+        "Ons praat Suid-Afrikaans, nie Nederlands nie.",
         "please subscribe",
         "Thanks for watching!",
     ]
@@ -117,12 +118,43 @@ def test_hallucination_filter():
         "Thanks for watching the demo, any questions?",
         "Ek het a passion as het kom by taal",
         "Lekker boys, soos baie van julle weet",
+        "Dit is Afrikaans, nie Nederlands nie",   # genuine: only the full anchor phrase is junk
     ]
     for t in drop:
         assert h(t), f"should have dropped: {t!r}"
     for t in keep:
         assert not h(t), f"should have kept: {t!r}"
     print("  OK  hallucination filter drops junk and whole-segment end-cards, keeps real speech")
+
+
+def test_mic_published_after_delay_no_live_dedup():
+    # The engine no longer de-dups live; it only holds MIC briefly (for live ordering) then
+    # publishes it. Echo removal is deferred to the saved-transcript cleanup, so a MIC echo of
+    # a SYS line is still published here (both copies present) and nothing is lost before save.
+    engine, collected = _make_engine()
+    engine.start()
+    engine.on_chunk("SYS", "alpha beta gamma delta", 1.0)
+    engine.on_chunk("MIC", "alpha beta gamma delta", 1.4)    # would-be echo: still published live
+    engine.on_chunk("MIC", "zulu yankee xray whiskey", 5.0)
+    engine.stop(drain=True, timeout=30)
+    assert collected.count("seg-alpha beta gamma delta") == 2, f"engine must not drop live: {collected}"
+    assert "seg-zulu yankee xray whiskey" in collected, collected
+    assert len(collected) == 3, f"unexpected segments: {collected}"
+    print("  OK  engine holds + publishes MIC (no live de-dup); echo removal deferred to save")
+
+
+def test_no_sys_means_all_mic_published():
+    # Mic-only (no system audio): nothing to match against, so every MIC line must survive
+    # the delay + flush. Guards against the hold ever silently swallowing real speech.
+    engine, collected = _make_engine()
+    engine.start()
+    n = 5
+    for i in range(n):
+        engine.on_chunk("MIC", i, float(i))
+    engine.stop(drain=True, timeout=30)
+    assert len(collected) == n, f"mic-only lost lines: {collected}"
+    assert sorted(collected) == sorted(f"seg-{i}" for i in range(n)), f"unexpected: {collected}"
+    print("  OK  mic-only: all MIC lines published (delay never drops without a SYS twin)")
 
 
 if __name__ == "__main__":
@@ -132,7 +164,9 @@ if __name__ == "__main__":
                test_abort_drops_backlog,
                test_no_new_audio_accepted_during_shutdown,
                test_blocking_feed_drops_nothing,
-               test_hallucination_filter):
+               test_hallucination_filter,
+               test_mic_published_after_delay_no_live_dedup,
+               test_no_sys_means_all_mic_published):
         try:
             fn()
         except AssertionError as e:

@@ -128,6 +128,8 @@ window.VM_I18N = {
     "System audio (everyone else)": "Stelselklank (almal anders)",
     "Your voice comes from the microphone. Everyone else comes from your computer's own audio.":
       "Jou stem kom van die mikrofoon. Almal anders kom van jou rekenaar se eie klank.",
+    "Tip: use headphones. On speakers your microphone can re-hear the other people, and they get transcribed twice.":
+      "Wenk: gebruik oorfone. Op luidsprekers kan jou mikrofoon die ander mense weer hoor, en hulle word twee keer getranskribeer.",
     "not detected": "nie bespeur nie",
     "Stays on this computer": "Bly op hierdie rekenaar",
     "No audio, transcript, or metadata is sent anywhere. Offline-safe.":
