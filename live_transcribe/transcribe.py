@@ -90,6 +90,13 @@ CPU_LADDER = ["medium", "small", "base", "tiny"]
 DOWNGRADE_RTF = 0.95     # rolling real-time factor above this = not keeping up
 DOWNGRADE_WINDOW = 4     # consecutive chunks of evidence required before a step down
 
+# Hold each MIC segment this long before showing it in the LIVE view, so a speaker echo lands
+# just after its cleaner SYS original instead of jumbled in front of it (the system channel
+# transcribes a touch behind the mic). Nothing is dropped live; ALL echo removal happens once
+# at the end, on the saved transcript (dedup.strip_mic_echoes in sinks.py), where the full
+# time-ordered context makes matching accurate and nothing is lost before it. Live ordering only.
+MIC_PUBLISH_DELAY = 1.0
+
 
 def _collapse_repetition(text, max_run=3):
     """Collapse pathological consecutive-token loops on bad audio.
@@ -131,7 +138,8 @@ _HALLUCINATION_RE = re.compile(
     r"|\bondertitel\w*\b.*\b(gemeenskap|gemeenschap|amara)"
     r"|\buntertitel\w*\b.*amara"
     r"|\balgemene woorde[:,]"           # AF_ANCHOR_PROMPT list header leaking
-    r"|\bbaie,\s*nogal,\s*lekker",      # AF_ANCHOR_PROMPT word-list leaking
+    r"|\bbaie,\s*nogal,\s*lekker"       # AF_ANCHOR_PROMPT word-list leaking
+    r"|ons praat suid-?afrikaans.{0,40}nie nederlands nie",  # AF_ANCHOR_PROMPT opening leaking
     re.IGNORECASE,
 )
 
@@ -198,6 +206,7 @@ class Engine:
         self._cpu_threads = cpu_threads
         self._rtf = deque(maxlen=DOWNGRADE_WINDOW)  # recent real-time factors (CPU downgrade)
         self.subscribers = []
+        self._pending_mic = []                # [(release_monotonic, Segment)] held by MIC_PUBLISH_DELAY
         self._queue = queue.Queue(maxsize=32)
         self._stop = threading.Event()    # shutting down: stop accepting new audio
         self._abort = threading.Event()   # hard abort: discard the backlog instead of draining
@@ -271,27 +280,56 @@ class Engine:
         """
         self.initial_prompt = prompt
 
+    def _fanout(self, seg):
+        """Deliver a finished segment to every subscriber. Single point of delivery."""
+        for sub in self.subscribers:
+            try:
+                sub(seg)
+            except Exception as e:
+                print(f"[engine] subscriber error: {e}", flush=True)
+
+    def _route(self, seg):
+        """Publish a finished segment. MIC is held briefly (MIC_PUBLISH_DELAY) so that in the
+        LIVE view a speaker echo lands just after its cleaner SYS original rather than jumbled
+        in front of it; nothing is dropped here. SYS and file-import segments publish at once.
+        All echo removal happens once at the end, on the saved transcript (sinks.py uses
+        dedup.strip_mic_echoes), where the full time-ordered context makes it safe."""
+        if seg.source == "MIC":
+            self._pending_mic.append((time.monotonic() + MIC_PUBLISH_DELAY, seg))
+        else:
+            self._fanout(seg)
+
+    def _flush_pending_mic(self, force=False):
+        """Publish held MIC segments whose delay has elapsed (or all of them when force=True,
+        at a clean shutdown). Nothing is dropped here: the live view shows everything, and echo
+        removal is deferred to the end-of-session rewrite of the saved transcript. On a hard
+        abort (drain=False) held MIC is discarded with the rest of the backlog, so the abort
+        stays prompt."""
+        if self._abort.is_set():
+            self._pending_mic = []
+            return
+        if not self._pending_mic:
+            return
+        now = time.monotonic()
+        keep = []
+        for release_at, seg in self._pending_mic:
+            if force or now >= release_at:
+                self._fanout(seg)
+            else:
+                keep.append((release_at, seg))
+        self._pending_mic = keep
+
     def _emit_marker(self, source, t_start, n_dropped):
-        out = Segment(
+        self._fanout(Segment(
             source=source,
             t_start=t_start,
             t_end=t_start,
             text=f"[… ~{n_dropped} chunk(s) not transcribed, transcriber fell behind …]",
-        )
-        for sub in self.subscribers:
-            try:
-                sub(out)
-            except Exception as e:
-                print(f"[engine] subscriber error: {e}", flush=True)
+        ))
 
     def _emit_notice(self, t_start, text):
         """Emit a system notice into the transcript (e.g. a model change)."""
-        out = Segment(source="SYS", t_start=t_start, t_end=t_start, text=text)
-        for sub in self.subscribers:
-            try:
-                sub(out)
-            except Exception as e:
-                print(f"[engine] subscriber error: {e}", flush=True)
+        self._fanout(Segment(source="SYS", t_start=t_start, t_end=t_start, text=text))
 
     def _maybe_downgrade(self, t_start):
         """Step down CPU_LADDER when sustained RTF shows we can't hold real-time.
@@ -331,6 +369,7 @@ class Engine:
         # We deliberately do NOT break the instant _stop is set, that would drop
         # the queued backlog (the last minutes of the session). Instead we drain.
         while True:
+            self._flush_pending_mic()   # release held MIC whose delay elapsed (ticks each ~0.5s)
             try:
                 item = self._queue.get(timeout=0.5)
             except queue.Empty:
@@ -383,11 +422,7 @@ class Engine:
                         t_end=t_start + float(seg.end),
                         text=text,
                     )
-                    for sub in self.subscribers:
-                        try:
-                            sub(out)
-                        except Exception as e:
-                            print(f"[engine] subscriber error: {e}", flush=True)
+                    self._route(out)
 
                 # Adaptive model downgrade (CPU only): track real-time factor and
                 # step down to a faster model if we're sustained-slower than real-time.
@@ -400,3 +435,6 @@ class Engine:
                 print(f"[engine] transcribe error on {source} chunk: {e}", flush=True)
             finally:
                 self._busy = False
+
+        # Worker exiting (drained or aborted): release anything still held by the MIC delay.
+        self._flush_pending_mic(force=True)

@@ -818,6 +818,7 @@ function preView() {
       deviceField("Your microphone", dev.mics, S.form.mic, dev.default_mic_index, function (v) { S.form.mic = v; }),
       deviceField("System audio (everyone else)", dev.loopbacks, S.form.loopback, dev.default_loopback_index, function (v) { S.form.loopback = v; }),
       el("p", { class: "ink-3", style: { fontSize: "11.5px", margin: "0" }, text: "Your voice comes from the microphone. Everyone else comes from your computer's own audio." }),
+      el("p", { class: "ink-3", style: { fontSize: "11.5px", margin: "8px 0 0" }, text: "Tip: use headphones. On speakers your microphone can re-hear the other people, and they get transcribed twice." }),
     ]),
     el("div", { class: "card", style: { padding: "16px", display: "flex", gap: "12px" } }, [
       el("div", { style: { color: "var(--ink-3)", flex: "0 0 auto" } }, icon("lock", 18)),
