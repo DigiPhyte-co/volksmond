@@ -48,6 +48,9 @@ a = Analysis(
 pyz = PYZ(a.pure)
 # console=True for this test build: if the native window fails to appear, the
 # console shows why. A polished release would set console=False.
+# icon: rounded-tile rendering of the inline SVG mark from app.js (see
+# build-icon.py); regenerate by running `python build-icon.py` if the brand
+# mark changes.
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True,
-          name="Volksmond", console=True)
+          name="Volksmond", console=True, icon="volksmond.ico")
 coll = COLLECT(exe, a.binaries, a.datas, name="Volksmond")

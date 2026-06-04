@@ -113,13 +113,38 @@ class AudioCapture:
         except Exception as e:
             print(f"[MIC] cannot resolve mic: {e}", flush=True)
 
+        # Wrap each open so the failing source identifies itself in the error
+        # the FastAPI layer surfaces. The raw PyAudio message (e.g. `[Errno -9996]
+        # Invalid device`) by itself does not tell the user whether their mic or
+        # their loopback choice failed, so they cannot guess which dropdown to
+        # change. WASAPI loopback in particular can enumerate a device whose
+        # actual endpoint is inactive (laptop "Headphones" reported as default
+        # when no headphones are plugged in is the common case): swapping to
+        # the Speakers loopback usually fixes it.
         if loopback_info is not None:
-            self._open_stream("SYS", loopback_info)
+            try:
+                self._open_stream("SYS", loopback_info)
+            except Exception as e:
+                raise RuntimeError(
+                    f"could not open system audio device #{loopback_info['index']} "
+                    f"'{loopback_info['name']}': {e}. Try a different option in "
+                    "the System audio dropdown (e.g. Speakers if Headphones fails)."
+                ) from e
         if mic_info is not None:
-            self._open_stream("MIC", mic_info)
+            try:
+                self._open_stream("MIC", mic_info)
+            except Exception as e:
+                raise RuntimeError(
+                    f"could not open microphone #{mic_info['index']} "
+                    f"'{mic_info['name']}': {e}. Try a different option in the "
+                    "Your microphone dropdown."
+                ) from e
 
         if not self._streams:
-            raise RuntimeError("No audio sources opened. Run --list-devices.")
+            raise RuntimeError(
+                "no audio sources opened (both loopback and mic resolution failed). "
+                "Run --list-devices from the CLI to enumerate what is available."
+            )
 
         # Per-source chunker worker
         for source in list(self._buffers):
@@ -146,47 +171,79 @@ class AudioCapture:
 
     def _open_stream(self, source, info):
         rate = int(info["defaultSampleRate"])
-        channels = max(1, int(info["maxInputChannels"]))
+        max_ch = max(1, int(info["maxInputChannels"]))
         block = int(rate * BLOCK_SECONDS)
 
-        self._buffers[source] = []
-        self._buffer_counts[source] = 0
-        self._buffer_locks[source] = threading.Lock()
-        self._rates[source] = rate
-        self._channels[source] = channels
+        # Channel-count fallback list, highest-first. Some Realtek WASAPI
+        # loopback drivers report maxInputChannels=8 (claiming surround
+        # capability) but only accept opens at their actual mix format
+        # (typically stereo); a `paInvalidDevice` is what the PortAudio
+        # layer reports back from the driver in that case. Try the device's
+        # reported max first, then fall through to common counts. The first
+        # combination that opens wins; we keep its `channels` so the
+        # callback reshapes correctly. For mono mics maxInputChannels=1 is
+        # the only candidate and the loop short-circuits in one iteration.
+        candidates = []
+        for c in (max_ch, 2, 1):
+            if 1 <= c <= max_ch and c not in candidates:
+                candidates.append(c)
 
-        # Bind these into the closure so the callback knows where to write
-        buf = self._buffers[source]
-        counts = self._buffer_counts
-        lock = self._buffer_locks[source]
-        ch = channels
+        last_err = None
+        for channels in candidates:
+            self._buffers[source] = []
+            self._buffer_counts[source] = 0
+            self._buffer_locks[source] = threading.Lock()
+            self._rates[source] = rate
+            self._channels[source] = channels
 
-        def callback(in_data, frame_count, time_info, status):
+            buf = self._buffers[source]
+            counts = self._buffer_counts
+            lock = self._buffer_locks[source]
+            ch = channels
+
+            def callback(in_data, frame_count, time_info, status, _ch=ch, _src=source, _buf=buf, _lock=lock):
+                try:
+                    arr = np.frombuffer(in_data, dtype=np.float32)
+                    if _ch > 1:
+                        arr = arr.reshape(-1, _ch)
+                    else:
+                        arr = arr.reshape(-1, 1)
+                    with _lock:
+                        _buf.append(arr)
+                        counts[_src] = counts[_src] + arr.shape[0]
+                except Exception as e:
+                    print(f"[{_src}] callback error: {e}", flush=True)
+                return (None, pa.paContinue)
+
             try:
-                arr = np.frombuffer(in_data, dtype=np.float32)
-                if ch > 1:
-                    arr = arr.reshape(-1, ch)
-                else:
-                    arr = arr.reshape(-1, 1)
-                with lock:
-                    buf.append(arr)
-                    counts[source] = counts[source] + arr.shape[0]
+                stream = self._pa.open(
+                    format=pa.paFloat32,
+                    channels=channels,
+                    rate=rate,
+                    input=True,
+                    input_device_index=info["index"],
+                    frames_per_buffer=block,
+                    stream_callback=callback,
+                )
             except Exception as e:
-                print(f"[{source}] callback error: {e}", flush=True)
-            return (None, pa.paContinue)
+                last_err = e
+                # Clear partial state so the next candidate starts clean and
+                # so a final failure doesn't leave half-initialised buffers.
+                for d in (self._buffers, self._buffer_counts, self._buffer_locks,
+                          self._rates, self._channels):
+                    d.pop(source, None)
+                continue
 
-        stream = self._pa.open(
-            format=pa.paFloat32,
-            channels=channels,
-            rate=rate,
-            input=True,
-            input_device_index=info["index"],
-            frames_per_buffer=block,
-            stream_callback=callback,
+            print(f"[{source}] opened '{info['name']}' @ {rate} Hz x{channels}ch (device #{info['index']})", flush=True)
+            stream.start_stream()
+            self._streams.append(stream)
+            return
+
+        # Every candidate failed; re-raise the most recent error so the wrapper
+        # in start() turns it into the user-facing "could not open ..." message.
+        raise last_err if last_err is not None else RuntimeError(
+            f"could not open {source} at any channel count (tried {candidates})"
         )
-        print(f"[{source}] opened '{info['name']}' @ {rate} Hz x{channels}ch (device #{info['index']})", flush=True)
-        stream.start_stream()
-        self._streams.append(stream)
 
     def _chunker(self, source):
         rate = self._rates[source]

@@ -117,11 +117,17 @@ function markSvg(size) {
   size = size || 22;
   var span = document.createElement("span");
   span.className = "mark";
-  span.innerHTML = '<svg width="' + size + '" height="' + size + '" viewBox="0 0 22 22" fill="none" aria-hidden="true">' +
-    '<path d="M3 12.5 C 6 16.5, 16 16.5, 19 12.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>' +
-    '<path d="M7.5 8.5 L 7.5 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>' +
-    '<path d="M11 8.5 L 11 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>' +
-    '<path d="M14.5 8.5 L 14.5 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>';
+  // Volksmond mark: five waveform bars over a smile. Real brand geometry (brand/),
+  // strokes on currentColor so it inherits --accent (brand blue on light, light-blue on dark).
+  span.innerHTML = '<svg width="' + size + '" height="' + size + '" viewBox="0 0 1500 1500" fill="none" aria-hidden="true">' +
+    '<g transform="matrix(1,0,0,1,0,272)">' +
+    '<path stroke-linecap="round" transform="matrix(-1.186979,0,0,-1.186979,1416.494791,955.573618)" d="M 40.546292 283.673258 C 387.882847 -56.587826 735.222693 -56.558207 1082.562539 283.758821" stroke="currentColor" stroke-width="57"/>' +
+    '<path stroke-linecap="round" transform="matrix(0,-1.186979,1.186979,0,463.342337,489.209138)" d="M 28.501117 28.500532 L 383.301472 28.500532" stroke="currentColor" stroke-width="57"/>' +
+    '<path stroke-linecap="round" transform="matrix(0,-1.186979,1.186979,0,968.995486,489.209138)" d="M 28.501117 28.499854 L 383.301472 28.499854" stroke="currentColor" stroke-width="57"/>' +
+    '<path stroke-linecap="round" transform="matrix(0,-1.186979,1.186979,0,1221.818952,358.298284)" d="M 28.500529 28.500488 L 162.727165 28.500488" stroke="currentColor" stroke-width="57"/>' +
+    '<path stroke-linecap="round" transform="matrix(0,-1.186979,1.186979,0,716.16302,419.705936)" d="M 28.49842 28.500221 L 266.201362 28.500221" stroke="currentColor" stroke-width="57"/>' +
+    '<path stroke-linecap="round" transform="matrix(0,-1.186979,1.186979,0,210.51271,358.298284)" d="M 28.500529 28.498507 L 162.727165 28.498507" stroke="currentColor" stroke-width="57"/>' +
+    '</g></svg>';
   return span;
 }
 
@@ -702,9 +708,42 @@ function setupView() {
         ]),
       ]),
       el("div", { class: "row gap-10" }, [
-        el("button", { class: "btn primary tall grow", onclick: function () { S.setup.stage = "summaries"; render(); } }, "Get started"),
+        el("button", { class: "btn primary tall grow", onclick: function () { S.setup.stage = "save_location"; render(); } }, "Get started"),
       ]),
       el("p", { class: "ink-3", style: { fontSize: "11.5px" }, text: "The language model for transcription is installed with the app. Summaries are an optional extra you can turn on next." }),
+    ]);
+  } else if (stage === "save_location") {
+    // The default location is per-user app data on this computer. Many users want
+    // their transcripts in Documents or a synced folder instead, so we ask before
+    // they start a session rather than hiding it in Settings. Picking nothing is
+    // fine -- "Continue" just keeps the default.
+    var savedLoc = (S.settings && S.settings.save_location) || "";
+    var defaultLoc = (S.appInfo && S.appInfo.save_dir) || "default folder";
+    var currentLoc = savedLoc || defaultLoc;
+    inner = el("div", { class: "col-narrow stack", style: { gap: "18px" } }, [
+      el("div", { class: "eyebrow", text: "Setup, where to save" }),
+      el("h1", { text: "Where should your transcripts go?" }),
+      el("p", { class: "ink-2", text: "Every meeting is saved as a Markdown file. Pick a folder you can find later, or keep the default." }),
+      el("div", { class: "card", style: { padding: "16px" } }, [
+        el("div", { class: "section-label", style: { marginBottom: "6px" }, text: savedLoc ? "Your folder" : "Default folder (per user, on this computer)" }),
+        el("div", { class: "mono ink-2", style: { fontSize: "12.5px", wordBreak: "break-all" }, text: currentLoc }),
+        el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "10px" }, text: "For maximum privacy, choose a folder that a cloud provider does not sync (OneDrive, Google Drive, Dropbox, and the like)." }),
+        el("div", { class: "row gap-8", style: { marginTop: "12px" } }, [
+          el("button", { class: "btn ghost", onclick: async function () {
+            var p = await pickFile("folder");
+            if (!p) return;
+            try {
+              S.settings = await api.post("/api/settings", { save_location: p });
+              S.appInfo = await api.get("/api/app-info");
+              render();
+            } catch (e) { toast(e.message || "Not a writable folder.", true); }
+          } }, savedLoc ? "Choose a different folder" : "Choose another folder"),
+        ]),
+      ]),
+      el("div", { class: "row gap-8", style: { justifyContent: "flex-end", marginTop: "4px" } }, [
+        el("button", { class: "btn ghost", onclick: function () { S.setup.stage = "welcome"; render(); } }, "Back"),
+        el("button", { class: "btn primary tall", onclick: function () { S.setup.stage = "summaries"; render(); } }, "Continue"),
+      ]),
     ]);
   } else if (stage === "summaries") {
     var installed = summaryInstalled();
