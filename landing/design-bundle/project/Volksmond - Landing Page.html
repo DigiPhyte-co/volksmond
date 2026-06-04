@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en-ZA" data-hfont="serif" data-logo="speaker">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Volksmond · A private transcript of any meeting, on your own computer</title>
+<meta name="description" content="Volksmond is private, on-device meeting transcription for Afrikaans, English, and the mix. It runs on your machine, fully offline, and never phones home. Early access for Windows." />
+
+<!-- Open Graph -->
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="Volksmond" />
+<meta property="og:title" content="A private transcript of any meeting, on your own computer." />
+<meta property="og:description" content="On-device meeting transcription for Afrikaans, English, and the mix. Runs on your machine. Never leaves it." />
+<meta property="og:locale" content="en_ZA" />
+<meta property="og:locale:alternate" content="af_ZA" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="A private transcript of any meeting, on your own computer." />
+<meta name="twitter:description" content="On-device meeting transcription for Afrikaans, English, and the mix. Runs on your machine. Never leaves it." />
+
+<link rel="stylesheet" href="vm-tokens.css" />
+
+<!-- SoftwareApplication: privacy + offline are the point, so they lead the description. -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Volksmond",
+  "applicationCategory": "BusinessApplication",
+  "operatingSystem": "Windows",
+  "description": "Private, on-device meeting transcription for Afrikaans, English, and the mix. Runs fully offline on your own computer, never phones home, and keeps every transcript on your machine. Source available.",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "ZAR" },
+  "publisher": { "@type": "Organization", "name": "DigiPhyte", "url": "https://digiphyte.com" }
+}
+</script>
+
+<style>
+  /* ── Landing layout. Tokens (colour, type, components) come from vm-tokens.css,
+     scoped to body.vm[data-palette][data-dark]. ───────────────────────────── */
+  html, body { margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--ink); line-height: 1.6; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  ::selection { background: var(--accent-soft); }
+
+  .wrap { max-width: 1140px; margin: 0 auto; padding: 0 24px; }
+
+  /* Display headings switch serif/sans via <html data-hfont>. */
+  .display { letter-spacing: -0.022em; font-weight: 600; text-wrap: balance; }
+  html[data-hfont="serif"] .display { font-family: var(--font-serif); }
+  html[data-hfont="sans"]  .display { font-family: var(--font-sans); }
+  h1.display { font-size: clamp(33px, 5.2vw, 53px); line-height: 1.06; margin: 0; }
+  h2.display { font-size: clamp(25px, 3.4vw, 35px); line-height: 1.12; margin: 0; }
+
+  .eyebrow { font: 500 11px/1 var(--font-sans); letter-spacing: 0.13em; text-transform: uppercase; color: var(--ink-3); }
+  .lead { font-size: clamp(16.5px, 1.5vw, 18.5px); color: var(--ink-2); line-height: 1.6; }
+  .mono { font-family: var(--font-mono); }
+
+  /* ── Header ───────────────────────────────────────────────────────────── */
+  header { position: sticky; top: 0; z-index: 30; background: color-mix(in oklch, var(--bg) 82%, transparent); backdrop-filter: blur(14px) saturate(150%); -webkit-backdrop-filter: blur(14px) saturate(150%); border-bottom: 1px solid var(--line); }
+  .nav { display: flex; align-items: center; gap: 14px; height: 62px; }
+  .wordmark { display: inline-flex; align-items: center; gap: 9px; font: 600 17px/1 var(--font-sans); letter-spacing: -0.02em; color: var(--ink); }
+  .wordmark .mark { color: var(--accent); display: inline-flex; width: 24px; height: 24px; }
+  .wordmark .mark svg { width: 100%; height: 100%; }
+  .wordmark .by { font: 500 11px/1 var(--font-sans); color: var(--ink-3); margin-left: 3px; letter-spacing: 0; }
+  .nav .spacer { flex: 1; }
+
+  .langtoggle { display: inline-flex; border: 1px solid var(--line-2); border-radius: 999px; overflow: hidden; height: 34px; }
+  .langtoggle button { border: 0; background: transparent; color: var(--ink-2); font: 600 12px/1 var(--font-sans); padding: 0 13px; cursor: pointer; transition: background .12s, color .12s; }
+  .langtoggle button.on { background: var(--accent); color: var(--accent-ink); }
+
+  .iconbtn { width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--line-2); border-radius: 999px; background: var(--surface); color: var(--ink-2); cursor: pointer; transition: background .12s, color .12s; }
+  .iconbtn:hover { background: var(--surface-2); color: var(--ink); }
+  .iconbtn .sun { display: none; } .iconbtn .moon { display: block; }
+  body[data-dark="true"] .iconbtn .sun { display: block; } body[data-dark="true"] .iconbtn .moon { display: none; }
+
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 40px; padding: 0 18px; border-radius: 9px; font: 600 14px/1 var(--font-sans); border: 1px solid var(--line-2); background: var(--surface); color: var(--ink); cursor: pointer; transition: filter .12s, background .12s; }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+  .btn.primary:hover { filter: brightness(0.96); text-decoration: none; }
+  .btn.big { height: 50px; padding: 0 24px; font-size: 15px; border-radius: 10px; }
+  .nav-cta { display: none; }
+  @media (min-width: 760px) { .nav-cta { display: inline-flex; } }
+
+  /* ── Hero ─────────────────────────────────────────────────────────────── */
+  .hero { position: relative; overflow: hidden; }
+  .hero::before { content: ""; position: absolute; inset: 0; background-image: radial-gradient(var(--line-2) 1.1px, transparent 1.1px); background-size: 26px 26px; opacity: 0.5; -webkit-mask-image: radial-gradient(120% 80% at 18% 0%, #000 0%, transparent 62%); mask-image: radial-gradient(120% 80% at 18% 0%, #000 0%, transparent 62%); pointer-events: none; }
+  body[data-dark="true"] .hero::before { opacity: 0.32; }
+  .hero .wrap { position: relative; }
+  .hero-grid { display: grid; grid-template-columns: 1fr; gap: 40px; align-items: center; padding: 50px 0 56px; }
+  @media (min-width: 940px) { .hero-grid { grid-template-columns: 1.02fr 0.98fr; gap: 52px; padding: 76px 0 84px; } }
+
+  .kicker { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
+  .tagline { font: 600 13.5px/1 var(--font-sans); color: var(--accent); letter-spacing: -0.005em; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font: 600 10.5px/1 var(--font-sans); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); border: 1px solid var(--line); border-radius: 999px; padding: 5px 10px; }
+  .hero h1 { margin-bottom: 20px; }
+  .hero .sub { max-width: 560px; margin-bottom: 6px; }
+  .pron { display: inline-flex; align-items: center; gap: 8px; margin-top: 22px; font-size: 13.5px; color: var(--ink-3); }
+  /* The English phonetic guide is redundant for Afrikaans readers. */
+  html[lang^="af"] .en-only { display: none; }
+  .pron strong { color: var(--ink-2); font-weight: 600; font-family: var(--font-mono); font-size: 12.5px; }
+
+  /* Email form */
+  .form { display: flex; flex-direction: column; max-width: 480px; margin-top: 26px; }
+  .form-fields { display: flex; flex-wrap: wrap; gap: 10px; }
+  .form input[type=email] { flex: 1; min-width: 220px; height: 50px; padding: 0 15px; border: 1px solid var(--line-2); border-radius: 10px; background: var(--surface); color: var(--ink); font: 400 15px/1 var(--font-sans); }
+  .form input[type=email]:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+  .reassure { display: inline-flex; align-items: center; gap: 7px; margin-top: 14px; font-size: 12.5px; color: var(--ok); font-weight: 500; }
+  .reassure .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: 0 0 auto; }
+  .consent { display: flex; align-items: flex-start; gap: 8px; margin-top: 12px; font-size: 12.5px; color: var(--ink-3); }
+  .consent input { margin-top: 3px; accent-color: var(--accent); }
+  .popia { font-size: 12px; color: var(--ink-3); margin-top: 10px; max-width: 480px; line-height: 1.5; }
+  .form .popia { margin-top: 12px; }
+  .popia .lock { color: var(--ink-2); font-weight: 500; }
+  .thanks { display: none; align-items: center; gap: 10px; margin-top: 4px; padding: 15px 17px; border-radius: var(--radius); background: var(--ok-soft); color: var(--ok); font-weight: 500; font-size: 14px; }
+
+  /* ── Hero transcript panel (forked from the app's live screen) ─────────── */
+  .vt-stage { perspective: 1600px; }
+  .vt-win { background: var(--bg); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; box-shadow: 0 1px 0 rgba(0,0,0,.03), 0 30px 60px -28px rgba(0,0,0,.34), 0 12px 24px -16px rgba(0,0,0,.18); }
+  body[data-dark="true"] .vt-win { box-shadow: 0 0 0 1px rgba(255,255,255,.04), 0 34px 70px -30px rgba(0,0,0,.7); }
+  .vt-titlebar { height: 38px; display: flex; align-items: center; gap: 10px; padding: 0 6px 0 14px; background: var(--surface); border-bottom: 1px solid var(--line); }
+  .vt-titlebar .mark { color: var(--accent); width: 15px; height: 15px; display: inline-flex; }
+  .vt-titlebar .mark svg { width: 100%; height: 100%; }
+  .vt-app { font: 500 12px/1 var(--font-sans); color: var(--ink-2); }
+  .vt-rec { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; background: var(--record-soft); color: var(--record); font: 600 10.5px/1 var(--font-sans); letter-spacing: 0.02em; }
+  .vt-rec i { width: 6px; height: 6px; border-radius: 50%; background: var(--record); animation: vm-pulse 1.6s ease-in-out infinite; }
+  .vt-winbtns { margin-left: auto; display: flex; }
+  .vt-winbtns span { width: 40px; height: 38px; display: inline-flex; align-items: center; justify-content: center; color: var(--ink-3); }
+
+  .vt-subhead { padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--surface); }
+  .vt-title { font: 600 12.5px/1.3 var(--font-sans); color: var(--ink); }
+  .vt-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 5px; font-size: 11px; color: var(--ink-3); }
+  .vt-meta .mono { font-feature-settings: "tnum"; }
+  .vt-meta .sep { width: 3px; height: 3px; border-radius: 50%; background: var(--ink-4); }
+  .vt-chip { margin-left: auto; display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 999px; font: 500 10.5px/1 var(--font-sans); background: var(--record-soft); color: var(--record); }
+  .vt-chip i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; animation: vm-pulse 1.6s ease-in-out infinite; }
+
+  .vt-body { padding: 18px 20px 8px; height: 296px; overflow: hidden; }
+  .vt-row { display: grid; grid-template-columns: 50px 1fr; column-gap: 14px; margin-bottom: 15px; }
+  .vt-time { font: 400 11px/1 var(--font-mono); color: var(--ink-3); padding-top: 4px; font-feature-settings: "tnum"; }
+  .vt-who { font: 600 10px/1 var(--font-sans); letter-spacing: 0.05em; text-transform: uppercase; margin-bottom: 3px; }
+  .vt-who.you { color: var(--accent); }
+  .vt-who.s2 { color: color-mix(in oklch, var(--accent) 55%, oklch(0.55 0.13 65)); }
+  .vt-who.s3 { color: color-mix(in oklch, var(--accent) 55%, oklch(0.55 0.11 205)); }
+  .vt-text { font: 400 14.5px/1.55 var(--font-sans); color: var(--ink); text-wrap: pretty; }
+  .caret { display: inline-block; width: 2px; height: 1em; vertical-align: -0.14em; background: var(--accent); margin-left: 2px; border-radius: 1px; animation: vm-caret 1.1s steps(2) infinite; }
+
+  .vt-foot { border-top: 1px solid var(--line); background: var(--surface); padding: 11px 18px; display: flex; align-items: center; gap: 16px; }
+  .vt-meterwrap { display: flex; align-items: center; gap: 8px; }
+  .vt-meterlbl { font: 500 9.5px/1 var(--font-sans); letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-3); }
+  .vt-meter { display: flex; align-items: flex-end; gap: 2px; height: 15px; }
+  .vt-meter i { width: 2.5px; border-radius: 1.5px; background: var(--line-2); }
+  .vt-meter i.on { background: var(--accent); }
+  .vt-meter i.peak { background: var(--warn); }
+  .vt-save { margin-left: auto; font: 400 10.5px/1 var(--font-sans); color: var(--ink-3); display: inline-flex; align-items: center; gap: 6px; }
+  .vt-save .mono { color: var(--ink-2); }
+  .vt-lock { display: inline-flex; align-items: center; gap: 5px; color: var(--ok); }
+  @media (max-width: 460px) { .vt-meterwrap.sysaudio { display: none; } .vt-save .path { display: none; } }
+
+  /* ── Sections ─────────────────────────────────────────────────────────── */
+  section { padding: 60px 0; }
+  .problem { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--surface); padding: 52px 0; }
+  .problem .inner { display: grid; grid-template-columns: 1fr; gap: 18px; align-items: start; }
+  @media (min-width: 820px) { .problem .inner { grid-template-columns: 160px 1fr; gap: 32px; } }
+  .problem .lbl { font: 500 11px/1.5 var(--font-sans); letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-3); padding-top: 6px; }
+  .problem p { font-size: clamp(19px, 2.1vw, 24px); color: var(--ink); max-width: 760px; line-height: 1.45; font-weight: 400; letter-spacing: -0.01em; }
+  .problem em { font-style: normal; color: var(--accent); }
+
+  .sec-head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 30px; }
+  .sec-head h2.display { white-space: nowrap; }
+  .sec-head .num { font: 500 12px/1 var(--font-mono); color: var(--ink-4); }
+
+  .cards { display: grid; grid-template-columns: 1fr; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: var(--radius-lg); overflow: hidden; }
+  @media (min-width: 620px) { .cards { grid-template-columns: 1fr 1fr; } }
+  @media (min-width: 1000px) { .cards { grid-template-columns: repeat(4, 1fr); } }
+  .card { background: var(--surface); padding: 26px 22px 28px; display: flex; flex-direction: column; min-height: 188px; transition: background .15s; }
+  .card:hover { background: var(--surface-2); }
+  .card .ic { width: 38px; height: 38px; border-radius: 10px; background: var(--accent-soft); color: var(--accent); display: inline-flex; align-items: center; justify-content: center; margin-bottom: 16px; }
+  .card .cnum { font: 500 10.5px/1 var(--font-mono); color: var(--ink-4); margin-bottom: 8px; }
+  .card h3 { font: 600 15.5px/1.25 var(--font-sans); margin: 0 0 7px; letter-spacing: -0.01em; color: var(--ink); }
+  .card p { font-size: 13.5px; color: var(--ink-2); margin: 0; line-height: 1.5; }
+
+  .ditch { display: grid; grid-template-columns: 1fr; gap: 30px; align-items: center; }
+  @media (min-width: 880px) { .ditch { grid-template-columns: 1.1fr 0.9fr; gap: 56px; } }
+  .ditch .copy p { font-size: 17px; color: var(--ink-2); margin-top: 16px; max-width: 520px; line-height: 1.55; }
+  .ditch .points { display: flex; flex-direction: column; }
+  .ditch .pt { display: flex; gap: 16px; padding: 20px 0; border-top: 1px solid var(--line); }
+  .ditch .pt:last-child { border-bottom: 1px solid var(--line); }
+  .ditch .pt .ico { color: var(--accent); flex: 0 0 auto; margin-top: 1px; }
+  .ditch .pt h4 { font: 600 15px/1.2 var(--font-sans); margin: 0 0 4px; color: var(--ink); }
+  .ditch .pt p { font-size: 13.5px; color: var(--ink-2); margin: 0; }
+
+  .trust { display: flex; flex-wrap: wrap; gap: 16px 40px; justify-content: center; align-items: center; padding: 30px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--surface); }
+  .trust .item { display: inline-flex; align-items: center; gap: 10px; font: 500 14px/1 var(--font-sans); color: var(--ink); }
+  .trust .item svg { color: var(--accent); flex: 0 0 auto; }
+
+  .cta { text-align: center; }
+  .cta h2 { margin-bottom: 10px; }
+  .cta .muted { color: var(--ink-3); font-size: 15px; }
+  .cta .form { margin: 26px auto 0; align-items: center; }
+  .cta .consent, .cta .popia { text-align: left; }
+
+  footer { border-top: 1px solid var(--line); padding: 40px 0 56px; color: var(--ink-3); font-size: 13px; }
+  footer .row { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: center; }
+  footer .row .spacer { flex: 1; }
+  footer .ftag { color: var(--ink-3); font-size: 12.5px; }
+  footer p { margin-top: 16px; max-width: 680px; line-height: 1.55; }
+  footer .wordmark { font-size: 15px; }
+  footer .wordmark .mark { width: 19px; height: 19px; }
+
+  #tweaks-root { position: fixed; z-index: 2147483646; }
+</style>
+</head>
+
+<body class="vm" data-palette="clinical" data-dark="false">
+
+<header>
+  <div class="wrap nav">
+    <span class="wordmark">
+      <span class="mark" aria-hidden="true"></span>
+      Volksmond <span class="by" data-en="by DigiPhyte" data-af="deur DigiPhyte">by DigiPhyte</span>
+    </span>
+    <span class="spacer"></span>
+    <span class="langtoggle" role="group" aria-label="Language">
+      <button type="button" id="lang-en" aria-pressed="true" onclick="VM.setLang('en')">EN</button>
+      <button type="button" id="lang-af" aria-pressed="false" onclick="VM.setLang('af')">AF</button>
+    </span>
+    <button type="button" class="iconbtn" id="themebtn" aria-pressed="false" title="Toggle dark theme" onclick="VM.toggleTheme()">
+      <svg class="moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A8.5 8.5 0 1 1 11.2 3 6.6 6.6 0 0 0 21 12.8z"/></svg>
+      <svg class="sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.4M12 19.1v2.4M4.6 4.6l1.7 1.7M17.7 17.7l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.6 19.4l1.7-1.7M17.7 6.3l1.7-1.7"/></svg>
+    </button>
+    <a class="btn primary nav-cta" href="#get" data-en="Request early access" data-af="Versoek vroeë toegang">Request early access</a>
+  </div>
+</header>
+
+<main>
+  <!-- Hero -->
+  <section class="hero">
+    <div class="wrap">
+      <div class="hero-grid">
+        <div class="lede">
+          <div class="kicker">
+            <span class="tagline">Speak freely · Praat vrylik</span>
+            <span class="pill" data-en="Early access" data-af="Vroeë toegang">Early access</span>
+          </div>
+          <h1 class="display"
+              data-en="A private transcript of any meeting, on your own computer."
+              data-af="'n Private transkripsie van enige vergadering, op jou eie rekenaar.">A private transcript of any meeting, on your own computer.</h1>
+          <p class="lead sub"
+             data-en="Volksmond transcribes your meetings on your machine. Your audio never leaves it, nothing is sent to the cloud, and it is built for Afrikaans and the way we actually mix it with English."
+             data-af="Volksmond transkribeer jou vergaderings op jou masjien. Jou klank verlaat dit nooit nie, niks word na die wolk gestuur nie, en dit is gebou vir Afrikaans en die manier waarop ons dit werklik met Engels meng.">Volksmond transcribes your meetings on your machine. Your audio never leaves it, nothing is sent to the cloud, and it is built for Afrikaans and the way we actually mix it with English.</p>
+
+          <form class="form" id="get" onsubmit="return VM.submitForm(event)">
+            <div class="form-fields">
+              <input type="email" required data-en-ph="you@example.com" data-af-ph="jy@voorbeeld.co.za" placeholder="you@example.com" aria-label="Email address" />
+              <button class="btn primary big" type="submit" data-en="Request early access" data-af="Versoek vroeë toegang">Request early access</button>
+            </div>
+            <span class="reassure"><span class="dot"></span><span data-en="Nothing leaves your machine. The download link comes by email." data-af="Niks verlaat jou masjien nie. Die aflaaiskakel kom per e-pos.">Nothing leaves your machine. The download link comes by email.</span></span>
+            <label class="consent">
+              <input type="checkbox" required />
+              <span data-en="I agree to be contacted about Volksmond early access."
+                    data-af="Ek stem in om oor Volksmond vroeë toegang gekontak te word.">I agree to be contacted about Volksmond early access.</span>
+            </label>
+            <p class="popia"><span class="lock" data-en="Under POPIA:" data-af="Onder POPIA:">Under POPIA:</span> <span data-en="we process your email only to send you the download and the occasional update. Nothing else, and never on to anyone else." data-af="ons verwerk jou e-pos net om vir jou die aflaai en af en toe 'n opdatering te stuur. Niks anders nie, en nooit aan iemand anders nie.">we process your email only to send you the download and the occasional update. Nothing else, and never on to anyone else.</span></p>
+            <div class="thanks" data-en="Thank you. We will email you the download link shortly." data-af="Dankie. Ons sal die aflaaiskakel binnekort vir jou e-pos.">Thank you. We will email you the download link shortly.</div>
+          </form>
+
+          <div class="pron en-only">
+            <span data-en="Say it" data-af="Sê dit">Say it</span>
+            <span>Volksmond · <strong>Fawlks-mawnt</strong></span>
+          </div>
+        </div>
+
+        <!-- Live transcript panel: the product, recording locally and offline. -->
+        <div class="vt-stage">
+          <div class="vt-win" role="img" aria-label="Volksmond transcribing a meeting locally, fully offline">
+            <div class="vt-titlebar">
+              <span class="mark" aria-hidden="true"></span>
+              <span class="vt-app">Volksmond</span>
+              <span class="vt-rec"><i></i><span data-en="Recording" data-af="Neem op">Recording</span></span>
+              <span class="vt-winbtns" aria-hidden="true">
+                <span><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 5h10" stroke="currentColor" stroke-width="1"/></svg></span>
+                <span><svg width="10" height="10" viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1"/></svg></span>
+                <span><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 0 L10 10 M10 0 L0 10" stroke="currentColor" stroke-width="1"/></svg></span>
+              </span>
+            </div>
+            <div class="vt-subhead">
+              <div class="vt-title" data-en="Q3 strategy review" data-af="Q3 strategie-oorsig">Q3 strategy review</div>
+              <div class="vt-meta">
+                <span class="mono">00:02:38</span>
+                <span class="sep"></span>
+                <span data-en="Afrikaans, auto-detect" data-af="Afrikaans, outo-bespeur">Afrikaans, auto-detect</span>
+                <span class="sep"></span>
+                <span data-en="Local only" data-af="Net plaaslik">Local only</span>
+                <span class="vt-chip"><i></i><span data-en="Listening" data-af="Luister">Listening</span></span>
+              </div>
+            </div>
+            <div class="vt-body">
+              <div class="vt-row">
+                <div class="vt-time mono">01:53</div>
+                <div>
+                  <div class="vt-who you">You</div>
+                  <div class="vt-text">OK, dan kan ons miskien net die preliminary cycle deurloop, en dan return na die forecast as ons dit het.</div>
+                </div>
+              </div>
+              <div class="vt-row">
+                <div class="vt-time mono">02:02</div>
+                <div>
+                  <div class="vt-who s3">Lebo</div>
+                  <div class="vt-text">Makes sense. So practically speaking, wat verander aan ons go-to-market?</div>
+                </div>
+              </div>
+              <div class="vt-row">
+                <div class="vt-time mono">02:14</div>
+                <div>
+                  <div class="vt-who s2">Thandi</div>
+                  <div class="vt-text">Niks groot nie. Ons hou by die enterprise segment, maar ons gaan SMB rolling laat oopgaan vanaf volgende kwartaal.</div>
+                </div>
+              </div>
+              <div class="vt-row">
+                <div class="vt-time mono">02:26</div>
+                <div>
+                  <div class="vt-who s3">Lebo</div>
+                  <div class="vt-text">Oraait. En het ons capacity op die delivery side, of moet ons eers nog mense aanstel?</div>
+                </div>
+              </div>
+              <div class="vt-row">
+                <div class="vt-time mono">02:35</div>
+                <div>
+                  <div class="vt-who s2">Thandi</div>
+                  <div class="vt-text">Goeie vraag. Ons is op die oomblik 80% utilised, so daar's bietjie ruimte maar ek wil nie<span class="caret"></span></div>
+                </div>
+              </div>
+            </div>
+            <div class="vt-foot">
+              <div class="vt-meterwrap">
+                <span class="vt-meterlbl" data-en="Mic" data-af="Mik">Mic</span>
+                <div class="vt-meter" aria-hidden="true">
+                  <i style="height:5px" class="on"></i><i style="height:7px" class="on"></i><i style="height:6px" class="on"></i><i style="height:9px" class="on"></i><i style="height:7px"></i><i style="height:11px"></i><i style="height:8px"></i><i style="height:6px"></i><i style="height:9px"></i><i style="height:5px"></i>
+                </div>
+              </div>
+              <div class="vt-meterwrap sysaudio">
+                <span class="vt-meterlbl" data-en="System" data-af="Stelsel">System</span>
+                <div class="vt-meter" aria-hidden="true">
+                  <i style="height:6px" class="on"></i><i style="height:10px" class="on"></i><i style="height:8px" class="on"></i><i style="height:12px" class="on"></i><i style="height:9px" class="on"></i><i style="height:13px" class="on"></i><i style="height:11px" class="on"></i><i style="height:14px" class="peak"></i><i style="height:8px"></i><i style="height:6px"></i>
+                </div>
+              </div>
+              <span class="vt-save">
+                <span class="vt-lock"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7.5a4 4 0 0 1 8 0V11"/></svg><span data-en="Offline" data-af="Vanlyn">Offline</span></span>
+                <span class="path" data-en="Saving to" data-af="Stoor na">Saving to</span> <span class="mono path">~/Volksmond/Q3-review.txt</span>
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Problem -->
+  <section class="problem">
+    <div class="wrap">
+      <div class="inner">
+        <div class="lbl" data-en="The problem" data-af="Die probleem">The problem</div>
+        <p data-en="You sit in meetings you do not host, often in Afrikaans or the mix. You cannot record them. And the tools that could help either turn Afrikaans into gibberish, or send the whole conversation to someone else's cloud."
+           data-af="Jy sit in vergaderings wat jy nie self aanbied nie, dikwels in Afrikaans of die mengsel. Jy kan dit nie opneem nie. En die hulpmiddels wat kan help, verander óf Afrikaans in onsin, óf stuur die hele gesprek na iemand anders se wolk.">You sit in meetings you do not host, often in Afrikaans or the mix. You cannot record them. And the tools that could help either turn Afrikaans into gibberish, or send the whole conversation to someone else's cloud.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- What you get -->
+  <section>
+    <div class="wrap">
+      <div class="sec-head">
+        <span class="num">01</span>
+        <h2 class="display" data-en="What you get" data-af="Wat jy kry">What you get</h2>
+      </div>
+      <div class="cards">
+        <div class="card">
+          <span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
+          <div class="cnum">01</div>
+          <h3 data-en="Runs on your machine" data-af="Loop op jou masjien">Runs on your machine</h3>
+          <p data-en="No cloud, no third-party servers, nothing to leak. Use it fully offline."
+             data-af="Geen wolk, geen derdeparty-bedieners, niks om te lek nie. Gebruik dit heeltemal vanlyn.">No cloud, no third-party servers, nothing to leak. Use it fully offline.</p>
+        </div>
+        <div class="card">
+          <span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3.5 12h17M12 3c2.6 2.6 2.6 14.4 0 18M12 3c-2.6 2.6-2.6 14.4 0 18"/></svg></span>
+          <div class="cnum">02</div>
+          <h3 data-en="Afrikaans, English, and the mix" data-af="Afrikaans, Engels, en die mengsel">Afrikaans, English, and the mix</h3>
+          <p data-en="A usable transcript for the meetings other tools turn into nonsense."
+             data-af="'n Bruikbare transkripsie vir die vergaderings wat ander hulpmiddels in onsin verander.">A usable transcript for the meetings other tools turn into nonsense.</p>
+        </div>
+        <div class="card">
+          <span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.8 5.6L19.5 10.5l-5.7 1.9L12 18l-1.8-5.6L4.5 10.5l5.7-1.9z" fill="currentColor" stroke="none"/></svg></span>
+          <div class="cnum">03</div>
+          <h3 data-en="Optional local summaries" data-af="Opsionele plaaslike opsommings">Optional local summaries</h3>
+          <p data-en="Decisions, action items, and open questions, generated on your machine."
+             data-af="Besluite, aksie-items en oop vrae, op jou masjien gegenereer.">Decisions, action items, and open questions, generated on your machine.</p>
+        </div>
+        <div class="card">
+          <span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h11l3 3v13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M8 4v5h7"/></svg></span>
+          <div class="cnum">04</div>
+          <h3 data-en="Yours to keep" data-af="Joune om te hou">Yours to keep</h3>
+          <p data-en="Transcripts saved as plain files on your computer, in your folder."
+             data-af="Transkripsies as gewone lêers op jou rekenaar gestoor, in jou vouer.">Transcripts saved as plain files on your computer, in your folder.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Good enough to leave the cloud behind -->
+  <section>
+    <div class="wrap">
+      <div class="ditch">
+        <div class="copy">
+          <div class="sec-head" style="margin-bottom:18px"><span class="num">02</span></div>
+          <h2 class="display" data-en="Good enough to leave the cloud behind." data-af="Goed genoeg om die wolk agter te laat.">Good enough to leave the cloud behind.</h2>
+          <p data-en="If Volksmond works for your meetings, you can drop the paid cloud transcribers entirely. The same usable transcript, with everything kept on your own computer."
+             data-af="As Volksmond vir jou vergaderings werk, kan jy die betaalde wolk-transkribeerders heeltemal laat staan. Dieselfde bruikbare transkripsie, met alles op jou eie rekenaar gehou.">If Volksmond works for your meetings, you can drop the paid cloud transcribers entirely. The same usable transcript, with everything kept on your own computer.</p>
+        </div>
+        <div class="points">
+          <div class="pt">
+            <span class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a10 10 0 1 0 10 10"/><path d="M22 5l-10 10-3-3"/></svg></span>
+            <div>
+              <h4 data-en="Fully offline" data-af="Heeltemal vanlyn">Fully offline</h4>
+              <p data-en="No connection needed. It works on a plane, in a boardroom, or off the grid."
+                 data-af="Geen verbinding nodig nie. Dit werk op 'n vliegtuig, in 'n raadsaal, of heeltemal van die net af.">No connection needed. It works on a plane, in a boardroom, or off the grid.</p>
+            </div>
+          </div>
+          <div class="pt">
+            <span class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></span>
+            <div>
+              <h4 data-en="Completely private" data-af="Heeltemal privaat">Completely private</h4>
+              <p data-en="Your audio and transcripts stay on your machine. We never see them."
+                 data-af="Jou klank en transkripsies bly op jou masjien. Ons sien hulle nooit nie.">Your audio and transcripts stay on your machine. We never see them.</p>
+            </div>
+          </div>
+          <div class="pt">
+            <span class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 8l-5 4 5 4M15 8l5 4-5 4"/></svg></span>
+            <div>
+              <h4 data-en="Source available" data-af="Bronkode beskikbaar">Source available</h4>
+              <p data-en="The code is open to read, so you can confirm it never phones home."
+                 data-af="Die kode is oop om te lees, sodat jy kan bevestig dat dit nooit huis toe bel nie.">The code is open to read, so you can confirm it never phones home.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Trust strip -->
+  <div class="trust">
+    <span class="item"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span data-en="Never phones home" data-af="Bel nooit huis toe nie">Never phones home</span></span>
+    <span class="item"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 8l-5 4 5 4M15 8l5 4-5 4"/></svg><span data-en="Source available" data-af="Bronkode beskikbaar">Source available</span></span>
+    <span class="item"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2.4 5 5.6.6-4.1 3.8 1.1 5.6L12 16.6 6.9 18l1.1-5.6L3.9 8.6 9.6 8z" fill="currentColor" stroke="none"/></svg><span data-en="by DigiPhyte" data-af="deur DigiPhyte">by DigiPhyte</span></span>
+  </div>
+
+  <!-- Repeat CTA -->
+  <section class="cta">
+    <div class="wrap">
+      <h2 class="display" data-en="Try it on your next meeting." data-af="Probeer dit by jou volgende vergadering.">Try it on your next meeting.</h2>
+      <p class="muted" data-en="Free in early access. Windows for now." data-af="Gratis in vroeë toegang. Voorlopig vir Windows.">Free in early access. Windows for now.</p>
+      <form class="form" onsubmit="return VM.submitForm(event)">
+        <div class="form-fields">
+          <input type="email" required data-en-ph="you@example.com" data-af-ph="jy@voorbeeld.co.za" placeholder="you@example.com" aria-label="Email address" />
+          <button class="btn primary big" type="submit" data-en="Request early access" data-af="Versoek vroeë toegang">Request early access</button>
+        </div>
+        <label class="consent">
+          <input type="checkbox" required />
+          <span data-en="I agree to be contacted about Volksmond early access."
+                data-af="Ek stem in om oor Volksmond vroeë toegang gekontak te word.">I agree to be contacted about Volksmond early access.</span>
+        </label>
+        <p class="popia"><span class="lock" data-en="Under POPIA:" data-af="Onder POPIA:">Under POPIA:</span> <span data-en="your email is only used to send the download and updates. Nothing else." data-af="jou e-pos word net gebruik om die aflaai en opdaterings te stuur. Niks anders nie.">your email is only used to send the download and updates. Nothing else.</span></p>
+        <div class="thanks" data-en="Thank you. We will email you the download link shortly." data-af="Dankie. Ons sal die aflaaiskakel binnekort vir jou e-pos.">Thank you. We will email you the download link shortly.</div>
+      </form>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="row">
+      <span class="wordmark"><span class="mark" aria-hidden="true"></span>Volksmond</span>
+      <span class="ftag">Speak freely · Praat vrylik</span>
+      <span class="spacer"></span>
+      <span><span data-en="A DigiPhyte product." data-af="'n DigiPhyte-produk.">A DigiPhyte product.</span> <a href="https://digiphyte.com" target="_blank" rel="noopener">digiphyte.com</a></span>
+    </div>
+    <p data-en="We only store the email you give us, to send you the download and updates. Nothing else. Volksmond itself sends nothing anywhere. We process personal information in line with POPIA."
+       data-af="Ons stoor net die e-pos wat jy vir ons gee, om vir jou die aflaai en opdaterings te stuur. Niks anders nie. Volksmond self stuur niks êrens heen nie. Ons verwerk persoonlike inligting in lyn met POPIA.">We only store the email you give us, to send you the download and updates. Nothing else. Volksmond itself sends nothing anywhere. We process personal information in line with POPIA.</p>
+  </div>
+</footer>
+
+<div id="tweaks-root"></div>
+
+<script src="landing.js"></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script type="text/babel" src="tweaks-panel.jsx"></script>
+<script type="text/babel" src="landing-tweaks.jsx"></script>
+</body>
+</html>
