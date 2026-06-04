@@ -1,5 +1,56 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-04, v1.0.4: no terminal window on launch (ready for wider testing)
+
+The shipped exe is now a windowed app. Double-clicking `Volksmond.exe` opens the
+native window only, with no console / terminal behind it. This is the build we hand
+to wider testers, and it carries the official Volksmond brand mark (see the entry
+below): the v1.0.3 zip predated the rebrand, this rebuild ships the new in-app mark
+and icon.
+
+### Changed
+
+- **`sa-live-transcribe.spec`**: the EXE is built with `console=False` (was
+  `console=True`, a debugging default). Windows now launches it under the GUI
+  subsystem, so no console window appears.
+- **`app_main.py`**: a windowed PyInstaller build has no console, so `sys.stdout`
+  and `sys.stderr` are `None` and any `print()` or uncaught traceback would raise.
+  `_redirect_windowed_output()` points both at a per-launch log file,
+  `%LOCALAPPDATA%\sa-live-transcribe\volksmond.log` (truncated each launch so it
+  stays small and always reflects the latest run). Source / console runs are
+  untouched. A tester who hits a problem can send that one file.
+- **`live_transcribe/licensing.py`**: `APP_VERSION` `1.0.3` -> `1.0.4`.
+
+### Notes
+
+- `--browser` and `--server-only` still work. With a single windowed exe they no
+  longer show a console; `--browser` is a vestigial fallback now that the v1.0.0
+  hang it worked around is fixed. To debug a build whose window will not appear,
+  set `console=True` in the spec and rebuild.
+- Deferred (not blocking wider testing): the cosmetic `IntelÂ®` mic-name mojibake
+  seen only in the built exe on one laptop, and defaulting the Whisper tier to
+  `medium` on slower CPUs so Stop drains faster.
+
+### Verification
+
+- All 4 test suites green via the project venv (`test_desktop_api`, `test_web_api`,
+  `test_engine_drain`, `test_dedup`).
+- Codex review of the diff: no blockers. The one acted-on nit moved the app import
+  after the output redirect so import-time failures are logged too. Record in
+  `codex-review-2026-06-04-v104.md`.
+- Build clean (PyInstaller 6.20.0): the bootloader is `runw.exe` (the windowed
+  loader), not `run.exe`; "Building because console changed". dist 378 MB,
+  `Volksmond.zip` 141 MB, copied to the project root.
+- PE header check on `Volksmond.exe`: Subsystem = 2 (Windows GUI), so Windows
+  allocates no console on launch. Embedded icon extracts at 32x32.
+- Headless boot (`Volksmond.exe --server-only`): server came up, `/api/app-info`
+  reports version 1.0.4, and `/assets/app.js` serves the new brand mark (viewBox
+  0 0 1500 1500). The startup line was written to `volksmond.log`, confirming the
+  no-console stdout redirect works.
+- Not re-verified here (unchanged from the confirmed-good v1.0.3 capture path; left
+  to Sean's retest): the native window appearing with the icon in the title bar /
+  taskbar, and a real-audio Begin -> transcript capture.
+
 ## 2026-06-04, brand: the official Volksmond logo everywhere
 
 Chenelle delivered the final Volksmond mark (the "listening face": five waveform

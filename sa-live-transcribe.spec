@@ -46,11 +46,13 @@ a = Analysis(
     noarchive=False,
 )
 pyz = PYZ(a.pure)
-# console=True for this test build: if the native window fails to appear, the
-# console shows why. A polished release would set console=False.
-# icon: rounded-tile rendering of the inline SVG mark from app.js (see
-# build-icon.py); regenerate by running `python build-icon.py` if the brand
-# mark changes.
+# console=False: windowed app, no terminal on launch (the shipped experience).
+# A windowed build has no console, so sys.stdout/stderr are None; app_main.py
+# redirects them to a per-launch log file (volksmond.log in the data dir) so
+# print() and tracebacks do not crash and testers still get a log to send. Flip
+# to console=True only to debug a build whose window will not appear.
+# icon: rounded-tile rendering of the brand mark (see build-icon.py); regenerate
+# by running `python build-icon.py` if the brand mark changes.
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True,
-          name="Volksmond", console=True, icon="volksmond.ico")
+          name="Volksmond", console=False, icon="volksmond.ico")
 coll = COLLECT(exe, a.binaries, a.datas, name="Volksmond")
