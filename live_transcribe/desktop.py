@@ -78,10 +78,20 @@ class DesktopApi:
     """Bridge exposed to the page as window.pywebview.api.*. Each method's return
     value reaches JS as a resolved promise. It gives the native-window UI the two
     things a browser does for free: open external links in the OS handler, and show
-    a native file or folder picker."""
+    a native file or folder picker.
+
+    NOTE: every PUBLIC attribute (no leading underscore) gets walked recursively by
+    pywebview's JS-API exposer (`webview.util.get_functions`, util.py:180). If we
+    exposed `self.window` as a public attribute, that walker would recurse into the
+    pywebview Window, then `.native` (the WinForms Form), then `.AccessibilityObject
+    .Bounds`, then `Rectangle.Empty` (a .NET static that pythonnet returns as a NEW
+    wrapper each access, so the visited-id-set never matches), recursing until the
+    Python recursion limit; each failure is logged, on every paint, and the GUI
+    thread chokes (the v1.0.0 "Not Responding" bug). Keep `_window` private so the
+    walker skips it (it skips names starting with `_`)."""
 
     def __init__(self):
-        self.window = None
+        self._window = None
 
     def open_external(self, url):
         """Open a URL (e.g. a mailto: bug report) in the OS default handler rather
@@ -100,7 +110,7 @@ class DesktopApi:
         location. Uses pywebview's own dialog (not tkinter) so it works inside the
         native window without a second GUI toolkit."""
         import webview
-        w = self.window
+        w = self._window
         if w is None:
             return None
         file_dialog = getattr(webview, "FileDialog", None)  # 6.x enum; fall back to the old ints
@@ -146,7 +156,7 @@ def main(argv=None):
             width=1180, height=860, min_size=(940, 640),
             js_api=api,
         )
-        api.window = window
+        api._window = window     # MUST stay underscored (see DesktopApi docstring)
         webview.start()          # blocks until the window is closed
         server.should_exit = True
     else:
