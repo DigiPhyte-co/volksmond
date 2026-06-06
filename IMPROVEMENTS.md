@@ -22,3 +22,28 @@
 ## 2. [related, lower priority] Reduce the real-time lag itself
 
 The backlog exists because the CPU tier (`large-v3-turbo`, int8) can't keep pace with real-time on this hardware, so chunks queue up (`_queue` maxsize=32 ≈ up to ~8 min before it starts dropping new chunks). Fixing item 1 makes us *keep* the tail, but Stop will then take ~the current lag to finish. If we also want to shrink the lag: a quantized GPU path on capable boxes, a smaller/faster model, shorter chunks, or parallel workers. Separate goal from item 1, noted only.
+
+## 3. [feature, later] Selectable transcription quality modes (Fast / Balanced / Quality)
+
+**Parked 2026-06-06 (Sean). Not now, roadmap.** Let the user pick the transcription
+approach BEFORE a run starts, trading speed for accuracy:
+
+- **Fast:** one small/fast model. Lowest latency and load, lowest accuracy. Good for
+  quick notes or weak hardware. Likely the same tier the dynamic downgrade targets today
+  (e.g. `medium` or a turbo tier).
+- **Balanced:** one large model (e.g. `large-v3` / `large-v3-turbo`). The current default.
+- **Quality:** two models run in series or in parallel that correct each other, so
+  disagreements and hallucinations get detected and resolved (a reconcile / consensus pass,
+  not merely a bigger single model). Highest accuracy, slowest, heaviest.
+
+Design notes for when greenlit:
+- This is a pre-run control (new-session / pre-meeting screen), with a persisted default in
+  settings. It selects the engine tier(s) at start, not a mid-run toggle.
+- Quality mode needs a reconcile step: align the two transcripts (timestamps + text), flag
+  divergences, and pick or merge (longer agreement wins, or a small local model adjudicates
+  the conflicting spans only). Decide series vs parallel by available RAM/CPU. Bound the
+  extra work so Stop-drain stays sane (ties into item 1's drain and item 2's lag).
+- Live (streaming) Quality may be infeasible in real time; it may only make sense for the
+  file-upload / record-then-transcribe path. Decide whether Quality is offered for live
+  capture at all, or uploads only.
+- Local-only constraint holds: any adjudication model must run on-device, no cloud.

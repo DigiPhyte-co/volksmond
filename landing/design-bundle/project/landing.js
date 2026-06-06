@@ -8,41 +8,28 @@
 (function () {
   "use strict";
 
-  // ── Logo set ───────────────────────────────────────────────────────────────
-  // Three marks, all stroke/fill on currentColor so they inherit --accent and
-  // adapt to every palette + dark mode. viewBox 0 0 24 24.
-  var LOGOS = {
-    // 1 · Loudspeaker with sound waves (the lead idea).
-    speaker:
-      '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
-      '<path d="M4 9.2h3.1L11.4 6v12L7.1 14.8H4z" fill="currentColor"/>' +
-      '<path d="M14.6 9.1a4.2 4.2 0 0 1 0 5.8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>' +
-      '<path d="M17.3 6.6a8 8 0 0 1 0 10.8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>' +
-      "</svg>",
-    // 2 · Waveform — seven rounded bars, symmetric, reads as audio levels.
-    wave:
-      '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true" stroke="currentColor" stroke-width="2.1" stroke-linecap="round">' +
-      '<path d="M3 11v2"/><path d="M6.5 8.5v7"/><path d="M10 5v14"/>' +
-      '<path d="M13.5 8v8"/><path d="M17 4.5v15"/><path d="M20.5 9v6"/>' +
-      "</svg>",
-    // 3 · Speech bubble holding a small waveform — "spoken words, captured".
-    bubble:
-      '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
-      '<path d="M5 4.2h14a2.6 2.6 0 0 1 2.6 2.6v7.4a2.6 2.6 0 0 1-2.6 2.6h-8.7L6 19.6v-2.8H5A2.6 2.6 0 0 1 2.4 14.2V6.8A2.6 2.6 0 0 1 5 4.2z" stroke="currentColor" stroke-width="1.6"/>' +
-      '<path d="M8 10v3.5M12 8v7.5M16 10v3.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>' +
-      "</svg>",
-  };
-  var LOGO_ORDER = ["speaker", "wave", "bubble"];
+  // ── Logo ─────────────────────────────────────────────────────────────────
+  // The chosen mark: a five-bar waveform over a smile (DigiPhyte supplied art,
+  // reconstructed as a single stroke on currentColor so it inherits --accent —
+  // navy in light mode, lighter blue in dark, and adapts to every palette).
+  // Geometry traced from the source SVG; viewBox framed to centre the artwork.
+  var MARK =
+    '<svg viewBox="80 130 1340 1340" fill="none" stroke="currentColor" ' +
+    'stroke-width="68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M211 437V596"/>' +
+    '<path d="M463 306V727"/>' +
+    '<path d="M716 376V658"/>' +
+    '<path d="M969 306V727"/>' +
+    '<path d="M1222 437V596"/>' +
+    '<path d="M131 891C544 1295 956 1295 1368 891"/>' +
+    "</svg>";
 
   function lsGet(k, d) { try { var v = localStorage.getItem(k); return v == null ? d : v; } catch (e) { return d; } }
   function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 
-  // ── Logo ─────────────────────────────────────────────────────────────────
-  function setLogo(name) {
-    if (LOGOS[name] == null) name = "speaker";
-    document.querySelectorAll(".mark").forEach(function (el) { el.innerHTML = LOGOS[name]; });
-    lsSet("vm_logo", name);
-    document.documentElement.setAttribute("data-logo", name);
+  // Paint the mark into every .mark slot (header, footer, transcript titlebar).
+  function setLogo() {
+    document.querySelectorAll(".mark").forEach(function (el) { el.innerHTML = MARK; });
   }
 
   // ── Theme: light/dark + palette ────────────────────────────────────────────
@@ -115,13 +102,12 @@
   window.VM = {
     setLang: setLang, toggleTheme: toggleTheme, setDark: setDark,
     setPalette: setPalette, setLogo: setLogo, setHeadingFont: setHeadingFont,
-    submitForm: submitForm, LOGO_ORDER: LOGO_ORDER,
+    submitForm: submitForm,
     get state() {
       return {
         lang: lsGet("vm_site_lang", "en"),
         dark: lsGet("vm_theme", "light") === "dark",
         palette: lsGet("vm_palette", "clinical"),
-        logo: lsGet("vm_logo", "speaker"),
         hfont: lsGet("vm_hfont", "serif"),
       };
     },
@@ -132,7 +118,7 @@
     var s = window.VM.state;
     setPalette(s.palette);
     setDark(s.dark);
-    setLogo(s.logo);
+    setLogo();
     setHeadingFont(s.hfont);
     // Language: stored choice, else browser hint.
     var lang = s.lang;

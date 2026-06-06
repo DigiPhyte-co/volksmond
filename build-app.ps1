@@ -41,9 +41,21 @@ try {
 if ($rc -ne 0) { Write-Host "  Build failed (rc=$rc)." -ForegroundColor Red; exit $rc }
 
 $dist = Join-Path $distRoot "Volksmond"
+
+# Bundle the Quick Start guides next to the exe so testers get them inside the zip.
+$pdfs = @("Volksmond - Quick Start Guide.pdf", "Volksmond - Snelgids (Afrikaans).pdf")
+foreach ($pdf in $pdfs) {
+    $pdfSrc = Join-Path $here $pdf
+    if (Test-Path $pdfSrc) {
+        Copy-Item $pdfSrc (Join-Path $dist $pdf) -Force
+    } else {
+        Write-Host "  WARNING: '$pdf' not found at repo root; not bundled in the zip." -ForegroundColor Yellow
+    }
+}
+
 $mb = [math]::Round((Get-ChildItem $dist -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB, 0)
 Write-Host ""
-Write-Host "  Built: $dist  ($mb MB)" -ForegroundColor Green
+Write-Host "  Built: $dist  ($mb MB, Quick Start PDFs bundled)" -ForegroundColor Green
 
 # Zip the one-folder app into a single file to copy to another PC.
 $zip = Join-Path $out "Volksmond.zip"
