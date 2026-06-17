@@ -18,8 +18,12 @@ LEANING:
   DigiPhyte-co/volksmond-releases), installers as release assets. Free, reliable CDN,
   versioned, public links; the source stays in the private repo. NOT off Sean's PC
   (reliability + security), NOT SharePoint as primary (anonymous-download throttling, not
-  a CDN). Cloudflare R2 is the upgrade for a branded dl. domain later. The email gate is
-  the lead capture, so a public release URL is fine.
+  a CDN). SOFT GATE, accepted 2026-06-11: because the release URL is public it is directly
+  reachable, so the email form is a soft gate (lead capture + POPIA consent), not access
+  control. Accepted as fine for a free give-away. To HARDEN it later, move the installer to
+  a PRIVATE Cloudflare R2 bucket served only through the Pages Function (download works only
+  after email + consent + Turnstile); a PUBLIC R2 bucket behind a branded dl. domain is the
+  separate, still-soft, branded-URL upgrade.
 - CODE-SIGNING: an unsigned Windows installer triggers SmartScreen "unknown publisher".
   Early access: ship with a "More info, then Run anyway" instruction. Before the wider v1
   push: get an OV/EV code-signing certificate to remove the warning.

@@ -1,5 +1,214 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-18, v1.0.8 to v1.0.11: GPU that just works, summary fix, history split, turnkey build
+
+Testing-driven fixes from Sean's GTX 1650 laptop, plus an independent Codex review
+(`codex-review-2026-06-18-v111.md`).
+
+### GPU / device
+- The GPU now engages with NO restart and NO manual "Check GPU": `cudadl.cuda_ready()`
+  registers the CUDA libs on demand and reports ready only after a cached load-test, so a
+  ready GPU is used on the next meeting and a broken/incompatible install falls back to CPU
+  instead of selecting a tier that then fails to load.
+- A ready GPU is used for ANY quality (`__main__.resolve_tier`). Previously Fast/Balanced/High
+  mapped to CPU even with a GPU; on the GPU the Best model is fast, so the GPU always wins.
+- "Run on: GPU / CPU" toggle on the pre-meeting and import screens (NVIDIA machines only),
+  remembered as a setting, default GPU. On the GPU the Best model runs; the Quality dropdown
+  applies on CPU.
+- Honest GPU/CPU badge on the live and import screens, a "Check GPU" self-test, and a `[tier]`
+  log line recording the device decision.
+
+### Summary
+- The summary engine (llama.cpp) is now the portable prebuilt CPU wheel, fixing a
+  STATUS_ILLEGAL_INSTRUCTION crash on CPUs without the build machine's AVX-512.
+- `build-app.ps1` enforces the portable wheel on every build (WHEEL-tag check, auto-reinstall,
+  then re-verify and fail the build if a native wheel slips in) and drops the zip in the synced
+  Cowork folder.
+
+### History / first run
+- Derived `<stem>-summary.md` files are hidden from History; opening a meeting shows the
+  transcript with a Transcript / Summary toggle and surfaces any saved summary.
+- The first-run wizard is persisted to disk (`config.setup_complete`), so it stops reappearing
+  on every launch (the WebView wipes localStorage); plus a "Skip setup" escape and an awaited
+  save.
+
+### Hardening (Codex review)
+- CUDA `.part` write path uses a sanitised basename for the PyPI-supplied wheel filename.
+- `licensing.APP_VERSION` 1.0.7 -> 1.0.11.
+- Deferred and documented: gate `--seed-from-calendar` in the offline build; decide whether to
+  block cloud-synced save locations.
+
+## 2026-06-09, v1.0.7: one app, optional NVIDIA GPU (CUDA) download
+
+The shipped build stays CPU-only (so it is one download for everyone), but now it can
+fetch the NVIDIA CUDA libraries on demand when an NVIDIA GPU is present, and run the
+Best model (large-v3) on the GPU. No separate GPU build.
+
+NVIDIA ONLY. The transcription engine is ctranslate2, whose GPU backend is CUDA. There
+is no AMD (ROCm) or Intel-GPU path in its shipped builds, so those machines use the CPU
+path (large-v3 on CPU is available for uploads). A Vulkan/OpenVINO route would mean a
+different ASR engine; out of scope. All the GPU copy says "NVIDIA" explicitly.
+
+### Added
+
+- **`live_transcribe/cudadl.py`** (new): downloads the matching NVIDIA pip wheels
+  (`nvidia-cublas-cu12`, `nvidia-cuda-runtime-cu12`, `nvidia-cudnn-cu12` 9.x) from PyPI,
+  verifies each against PyPI's SHA-256, and extracts only the Windows DLLs (basename
+  only, no path traversal) into `%LOCALAPPDATA%\sa-live-transcribe\cuda`. Background
+  thread + progress, idempotent `installed()`, `remove()`, cached hardware probes.
+  `cuda_ready()` decides whether the GPU is actually usable.
+- **`live_transcribe/transcribe.py`**: registers the CUDA folder on the DLL search path
+  (`cudadl.register_dll_dir()`) BEFORE ctranslate2 imports, so the downloaded libraries
+  are found. No-op when none are downloaded.
+- **`live_transcribe/__main__.py`**: `pick_tier` routes to the GPU only when
+  `cudadl.cuda_ready()` (frozen build: the libs are downloaded; source: a system CUDA
+  toolkit is assumed). So the app runs on CPU until the user opts into the GPU download,
+  then uses the GPU after a restart. GTX-1650-class 4 GB cards map to the int8 `gpu-4gb`
+  tier.
+- **`live_transcribe/web/app.py`**: `GET /api/cuda` (gpu_present / installed / ready /
+  vram / progress), `POST /api/cuda/download`, `POST /api/cuda/remove` (refused while a
+  session runs); `/api/open-folder?which=cuda`; `/api/app-info` gains `cuda_dir`.
+- **`live_transcribe/web/static/app.js`**: a CUDA download panel + a new first-run
+  "GPU acceleration" step (shown only when an NVIDIA GPU is detected) + a Settings card,
+  with download / progress / installed / restart-to-use / remove and the storage path.
+- Afrikaans for all the new copy; `tests/test_web_api.py` covers the new endpoints.
+
+### Note
+
+- After downloading the CUDA libraries, Volksmond must be restarted (the DLL search path
+  is set once at launch). The UI says so.
+- **`live_transcribe/licensing.py`**: `APP_VERSION` `1.0.6` -> `1.0.7`.
+- Needs validation on a real NVIDIA machine (GTX 1650): the exact cuBLAS/cuDNN versions
+  must load with the bundled ctranslate2 4.7.2. If a fetched version does not load, pin
+  a known-good one in `cudadl._WHEELS`.
+
+## 2026-06-09, v1.0.6: reconciled quality levels, large-v3 on CPU, first-run polish
+
+A follow-up to v1.0.5 from Sean's testing notes.
+
+### Changed
+
+- **One quality taxonomy, reconciled.** The meeting screen and the download panel now
+  show the SAME set: Auto (default) + four named models (Fast = small, Balanced =
+  medium, High quality = large-v3-turbo, Best = large-v3). On the meeting screen, a
+  model not downloaded yet is greyed out; clicking it starts that download and selects
+  it (ready once it lands). Previously the two surfaces used different names/counts.
+  - `live_transcribe/transcribe.py`: new `cpu-large` tier (large-v3 on CPU, int8).
+  - `live_transcribe/__main__.py`: `resolve_tier()` maps the UI's model-keyed quality
+    (or "auto", or a legacy tier key) to a concrete tier; "Best"/large-v3 picks the GPU
+    when present, else CPU. `pick_tier` CPU floor is now `small` (was `base`); base/tiny
+    remain internal live-downgrade rungs only.
+  - `live_transcribe/voicedl.py`: offers the four models (dropped base from the list).
+  - `live_transcribe/web/app.py`: `_resolve_tier_lang_prompt` uses `resolve_tier`.
+  - `live_transcribe/web/static/app.js`: `qualitySelector()` (grey-out + click-to-
+    download) replaces the old segmented control on both the meeting and import screens;
+    `normalizeQuality()` maps legacy saved settings.
+- **large-v3 runs on CPU.** Answer to "can the big model work on CPU?": yes. It is too
+  slow to hold real-time live on most machines (the adaptive ladder downgrades it
+  there), but it is the best-accuracy choice for an uploaded recording / post-meeting
+  pass, where there is no real-time constraint. "Best" is now selectable on any machine.
+- **First-run: language selector on the welcome screen** (EN/AF), and the **save-location
+  page is now translated** (it was English-only despite the rest being Afrikaans).
+- **Upgrade CTA is now "Coming soon"** (no pricing / buy flow for now).
+- **Model storage locations shown in Settings.** Both the transcription-model card and
+  the summaries card show the on-disk folder (voice = the HuggingFace cache; summary =
+  the app's models folder) with an Open button, so models can be found and removed by
+  hand as well as via the in-app Remove button. New `/api/app-info` fields
+  `voice_models_dir` + `summary_models_dir`; `/api/open-folder?which=voice_models|summary_models|sessions`.
+- **First-run, two follow-ups:** the welcome screen now shows a "Research Preview"
+  badge (the "working name" caveat is gone, the name is settled); and selecting
+  "Transcribe and summarise" always reveals the summary-model picker, even when a
+  model is already installed (it was hidden in that case, so the picker never showed).
+- **`live_transcribe/licensing.py`**: `APP_VERSION` `1.0.5` -> `1.0.6`.
+
+### Deferred (next focused build)
+
+- **One app with optional CUDA download.** Instead of a separate GPU build, ship the CPU
+  app and offer to download NVIDIA's cuBLAS/cuDNN libraries during setup when a GPU is
+  present, then run large-v3 on the GPU. Feasible; deferred because pinning the DLL
+  versions that load with the bundled ctranslate2 needs a test loop on a GPU machine.
+
+### Verification
+
+- All test suites green via the project venv (`test_web_api` incl. new quality-resolution
+  + reconciled-catalogue checks, `test_desktop_api`, `test_engine_drain`, `test_dedup`).
+- `node --check` clean on `app.js` + `i18n.js`. Frozen-exe smoke after the build.
+
+## 2026-06-08, v1.0.5: models download up front, and Begin no longer looks frozen
+
+**Problem (Sean, testing v1.0.4):** on the pre-meeting screen, clicking Begin sat on
+the same page for two to three minutes with no spinner or message before the live
+screen appeared, worst on the "Beste" (Best) quality. Two root causes: (1) the Whisper
+model is fetched by faster-whisper on first use (multi-GB, several minutes) with no
+progress surfaced, and the first-run welcome screen wrongly claimed the model "is
+installed with the app"; (2) the browser awaited `/api/start` (which loads the model
+synchronously) before changing the view, so the UI showed nothing meanwhile.
+
+### Fix, two parts
+
+1. **Download the models up front, in first-run setup.** A new step (welcome ->
+   transcription model -> save location -> summaries -> home) downloads the Whisper
+   model to this machine with a real progress bar, into the same cache faster-whisper
+   reads, so the first meeting starts without a hidden download. It recommends the
+   model the machine will actually use and lets the user grab others.
+2. **Immediate feedback on Begin.** Begin / Transcribe now switches straight to a
+   "Starting" screen (spinner, honest "loading the model" copy, elapsed timer) while
+   the model loads, then to the transcript when ready; a load error is shown there
+   with a Back button instead of a vanishing toast.
+3. **Manage downloaded models.** Settings now shows the real on-disk size of every
+   installed model (voice and summary) and a Remove button to free space; a removed
+   model can be downloaded again. Removing the model a running session is using is
+   refused.
+
+### Changed files
+
+- **`live_transcribe/voicedl.py`** (new): voice-model downloader, the twin of
+  `modeldl.py` (summary models). Background `snapshot_download` into the HuggingFace
+  cache with live progress (on-disk size), an idempotent "already cached" path, and a
+  hardware-aware recommendation (reuses `pick_tier`). Downloads only the public model
+  weights faster-whisper would fetch anyway; HuggingFace verifies each file's hash.
+- **`live_transcribe/web/app.py`**: new `GET /api/voice-models` (catalogue +
+  recommended model + tier->model map + live progress) and `POST
+  /api/voice-model/download` (CSRF-protected; bad model -> 400, already downloading ->
+  409). Plus `POST /api/voice-model/delete` and `POST /api/summary-model/delete` to
+  free space (re-downloadable later); voice-delete refuses the model a running session
+  is using. `/api/start` is unchanged.
+- **`live_transcribe/modeldl.py`**: `catalogue_public()` now reports `size_on_disk`,
+  and a `delete(key)` removes a summary model file (clearing it as the active model if
+  selected).
+- **`live_transcribe/web/static/app.js`**:
+  - First-run: new "voice" stage with a `voiceDownloadPanel` (mirrors the summary
+    panel); welcome copy corrected (the model is downloaded, not bundled).
+  - New "starting" route + `startingView`: immediate feedback on Begin and on file
+    import, replacing the frozen pre-meeting screen.
+  - Pre-meeting Quality hint: warns when "Best" is chosen on a machine with no GPU, or
+    notes the download size when the chosen quality's model is not present yet.
+  - Settings: a "Transcription model" card to download / switch models later.
+  - `boot()` loads `/api/voice-models` and resumes a download poll if one is running.
+- **`live_transcribe/web/static/i18n.js`**: Afrikaans for all new strings.
+- **`build-app.ps1`**: the zip is now versioned, `volksmond_<version>.zip` (e.g.
+  `volksmond_1_0_5.zip`). The Quick Start PDFs are bundled (unchanged).
+- **`live_transcribe/licensing.py`**: `APP_VERSION` `1.0.4` -> `1.0.5`.
+- **`tests/test_web_api.py`**: new test for the voice-model endpoints (catalogue,
+  recommended pick, tier map, bad model 400, CSRF-protected, no stray download).
+
+### Verification
+
+- All 4 test suites green via the project venv (`test_web_api` 13/13 including the new
+  voice-model test, `test_desktop_api`, `test_engine_drain`, `test_dedup`).
+- `node --check` clean on `app.js` and `i18n.js`.
+- Build + real-audio smoke test: pending the rebuild in this session.
+
+### Notes / tradeoffs
+
+- The Begin feedback is frontend-only; `/api/start` stays synchronous and runs on a
+  FastAPI worker thread, so `/api/status` etc. stay responsive while the model loads.
+  With the model now pre-downloaded in setup, the residual Begin wait is a short load,
+  not a multi-GB download.
+- `voicedl` does not pin a model commit revision yet (it fetches latest from the same
+  Systran / mobiuslabsgmbh repos faster-whisper already uses; HuggingFace verifies file
+  hashes). The structure accepts a pinned revision later.
+
 ## 2026-06-04, v1.0.4: no terminal window on launch (ready for wider testing)
 
 The shipped exe is now a windowed app. Double-clicking `Volksmond.exe` opens the

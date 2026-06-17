@@ -144,7 +144,8 @@ var S = {
   settings: null, features: null, models: null, appInfo: null, license: null, devices: null,
   sessions: [], sessionsFolder: "",
   live: freshLive(),
-  form: { title: "", language: "af", tier: "auto", participants: [], terms: [], record: false, mic: null, loopback: null },
+  starting: { active: false, kind: null, title: "", error: null, startedAt: null },
+  form: { title: "", language: "af", tier: "auto", device: "auto", participants: [], terms: [], record: false, mic: null, loopback: null },
   setup: { stage: "welcome", choice: "transcribe" },
   finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null },
   reader: { name: "", title: "", text: "", summarising: false, summary: null },
@@ -158,6 +159,7 @@ var S = {
 // transient refs + timers (not part of render state)
 var liveDocEl = null, liveBodyEl = null, elapsedEl = null, recTimerEl = null;
 var pollTimer = null, elapsedTimer = null, toastTimer = null;
+var startingTimer = null, startingElapsedEl = null;
 
 /* ── api ──────────────────────────────────────────────────── */
 async function errOf(r) {
@@ -249,6 +251,7 @@ function teardownLive() {
   closeStream();
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+  if (startingTimer) { clearInterval(startingTimer); startingTimer = null; }
 }
 function closeStream() { if (S.live.es) { try { S.live.es.close(); } catch (e) {} S.live.es = null; } }
 
@@ -300,13 +303,15 @@ function pollStatus(predicateDone, onDone, onTick) {
 async function startLive() {
   var body = {
     topic: S.form.title || "",
-    tier: S.form.tier, language: S.form.language,
+    tier: S.form.tier, device: S.form.device, language: S.form.language,
     prompt: S.form.participants.concat(S.form.terms).join(", "),
     record: !!S.form.record, transcribe: true,
     mic_device: S.form.mic, loopback_device: S.form.loopback,
   };
+  beginStarting("live", S.form.title || "Live meeting");
   try {
     var resp = await api.post("/api/start", body);
+    endStarting();
     S.live = freshLive();
     S.live.running = true; S.live.transcribing = true; S.live.recording = !!resp.recording;
     S.live.sourceKind = "live"; S.live.startedAt = new Date().toISOString();
@@ -314,7 +319,14 @@ async function startLive() {
     S.live.tier = resp.tier; S.live.model = resp.model; S.live.language = resp.language;
     S.live.title = S.form.title || "Live meeting";
     go("live"); openStream(); startElapsed();
-  } catch (e) { toast(e.message || "Could not start.", true); }
+  } catch (e) {
+    // Surface the failure on the Starting screen (with Back), not just a toast that
+    // vanishes; the model-load error ("Could not load model ...") needs to be readable.
+    // Stop the elapsed interval first so it does not leak while the error is shown.
+    if (startingTimer) { clearInterval(startingTimer); startingTimer = null; }
+    if (S.route === "starting") { S.starting.error = e.message || "Could not start."; render(); }
+    else { toast(e.message || "Could not start.", true); }
+  }
 }
 async function startRecordOnly() {
   try {
@@ -353,11 +365,13 @@ function recordPreView() {
   ]));
 }
 async function startImport(arg) {
-  var body = { topic: arg.topic || "", tier: S.form.tier, language: S.form.language, prompt: (S.form.participants || []).concat(S.form.terms || []).join(", ") };
+  var body = { topic: arg.topic || "", tier: S.form.tier, device: S.form.device, language: S.form.language, prompt: (S.form.participants || []).concat(S.form.terms || []).join(", ") };
   if (arg.path) body.paths = [arg.path];
   if (arg.stem) body.stem = arg.stem;
+  beginStarting("file", arg.topic || S.importName || "Recording");
   try {
     var resp = await api.post("/api/transcribe-file", body);
+    endStarting();
     S.live = freshLive();
     S.live.running = true; S.live.transcribing = true; S.live.sourceKind = "file";
     S.live.startedAt = new Date().toISOString();
@@ -366,7 +380,11 @@ async function startImport(arg) {
     S.live.title = arg.topic || topicFromName(baseName(resp.output_path));
     go("importing"); openStream();
     pollStatus(function (st) { return !st.running; }, function () { gotoFinish(S.live.outputPath); });
-  } catch (e) { toast(e.message || "Could not start transcription.", true); }
+  } catch (e) {
+    if (startingTimer) { clearInterval(startingTimer); startingTimer = null; }
+    if (S.route === "starting") { S.starting.error = e.message || "Could not start transcription."; render(); }
+    else { toast(e.message || "Could not start transcription.", true); }
+  }
 }
 function startElapsed() {
   if (elapsedTimer) clearInterval(elapsedTimer);
@@ -406,6 +424,52 @@ function pastePathModal(kind) {
     ]);
     function close(v) { modal.remove(); resolve(v); }
     APP.appendChild(modal); input.focus();
+  });
+}
+/* ── confirm modal (used for destructive actions like removing a model) ─── */
+function confirmModal(opts) {
+  var modal = el("div", { class: "modal-backdrop", onclick: function (e) { if (e.target === modal) modal.remove(); } }, [
+    el("div", { class: "modal" }, [
+      el("h2", { text: opts.title || "Are you sure?" }),
+      opts.message ? el("p", { class: "ink-2", style: { margin: "8px 0 4px", fontSize: "13px" }, text: opts.message }) : null,
+      opts.detail ? el("p", { class: "ink-3 mono", style: { margin: "0 0 4px", fontSize: "12.5px" } }, raw(opts.detail)) : null,
+      el("div", { class: "row gap-8", style: { justifyContent: "flex-end", marginTop: "16px" } }, [
+        el("button", { class: "btn ghost", onclick: function () { modal.remove(); } }, "Cancel"),
+        el("button", { class: "btn " + (opts.danger ? "record" : "primary"), onclick: function () { modal.remove(); if (opts.onConfirm) opts.onConfirm(); } }, opts.confirmLabel || "Confirm"),
+      ]),
+    ]),
+  ]);
+  APP.appendChild(modal);
+}
+function confirmRemoveVoice(m) {
+  var meta = VOICE_LABELS[m.model] || { title: m.model };
+  confirmModal({
+    title: "Remove this model?",
+    message: "Remove this transcription model from your computer? You can download it again later.",
+    detail: meta.title + "   " + fmtGB(m.size_on_disk || m.approx_bytes),
+    confirmLabel: "Remove", danger: true,
+    onConfirm: function () {
+      api.post("/api/voice-model/delete", { model: m.model })
+        .then(function () { toast("Model removed."); loadVoiceModels(); })
+        .catch(function (e) { toast(e.message || "Could not remove.", true); });
+    },
+  });
+}
+function confirmRemoveSummary(m) {
+  var meta = SUMMARY_LABELS[m.key] || { title: (m.params || "") + " model" };
+  confirmModal({
+    title: "Remove this model?",
+    message: "Remove this summary model from your computer? You can download it again later.",
+    detail: meta.title + "   " + fmtGB(m.size_on_disk || m.approx_bytes),
+    confirmLabel: "Remove", danger: true,
+    onConfirm: function () {
+      api.post("/api/summary-model/delete", { key: m.key })
+        .then(function () {
+          toast("Model removed."); loadSummaryModels();
+          api.get("/api/models").then(function (mm) { S.models = mm; render(); }).catch(function () {});
+        })
+        .catch(function (e) { toast(e.message || "Could not remove.", true); });
+    },
   });
 }
 async function importFromPicker() {
@@ -488,6 +552,7 @@ async function doSummarise(fileName, scope) {
   try {
     var resp = await api.post("/api/summarise", { file: fileName, language: target.sumLang || "en" });
     target.summary = resp.summary; target.savedAs = resp.saved; target.summarising = false;
+    if (scope === "reader") S.reader.tab = "summary";
     render();
   } catch (e) {
     target.summarising = false; render();
@@ -638,6 +703,7 @@ function render() {
   var view;
   switch (S.route) {
     case "setup": view = setupView(); break;
+    case "starting": view = startingView(); break;
     case "home": view = shell("home", homeView()); break;
     case "pre": view = shell("home", preView()); break;
     case "importpre": view = shell("home", importPreView()); break;
@@ -691,13 +757,28 @@ function sidebar(active) {
 }
 
 /* ── setup (first run) ────────────────────────────────────── */
-function finishSetup() { try { localStorage.setItem("vm_setup_done", "1"); } catch (e) {} go("home"); }
+async function finishSetup() {
+  // Persist the durable flag to disk and AWAIT it: localStorage is wiped by the WebView
+  // between launches (the reason the disk flag exists), so a silently-failed save would let
+  // the wizard reappear. Surface a failure instead of relying on localStorage alone.
+  try {
+    S.settings = await api.post("/api/settings", { setup_complete: true });
+  } catch (e) {
+    if (S.settings) S.settings.setup_complete = true;
+    toast(e.message || "Could not save setup state.", true);
+  }
+  try { localStorage.setItem("vm_setup_done", "1"); } catch (e) {}
+  go("home");
+}
 function setupView() {
   var stage = S.setup.stage;
   var inner;
   if (stage === "welcome") {
     inner = el("div", { class: "col-narrow stack", style: { gap: "20px" } }, [
-      el("div", { class: "wordmark", style: { marginBottom: "4px" } }, [markSvg(22), el("span", { text: "Volksmond" }), el("span", { class: "provisional", text: "working name" })]),
+      el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "center" } }, [
+        el("div", { class: "wordmark" }, [markSvg(22), el("span", { text: "Volksmond" }), el("span", { class: "provisional", text: "Research Preview" })]),
+        langToggleSeg(),
+      ]),
       el("h1", { text: "A calm, private transcript of any meeting on your computer." }),
       el("p", { class: "ink-2", style: { fontSize: "15px" }, text: "Volksmond listens to your microphone and the audio coming out of your computer, and writes it down as people talk. Built for Afrikaans, English, and the way people actually switch between them." }),
       el("div", { class: "card", style: { padding: "18px", display: "flex", gap: "14px" } }, [
@@ -708,9 +789,47 @@ function setupView() {
         ]),
       ]),
       el("div", { class: "row gap-10" }, [
-        el("button", { class: "btn primary tall grow", onclick: function () { S.setup.stage = "save_location"; render(); } }, "Get started"),
+        el("button", { class: "btn primary tall grow", onclick: function () { S.setup.stage = "voice"; render(); } }, "Get started"),
       ]),
-      el("p", { class: "ink-3", style: { fontSize: "11.5px" }, text: "The language model for transcription is installed with the app. Summaries are an optional extra you can turn on next." }),
+      el("div", { class: "row", style: { justifyContent: "center" } },
+        el("button", { class: "btn ghost sm", onclick: function () { finishSetup(); } }, "Skip setup for now")),
+      el("p", { class: "ink-3", style: { fontSize: "11.5px" }, text: "Next we download the transcription model to your computer, so your first meeting starts straight away. Summaries are an optional extra you can add after that." }),
+    ]);
+  } else if (stage === "voice") {
+    // Don't let Continue silently skip the whole point of this step. If nothing is
+    // present and nothing is downloading yet, the primary button kicks off the
+    // hardware-recommended model (in the background) and then advances, so a model
+    // is always at least on its way before the user leaves setup.
+    var vm = S.voiceModels;
+    var voiceReady = !!(vm && (((vm.models || []).some(function (m) { return m.present; })) || (vm.progress && vm.progress.state === "downloading")));
+    var recModel = vm && vm.recommended_model;
+    // If an NVIDIA GPU is present, offer the optional CUDA step before save-location.
+    var nextAfterVoice = (S.cuda && S.cuda.gpu_present) ? "cuda" : "save_location";
+    var voiceContinue = (vm && !voiceReady && recModel)
+      ? el("button", { class: "btn primary tall", onclick: function () { startVoiceDownload(recModel); S.setup.stage = nextAfterVoice; render(); } }, "Download recommended and continue")
+      : el("button", { class: "btn primary tall", onclick: function () { S.setup.stage = nextAfterVoice; render(); } }, "Continue");
+    inner = el("div", { class: "col-narrow stack", style: { gap: "18px" } }, [
+      el("div", { class: "eyebrow", text: "Setup, transcription model" }),
+      el("h1", { text: "Download the model that does the transcribing" }),
+      el("p", { class: "ink-2", text: "Volksmond transcribes on your own computer using a language model. Download the one that suits your machine now, so your first meeting starts straight away instead of waiting on a download. It runs offline afterwards." }),
+      voiceDownloadPanel(),
+      el("p", { class: "ink-3", style: { fontSize: "11.5px" }, text: "It downloads in the background. You can carry on with setup while it finishes; your first meeting waits for it to be ready." }),
+      el("div", { class: "row gap-8", style: { justifyContent: "flex-end", marginTop: "4px" } }, [
+        el("button", { class: "btn ghost", onclick: function () { S.setup.stage = "welcome"; render(); } }, "Back"),
+        voiceContinue,
+      ]),
+    ]);
+  } else if (stage === "cuda") {
+    inner = el("div", { class: "col-narrow stack", style: { gap: "18px" } }, [
+      el("div", { class: "eyebrow", text: "Setup, GPU acceleration" }),
+      el("h1", { text: "Use your NVIDIA graphics card?" }),
+      el("p", { class: "ink-2", text: "We found an NVIDIA graphics card. You can download the NVIDIA CUDA libraries so the Best model runs on your GPU, which is much faster than the CPU. This is optional and NVIDIA only; without it everything still works on the CPU. AMD and Intel graphics are not supported by the engine." }),
+      cudaPanel(false),
+      el("p", { class: "ink-3", style: { fontSize: "11.5px" }, text: "It is a large download (about 1.5 GB). You can skip this and set it up later in Settings. After it downloads, restart Volksmond to use your GPU." }),
+      el("div", { class: "row gap-8", style: { justifyContent: "flex-end", marginTop: "4px" } }, [
+        el("button", { class: "btn ghost", onclick: function () { S.setup.stage = "voice"; render(); } }, "Back"),
+        el("button", { class: "btn primary tall", onclick: function () { S.setup.stage = "save_location"; render(); } }, "Continue"),
+      ]),
     ]);
   } else if (stage === "save_location") {
     // The default location is per-user app data on this computer. Many users want
@@ -741,7 +860,7 @@ function setupView() {
         ]),
       ]),
       el("div", { class: "row gap-8", style: { justifyContent: "flex-end", marginTop: "4px" } }, [
-        el("button", { class: "btn ghost", onclick: function () { S.setup.stage = "welcome"; render(); } }, "Back"),
+        el("button", { class: "btn ghost", onclick: function () { S.setup.stage = (S.cuda && S.cuda.gpu_present) ? "cuda" : "voice"; render(); } }, "Back"),
         el("button", { class: "btn primary tall", onclick: function () { S.setup.stage = "summaries"; render(); } }, "Continue"),
       ]),
     ]);
@@ -755,10 +874,10 @@ function setupView() {
       choiceCard("transcribe", "mic", "Just transcribe", "The original promise. Live transcripts, history, all of it. No extra model, no extra RAM.", "Default. You can turn summaries on later in Settings."),
       choiceCard("summarise", "note", "Transcribe and summarise", "Adds a Summarise button at the end of every meeting, run entirely on this machine.",
         installed ? "A summary model is already installed on this machine." : "Choose a model size below and we download it for you. One click, no file hunting."),
-      (wantsSummaries && !installed) ? el("div", { class: "stack", style: { gap: "10px" } }, [
-        el("div", { class: "section-label", text: "Choose a summary model to download" }),
+      wantsSummaries ? el("div", { class: "stack", style: { gap: "10px" } }, [
+        el("div", { class: "section-label", text: installed ? "Your summary model (switch or add another)" : "Choose a summary model to download" }),
         summaryDownloadPanel(),
-        el("p", { class: "ink-3", style: { fontSize: "11.5px" }, text: "It downloads in the background. You can continue, it keeps going, and summaries switch on when it is ready." }),
+        el("p", { class: "ink-3", style: { fontSize: "11.5px" }, text: installed ? "Summaries are ready on this machine. You can switch model here, or add another." : "It downloads in the background. You can continue, it keeps going, and summaries switch on when it is ready." }),
       ]) : null,
       el("div", { class: "row gap-8", style: { justifyContent: "flex-end", marginTop: "4px" } }, [
         el("button", { class: "btn ghost", onclick: finishSetup }, "Skip for now"),
@@ -819,7 +938,7 @@ function homeView() {
 /* ── pre-meeting (live start) ─────────────────────────────── */
 function preView() {
   var langSeg = segmented([["af", "Afrikaans"], ["en", "English"], ["", "Auto-detect"]], S.form.language, function (v) { S.form.language = v; render(); });
-  var tierSeg = segmented([["auto", "Auto"], ["cpu-mid", "Fast"], ["cpu-strong", "Balanced"], ["gpu", "Best"]], S.form.tier, function (v) { S.form.tier = v; render(); });
+  var tierSeg = qualitySelector();
 
   var dev = S.devices || {};
 
@@ -845,6 +964,7 @@ function preView() {
       formField("Language", null, langSeg, true),
       formField("Quality", null, tierSeg, true),
     ]),
+    runOnField(),
     formField("Participants", el("span", { class: "label-muted", text: " (optional, helps accuracy)" }), termsBox(S.form.participants, "Add a name")),
     formField("Jargon and terms", el("span", { class: "label-muted", text: " (optional)" }), termsBox(S.form.terms, "Add a term")),
     defaultContextNote(),
@@ -913,7 +1033,7 @@ function defaultContextNote() {
 /* ── import setup (context before transcribing a file) ──────── */
 function importPreView() {
   var langSeg = segmented([["af", "Afrikaans"], ["en", "English"], ["", "Auto-detect"]], S.form.language, function (v) { S.form.language = v; render(); });
-  var tierSeg = segmented([["auto", "Auto"], ["cpu-mid", "Fast"], ["cpu-strong", "Balanced"], ["gpu", "Best"]], S.form.tier, function (v) { S.form.tier = v; render(); });
+  var tierSeg = qualitySelector();
   var fileLabel = S.importName || "the recording";
   function begin() { startImport({ path: S.importPath, stem: S.importStem, topic: S.form.title }); }
   return el("div", { class: "screen" }, el("div", { class: "screen-inner col-mid" }, [
@@ -935,6 +1055,7 @@ function importPreView() {
       formField("Language", null, langSeg, true),
       formField("Quality", null, tierSeg, true),
     ]),
+    runOnField(),
     formField("Participants", el("span", { class: "label-muted", text: " (optional, helps accuracy)" }), termsBox(S.form.participants, "Add a name")),
     formField("Jargon and terms", el("span", { class: "label-muted", text: " (optional)" }), termsBox(S.form.terms, "Add a term")),
     defaultContextNote(),
@@ -945,7 +1066,66 @@ function importPreView() {
   ]));
 }
 
+/* ── starting (immediate feedback while the model loads) ───── */
+// Begin / Transcribe loads the Whisper model synchronously on the server (seconds
+// once cached, minutes if it still has to download). Show this at once instead of
+// leaving the user on a frozen pre-meeting screen with no sign anything is happening.
+function beginStarting(kind, title) {
+  S.starting = { active: true, kind: kind, title: title || "", error: null, startedAt: new Date().toISOString() };
+  go("starting");
+  if (startingTimer) clearInterval(startingTimer);
+  startingTimer = setInterval(function () {
+    if (startingElapsedEl) startingElapsedEl.textContent = fmtElapsed(S.starting.startedAt);
+  }, 1000);
+}
+function endStarting() {
+  if (startingTimer) { clearInterval(startingTimer); startingTimer = null; }
+  S.starting.active = false;
+}
+function startingView() {
+  startingElapsedEl = el("span", { class: "mono", text: fmtElapsed(S.starting.startedAt) });
+  var err = S.starting.error;
+  var inner;
+  if (err) {
+    inner = el("div", { class: "rec-stage" }, [
+      el("div", { class: "tone-tile", style: { width: "44px", height: "44px", color: "var(--warn)" } }, icon("alert", 22)),
+      el("h1", { style: { fontSize: "22px" }, text: "Could not start" }),
+      el("p", { class: "ink-2", style: { maxWidth: "440px", textAlign: "center" } }, raw(err)),
+      el("div", { class: "row gap-8" }, [
+        el("button", { class: "btn primary", onclick: function () { endStarting(); go(S.starting.kind === "file" ? "importpre" : "pre"); } }, "Back"),
+        el("button", { class: "btn ghost", onclick: function () { endStarting(); go("settings"); } }, "Set up models"),
+      ]),
+    ]);
+  } else {
+    inner = el("div", { class: "rec-stage" }, [
+      el("span", { class: "spinner" }),
+      el("h1", { style: { fontSize: "22px", marginTop: "8px" }, text: "Starting" }),
+      startingElapsedEl,
+      el("p", { class: "ink-2", style: { maxWidth: "470px", textAlign: "center" }, text: "Loading the transcription model on your computer. The first time you use a quality level can take a moment, and if that model still needs downloading it can take a few minutes." }),
+      el("p", { class: "ink-3", style: { fontSize: "12px" }, text: "You can keep this open. It switches to the transcript by itself." }),
+    ]);
+  }
+  var header = el("div", { class: "live-header" }, [
+    el("div", { style: { minWidth: "0" } }, [
+      el("div", { class: "ttl" }, [S.starting.title ? raw(S.starting.title) : "Starting"]),
+      el("div", { class: "meta" }, [el("span", { text: err ? "Not started" : "Preparing" }), el("span", { text: "·" }), el("span", { text: "Local only" })]),
+    ]),
+    el("div", { class: "right" }, el("span", { class: "chip" + (err ? " warn" : "") }, [el("span", { class: "dot" }), err ? "Stopped" : "Preparing"])),
+  ]);
+  return el("div", { class: "live" }, [header, el("div", { class: "live-body" }, inner)]);
+}
+
 /* ── live screen ──────────────────────────────────────────── */
+// Honest GPU/CPU badge for the active screens, so the user never has to open Task
+// Manager to find out where transcription is actually running.
+function deviceBadge(tier) {
+  if (!tier) return null;
+  if (tier === "gpu" || tier === "gpu-4gb") {
+    return el("span", { class: "chip ok", title: (S.cuda && S.cuda.gpu_name) || "GPU" }, [icon("check", 12), "GPU"]);
+  }
+  return el("span", { class: "chip" }, "CPU");
+}
+
 function liveView() {
   var statusChip;
   if (S.live.stopping) statusChip = el("span", { class: "chip warn" }, [el("span", { class: "dot" }), el("span", { id: "live-status-text", text: "Finishing" })]);
@@ -961,7 +1141,8 @@ function liveView() {
       el("div", { class: "meta" }, [elapsedEl, el("span", { text: "·" }), el("span", { text: langLabel }), el("span", { text: "·" }), el("span", { text: "Local only" })]),
     ]),
     el("div", { class: "right" }, [
-      S.live.model ? el("span", { class: "chip" }, "On-device model") : null,
+      deviceBadge(S.live.tier),
+      S.live.model ? el("span", { class: "chip" }, raw(String(S.live.model))) : null,
       statusChip,
     ]),
   ]);
@@ -1049,7 +1230,10 @@ function importingView() {
         el("div", { class: "meta" }, [elapsedEl, el("span", { text: "·" }), el("span", { text: "Local only" })]),
       ]),
     ]),
-    el("div", { class: "right" }, el("button", { class: "btn ghost", onclick: function () { api.post("/api/stop?what=all").catch(function () {}); toast("Stopping."); go("home"); } }, "Cancel")),
+    el("div", { class: "right" }, [
+      deviceBadge(S.live.tier),
+      el("button", { class: "btn ghost", onclick: function () { api.post("/api/stop?what=all").catch(function () {}); toast("Stopping."); go("home"); } }, "Cancel"),
+    ]),
   ]);
   var strip = el("div", { class: "track thin", style: { borderRadius: "0" } }, el("div", { class: "indeterminate" }));
   liveDocEl = el("div", { class: "doc" }, S.live.segments.length
@@ -1191,26 +1375,52 @@ function historyView() {
   ]));
 }
 async function openReader(name) {
-  S.reader = { name: name, title: topicFromName(name), text: "Loading...", summarising: false, summary: null };
+  S.reader = { name: name, title: topicFromName(name), text: "Loading...", tab: "transcript", summarising: false, summary: null, savedAs: null };
   go("reader");
   try { S.reader.text = await api.text("/sessions/" + encodeURIComponent(name)); }
   catch (e) { S.reader.text = "Could not load this transcript: " + e.message; }
+  // Always try the sibling summary file (ignore 404). Don't gate on cached has_summary: a
+  // summary made this session may not be in S.sessions yet, which would hide the Summary tab.
+  var sumName = name.replace(/\.md$/, "") + "-summary.md";
+  try {
+    S.reader.summary = stripSummaryHeader(await api.text("/sessions/" + encodeURIComponent(sumName)));
+    S.reader.savedAs = sumName;
+  } catch (e) { /* no summary yet, or unreadable: the transcript still shows */ }
   render();
+}
+function stripSummaryHeader(s) {
+  // Saved summaries start with "# Summary: <stem>"; drop that header line for display.
+  return String(s || "").replace(/^#\s*Summary:[^\n]*\n+/, "");
 }
 
 /* ── reader (past transcript) ─────────────────────────────── */
 function readerView() {
+  var hasSummary = !!S.reader.summary;
+  var tab = hasSummary ? (S.reader.tab || "transcript") : "transcript";
+  var toggle = hasSummary ? el("div", { class: "row gap-8" }, [
+    el("button", { class: tab === "transcript" ? "btn sm" : "btn ghost sm", onclick: function () { S.reader.tab = "transcript"; render(); } }, [icon("note", 13), "Transcript"]),
+    el("button", { class: tab === "summary" ? "btn sm" : "btn ghost sm", onclick: function () { S.reader.tab = "summary"; render(); } }, [icon("sparkle", 13), "Summary"]),
+  ]) : null;
+  var body;
+  if (hasSummary && tab === "summary") {
+    body = summaryResult(S.reader.summary, S.reader.savedAs, S.reader.name, "reader");
+  } else {
+    body = el("div", { class: "stack", style: { gap: "16px" } }, [
+      hasSummary ? null : summariseCard(S.reader.name, "reader"),
+      el("div", { class: "card", style: { padding: "20px 22px" } },
+        el("div", { class: "doc", style: { maxWidth: "none", fontSize: "15px", whiteSpace: "pre-wrap", fontFamily: "var(--font-transcript)" } }, raw(S.reader.text))),
+    ]);
+  }
   return el("div", { class: "screen" }, el("div", { class: "screen-inner col-mid stack", style: { gap: "16px" } }, [
     el("button", { class: "btn ghost sm", style: { alignSelf: "flex-start" }, onclick: function () { go("history"); } }, [icon("back", 14), "Back to history"]),
     el("div", { class: "row gap-12" }, [
       el("h2", {}, raw(S.reader.title)),
       el("span", { class: "grow" }),
-      el("button", { class: "btn ghost sm", onclick: function () { copyText(S.reader.text); } }, [icon("copy", 13), "Copy"]),
+      toggle,
+      el("button", { class: "btn ghost sm", onclick: function () { copyText((hasSummary && tab === "summary") ? S.reader.summary : S.reader.text); } }, [icon("copy", 13), "Copy"]),
       el("button", { class: "btn ghost sm", onclick: function () { api.post("/api/open-folder").catch(function () {}); } }, [icon("folder", 13), "Folder"]),
     ]),
-    summariseCard(S.reader.name, "reader"),
-    el("div", { class: "card", style: { padding: "20px 22px" } },
-      el("div", { class: "doc", style: { maxWidth: "none", fontSize: "15px", whiteSpace: "pre-wrap", fontFamily: "var(--font-transcript)" } }, raw(S.reader.text))),
+    body,
   ]));
 }
 
@@ -1222,6 +1432,8 @@ function settingsView() {
     licenceCard(),
     appearanceCard(),
     transcriptionCard(st),
+    voiceModelCard(),
+    (S.cuda && S.cuda.gpu_present) ? cudaCard() : null,
     summariesCard(),
     dataCard(st),
     connected() ? dangerCard(st) : null,
@@ -1256,7 +1468,7 @@ function licenceCard() {
       ]),
       pro
         ? el("button", { class: "btn ghost", onclick: deactivateLicence }, "Deactivate")
-        : el("button", { class: "btn primary", onclick: function () { if (connected()) { S.upgrade = { keyState: "empty", value: "", msg: "" }; go("upgrade"); } else { openExternal(PRO_URL); } } }, "Upgrade"),
+        : el("span", { class: "chip", text: "Coming soon" }),
     ]),
   ]);
 }
@@ -1291,7 +1503,7 @@ function transcriptionCard(st) {
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("cpu", 18)),
       el("div", { class: "body" }, [el("div", { class: "t", text: "Quality" }), el("div", { class: "s", text: "Auto picks the best model your hardware can run." })]),
-      el("div", { class: "ctl" }, selectEl([["auto", "Auto-detect"], ["gpu", "Best (GPU)"], ["cpu-strong", "Balanced"], ["cpu-mid", "Fast"]], st.tier || "auto", function (v) { saveSettings({ tier: v }); })),
+      el("div", { class: "ctl" }, selectEl([["auto", "Auto"], ["small", "Fast"], ["medium", "Balanced"], ["large-v3-turbo", "High quality"], ["large-v3", "Best"]], normalizeQuality(st.tier), function (v) { saveSettings({ tier: v }); })),
     ]),
     el("div", { class: "set-row", style: { display: "block" } }, [
       el("div", { class: "t", style: { marginBottom: "4px" }, text: "Default context, names and jargon" }),
@@ -1350,7 +1562,7 @@ function loadSummaryModels() {
     .then(function (d) { S.summaryModels = d; S._loadingSM = false; render(); })
     .catch(function () { S._loadingSM = false; S._smError = true; render(); });
 }
-function summaryDownloadPanel() {
+function summaryDownloadPanel(manage) {
   if (!S.summaryModels) {
     if (S._smError) {
       return el("div", { class: "stack", style: { gap: "6px" } }, [
@@ -1370,17 +1582,226 @@ function summaryDownloadPanel() {
     return el("div", { class: "card", style: { padding: "14px" } }, [
       el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "flex-start", gap: "12px" } }, [
         el("div", { class: "grow" }, [
-          el("div", { style: { fontWeight: "600" } }, [el("span", { text: meta.title }), el("span", { class: "chip", style: { marginLeft: "8px" } }, raw(fmtGB(m.approx_bytes)))]),
+          el("div", { style: { fontWeight: "600" } }, [el("span", { text: meta.title }), el("span", { class: "chip", style: { marginLeft: "8px" } }, raw(fmtGB((m.present && m.size_on_disk) ? m.size_on_disk : m.approx_bytes)))]),
           el("div", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "2px" }, text: meta.note }),
         ]),
-        m.active
-          ? el("span", { class: "chip ok" }, [icon("check", 12), "Installed"])
-          : el("button", { class: "btn", onclick: function () { if (downloading) return; startModelDownload(m.key); } }, isThis ? "Downloading" : (m.present ? "Use" : "Download")),
+        (manage && m.present)
+          ? el("div", { class: "row gap-8", style: { alignItems: "center", flex: "0 0 auto" } }, [
+              m.active
+                ? el("span", { class: "chip ok" }, [icon("check", 12), "Installed"])
+                : el("button", { class: "btn", onclick: function () { if (downloading) return; startModelDownload(m.key); } }, isThis ? "Downloading" : "Use"),
+              el("button", { class: "btn ghost sm", onclick: function () { confirmRemoveSummary(m); } }, "Remove"),
+            ])
+          : (m.active
+              ? el("span", { class: "chip ok" }, [icon("check", 12), "Installed"])
+              : el("button", { class: "btn", onclick: function () { if (downloading) return; startModelDownload(m.key); } }, isThis ? "Downloading" : (m.present ? "Use" : "Download"))),
       ]),
       isThis ? progressBar(pct) : null,
       isThis ? el("div", { id: "vm-dl-text", class: "ink-3", style: { fontSize: "11.5px", marginTop: "4px" } }, raw(fmtGB(p.downloaded) + " of " + fmtGB(p.total) + "  (" + pct + "%)")) : null,
     ]);
   }));
+}
+/* ── voice (transcription) model download, shared by setup and settings ─── */
+var VOICE_LABELS = {
+  "base":   { title: "Lite",         note: "Fastest and smallest, roughest accuracy. For very modest computers." },
+  "small":  { title: "Light",        note: "Light and quick. Good on older or low-power machines." },
+  "medium": { title: "Balanced",     note: "A solid balance of speed and accuracy on a typical computer." },
+  "large-v3-turbo": { title: "High quality", note: "Near-best accuracy, lighter and faster than the largest model." },
+  "large-v3": { title: "Best",       note: "Most accurate. Best on a computer with a graphics card (GPU)." },
+};
+var _vdlTimer = null;
+function startVoiceDownload(model) {
+  api.post("/api/voice-model/download", { model: model })
+    .then(function () { pollVoiceDownload(); render(); })
+    .catch(function (e) { toast(e.message || "Could not start the download.", true); });
+}
+function pollVoiceDownload() {
+  if (_vdlTimer) return;
+  _vdlTimer = setInterval(function () {
+    api.get("/api/voice-models").then(function (d) {
+      S.voiceModels = d;
+      var p = (d && d.progress) || {};
+      if (p.state === "downloading") { updateVoiceProgress(p); return; }
+      clearInterval(_vdlTimer); _vdlTimer = null;
+      if (p.state === "done") { toast("Transcription model ready."); }
+      else if (p.state === "error") { toast("Download failed: " + (p.error || ""), true); }
+      render();
+    }).catch(function () {});
+  }, 1000);
+}
+function updateVoiceProgress(p) {
+  var pct = p.total ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0;
+  var bar = document.getElementById("vm-vdl-bar");
+  if (bar) bar.style.width = pct + "%";
+  var txt = document.getElementById("vm-vdl-text");
+  if (txt) txt.textContent = fmtGB(p.downloaded) + " of " + fmtGB(p.total) + "  (" + pct + "%)";
+}
+function loadVoiceModels() {
+  S._loadingVM = true; S._vmError = false;
+  api.get("/api/voice-models")
+    .then(function (d) { S.voiceModels = d; S._loadingVM = false; render(); })
+    .catch(function () { S._loadingVM = false; S._vmError = true; render(); });
+}
+function voiceProgressBar(pct) {
+  return el("div", { style: { height: "8px", borderRadius: "999px", background: "var(--line)", overflow: "hidden", marginTop: "10px" } },
+    el("div", { id: "vm-vdl-bar", style: { height: "100%", width: pct + "%", background: "var(--accent)", transition: "width .3s ease" } }));
+}
+function voiceDownloadPanel(manage) {
+  if (!S.voiceModels) {
+    if (S._vmError) {
+      return el("div", { class: "stack", style: { gap: "6px" } }, [
+        el("div", { class: "ink-3", style: { fontSize: "12px" }, text: "Could not load model options. Restart Volksmond and try again." }),
+        el("span", { class: "link", style: { fontSize: "12px" }, onclick: function () { loadVoiceModels(); } }, "Try again"),
+      ]);
+    }
+    if (!S._loadingVM) { loadVoiceModels(); }
+    return el("div", { class: "ink-3", style: { fontSize: "12px" }, text: "Loading model options..." });
+  }
+  var d = S.voiceModels; var models = (d.models || []).slice(); var p = d.progress || {};
+  var downloading = p.state === "downloading";
+  models.sort(function (a, b) { return (b.recommended ? 1 : 0) - (a.recommended ? 1 : 0); }); // recommended first
+  return el("div", { class: "stack", style: { gap: "10px" } }, models.map(function (m) {
+    var meta = VOICE_LABELS[m.model] || { title: m.model, note: "" };
+    var isThis = downloading && p.model === m.model;
+    var pct = (isThis && p.total) ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0;
+    var usable = !(m.model === "large-v3" && d.is_gpu === false);
+    return el("div", { class: "card", style: { padding: "14px", opacity: usable ? "1" : "0.6" } }, [
+      el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "flex-start", gap: "12px" } }, [
+        el("div", { class: "grow" }, [
+          el("div", { style: { fontWeight: "600" } }, [
+            el("span", { text: meta.title }),
+            m.recommended ? el("span", { class: "chip accent", style: { marginLeft: "8px" }, text: "Recommended" }) : null,
+            el("span", { class: "chip", style: { marginLeft: "8px" } }, raw(fmtGB((m.present && m.size_on_disk) ? m.size_on_disk : m.approx_bytes))),
+          ]),
+          el("div", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "2px" }, text: meta.note }),
+          (!usable) ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "4px" }, text: "Needs a graphics card (GPU). Choose another for this computer." }) : null,
+        ]),
+        m.present
+          ? el("div", { class: "row gap-8", style: { alignItems: "center", flex: "0 0 auto" } }, [
+              el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]),
+              manage ? el("button", { class: "btn ghost sm", onclick: function () { confirmRemoveVoice(m); } }, "Remove") : null,
+            ])
+          : (usable ? el("button", { class: "btn", onclick: function () { if (downloading) return; startVoiceDownload(m.model); } }, isThis ? "Downloading" : "Download") : null),
+      ]),
+      isThis ? voiceProgressBar(pct) : null,
+      isThis ? el("div", { id: "vm-vdl-text", class: "ink-3", style: { fontSize: "11.5px", marginTop: "4px" } }, raw(fmtGB(p.downloaded) + " of " + fmtGB(p.total) + "  (" + pct + "%)")) : null,
+    ]);
+  }));
+}
+function voiceModelCard() {
+  return el("div", { class: "card settings-card" }, [
+    el("div", { class: "card-title section-label", text: "Transcription model, on this machine" }),
+    el("div", { class: "set-row", style: { display: "block" } }, [
+      el("div", { class: "t", style: { marginBottom: "4px" }, text: "Download or switch model" }),
+      el("div", { class: "s", style: { marginBottom: "10px" }, text: "Volksmond transcribes on this computer. Download the model that suits your machine; the recommended one is marked. Bigger is more accurate, but slower and larger to download. Remove any you no longer need to free space." }),
+      voiceDownloadPanel(true),
+    ]),
+    el("div", { class: "set-row" }, [
+      el("div", { class: "ic" }, icon("folder", 18)),
+      el("div", { class: "body" }, [el("div", { class: "t", text: "Where models are stored" }),
+        el("div", { class: "s mono", style: { fontSize: "11px", wordBreak: "break-all" } }, raw((S.appInfo && S.appInfo.voice_models_dir) || "")),
+        el("div", { class: "s", style: { fontSize: "11px", marginTop: "4px" }, text: "You can delete these folders by hand to free space if you ever need to." })]),
+      el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: function () { api.post("/api/open-folder?which=voice_models").catch(function () {}); } }, "Open")),
+    ]),
+  ]);
+}
+/* ── NVIDIA CUDA (optional GPU acceleration) ─── shared by setup + settings ─── */
+var _cudaTimer = null;
+function loadCuda() {
+  api.get("/api/cuda").then(function (d) { S.cuda = d; render(); }).catch(function () {});
+}
+function startCudaDownload() {
+  api.post("/api/cuda/download").then(function () { pollCudaDownload(); render(); })
+    .catch(function (e) { toast(e.message || "Could not start the download.", true); });
+}
+function pollCudaDownload() {
+  if (_cudaTimer) return;
+  _cudaTimer = setInterval(function () {
+    api.get("/api/cuda").then(function (d) {
+      S.cuda = d;
+      var p = (d && d.progress) || {};
+      if (p.state === "downloading") { updateCudaProgress(p); return; }
+      clearInterval(_cudaTimer); _cudaTimer = null;
+      if (p.state === "done") { toast(d.ready ? "GPU ready. No restart needed." : "CUDA libraries ready. Restart Volksmond to use your GPU."); }
+      else if (p.state === "error") { toast("Download failed: " + (p.error || ""), true); }
+      render();
+    }).catch(function () {});
+  }, 1000);
+}
+function updateCudaProgress(p) {
+  var pct = p.total ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0;
+  var bar = document.getElementById("vm-cuda-bar");
+  if (bar) bar.style.width = pct + "%";
+  var txt = document.getElementById("vm-cuda-text");
+  if (txt) txt.textContent = fmtGB(p.downloaded) + " of " + fmtGB(p.total) + "  (" + pct + "%)";
+}
+function cudaProgressBar(pct) {
+  return el("div", { style: { height: "8px", borderRadius: "999px", background: "var(--line)", overflow: "hidden", marginTop: "10px" } },
+    el("div", { id: "vm-cuda-bar", style: { height: "100%", width: pct + "%", background: "var(--accent)", transition: "width .3s ease" } }));
+}
+// The CUDA download card. Returns null unless an NVIDIA GPU is present (NVIDIA only).
+function cudaPanel(manage) {
+  var c = S.cuda;
+  if (!c || !c.gpu_present) return null;
+  var p = c.progress || {};
+  var downloading = p.state === "downloading";
+  var pct = (downloading && p.total) ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0;
+  var vram = c.vram_mb ? (Math.round(c.vram_mb / 1024) + " GB") : "";
+  var action;
+  if (c.installed && c.ready) action = el("span", { class: "chip ok" }, [icon("check", 12), "Active"]);
+  else if (c.installed) action = el("span", { class: "chip warn" }, [el("span", { class: "dot" }), "Restart to use"]);
+  else if (downloading) action = el("button", { class: "btn", disabled: true }, "Downloading");
+  else action = el("button", { class: "btn primary", onclick: function () { startCudaDownload(); } }, "Download");
+  return el("div", { class: "card", style: { padding: "14px" } }, [
+    el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "flex-start", gap: "12px" } }, [
+      el("div", { class: "grow" }, [
+        el("div", { style: { fontWeight: "600" } }, [el("span", { text: "NVIDIA GPU acceleration" }), vram ? el("span", { class: "chip", style: { marginLeft: "8px" } }, raw(vram)) : null]),
+        el("div", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "2px" }, text: "An NVIDIA graphics card was detected. Download the NVIDIA CUDA libraries (about 1.5 GB) to run the Best model on your GPU, much faster than the CPU. NVIDIA only." }),
+      ]),
+      action,
+    ]),
+    downloading ? cudaProgressBar(pct) : null,
+    downloading ? el("div", { id: "vm-cuda-text", class: "ink-3", style: { fontSize: "11.5px", marginTop: "4px" } }, raw(fmtGB(p.downloaded) + " of " + fmtGB(p.total) + "  (" + pct + "%)")) : null,
+    (c.installed && !c.ready) ? el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "6px" }, text: "Downloaded. Close and reopen Volksmond to start using your GPU." }) : null,
+    (manage && c.installed) ? el("div", { class: "row", style: { justifyContent: "flex-end", marginTop: "8px", gap: "8px" } }, [
+      el("button", { class: "btn ghost sm", onclick: function () { checkGpu(); } }, "Check GPU"),
+      el("button", { class: "btn ghost sm", onclick: function () { confirmRemoveCuda(); } }, "Remove"),
+    ]) : null,
+  ]);
+}
+function confirmRemoveCuda() {
+  confirmModal({
+    title: "Remove CUDA libraries?",
+    message: "Remove the NVIDIA CUDA libraries from your computer? Transcription falls back to the CPU. You can download them again later.",
+    detail: "NVIDIA CUDA libraries  (~1.5 GB)",
+    confirmLabel: "Remove", danger: true,
+    onConfirm: function () {
+      api.post("/api/cuda/remove").then(function () { toast("CUDA libraries removed."); loadCuda(); })
+        .catch(function (e) { toast(e.message || "Could not remove.", true); });
+    },
+  });
+}
+function checkGpu() {
+  api.post("/api/cuda/self-test").then(function (r) {
+    if (r && r.ok) toast("GPU is working. It will be used for transcription.");
+    else toast("GPU check failed: " + ((r && r.error) || ""), true);
+    loadCuda();
+  }).catch(function (e) { toast(e.message || "Could not check the GPU.", true); });
+}
+function cudaCard() {
+  return el("div", { class: "card settings-card" }, [
+    el("div", { class: "card-title section-label", text: "GPU acceleration (NVIDIA only)" }),
+    el("div", { class: "set-row", style: { display: "block" } }, [
+      el("div", { class: "s", style: { marginBottom: "10px" }, text: "Run the Best model on your NVIDIA graphics card instead of the CPU. Optional, and NVIDIA only; AMD and Intel graphics use the CPU." }),
+      cudaPanel(true),
+    ]),
+    el("div", { class: "set-row" }, [
+      el("div", { class: "ic" }, icon("folder", 18)),
+      el("div", { class: "body" }, [el("div", { class: "t", text: "Where the CUDA libraries are stored" }),
+        el("div", { class: "s mono", style: { fontSize: "11px", wordBreak: "break-all" } }, raw((S.appInfo && S.appInfo.cuda_dir) || ""))]),
+      el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: function () { api.post("/api/open-folder?which=cuda").catch(function () {}); } }, "Open")),
+    ]),
+  ]);
 }
 function summariesCard() {
   var d = S.summaryModels || {};
@@ -1392,12 +1813,14 @@ function summariesCard() {
       el("div", { class: "s", style: { marginBottom: "10px" }, text: anyActive
         ? "Summaries run on this computer and are free. You can switch model below any time."
         : "Download a small model and Volksmond can summarise a finished transcript on this computer. Pick a size, we download it for you." }),
-      summaryDownloadPanel(),
+      summaryDownloadPanel(true),
     ]),
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("folder", 18)),
-      el("div", { class: "body" }, [el("div", { class: "t", text: "Open data folder" }), el("div", { class: "s", text: "See the transcripts and any models stored on this computer." })]),
-      el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: function () { api.post("/api/open-folder").catch(function () {}); } }, "Open")),
+      el("div", { class: "body" }, [el("div", { class: "t", text: "Where summary models are stored" }),
+        el("div", { class: "s mono", style: { fontSize: "11px", wordBreak: "break-all" } }, raw((S.appInfo && S.appInfo.summary_models_dir) || "")),
+        el("div", { class: "s", style: { fontSize: "11px", marginTop: "4px" }, text: "You can delete these files by hand to free space if you ever need to." })]),
+      el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: function () { api.post("/api/open-folder?which=summary_models").catch(function () {}); } }, "Open")),
     ]),
   ]);
 }
@@ -1520,10 +1943,66 @@ function stopRow(what, recommended, title, sub, kb, finish) {
 }
 
 /* ── small shared builders ────────────────────────────────── */
+// Quality choices, keyed by the model each maps to (plus "auto"). The SAME set is
+// shown here and in the download panel, so the two never disagree. Auto is default.
+var QUALITY_OPTS = [["auto", "Auto"], ["small", "Fast"], ["medium", "Balanced"], ["large-v3-turbo", "High quality"], ["large-v3", "Best"]];
+// Legacy saved tier keys -> the new model-keyed quality, so old settings still highlight.
+var LEGACY_QUALITY = { "gpu": "large-v3", "gpu-4gb": "large-v3", "cpu-large": "large-v3", "cpu-strong": "large-v3-turbo", "cpu-mid": "medium", "cpu": "small", "cpu-min": "small" };
+function normalizeQuality(q) {
+  if (!q) return "auto";
+  for (var i = 0; i < QUALITY_OPTS.length; i++) { if (QUALITY_OPTS[i][0] === q) return q; }
+  return LEGACY_QUALITY[q] || "auto";
+}
+// The meeting / import Quality picker. A model not downloaded yet is greyed out;
+// clicking it starts that model's download (and selects it, ready once it lands).
+// "Auto" is always available and is the default.
+function qualitySelector() {
+  var vm = S.voiceModels || {};
+  var present = {};
+  (vm.models || []).forEach(function (m) { present[m.model] = !!m.present; });
+  return el("div", { class: "segmented block" }, QUALITY_OPTS.map(function (o) {
+    var key = o[0], label = o[1], model = (key === "auto") ? null : key;
+    var ready = (model === null) || present[model];
+    return el("button", {
+      class: S.form.tier === key ? "on" : "",
+      style: { opacity: ready ? "1" : "0.5" },
+      title: ready ? null : tr("Not downloaded yet. Click to download."),
+      onclick: function () {
+        S.form.tier = key;
+        if (model && !ready) {
+          startVoiceDownload(model);
+          toast("Downloading the model. You can begin once it is ready.");
+        }
+        render();
+      },
+    }, el("span", { text: label }));
+  }));
+}
+// EN/AF interface-language toggle (used on the first-run welcome screen).
+function langToggleSeg() {
+  var cur = afLang(S.settings);
+  return el("div", { class: "segmented", style: { width: "auto" } }, [["en-ZA", "English", "en"], ["af", "Afrikaans", "af"]].map(function (o) {
+    return el("button", { class: cur === o[2] ? "on" : "", onclick: function () { saveSettings({ interface_language: o[0] }); } }, el("span", { text: o[1] }));
+  }));
+}
 function segmented(options, value, onChange) {
   return el("div", { class: "segmented block" }, options.map(function (o) {
     return el("button", { class: value === o[0] ? "on" : "", onclick: function () { onChange(o[0]); } }, o[1]);
   }));
+}
+// "Run on" GPU/CPU choice for the pre-meeting + import screens. Returns null unless an
+// NVIDIA GPU is present. Remembered as a setting (default GPU). On the GPU the best model
+// runs, so the Quality picker only matters on CPU.
+function runOnField() {
+  if (!(S.cuda && S.cuda.gpu_present)) return null;
+  var v = (S.form.device === "cpu") ? "cpu" : "auto";
+  var seg = segmented([["auto", "GPU"], ["cpu", "CPU"]], v, function (val) {
+    S.form.device = val; saveSettings({ device: val }); render();
+  });
+  var note = (v === "cpu")
+    ? el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Running on the CPU. The Quality choice above applies." })
+    : el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "On the GPU, Volksmond runs the Best model. The Quality choice applies on CPU." });
+  return formField("Run on", null, el("div", {}, [seg, note]), true);
 }
 function selectEl(options, value, onChange) {
   var sel = el("select", { class: "field", style: { width: "auto", minWidth: "150px" }, onchange: function (e) { onChange(e.target.value); } },
@@ -1564,15 +2043,22 @@ async function boot() {
     api.get("/api/license").catch(function () { return null; }),
     api.get("/api/devices").catch(function () { return null; }),
     api.get("/api/summary-models").catch(function () { return null; }),
+    api.get("/api/voice-models").catch(function () { return null; }),
+    api.get("/api/cuda").catch(function () { return null; }),
   ]);
   S.settings = results[0]; S.features = results[1]; S.models = results[2];
   S.appInfo = results[3]; S.license = results[4]; S.devices = results[5];
   S.summaryModels = results[6];
+  S.voiceModels = results[7];
+  S.cuda = results[8];
   if (S.summaryModels && S.summaryModels.progress && S.summaryModels.progress.state === "downloading") pollModelDownload();
+  if (S.voiceModels && S.voiceModels.progress && S.voiceModels.progress.state === "downloading") pollVoiceDownload();
+  if (S.cuda && S.cuda.progress && S.cuda.progress.state === "downloading") pollCudaDownload();
   LANG = afLang(S.settings);
   if (S.settings) {
     S.form.language = S.settings.transcription_language != null ? S.settings.transcription_language : "af";
-    S.form.tier = S.settings.tier || "auto";
+    S.form.tier = normalizeQuality(S.settings.tier);
+    S.form.device = S.settings.device || "auto";
   }
   if (S.devices) {
     if (S.devices.default_mic_index != null) S.form.mic = String(S.devices.default_mic_index);
@@ -1589,6 +2075,7 @@ async function boot() {
   if (!resumed) {
     var done = false;
     try { done = !!localStorage.getItem("vm_setup_done"); } catch (e) {}
+    if (S.settings && S.settings.setup_complete) done = true;   // disk flag survives WebView storage resets
     S.route = done ? "home" : "setup";
   }
   S.booted = true;

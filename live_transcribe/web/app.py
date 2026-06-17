@@ -29,7 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .. import capture, config, licensing, sinks, transcribe
-from ..__main__ import default_chunk_seconds, pick_tier
+from ..__main__ import default_chunk_seconds, pick_tier, resolve_tier
 
 app = FastAPI(title="SA-Live-Transcribe")
 STATIC_DIR = Path(__file__).parent / "static"
@@ -159,6 +159,7 @@ _PICK_LOCK = threading.Lock()
 class StartRequest(BaseModel):
     topic: str = ""
     tier: str = "auto"            # "auto" | "gpu" | "cpu-strong" | "cpu-mid"
+    device: str = "auto"          # "auto"/"gpu" use the GPU when ready; "cpu" forces CPU
     language: str = "af"          # "af" | "en" | "" (empty == auto-detect)
     prompt: str = ""
     mic_device: Optional[str] = None
@@ -373,12 +374,24 @@ def devices_list():
 
 
 def _resolve_tier_lang_prompt(req):
-    """Shared start/file-import resolution of tier, language, and seeded prompt."""
+    """Shared start/file-import resolution of tier, language, and seeded prompt.
+
+    req.tier is a UI quality key (a model name like "medium"/"large-v3", or "auto",
+    or a legacy tier key); resolve_tier maps it to a concrete TIER_CONFIG tier."""
     settings = config.load()
-    req_tier = req.tier if (req.tier and req.tier != "auto") else None
-    if req_tier is None and settings["tier"] != "auto":
-        req_tier = settings["tier"]
-    tier = pick_tier(req_tier)
+    quality = req.tier if (req.tier and req.tier != "auto") else None
+    if quality is None and settings.get("tier") and settings["tier"] != "auto":
+        quality = settings["tier"]
+    device = getattr(req, "device", None) or settings.get("device") or "auto"
+    tier = resolve_tier(quality or "auto", device)
+    # Record the device decision in the log so a "why is it on CPU?" is answerable at a
+    # glance (calling cuda_ready here also registers the libs before the engine loads).
+    try:
+        from .. import cudadl
+        print(f"[tier] quality={quality!r} device={device!r} gpu_present={cudadl.gpu_present()} "
+              f"installed={cudadl.installed()} cuda_ready={cudadl.cuda_ready()} -> {tier}", flush=True)
+    except Exception:
+        pass
     language = req.language if req.language else None  # "" -> None (auto-detect)
     parts = [p for p in (settings.get("default_context", "").strip(), req.prompt.strip()) if p]
     prompt = ", ".join(parts) or None
@@ -477,6 +490,7 @@ class TranscribeFileRequest(BaseModel):
     stem: Optional[str] = None     # alternatively a recording stem; globs <stem>-*.wav
     topic: str = ""
     tier: str = "auto"
+    device: str = "auto"
     language: str = "af"
     prompt: str = ""
 
@@ -745,19 +759,31 @@ def _parse_session_filename(name: str) -> dict:
 
 @app.get("/api/sessions")
 def sessions_list():
-    """List session Markdown files in the active save location, newest first."""
+    """List session transcripts in the active save location, newest first.
+
+    A summary is saved next to its transcript as `<transcript>-summary.md`. That is a
+    derived artifact, not its own session, so it is hidden from the list (it was showing
+    up as a separate row and, when opened, masqueraded as a transcript). Each transcript
+    instead carries `has_summary` so the reader can surface the saved summary."""
     sdir = _sessions_dir()
+    names = {p.name for p in sdir.glob("*.md")}
     files = []
     for p in sdir.glob("*.md"):
+        name = p.name
+        # Hide a derived summary, but only when its transcript actually exists, so a
+        # meeting whose topic happens to end in "summary" is never wrongly suppressed.
+        if name.endswith("-summary.md") and (name[:-len("-summary.md")] + ".md") in names:
+            continue
         try:
             st = p.stat()
         except OSError:
             continue
-        meta = _parse_session_filename(p.name)
+        meta = _parse_session_filename(name)
         files.append({
-            "name": p.name,
+            "name": name,
             "size": st.st_size,
             "mtime": st.st_mtime,
+            "has_summary": (name[:-3] + "-summary.md") in names,
             **meta,
         })
     files.sort(key=lambda f: f["mtime"], reverse=True)
@@ -780,9 +806,27 @@ def session_content(filename: str):
 
 
 @app.post("/api/open-folder")
-def open_folder():
-    """Open the active save location in the OS file browser (Windows: Explorer)."""
-    target = str(_sessions_dir())
+def open_folder(which: str = "sessions"):
+    """Open a known app folder in the OS file browser (Windows: Explorer).
+
+    which: "sessions" (default, transcripts + recordings) | "voice_models" (the
+    Whisper model cache) | "summary_models" (the local summary GGUFs), so the user
+    can find and remove models on disk themselves."""
+    if which == "voice_models":
+        from .. import voicedl
+        p = Path(voicedl.cache_dir())
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        target = str(p)
+    elif which == "summary_models":
+        target = str(config.models_dir(create=True))
+    elif which == "cuda":
+        from .. import cudadl
+        target = str(cudadl.cuda_dir(create=True))
+    else:
+        target = str(_sessions_dir())
     try:
         if sys.platform == "win32":
             os.startfile(target)  # type: ignore[attr-defined]
@@ -799,11 +843,13 @@ class SettingsPatch(BaseModel):
     interface_language: Optional[str] = None
     transcription_language: Optional[str] = None
     tier: Optional[str] = None
+    device: Optional[str] = None
     save_location: Optional[str] = None
     default_context: Optional[str] = None
     ai_backend: Optional[str] = None
     ai_instructions: Optional[list] = None
     active_instruction_id: Optional[str] = None
+    setup_complete: Optional[bool] = None
     # summary_model is intentionally NOT settable here: only the verified downloader
     # (modeldl.py) sets it, to a pinned catalogue filename, so an arbitrary or
     # unverified path cannot be made the active summary model via the settings API.
@@ -911,16 +957,140 @@ def summary_model_download(req: ModelDownloadRequest):
     return modeldl.progress()
 
 
+@app.post("/api/summary-model/delete")
+def summary_model_delete(req: ModelDownloadRequest):
+    """Remove a downloaded summary model to free space (re-downloadable later)."""
+    from .. import modeldl
+    try:
+        modeldl.delete(req.key)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"ok": True}
+
+
+@app.get("/api/voice-models")
+def voice_models():
+    """Catalogue of downloadable transcription (Whisper) models plus live download
+    progress, so first-run setup can pull the model down up front with a progress
+    bar instead of faster-whisper fetching it silently at the first Begin."""
+    from .. import voicedl
+    cat = voicedl.catalogue_public()
+    cat["progress"] = voicedl.progress()
+    return cat
+
+
+class VoiceDownloadRequest(BaseModel):
+    model: str
+
+
+@app.post("/api/voice-model/download")
+def voice_model_download(req: VoiceDownloadRequest):
+    """Start downloading a transcription model to this machine (background). Returns
+    the current progress snapshot; the UI polls /api/voice-models for updates."""
+    from .. import voicedl
+    try:
+        voicedl.start_download(req.model)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return voicedl.progress()
+
+
+@app.post("/api/voice-model/delete")
+def voice_model_delete(req: VoiceDownloadRequest):
+    """Remove a downloaded transcription model to free space (re-downloadable later).
+    Refuses to delete the model the running session is currently using."""
+    from .. import voicedl
+    with STATE.lock:
+        # A live CPU session can downgrade to a smaller model on the fly (the CPU
+        # ladder in transcribe.py), so STATE.model is not a reliable "in use" marker.
+        # Refuse removing ANY transcription model while an engine is loaded.
+        if STATE.engine is not None:
+            raise HTTPException(status_code=409, detail="A transcription session is running. Stop it before removing a transcription model.")
+    try:
+        voicedl.delete(req.model)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"ok": True}
+
+
+@app.get("/api/cuda")
+def cuda_status():
+    """NVIDIA CUDA (optional GPU acceleration) status. NVIDIA ONLY; AMD/Intel GPUs use
+    the CPU path. gpu_present = a CUDA device is visible; installed = the libs are on
+    disk; ready = the GPU will actually be used (needs a restart after a fresh download)."""
+    from .. import cudadl
+    present = cudadl.gpu_present()
+    return {
+        "gpu_present": present,
+        "installed": cudadl.installed(),
+        "ready": cudadl.cuda_ready(),
+        "vram_mb": cudadl.vram_mb() if present else None,
+        "gpu_name": cudadl.gpu_name() if present else None,
+        "approx_bytes": cudadl.APPROX_BYTES,
+        "progress": cudadl.progress(),
+    }
+
+
+@app.post("/api/cuda/download")
+def cuda_download():
+    """Start downloading the NVIDIA CUDA libraries (background). 400 if no NVIDIA GPU."""
+    from .. import cudadl
+    if not cudadl.gpu_present():
+        raise HTTPException(status_code=400, detail="No NVIDIA GPU detected on this computer.")
+    try:
+        cudadl.start_download()
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return cudadl.progress()
+
+
+@app.post("/api/cuda/remove")
+def cuda_remove():
+    """Remove the downloaded CUDA libraries to free space. Refused while a session runs."""
+    from .. import cudadl
+    with STATE.lock:
+        if STATE.engine is not None:
+            raise HTTPException(status_code=409, detail="A transcription session is running. Stop it first.")
+    try:
+        cudadl.remove()
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"ok": True}
+
+
+@app.post("/api/cuda/self-test")
+def cuda_self_test():
+    """Load the CUDA libraries now and report the result, so the user can confirm the GPU
+    will be used (or see the exact error) without starting a meeting."""
+    from .. import cudadl
+    if not cudadl.gpu_present():
+        raise HTTPException(status_code=400, detail="No NVIDIA GPU detected on this computer.")
+    ok, err = cudadl.self_test()
+    return {"ok": bool(ok), "error": err, "ready": cudadl.cuda_ready()}
+
+
 @app.get("/api/app-info")
 def app_info():
     """Light, non-sensitive facts for the footer and the bug-report mailto: the
     display name, version, OS string, and where files are saved. Nothing here
     leaves the machine unless the user chooses to send a bug report."""
+    from .. import voicedl, cudadl
     return {
         "name": "Volksmond",
         "version": licensing.APP_VERSION,
         "platform": platform.platform(),
         "save_dir": str(_sessions_dir()),
+        # Where downloaded models live on disk, so the UI can show the user where to
+        # find and remove them (voice = the HuggingFace cache; summary = our folder).
+        "voice_models_dir": voicedl.cache_dir(),
+        "summary_models_dir": str(config.models_dir()),
+        "cuda_dir": str(cudadl.cuda_dir()),
         # Edition flag. The offline-only build (default) hides the online-feature UI:
         # the cloud-key danger zone and the in-app Pro pricing page. A future connected
         # build sets SA_LIVE_CONNECTED=1 to surface them. The actual cloud paths are not

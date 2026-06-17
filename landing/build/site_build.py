@@ -17,6 +17,7 @@ addEventListener (so the CSP needs no script unsafe-inline), wires the email for
 the /api/early-access Pages Function, adds canonical/OG/JSON-LD/skip-link, and strips
 em and en dashes. Idempotent: rerun after any design-bundle refresh.
 """
+import hashlib
 import re
 from pathlib import Path
 
@@ -82,6 +83,22 @@ a:focus-visible, button:focus-visible, input:focus-visible, [tabindex]:focus-vis
 .legal p, .legal li { color: var(--ink-2); font-size: 15px; line-height: 1.62; margin: 0 0 12px; }
 .legal ul { padding-left: 20px; margin: 0 0 12px; }
 .legal a { color: var(--accent); }
+
+/* The header CTA is a .btn, and vm-tokens' `.vm .btn` (0,2,0) outranks the design's
+   `.nav-cta { display: none }` (0,1,0), so the CTA leaked onto mobile and crowded the
+   EN/AF toggle (and bloated the header). Re-hide it with matching specificity; show it
+   from 760px up. */
+.vm .nav-cta { display: none; }
+@media (min-width: 760px) { .vm .nav-cta { display: inline-flex; } }
+
+/* Mobile header + hero. The EN/AF toggle matters more than the byline, so drop the
+   byline on narrow screens to keep the toggle in view; and tighten the hero top. */
+@media (max-width: 560px) {
+  .wordmark .by { display: none; }
+  .nav { gap: 10px; }
+  .hero-grid { padding-top: 14px; }
+  .kicker { margin-bottom: 14px; }
+}
 """
 
 # Production behaviour. No logo machinery (marks are inlined), no entrance animation,
@@ -203,6 +220,8 @@ def build():
         "   in assets/fonts.css (self-hosted base64, no external calls). */\n\n"
         + tokens.strip() + "\n\n/* ===== Landing layout ===== */\n" + inline_css + EXTRA_CSS
     )
+    # Cache-bust the assets that change between builds (browsers were serving stale CSS/JS).
+    ver = hashlib.md5((style_css + PROD_JS).encode("utf-8")).hexdigest()[:8]
 
     # --- index.html transforms ---
     html = html.replace(
@@ -213,7 +232,7 @@ def build():
     html = html.replace(
         '<link rel="stylesheet" href="vm-tokens.css" />',
         '<link rel="stylesheet" href="/assets/fonts.css" />\n'
-        '<link rel="stylesheet" href="/assets/style.css" />')
+        f'<link rel="stylesheet" href="/assets/style.css?v={ver}" />')
 
     html = re.sub(r"<style>.*?</style>\n?", "", html, count=1, flags=re.DOTALL)
     assert "<style>" not in html, "inline style not removed"
@@ -261,7 +280,7 @@ def build():
     assert anchor in html, "landing.js script tag not found"
     head, _, tail = html.partition(anchor)
     after = tail[tail.index("</body>"):]
-    html = head + '<script src="/assets/landing.js" defer></script>\n\n' + after
+    html = head + f'<script src="/assets/landing.js?v={ver}" defer></script>\n\n' + after
 
     # Remove the tweaks mount
     html = html.replace('<div id="tweaks-root"></div>\n', "")
@@ -285,6 +304,15 @@ def build():
     print("wrote site/assets/style.css", len(style_css.encode()) // 1024, "KB,",
           "marks inlined:", n_marks)
     print("wrote site/assets/landing.js", len(PROD_JS.encode()) // 1024, "KB")
+
+    # Keep the hand-written privacy page's asset links cache-busted to the same version.
+    priv = OUT / "privacy.html"
+    if priv.exists():
+        p = priv.read_text(encoding="utf-8")
+        p = re.sub(r"/assets/style\.css(\?v=[a-f0-9]+)?", f"/assets/style.css?v={ver}", p)
+        p = re.sub(r"/assets/landing\.js(\?v=[a-f0-9]+)?", f"/assets/landing.js?v={ver}", p)
+        priv.write_text(p, encoding="utf-8")
+        print("stamped privacy.html assets   v=" + ver)
 
 
 if __name__ == "__main__":
