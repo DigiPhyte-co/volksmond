@@ -53,9 +53,12 @@ def catalogue_public():
     selected = (config.load().get("summary_model") or "").strip()
     out = []
     for m in CATALOGUE:
-        present = (mdir / m["filename"]).is_file()
+        f = mdir / m["filename"]
+        present = f.is_file()
         out.append({"key": m["key"], "params": m["params"], "approx_bytes": m["approx_bytes"],
-                    "present": present, "active": present and selected == m["filename"]})
+                    "present": present, "active": present and selected == m["filename"],
+                    # Real bytes on disk, so the user can see what removing it frees.
+                    "size_on_disk": (f.stat().st_size if present else 0)})
     return out
 
 
@@ -86,6 +89,27 @@ def start_download(key):
         _STATE.update({"state": "downloading", "key": key, "downloaded": 0,
                        "total": m["approx_bytes"], "error": None})
     threading.Thread(target=_run, args=(m,), daemon=True).start()
+
+
+def delete(key):
+    """Remove a downloaded summary model file to free space (re-downloadable later).
+    If it was the selected model, clear the setting so the UI and the summarise
+    endpoint reflect "not installed" instead of pointing at a missing file. Refuses
+    while that same model is downloading."""
+    m = _BY_KEY.get(key)
+    if not m:
+        raise ValueError("Unknown model")
+    with _LOCK:
+        if _STATE["state"] == "downloading" and _STATE.get("key") == key:
+            raise RuntimeError("That model is downloading.")
+    path = config.models_dir() / m["filename"]
+    try:
+        if path.is_file():
+            path.unlink()
+    except OSError as e:
+        raise RuntimeError(f"Could not remove the file: {e}")
+    if (config.load().get("summary_model") or "") == m["filename"]:
+        config.update({"summary_model": ""})
 
 
 def _sha256(path):

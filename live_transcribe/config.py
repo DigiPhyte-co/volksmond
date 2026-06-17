@@ -42,6 +42,8 @@ DEFAULTS = {
     "ai_instructions": [],            # [{"id","name","prompt"}] saved system prompts
     "active_instruction_id": "",      # which saved instruction is active
     "summary_model": "",              # installed summary model: a .gguf filename in <_DIR>/models/ (or an absolute path)
+    "setup_complete": False,          # first-run wizard done; persisted here so it survives WebView storage resets
+    "device": "auto",                 # transcription device: "auto"/"gpu" use the GPU when ready, "cpu" forces CPU
 }
 
 

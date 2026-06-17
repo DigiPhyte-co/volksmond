@@ -80,6 +80,78 @@ def test_summary_model_download_api():
     print("  OK  summary-model download: catalogue listed, bad key 400, CSRF-protected, no stray download")
 
 
+def test_voice_model_download_api():
+    # Voice-model pre-download (so the first Begin is not a silent multi-GB wait):
+    # the catalogue lists models with sizes, flags a recommended pick for this
+    # machine, and exposes the tier->model map the UI needs. A bad model is
+    # rejected and the download endpoint is CSRF-protected. No real download is
+    # triggered (a bad model with the token, and a good one without it, are both
+    # refused before any bytes move).
+    j = client.get("/api/voice-models").json()
+    assert j.get("recommended_model"), j
+    models = j["models"]
+    # The four reconciled quality models, shown identically here and on the meeting screen.
+    assert [m["model"] for m in models] == ["small", "medium", "large-v3-turbo", "large-v3"], models
+    assert all(m["approx_bytes"] > 0 and "size_on_disk" in m for m in models), j
+    assert any(m["recommended"] for m in models), "no recommended voice model flagged"
+    r = client.post("/api/voice-model/download", json={"model": "nope"})
+    assert r.status_code == 400, f"bad voice model should 400, got {r.status_code}: {r.text}"
+    bare = TestClient(app, base_url="http://localhost")
+    r2 = bare.post("/api/voice-model/download", json={"model": "small"})
+    assert r2.status_code == 403, f"voice download endpoint not CSRF-protected: {r2.status_code}"
+    assert client.get("/api/voice-models").json()["progress"]["state"] in ("idle", "done"), \
+        "a rejected request still started a voice download"
+    print("  OK  voice-model download: catalogue + recommended + tier map, bad model 400, CSRF-protected, no stray download")
+
+
+def test_cuda_api():
+    # Optional NVIDIA CUDA (GPU) status + the download/remove endpoints. The endpoints
+    # are CSRF-protected; the test only hits them WITHOUT the token (403), so it never
+    # triggers a real multi-GB download regardless of whether this machine has a GPU.
+    j = client.get("/api/cuda").json()
+    for k in ("gpu_present", "installed", "ready", "approx_bytes", "progress"):
+        assert k in j, (k, j)
+    assert j["approx_bytes"] > 0, j
+    bare = TestClient(app, base_url="http://localhost")
+    assert bare.post("/api/cuda/download").status_code == 403, "cuda download not CSRF-protected"
+    assert bare.post("/api/cuda/remove").status_code == 403, "cuda remove not CSRF-protected"
+    print("  OK  cuda: status shape + download/remove CSRF-protected (no real download triggered)")
+
+
+def test_quality_resolution():
+    # The UI sends model-keyed quality choices; resolve_tier maps each to a real tier
+    # whose model matches, and "Best"/large-v3 resolves to a tier that loads large-v3
+    # (GPU when present, else the CPU-large tier). auto + legacy keys still resolve.
+    from live_transcribe.__main__ import resolve_tier
+    from live_transcribe.transcribe import TIER_CONFIG
+    assert TIER_CONFIG[resolve_tier("small")]["model"] == "small"
+    assert TIER_CONFIG[resolve_tier("medium")]["model"] == "medium"
+    assert TIER_CONFIG[resolve_tier("large-v3-turbo")]["model"] == "large-v3-turbo"
+    assert TIER_CONFIG[resolve_tier("large-v3")]["model"] == "large-v3"
+    assert resolve_tier("auto") in TIER_CONFIG
+    assert resolve_tier("cpu-mid") in TIER_CONFIG          # legacy tier key passthrough
+    assert "cpu-large" in TIER_CONFIG and TIER_CONFIG["cpu-large"]["device"] == "cpu"
+    print("  OK  quality resolution: model keys + auto + legacy all map to valid tiers")
+
+
+def test_model_delete_api():
+    # Removing models to free space: both delete endpoints reject a bad id (400) and
+    # are CSRF-protected (403 without the token). We deliberately never issue a valid
+    # delete, so no real model is removed by the test.
+    assert client.post("/api/voice-model/delete", json={"model": "nope"}).status_code == 400, "bad voice model should 400"
+    assert client.post("/api/summary-model/delete", json={"key": "nope"}).status_code == 400, "bad summary key should 400"
+    bare = TestClient(app, base_url="http://localhost")
+    assert bare.post("/api/voice-model/delete", json={"model": "small"}).status_code == 403, "voice delete not CSRF-protected"
+    assert bare.post("/api/summary-model/delete", json={"key": "gemma-4-e2b"}).status_code == 403, "summary delete not CSRF-protected"
+    # The catalogue now reports real on-disk size for present models (so the UI can
+    # show what removing one frees); the field is always present.
+    vm = client.get("/api/voice-models").json()
+    assert all("size_on_disk" in m for m in vm["models"]), vm
+    sm = client.get("/api/summary-models").json()
+    assert all("size_on_disk" in m for m in sm["models"]), sm
+    print("  OK  model delete: bad id -> 400, CSRF-protected (no real deletion); size_on_disk exposed")
+
+
 def test_summary_language_validated():
     # The summary output language is constrained to af/en; junk is a 422 (not silently ignored).
     bad = client.post("/api/summarise", json={"file": "no-such.md", "language": "fr"})
@@ -185,6 +257,10 @@ if __name__ == "__main__":
                test_summaries_are_free,
                test_summarise_not_pro_gated,
                test_summary_model_download_api,
+               test_voice_model_download_api,
+               test_cuda_api,
+               test_quality_resolution,
+               test_model_delete_api,
                test_summary_language_validated,
                test_settings_never_leak_secret,
                test_static_assets_served,

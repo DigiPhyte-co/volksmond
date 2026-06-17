@@ -24,7 +24,7 @@ window.VM_I18N = {
     "Report a bug or idea": "Meld 'n fout of idee",
 
     // First-run: welcome
-    "working name": "werksnaam",
+    "Research Preview": "Navorsingsvoorskou",
     "A calm, private transcript of any meeting on your computer.":
       "'n Rustige, private transkripsie van enige vergadering op jou rekenaar.",
     "Volksmond listens to your microphone and the audio coming out of your computer, and writes it down as people talk. Built for Afrikaans, English, and the way people actually switch between them.":
@@ -33,8 +33,17 @@ window.VM_I18N = {
     "No telemetry and no accounts. Your audio and transcripts are never uploaded; everything is transcribed and summarised on your own machine. Once the models are downloaded, you can use Volksmond completely offline.":
       "Geen telemetrie en geen rekeninge nie. Jou klank en transkripsies word nooit opgelaai nie; alles word op jou eie masjien getranskribeer en opgesom. Sodra die modelle afgelaai is, kan jy Volksmond heeltemal vanlyn gebruik.",
     "Get started": "Kom ons begin",
-    "The language model for transcription is installed with the app. Summaries are an optional extra you can turn on next.":
-      "Die taalmodel vir transkripsie word saam met die program geïnstalleer. Opsommings is 'n opsionele ekstra wat jy volgende kan aanskakel.",
+    "Next we download the transcription model to your computer, so your first meeting starts straight away. Summaries are an optional extra you can add after that.":
+      "Vervolgens laai ons die transkripsiemodel na jou rekenaar af, sodat jou eerste vergadering dadelik begin. Opsommings is 'n opsionele ekstra wat jy daarna kan byvoeg.",
+
+    // First-run: transcription model
+    "Setup, transcription model": "Opstelling, transkripsiemodel",
+    "Download the model that does the transcribing": "Laai die model af wat die transkripsie doen",
+    "Volksmond transcribes on your own computer using a language model. Download the one that suits your machine now, so your first meeting starts straight away instead of waiting on a download. It runs offline afterwards.":
+      "Volksmond transkribeer op jou eie rekenaar met 'n taalmodel. Laai nou die een af wat by jou masjien pas, sodat jou eerste vergadering dadelik begin in plaas daarvan om vir 'n aflaai te wag. Dit loop daarna vanlyn.",
+    "It downloads in the background. You can carry on with setup while it finishes; your first meeting waits for it to be ready.":
+      "Dit laai in die agtergrond af. Jy kan met die opstelling aangaan terwyl dit klaarmaak; jou eerste vergadering wag totdat dit gereed is.",
+    "Download recommended and continue": "Laai aanbevole af en gaan voort",
 
     // First-run: summaries question
     "Setup, summaries": "Opstelling, opsommings",
@@ -270,6 +279,9 @@ window.VM_I18N = {
     "Download a small model and Volksmond can summarise a finished transcript on this computer. Pick a size, we download it for you.":
       "Laai 'n klein model af en Volksmond kan 'n voltooide transkripsie op hierdie rekenaar opsom. Kies 'n grootte, ons laai dit vir jou af.",
     "Choose a summary model to download": "Kies 'n opsommingsmodel om af te laai",
+    "Your summary model (switch or add another)": "Jou opsommingsmodel (wissel of voeg nog een by)",
+    "Summaries are ready on this machine. You can switch model here, or add another.":
+      "Opsommings is gereed op hierdie masjien. Jy kan hier van model wissel, of nog een byvoeg.",
     "Gemma 4 (2 billion)": "Gemma 4 (2 miljard)",
     "Gemma 4 (4 billion)": "Gemma 4 (4 miljard)",
     "Smaller and faster, light on memory. Works well on most machines.":
@@ -350,5 +362,115 @@ window.VM_I18N = {
     "Close": "Maak toe",
     "A DigiPhyte product, built in South Africa. All transcription happens on this machine unless you explicitly opt in.":
       "'n DigiPhyte-produk, gebou in Suid-Afrika. Alle transkripsie gebeur op hierdie masjien tensy jy uitdruklik inteken.",
+
+    // Voice (transcription) model download
+    "Lite": "Lig (basies)",
+    "Light": "Lig",
+    "High quality": "Hoë gehalte",
+    "Fastest and smallest, roughest accuracy. For very modest computers.":
+      "Vinnigste en kleinste, growwe akkuraatheid. Vir baie beskeie rekenaars.",
+    "Light and quick. Good on older or low-power machines.":
+      "Lig en vinnig. Goed op ouer of lae-krag masjiene.",
+    "A solid balance of speed and accuracy on a typical computer.":
+      "'n Goeie balans van spoed en akkuraatheid op 'n tipiese rekenaar.",
+    "Near-best accuracy, lighter and faster than the largest model.":
+      "Naaste aan die beste akkuraatheid, ligter en vinniger as die grootste model.",
+    "Most accurate. Best on a computer with a graphics card (GPU).":
+      "Mees akkuraat. Beste op 'n rekenaar met 'n grafikakaart (GPU).",
+    "Needs a graphics card (GPU). Choose another for this computer.":
+      "Benodig 'n grafikakaart (GPU). Kies 'n ander een vir hierdie rekenaar.",
+    "Transcription model ready.": "Transkripsiemodel gereed.",
+    "Transcription model, on this machine": "Transkripsiemodel, op hierdie masjien",
+    "Download or switch model": "Laai af of wissel model",
+    "Volksmond transcribes on this computer. Download the model that suits your machine; the recommended one is marked. Bigger is more accurate, but slower and larger to download. Remove any you no longer need to free space.":
+      "Volksmond transkribeer op hierdie rekenaar. Laai die model af wat by jou masjien pas; die aanbevole een is gemerk. Groter is meer akkuraat, maar stadiger en groter om af te laai. Verwyder enige wat jy nie meer nodig het nie om spasie vry te maak.",
+    "Remove": "Verwyder",
+    "Remove this model?": "Verwyder hierdie model?",
+    "Remove this transcription model from your computer? You can download it again later.":
+      "Verwyder hierdie transkripsiemodel van jou rekenaar? Jy kan dit later weer aflaai.",
+    "Remove this summary model from your computer? You can download it again later.":
+      "Verwyder hierdie opsommingsmodel van jou rekenaar? Jy kan dit later weer aflaai.",
+    "Model removed.": "Model verwyder.",
+    "Could not remove.": "Kon nie verwyder nie.",
+    "A transcription session is running. Stop it before removing a transcription model.":
+      "'n Transkripsiesessie loop tans. Stop dit voordat jy 'n transkripsiemodel verwyder.",
+    "Are you sure?": "Is jy seker?",
+
+    // First-run: save location (was previously untranslated)
+    "Setup, where to save": "Opstelling, waar om te stoor",
+    "Where should your transcripts go?": "Waarheen moet jou transkripsies gaan?",
+    "Every meeting is saved as a Markdown file. Pick a folder you can find later, or keep the default.":
+      "Elke vergadering word as 'n Markdown-lêer gestoor. Kies 'n vouer wat jy later kan kry, of hou die verstek.",
+    "Your folder": "Jou vouer",
+    "Default folder (per user, on this computer)": "Verstekvouer (per gebruiker, op hierdie rekenaar)",
+    "Choose a different folder": "Kies 'n ander vouer",
+    "Choose another folder": "Kies 'n ander vouer",
+
+    // Quality selector (meeting screen) + model storage
+    "Not downloaded yet. Click to download.": "Nog nie afgelaai nie. Klik om af te laai.",
+    "Downloading the model. You can begin once it is ready.":
+      "Laai die model af. Jy kan begin sodra dit gereed is.",
+    "Where models are stored": "Waar modelle gestoor word",
+    "Where summary models are stored": "Waar opsommingsmodelle gestoor word",
+    "You can delete these folders by hand to free space if you ever need to.":
+      "Jy kan hierdie vouers met die hand uitvee om spasie vry te maak as jy ooit moet.",
+    "You can delete these files by hand to free space if you ever need to.":
+      "Jy kan hierdie lêers met die hand uitvee om spasie vry te maak as jy ooit moet.",
+
+    // Licence / upgrade
+    "Coming soon": "Binnekort beskikbaar",
+
+    // NVIDIA CUDA (optional GPU acceleration)
+    "Setup, GPU acceleration": "Opstelling, GPU-versnelling",
+    "Use your NVIDIA graphics card?": "Gebruik jou NVIDIA-grafikakaart?",
+    "We found an NVIDIA graphics card. You can download the NVIDIA CUDA libraries so the Best model runs on your GPU, which is much faster than the CPU. This is optional and NVIDIA only; without it everything still works on the CPU. AMD and Intel graphics are not supported by the engine.":
+      "Ons het 'n NVIDIA-grafikakaart gevind. Jy kan die NVIDIA CUDA-biblioteke aflaai sodat die Beste model op jou GPU loop, wat baie vinniger as die SVE is. Dit is opsioneel en slegs vir NVIDIA; daarsonder werk alles steeds op die SVE. AMD- en Intel-grafika word nie deur die enjin ondersteun nie.",
+    "It is a large download (about 1.5 GB). You can skip this and set it up later in Settings. After it downloads, restart Volksmond to use your GPU.":
+      "Dit is 'n groot aflaai (omtrent 1.5 GB). Jy kan dit oorslaan en later in Instellings opstel. Nadat dit afgelaai is, herbegin Volksmond om jou GPU te gebruik.",
+    "NVIDIA GPU acceleration": "NVIDIA GPU-versnelling",
+    "An NVIDIA graphics card was detected. Download the NVIDIA CUDA libraries (about 1.5 GB) to run the Best model on your GPU, much faster than the CPU. NVIDIA only.":
+      "'n NVIDIA-grafikakaart is bespeur. Laai die NVIDIA CUDA-biblioteke af (omtrent 1.5 GB) om die Beste model op jou GPU te loop, baie vinniger as die SVE. Slegs NVIDIA.",
+    "Active": "Aktief",
+    "Restart to use": "Herbegin om te gebruik",
+    "Downloaded. Close and reopen Volksmond to start using your GPU.":
+      "Afgelaai. Maak Volksmond toe en weer oop om jou GPU te begin gebruik.",
+    "GPU acceleration (NVIDIA only)": "GPU-versnelling (slegs NVIDIA)",
+    "Run the Best model on your NVIDIA graphics card instead of the CPU. Optional, and NVIDIA only; AMD and Intel graphics use the CPU.":
+      "Loop die Beste model op jou NVIDIA-grafikakaart in plaas van die SVE. Opsioneel, en slegs NVIDIA; AMD- en Intel-grafika gebruik die SVE.",
+    "Where the CUDA libraries are stored": "Waar die CUDA-biblioteke gestoor word",
+    "Remove CUDA libraries?": "Verwyder CUDA-biblioteke?",
+    "Remove the NVIDIA CUDA libraries from your computer? Transcription falls back to the CPU. You can download them again later.":
+      "Verwyder die NVIDIA CUDA-biblioteke van jou rekenaar? Transkripsie val terug na die SVE. Jy kan dit later weer aflaai.",
+    "CUDA libraries ready. Restart Volksmond to use your GPU.":
+      "CUDA-biblioteke gereed. Herbegin Volksmond om jou GPU te gebruik.",
+    "CUDA libraries removed.": "CUDA-biblioteke verwyder.",
+    "GPU ready. No restart needed.": "GPU gereed. Geen herbegin nodig nie.",
+    "Check GPU": "Toets GPU",
+    "GPU is working. It will be used for transcription.": "GPU werk. Dit sal vir transkripsie gebruik word.",
+    "Could not check the GPU.": "Kon nie die GPU toets nie.",
+    "CPU": "SVE",
+    "Transcript": "Transkripsie",
+    "Skip setup for now": "Slaan opstelling vir eers oor",
+    "Run on": "Verwerk op",
+    "On the GPU, Volksmond runs the Best model. The Quality choice applies on CPU.": "Op die GPU loop Volksmond die Beste model. Die Gehalte-keuse geld op die SVE.",
+    "Running on the CPU. The Quality choice above applies.": "Loop op die SVE. Die Gehalte-keuse hierbo geld.",
+
+    // Pre-meeting quality hint
+    "Best needs a graphics card (GPU), which this computer does not have. Choose Balanced or Fast.":
+      "Beste benodig 'n grafikakaart (GPU), wat hierdie rekenaar nie het nie. Kies Gebalanseerd of Vinnig.",
+    "This quality downloads the first time you use it.":
+      "Hierdie gehalte laai die eerste keer wat jy dit gebruik af.",
+
+    // Starting screen (immediate feedback while the model loads)
+    "Starting": "Begin tans",
+    "Preparing": "Berei voor",
+    "Not started": "Nie begin nie",
+    "Stopped": "Gestop",
+    "Could not start": "Kon nie begin nie",
+    "Set up models": "Stel modelle op",
+    "Loading the transcription model on your computer. The first time you use a quality level can take a moment, and if that model still needs downloading it can take a few minutes.":
+      "Laai die transkripsiemodel op jou rekenaar. Die eerste keer wat jy 'n gehaltevlak gebruik kan 'n oomblik neem, en as daardie model nog afgelaai moet word kan dit 'n paar minute neem.",
+    "You can keep this open. It switches to the transcript by itself.":
+      "Jy kan dit oop hou. Dit wissel vanself na die transkripsie.",
   },
 };

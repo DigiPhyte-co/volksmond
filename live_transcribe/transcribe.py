@@ -13,6 +13,11 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+# Make any downloaded NVIDIA CUDA libraries (optional GPU support, see cudadl.py)
+# findable BEFORE ctranslate2 loads. No-op when none have been downloaded.
+from . import cudadl
+cudadl.register_dll_dir()
+
 from faster_whisper import WhisperModel
 
 
@@ -35,6 +40,10 @@ TIER_CONFIG = {
     "cpu-min":    {"model": "base",           "device": "cpu",  "compute_type": "int8"},
     "cpu-strong": {"model": "large-v3-turbo", "device": "cpu",  "compute_type": "int8"},
     "cpu-mid":    {"model": "medium",         "device": "cpu",  "compute_type": "int8"},
+    # large-v3 on CPU: too slow to hold real-time for LIVE on most machines (the
+    # adaptive ladder downgrades it there), but the best-accuracy choice for an
+    # uploaded recording / post-meeting pass, where there is no real-time constraint.
+    "cpu-large":  {"model": "large-v3",       "device": "cpu",  "compute_type": "int8"},
 }
 
 # Anti-Dutch anchor for Afrikaans transcription.

@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-TIER_CHOICES = ["auto", "gpu", "gpu-4gb", "cpu", "cpu-min", "cpu-strong", "cpu-mid"]
+TIER_CHOICES = ["auto", "gpu", "gpu-4gb", "cpu", "cpu-min", "cpu-strong", "cpu-mid", "cpu-large"]
 
 
 def parse_args():
@@ -67,16 +67,27 @@ def _gpu_vram_mb():
 
 def pick_tier(explicit):
     """Resolution order: explicit flag > SA_LIVE_TIER env > auto-detect."""
-    if explicit and explicit != "auto":
-        return explicit
-    env = os.environ.get("SA_LIVE_TIER", "").strip()
-    if env in TIER_CHOICES and env != "auto":
-        return env
-    # Auto-detect GPU via ctranslate2 (already a dep, avoids a heavy torch install)
+    chosen = explicit if (explicit and explicit != "auto") else None
+    if chosen is None:
+        env = os.environ.get("SA_LIVE_TIER", "").strip()
+        if env in TIER_CHOICES and env != "auto":
+            chosen = env
+    # An explicit / env GPU tier is honoured only if CUDA is actually usable; otherwise
+    # fall back to large-v3 on CPU so a forced "gpu" can never fail to load.
+    if chosen in ("gpu", "gpu-4gb"):
+        try:
+            from . import cudadl
+            return chosen if cudadl.cuda_ready() else "cpu-large"
+        except Exception:
+            return "cpu-large"
+    if chosen:
+        return chosen
+    # No explicit choice: auto-detect. Use the GPU only when CUDA is actually usable
+    # (frozen: the libs are downloaded; source: a system CUDA toolkit is assumed).
     try:
-        import ctranslate2
-        if ctranslate2.get_cuda_device_count() > 0:
-            # large-v3 float16 needs ~3GB+; small cards (GTX 1650, 4GB) must use
+        from . import cudadl
+        if cudadl.cuda_ready():
+            # large-v3 float16 needs ~6GB+; small cards (e.g. GTX 1650, 4GB) use
             # int8_float16 to fit. Probe VRAM and pick the safe tier.
             vram = _gpu_vram_mb()
             if vram is not None and vram < 6000:
@@ -91,9 +102,46 @@ def pick_tier(explicit):
     cores = os.cpu_count() or 0
     if cores >= 8:
         return "cpu-mid"    # medium start; downgrades to small/base if it lags
-    if cores <= 2:
-        return "cpu-min"    # base start for very weak CPUs
-    return "cpu"            # small start for modest CPUs
+    return "cpu"            # small start for modest CPUs (downgrades live if it lags)
+
+
+# UI quality keys are model names (plus "auto"); map them to concrete tiers. large-v3
+# uses the GPU when one is present, else CPU (slow live, but fine for uploaded files).
+_QUALITY_TO_CPU_TIER = {
+    "small": "cpu", "medium": "cpu-mid", "large-v3-turbo": "cpu-strong",
+    "large-v3": "cpu-large", "base": "cpu-min",
+}
+
+
+def _cpu_auto_tier():
+    """CPU 'auto' quality: ambitious by core count; the engine downgrades live if it lags."""
+    cores = os.cpu_count() or 0
+    return "cpu-mid" if cores >= 8 else "cpu"
+
+
+def resolve_tier(quality, device="auto"):
+    """Resolve a UI quality choice + device preference to a concrete TIER_CONFIG tier.
+
+    device: "cpu" forces the CPU even when a GPU is present; "auto"/"gpu" use the GPU when
+    it is ready. The UI exposes this as a GPU/CPU toggle (default GPU on GPU machines). On
+    the GPU large-v3 is fast, so the Quality dropdown only applies on the CPU; on the GPU we
+    run the best model the card can hold."""
+    if device != "cpu":
+        try:
+            from . import cudadl
+            if cudadl.cuda_ready():
+                return pick_tier("auto")      # -> "gpu" or "gpu-4gb" per VRAM
+        except Exception:
+            pass
+    # CPU path (forced, or no usable GPU): honour the picked quality, never a GPU tier.
+    if not quality or quality == "auto":
+        return _cpu_auto_tier()
+    if quality in TIER_CHOICES:
+        t = pick_tier(quality)
+        return "cpu-large" if t in ("gpu", "gpu-4gb") else t
+    if quality == "large-v3":
+        return "cpu-large"
+    return _QUALITY_TO_CPU_TIER.get(quality, _cpu_auto_tier())
 
 
 def default_chunk_seconds(tier):
