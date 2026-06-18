@@ -1,5 +1,22 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-18, v1.0.13: fix summary crash on AVX2-only CPUs (no more AVX-512)
+
+The real fix for the summary `[WinError -1073741795]` (STATUS_ILLEGAL_INSTRUCTION) on Sean's
+i7-9750H laptop. Root cause, proven by disassembly: abetlen's llama-cpp-python **0.3.23** "cpu"
+wheel is compiled WITH AVX-512 (1203 AVX-512 instructions in `ggml-cpu.dll`), which the
+i7-9750H does not have. The earlier "portable wheel" guard did not catch it because the
+AVX-512 wheel is also tagged `py3-none`.
+
+- Pinned llama-cpp-python to **0.3.22**, whose cpu wheel is AVX2-safe (0 AVX-512 instructions)
+  and still loads Gemma 4. Verified: 0 AVX-512 by disassembly + a real Gemma 4 summary.
+- Replaced the build guard with `tools/ensure_avx2_llama.py`, which disassembles `ggml-cpu.dll`
+  and FAILS the build if any AVX-512 instruction is present (the tag check was insufficient).
+- `licensing.APP_VERSION` 1.0.12 -> 1.0.13.
+
+Note: this fixes ALL summary models on AVX2-only CPUs (they all share this llama.cpp), not just
+the 12B. Summaries run CPU-only; on a 4 GB GPU the 12B cannot be offloaded anyway.
+
 ## 2026-06-18, v1.0.12: Gemma 4 12B summary model option
 
 - Adds Gemma 4 12B (Q4_K_M, ~7.12 GB) to the summary-model catalogue (`modeldl.py`), pinned to

@@ -30,35 +30,13 @@ if ($LASTEXITCODE -ne 0) {
     & $pyexe -m pip install pyinstaller
 }
 
-# llama.cpp MUST be the PORTABLE prebuilt CPU wheel, not a local source build. A source
-# build bakes in THIS PC's CPU instructions (the Ryzen 7700X's AVX-512) and then crashes
-# with STATUS_ILLEGAL_INSTRUCTION on any machine without them (e.g. an Intel laptop). The
-# portable wheel is tagged "py3-none"; a local build is tagged "cp3xx". Enforce portable so
-# the app opens on any CPU; auto-installs the portable wheel of the same version if needed.
-$llVer = (& $pyexe -c "import importlib.metadata as m; print(m.version('llama-cpp-python'))").Trim()
-$site = Join-Path (Split-Path $pyexe) "..\Lib\site-packages"
-$llDist = Get-ChildItem $site -Filter "llama_cpp_python-*.dist-info" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
-$llPortable = $false
-if ($llDist) {
-    $llTag = Get-Content (Join-Path $llDist.FullName "WHEEL") -ErrorAction SilentlyContinue | Where-Object { $_ -match '^Tag:' }
-    if ($llTag -match 'py3-none') { $llPortable = $true }
-}
-if (-not $llPortable) {
-    Write-Host "  llama-cpp-python is a native build (would crash on CPUs without this PC's instructions); installing the portable CPU wheel..." -ForegroundColor Yellow
-    & $pyexe -m pip install --force-reinstall --no-deps --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu "llama-cpp-python==$llVer"
-    if ($LASTEXITCODE -ne 0) { Write-Host "  Could not install the portable llama-cpp-python wheel. Fix before shipping." -ForegroundColor Red; exit 1 }
-    # Re-verify: --extra-index-url leaves PyPI in the candidate set, so a native wheel could
-    # still have been picked. Re-read the WHEEL tag and FAIL unless it is portable (py3-none),
-    # so a CPU-specific binary can never ship.
-    $llDist2 = Get-ChildItem $site -Filter "llama_cpp_python-*.dist-info" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
-    $tag2 = ""
-    if ($llDist2) { $tag2 = (Get-Content (Join-Path $llDist2.FullName "WHEEL") -ErrorAction SilentlyContinue | Where-Object { $_ -match '^Tag:' }) -join " " }
-    if ($tag2 -notmatch 'py3-none') {
-        Write-Host "  After reinstall, llama-cpp-python is STILL not the portable wheel (tag: '$tag2'). Aborting so a native binary cannot ship." -ForegroundColor Red
-        exit 1
-    }
-    Write-Host "  Portable llama-cpp-python wheel confirmed (tag: $tag2)." -ForegroundColor Green
-}
+# llama.cpp must contain NO AVX-512, or the summary engine crashes with
+# STATUS_ILLEGAL_INSTRUCTION on AVX2-only CPUs (e.g. an Intel i7-9750H). abetlen's 0.3.23
+# "cpu" wheel is compiled WITH AVX-512; the 0.3.22 "cpu" wheel is AVX2-safe and still supports
+# Gemma 4. This guard pins 0.3.22 and VERIFIES by disassembling ggml-cpu.dll (a WHEEL-tag check
+# is NOT enough: both wheels are tagged py3-none). It fails the build if any AVX-512 remains.
+& $pyexe (Join-Path $here "tools\ensure_avx2_llama.py")
+if ($LASTEXITCODE -ne 0) { Write-Host "  llama.cpp AVX-512 guard failed; aborting build." -ForegroundColor Red; exit 1 }
 
 Push-Location $here
 $rc = 0
