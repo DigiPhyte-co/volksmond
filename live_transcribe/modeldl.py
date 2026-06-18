@@ -38,6 +38,17 @@ CATALOGUE = [
         "revision": "653803f092503c04a65164346f3208a36e707693",
         "sha256": "519b9793ed6ce0ff530f1b7c96e848e08e49e7af4d57bb97f76215963a54146d",
     },
+    {
+        "key": "gemma-4-12b",
+        "params": "12B",
+        "approx_bytes": 7_121_860_000,      # ~7.12 GB (exact, pinned). Biggest/best local
+                                            # summary; CPU-only like the rest, so it wants a
+                                            # capable machine with plenty of RAM.
+        "repo_id": "unsloth/gemma-4-12b-it-GGUF",
+        "filename": "gemma-4-12b-it-Q4_K_M.gguf",
+        "revision": "3249fa54d5efa384afc552cc6700ad091efd5c39",
+        "sha256": "43fec98c5102b1c446b4ddd0a9439f1db3a2e1f2e0b8cd143ce1ea619a9403d6",
+    },
 ]
 _BY_KEY = {m["key"]: m for m in CATALOGUE}
 
