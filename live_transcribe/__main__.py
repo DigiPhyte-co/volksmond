@@ -130,7 +130,13 @@ def resolve_tier(quality, device="auto"):
         try:
             from . import cudadl
             if cudadl.cuda_ready():
-                return pick_tier("auto")      # -> "gpu" or "gpu-4gb" per VRAM
+                # Pick the GPU tier directly from VRAM. Do NOT route through pick_tier() here:
+                # it honours the SA_LIVE_TIER env override (a CLI-only feature), so a stray
+                # leftover like SA_LIVE_TIER=cpu-strong would silently force a CPU tier even
+                # though the user chose GPU and the GPU is ready (the cuda_ready=True ->
+                # cpu-strong bug seen on the test laptop). The GUI app never honours it.
+                vram = _gpu_vram_mb()
+                return "gpu-4gb" if (vram is not None and vram < 6000) else "gpu"
         except Exception:
             pass
     # CPU path (forced, or no usable GPU): honour the picked quality, never a GPU tier.

@@ -1,5 +1,17 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-18, v1.0.14: GPU ignored because of a stray SA_LIVE_TIER env var
+
+The GPU was detected and ready (`cuda_ready=True`) but transcription still ran on CPU. The
+`[tier]` log line caught it: `quality=None device='auto' ... cuda_ready=True -> cpu-strong`.
+Cause: `resolve_tier` routed the GPU choice through `pick_tier("auto")`, which honours the
+CLI-only `SA_LIVE_TIER` env override. A leftover `SA_LIVE_TIER=cpu-strong` on the test laptop
+therefore forced a CPU tier even with a ready GPU.
+
+- `__main__.resolve_tier`: when a GPU is ready, compute the GPU tier directly from VRAM rather
+  than calling `pick_tier`, so the GUI app never honours `SA_LIVE_TIER` (it stays a CLI-only
+  override). `licensing.APP_VERSION` 1.0.13 -> 1.0.14.
+
 ## 2026-06-18, v1.0.13: fix summary crash on AVX2-only CPUs (no more AVX-512)
 
 The real fix for the summary `[WinError -1073741795]` (STATUS_ILLEGAL_INSTRUCTION) on Sean's
