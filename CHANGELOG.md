@@ -1,5 +1,12 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-18, v1.0.12: Gemma 4 12B summary model option
+
+- Adds Gemma 4 12B (Q4_K_M, ~7.12 GB) to the summary-model catalogue (`modeldl.py`), pinned to
+  the unsloth GGUF mirror with commit + SHA-256 exactly like the E2B/E4B entries. The biggest,
+  highest-quality local summary option; CPU-only like the others, so it wants a capable machine
+  with plenty of RAM. `licensing.APP_VERSION` 1.0.11 -> 1.0.12.
+
 ## 2026-06-18, v1.0.8 to v1.0.11: GPU that just works, summary fix, history split, turnkey build
 
 Testing-driven fixes from Sean's GTX 1650 laptop, plus an independent Codex review
