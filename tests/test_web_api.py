@@ -68,7 +68,7 @@ def test_summary_model_download_api():
     # are both refused before any bytes move).
     j = client.get("/api/summary-models").json()
     keys = [m["key"] for m in j["models"]]
-    assert keys == ["gemma-4-e2b", "gemma-4-e4b"], keys
+    assert keys == ["gemma-4-e2b", "gemma-4-e4b", "gemma-4-12b"], keys
     assert all(m["approx_bytes"] > 0 for m in j["models"]), j
     r = client.post("/api/summary-model/download", json={"key": "nope"})
     assert r.status_code == 400, f"bad model key should 400, got {r.status_code}"
@@ -120,14 +120,15 @@ def test_cuda_api():
 
 def test_quality_resolution():
     # The UI sends model-keyed quality choices; resolve_tier maps each to a real tier
-    # whose model matches, and "Best"/large-v3 resolves to a tier that loads large-v3
-    # (GPU when present, else the CPU-large tier). auto + legacy keys still resolve.
+    # whose model matches. Force the CPU path (device="cpu"): on a GPU box every quality
+    # is overridden to the GPU tier (the Quality dropdown only applies on the CPU), so the
+    # quality->model mapping is only meaningful, and only deterministic, on the CPU path.
     from live_transcribe.__main__ import resolve_tier
     from live_transcribe.transcribe import TIER_CONFIG
-    assert TIER_CONFIG[resolve_tier("small")]["model"] == "small"
-    assert TIER_CONFIG[resolve_tier("medium")]["model"] == "medium"
-    assert TIER_CONFIG[resolve_tier("large-v3-turbo")]["model"] == "large-v3-turbo"
-    assert TIER_CONFIG[resolve_tier("large-v3")]["model"] == "large-v3"
+    assert TIER_CONFIG[resolve_tier("small", "cpu")]["model"] == "small"
+    assert TIER_CONFIG[resolve_tier("medium", "cpu")]["model"] == "medium"
+    assert TIER_CONFIG[resolve_tier("large-v3-turbo", "cpu")]["model"] == "large-v3-turbo"
+    assert TIER_CONFIG[resolve_tier("large-v3", "cpu")]["model"] == "large-v3"
     assert resolve_tier("auto") in TIER_CONFIG
     assert resolve_tier("cpu-mid") in TIER_CONFIG          # legacy tier key passthrough
     assert "cpu-large" in TIER_CONFIG and TIER_CONFIG["cpu-large"]["device"] == "cpu"
@@ -251,6 +252,85 @@ def test_host_rebinding_blocked():
     print("  OK  non-loopback Host rejected (DNS-rebinding defence); loopback served")
 
 
+def test_summary_device_and_capability():
+    # /api/models reports whether summaries can use the GPU on this build, plus the current
+    # summary device. summary_gpu_capable is True only when an NVIDIA GPU is present AND this
+    # build's llama.cpp can offload (the CPU wheel cannot), so it is a plain bool here.
+    m = client.get("/api/models").json()
+    for k in ("summary_installed", "summary_gpu_capable", "summary_device"):
+        assert k in m, (k, m)
+    assert isinstance(m["summary_gpu_capable"], bool), m
+    # summary_device round-trips through settings; save and restore the real value.
+    from live_transcribe import config
+    orig = config.load().get("summary_device")
+    try:
+        assert client.post("/api/settings", json={"summary_device": "cpu"}).json()["summary_device"] == "cpu"
+        assert client.post("/api/settings", json={"summary_device": "auto"}).json()["summary_device"] == "auto"
+    finally:
+        config.update({"summary_device": orig or "auto"})
+    print("  OK  /api/models reports summary GPU capability + device; summary_device round-trips")
+
+
+def test_fits_on_gpu_logic():
+    # The GPU fit check: full offload only when the model file plus a working-memory
+    # headroom fits in VRAM. A tiny real file fits a big card; nothing fits an unknown
+    # or too-small card. (Matches the rule that a 12B cannot be offloaded to a 4 GB card.)
+    from live_transcribe import summarise as sm
+    small = os.path.abspath(__file__)            # a real, tiny file
+    assert sm.fits_on_gpu(small, 24000) is True
+    assert sm.fits_on_gpu(small, 1000) is False  # below the 2 GB headroom
+    assert sm.fits_on_gpu(small, None) is False
+    assert sm.fits_on_gpu("does-not-exist.gguf", 24000) is False  # missing file -> not on GPU
+    print("  OK  fits_on_gpu: fits a big card, refuses a small/unknown card and a missing file")
+
+
+def test_levels_and_switch_device():
+    # The live meter endpoint is always safe to poll; idle -> running False + zeroed levels.
+    j = client.get("/api/levels").json()
+    assert j["running"] is False and j["mic"]["peak"] == 0.0 and j["sys"]["rms"] == 0.0, j
+    # Switching devices is only valid during a live session: idle -> 409 (not a crash).
+    assert client.post("/api/switch-device", json={"which": "mic", "device": "1"}).status_code == 409
+    # which is constrained to mic/loopback; junk -> 422.
+    assert client.post("/api/switch-device", json={"which": "nope"}).status_code == 422
+    # State-changing, so CSRF-protected.
+    bare = TestClient(app, base_url="http://localhost")
+    assert bare.post("/api/switch-device", json={"which": "mic"}).status_code == 403
+    # The capture stores a passed-in t0, so a live device switch can keep the timeline.
+    from live_transcribe import capture as _cap
+    assert _cap.AudioCapture(t0=123.0)._t0_init == 123.0, "t0 not stored for timeline continuity"
+    print("  OK  /api/levels idle-safe; /api/switch-device session-gated + validated + CSRF; capture keeps t0")
+
+
+def test_warm_up():
+    # Warm-up status is always readable, and shaped for the UI.
+    st = client.get("/api/warm-up").json()
+    assert "state" in st and "tier" in st, st
+    # POST is state-changing -> CSRF-protected (a bare client is refused before any warm-up runs).
+    bare = TestClient(app, base_url="http://localhost")
+    assert bare.post("/api/warm-up", json={}).status_code == 403
+    # With the token it returns a state. Stub the loader so the test never builds or downloads
+    # a model; we are checking the endpoint contract, not loading weights.
+    import live_transcribe.transcribe as T
+    orig = T.warm_up_async
+    T.warm_up_async = lambda tier: {"state": "warming", "tier": tier}
+    try:
+        r = client.post("/api/warm-up", json={"tier": "small", "device": "cpu"})
+        assert r.status_code == 200 and r.json().get("state") in ("warming", "ready", "busy", "idle"), r.text
+    finally:
+        T.warm_up_async = orig
+    print("  OK  /api/warm-up: status readable, CSRF-protected, trigger returns a state (loader stubbed)")
+
+
+def test_summarise_accepts_instruction():
+    # The summary-style feature sends a free-text instruction. The endpoint must accept it
+    # (a bogus file still 404s, proving the field validates rather than 422-ing), so custom
+    # and template summaries are not rejected at the schema.
+    r = client.post("/api/summarise", json={"file": "no-such.md",
+                                            "instruction": "List only the action items.", "language": "en"})
+    assert r.status_code == 404, f"instruction should validate; expected 404 on missing file, got {r.status_code}: {r.text}"
+    print("  OK  /api/summarise accepts a custom instruction (bogus file -> 404, not 422)")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_app_info,
@@ -268,7 +348,12 @@ if __name__ == "__main__":
                test_host_rebinding_blocked,
                test_unique_transcript_filenames,
                test_filename_allow_list,
-               test_license_pubkey_precedence):
+               test_license_pubkey_precedence,
+               test_summary_device_and_capability,
+               test_fits_on_gpu_logic,
+               test_levels_and_switch_device,
+               test_warm_up,
+               test_summarise_accepts_instruction):
         try:
             fn()
         except AssertionError as e:

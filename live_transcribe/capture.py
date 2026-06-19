@@ -77,8 +77,13 @@ def _find_last_silence(audio: np.ndarray, sample_rate: int,
 
 
 class AudioCapture:
-    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None):
-        """on_chunk(source: str, audio_16k_mono: np.ndarray, t_start: float)"""
+    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None, t0=None):
+        """on_chunk(source: str, audio_16k_mono: np.ndarray, t_start: float).
+
+        t0: optional monotonic start time. When a live session switches its mic or
+        loopback we tear this capture down and start a fresh one; passing the original
+        t0 keeps transcript timestamps continuous across the switch instead of jumping
+        back to 00:00."""
         self.mic_device_spec = mic_device
         self.loopback_device_spec = loopback_device
         self.chunk_seconds = chunk_seconds
@@ -86,9 +91,11 @@ class AudioCapture:
 
         self._stop_event = threading.Event()
         self._t0 = None
+        self._t0_init = t0
         self._pa = None
         self._streams = []
         self._workers = []
+        self._levels = {}         # source -> (peak, rms), latest input level for a live meter
 
         # Per-source state, keyed by "MIC" / "SYS"
         self._buffers = {}        # source -> list[np.ndarray]
@@ -98,7 +105,7 @@ class AudioCapture:
         self._channels = {}       # source -> int
 
     def start(self):
-        self._t0 = time.monotonic()
+        self._t0 = self._t0_init if self._t0_init is not None else time.monotonic()
         self._pa = pa.PyAudio()
 
         loopback_info = None
@@ -169,6 +176,17 @@ class AudioCapture:
         for w in self._workers:
             w.join(timeout=BLOCK_SECONDS + 1.5)
 
+    def levels(self):
+        """Latest per-source input level as {source: {"peak": x, "rms": y}}, 0..1, for a
+        live meter. Refreshed every PortAudio callback (about every BLOCK_SECONDS). A source
+        with no audio yet is simply absent."""
+        out = {}
+        for src in list(self._levels):
+            v = self._levels.get(src)
+            if v is not None:
+                out[src] = {"peak": v[0], "rms": v[1]}
+        return out
+
     def _open_stream(self, source, info):
         rate = int(info["defaultSampleRate"])
         max_ch = max(1, int(info["maxInputChannels"]))
@@ -201,13 +219,17 @@ class AudioCapture:
             lock = self._buffer_locks[source]
             ch = channels
 
-            def callback(in_data, frame_count, time_info, status, _ch=ch, _src=source, _buf=buf, _lock=lock):
+            def callback(in_data, frame_count, time_info, status, _ch=ch, _src=source, _buf=buf, _lock=lock, _levels=self._levels):
                 try:
                     arr = np.frombuffer(in_data, dtype=np.float32)
                     if _ch > 1:
                         arr = arr.reshape(-1, _ch)
                     else:
                         arr = arr.reshape(-1, 1)
+                    # Cheap per-block level for the live meter (peak + RMS, 0..1). A single
+                    # dict assignment, so the reader (levels()) never sees a torn value.
+                    if arr.size:
+                        _levels[_src] = (float(np.max(np.abs(arr))), float(np.sqrt(np.mean(arr * arr))))
                     with _lock:
                         _buf.append(arr)
                         counts[_src] = counts[_src] + arr.shape[0]

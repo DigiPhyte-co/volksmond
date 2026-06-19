@@ -61,6 +61,32 @@ On a machine with an NVIDIA GPU + driver but NO Python and NO CUDA toolkit:
    missing-DLL error.
 4. Stop -> transcript saved to `%LOCALAPPDATA%\sa-live-transcribe\sessions`.
 
+## GPU summaries (app code added 2026-06-19, packaging still PLANNED)
+The summary path (llama.cpp / Gemma 4) is independent of the transcription GPU above
+(ctranslate2). The app now offloads summaries to the GPU when llama.cpp supports it and the
+model fits in VRAM:
+- `summarise.gpu_offload_supported()` returns True only if the installed llama-cpp-python has
+  a CUDA backend (the shipped CPU wheel returns False).
+- `summarise.fits_on_gpu(model_path, vram_mb)` requires the file size + a 2 GB headroom to fit.
+- The `/api/summarise` endpoint picks `n_gpu_layers` (-1 to offload all, else 0) and falls back
+  to the CPU on any GPU error (e.g. CUDA OOM). A `summary_device` setting ("auto"/"cpu") and a
+  Settings toggle (shown only when `summary_gpu_capable`) let the user force CPU.
+
+This is build-agnostic and safe: with the CPU wheel `gpu_offload_supported()` is False, so the
+toggle is hidden and summaries stay on the CPU exactly as before. To ENABLE GPU summaries:
+- From source: install the CUDA wheel instead of the CPU one (see requirements.txt):
+  `pip install llama-cpp-python==0.3.22 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124`
+- In the packaged GPU build: install that CUDA wheel into the build venv before PyInstaller
+  runs (fold into `build-app.ps1 -Gpu`). llama.cpp's CUDA backend needs cudart + cuBLAS at
+  runtime (already part of the CUDA libs fetched for transcription); PyInstaller pulls the
+  wheel's own ggml-cuda DLLs. cuDNN is NOT needed by llama.cpp.
+
+Status: the device-selection logic is verified on Sean's 3090 box (gpu_present=True,
+vram=24576 MB, and it correctly chooses CPU while the CPU wheel is installed). Actual GPU
+summary EXECUTION still needs a run with the CUDA wheel installed there.
+
 ## Open decisions
 - Public second download vs author-only? Recommend: secondary, clearly labelled.
 - Minimum NVIDIA driver version to state on the download page.
+- GPU summaries: ship in the same GPU build as GPU transcription (recommended), or keep CPU-only
+  summaries even in the GPU build to bound its size?
