@@ -1,5 +1,59 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-19, v1.0.15: summary styles, GPU summaries, live device switch + meters, faster first start
+
+Five user-facing features (`licensing.APP_VERSION` 1.0.14 -> 1.0.15).
+
+- **Reader transcript/summary switch is now an obvious toggle.** In the reader, Transcript and
+  Summary were two loose ghost buttons next to Copy and Folder, so while reading the transcript
+  the way back to the summary looked like just another toolbar action (the sparkle icon even read
+  as "make a new summary"). They are now a connected segmented control, visually distinct from the
+  actions. The switching logic itself already worked both ways; this is the affordance fix.
+  (`web/static/app.js`, readerView.)
+- **Summary styles and custom instructions.** The summarise card and the regenerate controls now
+  offer a style: Standard (meeting minutes), Action items only, Decisions and owners, Detailed
+  notes, One-paragraph summary, or Custom (a free-text instruction box). The chosen instruction is
+  sent to the existing `/api/summarise` (which already accepted `instruction`); the server still
+  adds the transcript-cleanup guidance and the output-language directive. EN and AF strings added.
+  (`web/static/app.js`, `i18n.js`.)
+- **GPU summaries (app code; packaging pending).** Summaries can run on an NVIDIA GPU instead of
+  the CPU when this build's llama.cpp has a CUDA backend and the model fits in VRAM, with automatic
+  CPU fallback and a Settings GPU/CPU toggle (shown only when capable). Build-agnostic: the shipped
+  CPU wheel keeps summaries on the CPU, unchanged. Enabling it ships with the separate GPU build
+  (see `docs/cuda-build-plan.md` and `requirements.txt`). New `summary_device` setting.
+  (`summarise.py`, `web/app.py`, `config.py`.)
+- **Switch mic/speaker and see input levels during a live session.** The live and record-only
+  screens now carry a compact audio strip: a dropdown per source to change the microphone or
+  system-audio device mid-session, and a level meter for each (peak, with a clip tint). Switching
+  restarts the capture on the new device while the engine, recorder, and transcript keep running,
+  preserving the timeline (a brief ~1s capture gap during the switch) and reverting to the previous
+  device if the new one fails to open. New `/api/levels` and `/api/switch-device`; `/api/status`
+  now reports the current devices so a resumed session shows the right ones.
+  (`capture.py`, `web/app.py`, `web/static/app.js`, `i18n.js`.)
+- **Kill the multi-minute first-use stall.** Loading an already-downloaded model used to revalidate
+  it against HuggingFace over the network on every launch (minutes on a slow or flaky connection),
+  and the model only loaded when you pressed Begin. Now models load from the local cache only (no
+  network), are cached and reused across sessions, and are warmed up in the background the moment you
+  open a pre-meeting screen, with a "Preparing / ready" chip next to Begin. A tiny dummy inference in
+  the warm-up also pre-initialises CUDA/cuDNN off the critical path. Measured on the 3090: a cached
+  load drops to ~0.5s, and the full background warm-up reaches ready in ~5s. New `/api/warm-up`.
+  (`transcribe.py`, `web/app.py`, `web/static/app.js`, `i18n.js`.)
+
+Tests: `tests/test_web_api.py` extended (summary GPU capability and device, `fits_on_gpu`, custom
+instruction accepted, `/api/levels` + `/api/switch-device` validation, capture keeps `t0`,
+`/api/warm-up`) and two stale assertions fixed (the 12B model is in the catalogue now; the
+quality-resolution test forces the CPU path so it is correct on GPU boxes too). All web-API tests
+pass. Verified in the browser: the nav toggle, the style picker, the live audio strip (device
+dropdowns + working meters with clip tint), and the warm-up chip; and measured the cached-load and
+warm-up timings on the 3090. Still need an on-machine run for: GPU summary EXECUTION (with the CUDA
+wheel on the 3090), real level movement, and a real mid-session device hot-swap.
+
+Codex review (gpt-5.5), folded in: a failed device switch now stops the half-opened capture so it
+cannot leak the audio device; and `AudioCapture.levels()` reads the fixed MIC/SYS keys instead of
+iterating the live dict, so a startup race can no longer 500 `/api/levels`. Codex's third finding
+(warm-up dummy vs session start) was a false positive: the dummy runs inside the build lock that
+session start also takes, so they never overlap.
+
 ## 2026-06-18, v1.0.14: GPU ignored because of a stray SA_LIVE_TIER env var
 
 The GPU was detected and ready (`cuda_ready=True`) but transcription still ran on CPU. The

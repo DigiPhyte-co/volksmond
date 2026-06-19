@@ -121,6 +121,11 @@ class _State:
         self.model: Optional[str] = None
         self.output_path: Optional[Path] = None
         self.language: Optional[str] = None
+        # Current capture device specs + chunk size, so a live device switch can rebuild
+        # the capture with one source changed and the rest identical.
+        self.mic_device: Optional[str] = None
+        self.loopback_device: Optional[str] = None
+        self.chunk_seconds: Optional[int] = None
         self.running: bool = False
         self.recording: bool = False
         self.transcribing: bool = False
@@ -142,6 +147,9 @@ class _State:
         self.model = None
         self.output_path = None
         self.language = None
+        self.mic_device = None
+        self.loopback_device = None
+        self.chunk_seconds = None
         self.running = False
         self.recording = False
         self.transcribing = False
@@ -154,6 +162,19 @@ STATE = _State()
 # Only one native file dialog (tkinter) at a time: concurrent Tk roots on worker
 # threads can hang or trip Tk's thread assumptions. A second pick returns 409.
 _PICK_LOCK = threading.Lock()
+
+
+def _feed(source, audio, t_start):
+    """Route a captured chunk to the recorder and/or the engine, honouring the live flags.
+
+    Tapped before the engine so a recording stays complete even if transcription drops
+    chunks under load. Module-level (not a closure) so /api/switch-device can rebuild the
+    capture with the same feed without re-deriving it; the flags and targets are read live
+    off STATE, so a three-way stop or a device switch is picked up without rewiring."""
+    if STATE.recording and STATE.recorder is not None:
+        STATE.recorder.on_chunk(source, audio, t_start)
+    if STATE.transcribing and STATE.engine is not None:
+        STATE.engine.on_chunk(source, audio, t_start)
 
 
 class StartRequest(BaseModel):
@@ -264,6 +285,8 @@ def status():
             "output_path": str(STATE.output_path) if STATE.output_path else None,
             "started_at": STATE.started_at.isoformat() if STATE.started_at else None,
             "sink_error": live_err or STATE.sink_error,
+            "mic_device": STATE.mic_device,
+            "loopback_device": STATE.loopback_device,
         }
         if STATE.stopping and STATE.engine is not None:
             resp["pending"] = STATE.engine.pending()
@@ -373,6 +396,105 @@ def devices_list():
         p.terminate()
 
 
+@app.get("/api/levels")
+def levels():
+    """Latest mic and system-audio input levels for the live meter: peak + rms, 0..1.
+    Zeros when nothing is capturing. GET and cheap, so the UI can poll a few times a second."""
+    z = {"peak": 0.0, "rms": 0.0}
+    with STATE.lock:
+        cap = STATE.capture if (STATE.running and STATE.capture is not None) else None
+    lv = cap.levels() if cap is not None else {}
+    return {"running": cap is not None, "mic": lv.get("MIC", z), "sys": lv.get("SYS", z)}
+
+
+class SwitchDeviceRequest(BaseModel):
+    which: Literal["mic", "loopback"]
+    device: Optional[str] = None    # device index (or name substring); None = system default
+
+
+@app.post("/api/switch-device")
+def switch_device(req: SwitchDeviceRequest):
+    """Change the mic or system-audio device during a LIVE session without ending it.
+
+    The capture is restarted on the new device while the engine, recorder, and transcript
+    file keep running; the original timeline (t0) is preserved so timestamps stay continuous.
+    There is a brief (~1s) capture gap during the switch. On failure we revert to the
+    previously working devices, so a bad pick never leaves the session with no audio."""
+    with STATE.lock:
+        if not STATE.running or STATE.stopping or STATE.source_kind != "live" or STATE.capture is None:
+            raise HTTPException(status_code=409, detail="Switching devices is only available during a live session.")
+        old_cap = STATE.capture
+        prev_mic, prev_loop = STATE.mic_device, STATE.loopback_device
+        mic = req.device if req.which == "mic" else prev_mic
+        loop = req.device if req.which == "loopback" else prev_loop
+        chunk = STATE.chunk_seconds or 15
+
+        def _build(m, l):
+            return capture.AudioCapture(mic_device=m, loopback_device=l, chunk_seconds=chunk,
+                                        on_chunk=_feed, t0=old_cap._t0)
+
+        try:
+            old_cap.stop()
+        except Exception:
+            pass
+        new_cap = None
+        try:
+            new_cap = _build(mic, loop)
+            new_cap.start()
+        except Exception as e:
+            # The new device would not open. Stop the half-opened attempt first so it cannot
+            # leak the audio device and a thread, then bring the previous (working) one back
+            # so the session keeps capturing rather than going silent.
+            if new_cap is not None:
+                try:
+                    new_cap.stop()
+                except Exception:
+                    pass
+            revert = None
+            try:
+                revert = _build(prev_mic, prev_loop)
+                revert.start()
+                STATE.capture = revert
+            except Exception:
+                if revert is not None:
+                    try:
+                        revert.stop()
+                    except Exception:
+                        pass
+                STATE.capture = None  # both failed: session stays running with no capture; the user can Stop
+            raise HTTPException(status_code=500, detail=f"Could not switch the {req.which}: {e}")
+        STATE.capture = new_cap
+        STATE.mic_device, STATE.loopback_device = mic, loop
+        return {"which": req.which, "device": req.device, "mic_device": mic, "loopback_device": loop}
+
+
+class WarmUpRequest(BaseModel):
+    tier: str = "auto"
+    device: str = "auto"
+
+
+@app.get("/api/warm-up")
+def warm_up_status():
+    """Current background warm-up state, so the UI can show 'preparing' / 'ready'."""
+    return transcribe.warm_status()
+
+
+@app.post("/api/warm-up")
+def warm_up(req: WarmUpRequest):
+    """Pre-load (and lightly exercise) the transcription model in the background so the first
+    Begin is instant instead of a multi-minute first-use stall. Idempotent and best-effort:
+    safe to call whenever the user reaches a pre-meeting screen. A no-op during a running
+    session, which already owns the model."""
+    with STATE.lock:
+        if STATE.running:
+            return {"state": "busy", "tier": None}
+    settings = config.load()
+    quality = req.tier if (req.tier and req.tier != "auto") else (settings.get("tier") or "auto")
+    device = (getattr(req, "device", None) or settings.get("device") or "auto")
+    tier = resolve_tier(quality, device)
+    return transcribe.warm_up_async(tier)
+
+
 def _resolve_tier_lang_prompt(req):
     """Shared start/file-import resolution of tier, language, and seeded prompt.
 
@@ -444,21 +566,17 @@ def start(req: StartRequest):
         STATE.language = (language or "auto") if transcribe_on else None
         STATE.source_kind = "live"
         STATE.running = True
+        STATE.mic_device = req.mic_device
+        STATE.loopback_device = req.loopback_device
+        STATE.chunk_seconds = chunk_seconds
 
-        # Recorder is tapped BEFORE the engine, so the recording stays complete
-        # even when transcription drops chunks under load. Flags are read live so a
-        # three-way stop can switch either stream off without restarting capture.
-        def feed(source, audio, t_start):
-            if STATE.recording and STATE.recorder is not None:
-                STATE.recorder.on_chunk(source, audio, t_start)
-            if STATE.transcribing and STATE.engine is not None:
-                STATE.engine.on_chunk(source, audio, t_start)
-
+        # Recorder is tapped BEFORE the engine (see _feed), so the recording stays complete
+        # even when transcription drops chunks under load.
         cap = capture.AudioCapture(
             mic_device=req.mic_device,
             loopback_device=req.loopback_device,
             chunk_seconds=chunk_seconds,
-            on_chunk=feed,
+            on_chunk=_feed,
         )
         try:
             cap.start()
@@ -844,6 +962,7 @@ class SettingsPatch(BaseModel):
     transcription_language: Optional[str] = None
     tier: Optional[str] = None
     device: Optional[str] = None
+    summary_device: Optional[str] = None
     save_location: Optional[str] = None
     default_context: Optional[str] = None
     ai_backend: Optional[str] = None
@@ -920,10 +1039,21 @@ def get_features():
 
 @app.get("/api/models")
 def models_status():
-    """Which summary model is installed (the Whisper model is handled by the tier)."""
+    """Which summary model is installed (the Whisper model is handled by the tier).
+
+    summary_gpu_capable is True only when an NVIDIA GPU is present AND this build's
+    llama.cpp can offload to it (the CPU-only wheel cannot), so the UI shows a GPU/CPU
+    choice for summaries only when it would actually do something."""
+    from .. import summarise as _summarise, cudadl
+    try:
+        gpu_capable = bool(cudadl.gpu_present() and _summarise.gpu_offload_supported())
+    except Exception:
+        gpu_capable = False
     return {
         "summary_model": config.load().get("summary_model") or "",
         "summary_installed": config.summary_model_path() is not None,
+        "summary_gpu_capable": gpu_capable,
+        "summary_device": config.load().get("summary_device") or "auto",
     }
 
 
@@ -1183,10 +1313,34 @@ def summarise_endpoint(req: SummariseRequest):
 
     transcript = target.read_text(encoding="utf-8")
     instruction = (req.instruction or config.active_instruction()) or None
-    from .. import summarise as _summarise
+    from .. import summarise as _summarise, cudadl
+
+    # Decide where to run. GPU only when: the user has not forced CPU, an NVIDIA GPU is
+    # present, this build's llama.cpp can offload (the CPU wheel cannot), and the model
+    # fits in VRAM with headroom. Anything else stays on the CPU.
+    device = (config.load().get("summary_device") or "auto").strip().lower()
+    n_gpu_layers = 0
+    if (device != "cpu" and _summarise.gpu_offload_supported() and cudadl.gpu_present()
+            and _summarise.fits_on_gpu(model_path, cudadl.vram_mb())):
+        n_gpu_layers = -1
+    print(f"[summarise] device={device!r} offload={_summarise.gpu_offload_supported()} "
+          f"gpu_present={cudadl.gpu_present()} vram={cudadl.vram_mb()} -> n_gpu_layers={n_gpu_layers}", flush=True)
+
+    def _run(layers):
+        s = _summarise.Summariser(model_path, n_gpu_layers=layers)
+        return s.summarise(transcript, instruction=instruction, language=req.language)
+
     try:
-        s = _summarise.Summariser(model_path)
-        summary = s.summarise(transcript, instruction=instruction, language=req.language)
+        try:
+            summary = _run(n_gpu_layers)
+        except Exception as e:
+            # A GPU run can fail (e.g. CUDA out of memory on a transcript with a big
+            # KV cache). Fall back to the CPU rather than failing the summary outright.
+            if n_gpu_layers != 0:
+                print(f"[summarise] GPU run failed ({e}); retrying on CPU", flush=True)
+                summary = _run(0)
+            else:
+                raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Summarise failed: {e}")
 

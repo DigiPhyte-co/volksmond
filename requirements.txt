@@ -51,4 +51,12 @@ pywebview==6.2.1
 # CPUs (e.g. i7-9750H). The 0.3.23 cpu wheel is compiled WITH AVX-512 and crashes there with
 # STATUS_ILLEGAL_INSTRUCTION. The build guard (tools/ensure_avx2_llama.py) re-verifies by
 # disassembly. Both versions still load Gemma 4.
+#
+# GPU SUMMARIES (optional): the CPU wheel above runs summaries on the CPU. To run them on an
+# NVIDIA GPU, install the matching CUDA wheel INSTEAD (abetlen ships prebuilt CUDA wheels):
+#   pip install llama-cpp-python==0.3.22 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+# (use the cu12x that matches your CUDA 12 runtime). The app detects this at runtime via
+# llama_cpp.llama_supports_gpu_offload() and offloads the summary model to the GPU when it
+# fits in VRAM; with the CPU wheel that returns False and summaries stay on the CPU. Shipping
+# this in the packaged app belongs in the separate GPU build (see docs/cuda-build-plan.md).
 llama-cpp-python==0.3.22

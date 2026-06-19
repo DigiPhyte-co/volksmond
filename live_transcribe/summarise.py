@@ -34,8 +34,46 @@ TRANSCRIPT_NOTE = (
 )
 
 
+# Cached: whether the installed llama-cpp-python was built with a GPU (CUDA) backend.
+# The shipped CPU wheel returns False, so GPU summaries only ever light up in a CUDA
+# build or a source install with the CUDA wheel. Probed once (importing llama_cpp is
+# not free) and reused.
+_GPU_OFFLOAD = None
+
+
+def gpu_offload_supported():
+    """True only if this llama-cpp-python can offload layers to an NVIDIA GPU."""
+    global _GPU_OFFLOAD
+    if _GPU_OFFLOAD is None:
+        try:
+            from llama_cpp import llama_supports_gpu_offload
+            _GPU_OFFLOAD = bool(llama_supports_gpu_offload())
+        except Exception:
+            _GPU_OFFLOAD = False
+    return _GPU_OFFLOAD
+
+
+def fits_on_gpu(model_path, vram_mb, headroom_mb=2048):
+    """Whether a GGUF of this size should be fully offloaded to a GPU with vram_mb of VRAM.
+
+    Full offload (all layers) only when the file plus a working-memory headroom (KV cache,
+    context, overhead) fits; otherwise keep it on the CPU rather than risk a CUDA out-of-
+    memory partway through a summary. Partial offload is deliberately not used yet: it
+    complicates the fit maths for little gain on the machines this targets (a 24 GB card
+    holds even the 12B comfortably; a 4 GB card cannot, and falls back to the CPU)."""
+    try:
+        if not vram_mb or vram_mb <= 0:
+            return False
+        size_mb = os.path.getsize(model_path) / (1024 * 1024)
+        return vram_mb >= size_mb + headroom_mb
+    except OSError:
+        return False
+
+
 class Summariser:
-    """Load a GGUF summary model and generate summaries. CPU by default.
+    """Load a GGUF summary model and generate summaries. CPU by default; pass
+    n_gpu_layers=-1 to offload all layers to an NVIDIA GPU (needs a CUDA build of
+    llama-cpp-python, see gpu_offload_supported()).
 
     chunk_tokens caps how much transcript a single generation sees; beyond that the
     transcript is summarised in parts and the parts are combined. The cap is about
