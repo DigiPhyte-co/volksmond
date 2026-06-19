@@ -140,6 +140,11 @@ window.VM_I18N = {
     "Tip: use headphones. On speakers your microphone can re-hear the other people, and they get transcribed twice.":
       "Wenk: gebruik oorfone. Op luidsprekers kan jou mikrofoon die ander mense weer hoor, en hulle word twee keer getranskribeer.",
     "not detected": "nie bespeur nie",
+    "Microphone switched.": "Mikrofoon geskakel.",
+    "System audio switched.": "Stelselklank geskakel.",
+    "Could not switch device.": "Kon nie die toestel skakel nie.",
+    "Preparing transcription model": "Berei transkripsiemodel voor",
+    "Transcription model ready": "Transkripsiemodel gereed",
     "Stays on this computer": "Bly op hierdie rekenaar",
     "No audio, transcript, or metadata is sent anywhere. Offline-safe.":
       "Geen klank, transkripsie of metadata word êrens gestuur nie. Vanlyn-veilig.",
@@ -213,8 +218,8 @@ window.VM_I18N = {
     "Working on your summary": "Werk aan jou opsomming",
     "Reading the full transcript on this machine. This takes a little while.":
       "Lees die volle transkripsie op hierdie masjien. Dit neem 'n rukkie.",
-    "Runs on this computer using your installed model. Produces decisions, action items, and open questions.":
-      "Loop op hierdie rekenaar met jou geïnstalleerde model. Lewer besluite, aksie-items en oop vrae.",
+    "Runs on this computer using your installed model. Pick a style, or write your own instructions.":
+      "Loop op hierdie rekenaar met jou geïnstalleerde model. Kies 'n styl, of skryf jou eie instruksies.",
     "Summarise": "Som op",
     "Summary": "Opsomming",
     "Ran on this computer, saved next to the transcript": "Het op hierdie rekenaar geloop, gestoor langs die transkripsie",
@@ -222,6 +227,17 @@ window.VM_I18N = {
     "Saved as ": "Gestoor as ",
     ", next to the transcript. Nothing was sent off this computer.":
       ", langs die transkripsie. Niks is van hierdie rekenaar af gestuur nie.",
+    // Summary styles
+    "Summary style": "Opsommingstyl",
+    "Standard (meeting minutes)": "Standaard (vergaderingnotules)",
+    "Action items only": "Net aksiepunte",
+    "Decisions and owners": "Besluite en eienaars",
+    "Detailed notes": "Gedetailleerde notas",
+    "One-paragraph summary": "Een-paragraaf-opsomming",
+    "Custom instructions": "Eie instruksies",
+    "Describe the summary you want. e.g. A bulleted list of risks raised, each with who raised it. Write in the second person to the team.":
+      "Beskryf die opsomming wat jy wil hê. Bv. 'n Kolpuntlys van risiko's wat geopper is, elk met wie dit geopper het. Skryf in die tweede persoon aan die span.",
+    "Make another summary": "Maak nog 'n opsomming",
 
     // History
     "Past meetings": "Vorige vergaderings",
@@ -268,6 +284,10 @@ window.VM_I18N = {
       "Toegepas op elke vergadering om akkuraatheid te help. Net op hierdie rekenaar gestoor.",
     "Save context": "Stoor konteks",
     "Summaries, run on this machine": "Opsommings, loop op hierdie masjien",
+    "Run summaries on": "Loop opsommings op",
+    "Summaries run on the CPU.": "Opsommings loop op die CPU.",
+    "Summaries run on your NVIDIA GPU when the model fits, which is much faster. Falls back to the CPU automatically if it will not fit in graphics memory.":
+      "Opsommings loop op jou NVIDIA-GPU wanneer die model pas, wat baie vinniger is. Val outomaties terug na die CPU as dit nie in die grafiese geheue pas nie.",
     "Summary model": "Opsommingsmodel",
     "Change": "Verander",
     "Choose model": "Kies model",

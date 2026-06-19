@@ -44,6 +44,7 @@ DEFAULTS = {
     "summary_model": "",              # installed summary model: a .gguf filename in <_DIR>/models/ (or an absolute path)
     "setup_complete": False,          # first-run wizard done; persisted here so it survives WebView storage resets
     "device": "auto",                 # transcription device: "auto"/"gpu" use the GPU when ready, "cpu" forces CPU
+    "summary_device": "auto",         # summary device: "auto" uses the GPU when the build supports it and the model fits VRAM, "cpu" forces CPU
 }
 
 

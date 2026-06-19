@@ -46,6 +46,98 @@ TIER_CONFIG = {
     "cpu-large":  {"model": "large-v3",       "device": "cpu",  "compute_type": "int8"},
 }
 
+
+# ── model cache + warm-up ──────────────────────────────────────────────────
+# Building a WhisperModel is the slow part of starting a session. Two costs hide here:
+#  1. With no local_files_only, faster-whisper revalidates the model against HuggingFace
+#     Hub over the NETWORK on every load, even when it is fully downloaded. On a slow or
+#     flaky connection those per-file checks retry for minutes: the "initialising forever"
+#     first-use stall, fast next time only because the caches are warm.
+#  2. On the GPU the first inference also initialises CUDA/cuDNN.
+# So load_model() loads from the local cache only (never the network) and reuses the
+# instance, and warm_up_async() pre-builds + lightly exercises it in the background BEFORE
+# the user hits Begin, so the first real chunk is instant.
+_MODEL_CACHE = {}                 # (model, device, compute_type) -> WhisperModel
+_CACHE_MAX = 3                    # bound memory; evicted entries stay alive while a session still references them
+_BUILD_LOCK = threading.RLock()   # serialise builds + warm-up, so a Begin during warm-up reuses the warm model
+_WARM_LOCK = threading.Lock()     # guards _WARM only (kept separate so status reads never wait on a long build)
+_WARM = {"state": "idle", "tier": None}   # state: idle | warming | ready | error
+
+
+def _build_model(model_name, device, compute_type, cpu_threads):
+    kw = dict(device=device, compute_type=compute_type)
+    if device == "cpu":
+        kw["cpu_threads"] = cpu_threads
+        kw["num_workers"] = 1
+    # Local cache only: never touch the network for an already-downloaded model. Fall back
+    # to a normal (network-allowed) load only if it genuinely is not on disk yet.
+    try:
+        return WhisperModel(model_name, local_files_only=True, **kw)
+    except Exception as e:
+        print(f"[engine] {model_name} not in local cache ({e}); allowing a download", flush=True)
+        return WhisperModel(model_name, local_files_only=False, **kw)
+
+
+def load_model(model_name, device, compute_type, cpu_threads=8):
+    """Return a cached WhisperModel for these settings, building it (from the local cache,
+    no network) if needed. Safe from both the warm-up thread and session start; the build
+    lock makes a Begin during warm-up wait for the warm model instead of building a second."""
+    key = (model_name, device, compute_type)
+    with _BUILD_LOCK:
+        m = _MODEL_CACHE.get(key)
+        if m is None:
+            m = _build_model(model_name, device, compute_type, cpu_threads)
+            # Bound memory: drop the oldest cache slot. The just-built model, and any model a
+            # live session still holds, stay alive via their own references; only the slot goes.
+            while len(_MODEL_CACHE) >= _CACHE_MAX:
+                _MODEL_CACHE.pop(next(iter(_MODEL_CACHE)), None)
+            _MODEL_CACHE[key] = m
+        return m
+
+
+def warm_status():
+    with _WARM_LOCK:
+        return dict(_WARM)
+
+
+def warm_up_async(tier):
+    """Pre-load and lightly exercise the model for `tier` in the background, so the first
+    Begin is instant. Idempotent: a no-op while already warming, or once it is cached."""
+    cfg = TIER_CONFIG.get(tier)
+    if not cfg:
+        return {"state": "idle", "tier": None}
+    key = (cfg["model"], cfg["device"], cfg["compute_type"])
+    with _WARM_LOCK:
+        if _WARM["state"] == "warming":
+            return dict(_WARM)
+        if key in _MODEL_CACHE:        # GIL-safe membership read; just an idempotency hint
+            _WARM.update(state="ready", tier=tier)
+            return dict(_WARM)
+        _WARM.update(state="warming", tier=tier)
+    threading.Thread(target=_warm_run, args=(tier, cfg), daemon=True, name="warmup").start()
+    return {"state": "warming", "tier": tier}
+
+
+def _warm_run(tier, cfg):
+    import numpy as np
+    try:
+        with _BUILD_LOCK:   # hold across build + dummy so a concurrent Begin waits for a fully warm model
+            m = load_model(cfg["model"], cfg["device"], cfg["compute_type"])
+            # A tiny dummy inference triggers CUDA/cuDNN init (and any first-call autotune) now,
+            # off the user's critical path. vad_filter=False so the encoder actually runs on the
+            # silence rather than the VAD discarding it.
+            try:
+                list(m.transcribe(np.zeros(16000, dtype=np.float32), language="af",
+                                  vad_filter=False, beam_size=1)[0])
+            except Exception:
+                pass
+        with _WARM_LOCK:
+            _WARM.update(state="ready", tier=tier)
+    except Exception as e:
+        print(f"[warmup] failed for {tier}: {e}", flush=True)
+        with _WARM_LOCK:
+            _WARM.update(state="error", tier=tier)
+
 # Anti-Dutch anchor for Afrikaans transcription.
 #
 # Whisper's training data has Dutch heavily represented and Afrikaans sparsely.
@@ -204,12 +296,9 @@ class Engine:
         cfg = TIER_CONFIG[tier]
         self.model_name = cfg["model"]
 
-        kw = dict(device=cfg["device"], compute_type=cfg["compute_type"])
-        if cfg["device"] == "cpu":
-            kw["cpu_threads"] = cpu_threads
-            kw["num_workers"] = 1
-
-        self.model = WhisperModel(cfg["model"], **kw)
+        # Cached, local-only load (no network revalidation) and reused across sessions, so a
+        # warmed model makes Begin instant. See load_model / warm_up_async above.
+        self.model = load_model(cfg["model"], cfg["device"], cfg["compute_type"], cpu_threads=cpu_threads)
         self._is_cpu = cfg["device"] == "cpu"
         self._compute_type = cfg["compute_type"]
         self._cpu_threads = cpu_threads
@@ -362,9 +451,7 @@ class Engine:
         print(f"[engine] CPU RTF ~{avg:.2f} (> {DOWNGRADE_RTF}); "
               f"downgrading {self.model_name} -> {new_model}", flush=True)
         try:
-            new = WhisperModel(new_model, device="cpu",
-                               compute_type=self._compute_type,
-                               cpu_threads=self._cpu_threads, num_workers=1)
+            new = load_model(new_model, "cpu", self._compute_type, cpu_threads=self._cpu_threads)
         except Exception as e:
             print(f"[engine] downgrade load failed ({new_model}): {e}", flush=True)
             return

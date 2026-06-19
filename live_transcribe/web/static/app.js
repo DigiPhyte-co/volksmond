@@ -137,6 +137,7 @@ function freshLive() {
     running: false, recording: false, transcribing: false, sourceKind: null,
     startedAt: null, outputPath: null, audioStem: null, tier: null, model: null,
     language: null, stopping: false, segments: [], es: null, title: "", importName: "",
+    micDevice: null, loopbackDevice: null, switching: false,
   };
 }
 var S = {
@@ -154,11 +155,12 @@ var S = {
   theme: (function () { try { return localStorage.getItem("vm_theme") || "system"; } catch (e) { return "system"; } })(),
   stopMenuOpen: false,
   toast: null,
+  warm: null,
 };
 
 // transient refs + timers (not part of render state)
 var liveDocEl = null, liveBodyEl = null, elapsedEl = null, recTimerEl = null;
-var pollTimer = null, elapsedTimer = null, toastTimer = null;
+var pollTimer = null, elapsedTimer = null, toastTimer = null, levelTimer = null, warmTimer = null;
 var startingTimer = null, startingElapsedEl = null;
 
 /* ── api ──────────────────────────────────────────────────── */
@@ -243,12 +245,17 @@ function go(route) {
       route !== S.route && !S.live.running) {
     teardownLive();
   }
+  // Stop polling warm-up status once we leave the pre-meeting screens.
+  if (warmTimer && route !== "pre" && route !== "importpre") { clearInterval(warmTimer); warmTimer = null; }
   S.stopMenuOpen = false;
   S.route = route;
+  // Reaching a pre-meeting screen is the signal that a transcription is imminent: warm the model.
+  if (route === "pre" || route === "importpre") warmUp();
   render();
 }
 function teardownLive() {
   closeStream();
+  stopLevels();
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
   if (startingTimer) { clearInterval(startingTimer); startingTimer = null; }
@@ -299,6 +306,104 @@ function pollStatus(predicateDone, onDone, onTick) {
   pollTimer = setTimeout(tick, 900);
 }
 
+/* ── audio levels + live device switch ────────────────────── */
+// Poll the mic/system levels a few times a second and paint the meter bars in place
+// (by id), so a steady meeting never triggers a full re-render just to move a meter.
+function startLevels() {
+  if (levelTimer) return;
+  levelTimer = setInterval(function () {
+    api.get("/api/levels").then(function (d) {
+      if (!d || !d.running) return;
+      updateMeter("vm-meter-mic", d.mic);
+      updateMeter("vm-meter-sys", d.sys);
+    }).catch(function () {});
+  }, 250);
+}
+function stopLevels() { if (levelTimer) { clearInterval(levelTimer); levelTimer = null; } }
+function updateMeter(id, lv) {
+  var bar = document.getElementById(id);
+  if (!bar || !lv) return;
+  // peak 0..1 -> bar width. A small gain + sqrt lifts ordinary speech off the floor so the
+  // meter is legible; a near-full peak tints the bar to warn of clipping.
+  var peak = lv.peak || 0;
+  var w = Math.max(0, Math.min(1, Math.sqrt(Math.min(1, peak * 1.3))));
+  bar.style.width = Math.round(w * 100) + "%";
+  bar.style.background = peak > 0.97 ? "var(--record)" : "var(--accent)";
+}
+async function switchDevice(which, value) {
+  var prev = which === "mic" ? S.live.micDevice : S.live.loopbackDevice;
+  if (which === "mic") S.live.micDevice = value; else S.live.loopbackDevice = value;
+  S.live.switching = true; render();
+  try {
+    await api.post("/api/switch-device", { which: which, device: value });
+    toast(which === "mic" ? "Microphone switched." : "System audio switched.");
+  } catch (e) {
+    if (which === "mic") S.live.micDevice = prev; else S.live.loopbackDevice = prev;
+    toast(e.message || "Could not switch device.", true);
+  } finally {
+    S.live.switching = false; render();
+  }
+}
+// Compact strip for the live + record-only screens: per source, a dropdown to switch the
+// device on the fly and a level meter. An empty device list degrades to "not detected".
+function liveAudioStrip() {
+  var dev = S.devices || {};
+  function channel(which, ic, list, sel, defIdx, meterId) {
+    var control;
+    if (!list || !list.length) {
+      control = el("span", { class: "row gap-6", style: { color: "var(--warn)", fontSize: "11.5px" } }, [icon("alert", 13), el("span", { text: "not detected" })]);
+    } else {
+      var s = el("select", {
+        class: "field", style: { width: "auto", maxWidth: "190px", fontSize: "12px", padding: "5px 8px" },
+        disabled: S.live.switching,
+        onchange: function (e) { switchDevice(which, e.target.value); },
+      }, list.map(function (d) { return el("option", { value: String(d.index) }, raw(d.name)); }));
+      s.value = sel != null ? String(sel) : (defIdx != null ? String(defIdx) : String(list[0].index));
+      control = s;
+    }
+    return el("div", { class: "row gap-8", style: { alignItems: "center", minWidth: "0", flex: "1 1 260px" } }, [
+      el("span", { style: { color: "var(--ink-3)", display: "inline-flex", flex: "0 0 auto" } }, icon(ic, 15)),
+      control,
+      el("div", { style: { flex: "1 1 50px", minWidth: "44px", height: "6px", background: "var(--line)", borderRadius: "999px", overflow: "hidden" } },
+        el("div", { id: meterId, style: { height: "100%", width: "0%", background: "var(--accent)", borderRadius: "999px", transition: "width .2s ease-out" } })),
+    ]);
+  }
+  return el("div", { class: "row gap-16", style: { flexWrap: "wrap", padding: "10px 16px", borderBottom: "1px solid var(--line)", background: "var(--surface-2)" } }, [
+    channel("mic", "mic", dev.mics, S.live.micDevice, dev.default_mic_index, "vm-meter-mic"),
+    channel("loopback", "speaker", dev.loopbacks, S.live.loopbackDevice, dev.default_loopback_index, "vm-meter-sys"),
+  ]);
+}
+
+/* ── model warm-up (kill the first-use stall) ─────────────── */
+// Loading the model the first time after launch can stall for minutes (network revalidation
+// of an already-downloaded model, plus CUDA/AV cold start). We pre-load it in the background
+// the moment the user reaches a pre-meeting screen, so Begin reuses a warm model.
+function warmUp() {
+  api.post("/api/warm-up", { tier: S.form.tier || "auto", device: S.form.device || "auto" })
+    .then(function (st) {
+      S.warm = st;
+      if (st && st.state === "warming") pollWarm();
+      if (S.route === "pre" || S.route === "importpre") render();
+    }).catch(function () {});
+}
+function pollWarm() {
+  if (warmTimer) return;
+  warmTimer = setInterval(function () {
+    api.get("/api/warm-up").then(function (st) {
+      S.warm = st;
+      if (!st || st.state !== "warming") { clearInterval(warmTimer); warmTimer = null; }
+      if (S.route === "pre" || S.route === "importpre") render();
+    }).catch(function () { clearInterval(warmTimer); warmTimer = null; });
+  }, 1500);
+}
+function warmChip() {
+  var w = S.warm;
+  if (!w) return null;
+  if (w.state === "warming") return el("span", { class: "chip" }, [el("span", { class: "dot" }), el("span", { text: "Preparing transcription model" })]);
+  if (w.state === "ready") return el("span", { class: "chip ok" }, [icon("check", 12), el("span", { text: "Transcription model ready" })]);
+  return null;  // idle / busy / error: stay quiet, Begin still loads on demand
+}
+
 /* ── session lifecycle ────────────────────────────────────── */
 async function startLive() {
   var body = {
@@ -318,7 +423,8 @@ async function startLive() {
     S.live.outputPath = resp.output_path; S.live.audioStem = resp.audio_stem;
     S.live.tier = resp.tier; S.live.model = resp.model; S.live.language = resp.language;
     S.live.title = S.form.title || "Live meeting";
-    go("live"); openStream(); startElapsed();
+    S.live.micDevice = S.form.mic; S.live.loopbackDevice = S.form.loopback;
+    go("live"); openStream(); startElapsed(); startLevels();
   } catch (e) {
     // Surface the failure on the Starting screen (with Back), not just a toast that
     // vanishes; the model-load error ("Could not load model ...") needs to be readable.
@@ -336,7 +442,8 @@ async function startRecordOnly() {
     S.live.sourceKind = "live"; S.live.startedAt = new Date().toISOString();
     S.live.outputPath = resp.output_path; S.live.audioStem = resp.audio_stem;
     S.live.title = S.form.title || "Recording";
-    go("recordonly"); startElapsed();
+    S.live.micDevice = S.form.mic; S.live.loopbackDevice = S.form.loopback;
+    go("recordonly"); startElapsed(); startLevels();
   } catch (e) { toast(e.message || "Could not start recording.", true); }
 }
 
@@ -546,11 +653,41 @@ async function stopRecordOnly() {
 }
 
 /* ── summarise ────────────────────────────────────────────── */
+// Summary styles. "Standard" sends no instruction, so the server uses its own
+// meeting-minutes default. The rest send an explicit instruction; the server still
+// adds the transcript-cleanup guidance and the output-language directive on top, so
+// these only describe the SHAPE of the summary. "Custom" reveals a free-text box.
+// The prompt text stays English regardless of output language (the server handles
+// translation); only the names are translated for the UI.
+var SUMMARY_STYLES = [
+  { id: "standard", name: "Standard (meeting minutes)", prompt: "" },
+  { id: "actions", name: "Action items only",
+    prompt: "From this transcript, list only the action items: who needs to do what, with any due dates or deadlines mentioned. Use a short bulleted list, grouped by person where it is clear. If there are no clear action items, say so plainly." },
+  { id: "decisions", name: "Decisions and owners",
+    prompt: "Summarise only the decisions taken in this meeting and who owns each resulting follow-up. Use a concise bulleted list. Note anything that was explicitly left undecided." },
+  { id: "detailed", name: "Detailed notes",
+    prompt: "Write thorough, well-structured notes from this transcript: a short context line, the main topics discussed in the order they came up, the decisions, the action items, and any open questions. Use headings and bullet points." },
+  { id: "tldr", name: "One-paragraph summary",
+    prompt: "Summarise this meeting in a single short paragraph of three or four sentences, capturing the gist and the single most important outcome. No headings and no bullet points." },
+  { id: "custom", name: "Custom instructions", prompt: null },
+];
+// Resolve the instruction to send for the target's chosen style. "" means "let the
+// server use its default" (standard); a custom style with an empty box is treated the
+// same, so an unfinished custom choice never produces a confusing empty-instruction run.
+function summaryInstructionFor(target) {
+  var id = target.summaryStyle || "standard";
+  if (id === "custom") return (target.customInstruction || "").trim();
+  var st = SUMMARY_STYLES.filter(function (s) { return s.id === id; })[0];
+  return (st && st.prompt) || "";
+}
 async function doSummarise(fileName, scope) {
   var target = scope === "reader" ? S.reader : S.finish;
   target.summarising = true; render();
   try {
-    var resp = await api.post("/api/summarise", { file: fileName, language: target.sumLang || "en" });
+    var body = { file: fileName, language: target.sumLang || "en" };
+    var instruction = summaryInstructionFor(target);
+    if (instruction) body.instruction = instruction;
+    var resp = await api.post("/api/summarise", body);
     target.summary = resp.summary; target.savedAs = resp.saved; target.summarising = false;
     if (scope === "reader") S.reader.tab = "summary";
     render();
@@ -558,6 +695,28 @@ async function doSummarise(fileName, scope) {
     target.summarising = false; render();
     toast(e.message || "Summarise failed.", true);
   }
+}
+// The style picker (a dropdown, plus a textarea when "Custom" is chosen). Shared by the
+// pre-summarise card and the regenerate controls so the two never drift.
+function summaryStyleControl(target) {
+  var id = target.summaryStyle || "standard";
+  var rows = [
+    el("div", { class: "row gap-8", style: { alignItems: "center", flexWrap: "wrap" } }, [
+      el("span", { class: "ink-3", style: { fontSize: "11.5px" }, text: "Summary style" }),
+      selectEl(SUMMARY_STYLES.map(function (s) { return [s.id, s.name]; }), id, function (v) {
+        target.summaryStyle = v; render();
+      }),
+    ]),
+  ];
+  if (id === "custom") {
+    rows.push(el("textarea", {
+      class: "field", style: { marginTop: "8px", minHeight: "72px" },
+      value: target.customInstruction || "",
+      placeholder: "Describe the summary you want. e.g. A bulleted list of risks raised, each with who raised it. Write in the second person to the team.",
+      oninput: function (e) { target.customInstruction = e.target.value; },
+    }));
+  }
+  return el("div", { class: "stack", style: { gap: "0" } }, rows);
 }
 function renderMarkdown(md) {
   var frag = document.createDocumentFragment();
@@ -998,9 +1157,10 @@ function preView() {
       el("span", { class: "chip ok" }, [icon("check", 12), "On this machine"]),
     ]),
     el("div", { style: { display: "grid", gridTemplateColumns: "1fr 320px", gap: "24px", alignItems: "start" } }, [left, right]),
-    el("div", { class: "row gap-16", style: { marginTop: "24px" } }, [
+    el("div", { class: "row gap-16", style: { marginTop: "24px", alignItems: "center" } }, [
       el("button", { class: "btn primary big", onclick: startLive }, [icon("dot", 15), "Begin"]),
       el("button", { class: "btn ghost", onclick: function () { go("home"); } }, "Back"),
+      warmChip(),
       el("span", { class: "ink-3", style: { fontSize: "11.5px", marginLeft: "auto" }, text: "Audio stays on this machine unless you opt in." }),
     ]),
   ]));
@@ -1059,9 +1219,10 @@ function importPreView() {
     formField("Participants", el("span", { class: "label-muted", text: " (optional, helps accuracy)" }), termsBox(S.form.participants, "Add a name")),
     formField("Jargon and terms", el("span", { class: "label-muted", text: " (optional)" }), termsBox(S.form.terms, "Add a term")),
     defaultContextNote(),
-    el("div", { class: "row gap-16", style: { marginTop: "8px" } }, [
+    el("div", { class: "row gap-16", style: { marginTop: "8px", alignItems: "center" } }, [
       el("button", { class: "btn primary big", onclick: begin }, [icon("note", 15), "Transcribe"]),
       el("button", { class: "btn ghost", onclick: function () { go("home"); } }, "Back"),
+      warmChip(),
     ]),
   ]));
 }
@@ -1169,7 +1330,7 @@ function liveView() {
     S.live.outputPath ? el("span", { class: "saving" }, ["Saving to ", el("span", { class: "mono", text: baseName(S.live.outputPath) })]) : null,
   ]);
 
-  return el("div", { class: "live" }, [header, liveBodyEl, footer]);
+  return el("div", { class: "live" }, [header, liveAudioStrip(), liveBodyEl, footer]);
 }
 
 /* ── record only ──────────────────────────────────────────── */
@@ -1194,7 +1355,7 @@ function recordOnlyView() {
         ? el("button", { class: "btn", disabled: true }, [el("span", { class: "spinner" }), "Saving"])
         : el("button", { class: "btn record", onclick: stopRecordOnly }, [icon("stop", 14), "Stop recording"]),
     ]);
-    return el("div", { class: "live" }, [header, body, footer]);
+    return el("div", { class: "live" }, [header, liveAudioStrip(), body, footer]);
   }
   // stopped: handoff
   var stem = S.finish.recordingStem;
@@ -1301,13 +1462,16 @@ function summariseCard(fileName, scope) {
       el("p", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "8px" }, text: "Reading the full transcript on this machine. This takes a little while." }),
     ]);
   }
-  return el("div", { class: "card disclosure accent", style: { padding: "18px", display: "flex", gap: "14px", alignItems: "flex-start" } }, [
-    el("div", { class: "tone-tile accent", style: { width: "30px", height: "30px", flex: "0 0 auto" } }, icon("sparkle", 16)),
-    el("div", { class: "grow" }, [
-      el("div", { style: { fontWeight: "600" }, text: "Summarise this transcript" }),
-      el("p", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "4px" }, text: "Runs on this computer using your installed model. Produces decisions, action items, and open questions." }),
+  return el("div", { class: "card disclosure accent", style: { padding: "18px" } }, [
+    el("div", { class: "row gap-12", style: { alignItems: "flex-start" } }, [
+      el("div", { class: "tone-tile accent", style: { width: "30px", height: "30px", flex: "0 0 auto" } }, icon("sparkle", 16)),
+      el("div", { class: "grow" }, [
+        el("div", { style: { fontWeight: "600" }, text: "Summarise this transcript" }),
+        el("p", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "4px" }, text: "Runs on this computer using your installed model. Pick a style, or write your own instructions." }),
+      ]),
     ]),
-    el("div", { class: "row gap-8", style: { alignItems: "center" } }, [
+    el("div", { style: { marginTop: "12px" } }, summaryStyleControl(target)),
+    el("div", { class: "row gap-8", style: { alignItems: "center", justifyContent: "flex-end", marginTop: "12px" } }, [
       el("span", { class: "ink-3", style: { fontSize: "11.5px" }, text: "Summary in" }),
       selectEl([["en", "English"], ["af", "Afrikaans"]], (target.sumLang || "en"), function (v) { target.sumLang = v; render(); }),
       el("button", { class: "btn primary", onclick: function () { doSummarise(fileName, scope); } }, [icon("sparkle", 14), "Summarise"]),
@@ -1324,11 +1488,20 @@ function summaryResult(summary, savedAs, fileName, scope) {
         el("div", { class: "ink-3", style: { fontSize: "11.5px" }, text: "Ran on this computer, saved next to the transcript" }),
       ]),
       el("button", { class: "btn ghost sm", onclick: function () { copyText(summary); } }, [icon("copy", 13), "Copy"]),
-      selectEl([["en", "English"], ["af", "Afrikaans"]], (target.sumLang || "en"), function (v) { target.sumLang = v; render(); }),
-      el("button", { class: "btn ghost sm", onclick: function () { target.summary = null; doSummarise(fileName, scope); } }, "Regenerate"),
     ]),
     el("div", { class: "sum-body" }, renderMarkdown(summary)),
     savedAs ? el("div", { class: "saved-strip" }, [icon("check", 14), el("span", {}, ["Saved as ", el("span", { class: "mono", text: baseName(savedAs) }), ", next to the transcript. Nothing was sent off this computer."])]) : null,
+    // Regenerate in a different style or your own words. Reuses the same picker as the
+    // pre-summarise card, so a fresh run overwrites the saved summary with the new shape.
+    el("div", { style: { marginTop: "14px", paddingTop: "14px", borderTop: "1px solid var(--line)" } }, [
+      el("div", { class: "section-label", style: { marginBottom: "8px" }, text: "Make another summary" }),
+      summaryStyleControl(target),
+      el("div", { class: "row gap-8", style: { alignItems: "center", justifyContent: "flex-end", marginTop: "10px" } }, [
+        el("span", { class: "ink-3", style: { fontSize: "11.5px" }, text: "Summary in" }),
+        selectEl([["en", "English"], ["af", "Afrikaans"]], (target.sumLang || "en"), function (v) { target.sumLang = v; render(); }),
+        el("button", { class: "btn", onclick: function () { target.summary = null; doSummarise(fileName, scope); } }, [icon("sparkle", 13), "Regenerate"]),
+      ]),
+    ]),
   ]);
   return card;
 }
@@ -1397,9 +1570,14 @@ function stripSummaryHeader(s) {
 function readerView() {
   var hasSummary = !!S.reader.summary;
   var tab = hasSummary ? (S.reader.tab || "transcript") : "transcript";
-  var toggle = hasSummary ? el("div", { class: "row gap-8" }, [
-    el("button", { class: tab === "transcript" ? "btn sm" : "btn ghost sm", onclick: function () { S.reader.tab = "transcript"; render(); } }, [icon("note", 13), "Transcript"]),
-    el("button", { class: tab === "summary" ? "btn sm" : "btn ghost sm", onclick: function () { S.reader.tab = "summary"; render(); } }, [icon("sparkle", 13), "Summary"]),
+  // A connected segmented control, not two loose ghost buttons. Viewing the
+  // transcript, a lone "Summary" ghost button is indistinguishable from the Copy
+  // and Folder actions next to it, so the way back to the summary reads as just
+  // another toolbar action. The segmented switch makes Transcript/Summary an
+  // obvious two-way toggle, distinct from the actions.
+  var toggle = hasSummary ? el("div", { class: "segmented", style: { width: "auto", flex: "0 0 auto" } }, [
+    el("button", { class: tab === "transcript" ? "on" : "", onclick: function () { S.reader.tab = "transcript"; render(); } }, [icon("note", 13), el("span", { text: "Transcript" })]),
+    el("button", { class: tab === "summary" ? "on" : "", onclick: function () { S.reader.tab = "summary"; render(); } }, [icon("sparkle", 13), el("span", { text: "Summary" })]),
   ]) : null;
   var body;
   if (hasSummary && tab === "summary") {
@@ -1803,6 +1981,26 @@ function cudaCard() {
     ]),
   ]);
 }
+// "Run summaries on" GPU/CPU choice. Returns null unless this build can actually offload
+// summaries to an NVIDIA GPU (summary_gpu_capable), so a CPU build never shows a dead toggle.
+function summaryDeviceRow() {
+  if (!(S.models && S.models.summary_gpu_capable)) return null;
+  var v = (S.settings && S.settings.summary_device === "cpu") ? "cpu" : "auto";
+  var seg = el("div", { class: "segmented", style: { width: "auto" } },
+    [["auto", "GPU"], ["cpu", "CPU"]].map(function (o) {
+      return el("button", { class: v === o[0] ? "on" : "", onclick: function () { saveSettings({ summary_device: o[0] }); } }, el("span", { text: o[1] }));
+    }));
+  return el("div", { class: "set-row" }, [
+    el("div", { class: "ic" }, icon("cpu", 18)),
+    el("div", { class: "body" }, [
+      el("div", { class: "t", text: "Run summaries on" }),
+      el("div", { class: "s", text: v === "cpu"
+        ? "Summaries run on the CPU."
+        : "Summaries run on your NVIDIA GPU when the model fits, which is much faster. Falls back to the CPU automatically if it will not fit in graphics memory." }),
+    ]),
+    el("div", { class: "ctl" }, seg),
+  ]);
+}
 function summariesCard() {
   var d = S.summaryModels || {};
   var anyActive = (d.installed != null) ? d.installed : !!(S.models && S.models.summary_installed);
@@ -1815,6 +2013,7 @@ function summariesCard() {
         : "Download a small model and Volksmond can summarise a finished transcript on this computer. Pick a size, we download it for you." }),
       summaryDownloadPanel(true),
     ]),
+    summaryDeviceRow(),
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("folder", 18)),
       el("div", { class: "body" }, [el("div", { class: "t", text: "Where summary models are stored" }),
@@ -2092,7 +2291,10 @@ function adoptRunning(status) {
   S.live.tier = status.tier; S.live.model = status.model; S.live.language = status.language;
   S.live.stopping = !!status.stopping;
   S.live.title = topicFromName(baseName(status.output_path));
+  S.live.micDevice = status.mic_device != null ? status.mic_device : null;
+  S.live.loopbackDevice = status.loopback_device != null ? status.loopback_device : null;
   openStream(); startElapsed();
+  if (status.source_kind !== "file") startLevels();
   if (status.source_kind === "file") {
     S.route = "importing";
     pollStatus(function (st) { return !st.running; }, function () { gotoFinish(S.live.outputPath); });
