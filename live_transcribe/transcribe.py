@@ -6,6 +6,7 @@ memory at one model's footprint and simplifies the data flow. If GPU under-
 utilisation becomes a problem in V1 with a snappier chunk size, we can run
 two model instances; not worth it for V0.
 """
+import os
 import queue
 import re
 import threading
@@ -21,16 +22,32 @@ cudadl.register_dll_dir()
 from faster_whisper import WhisperModel
 
 
+# Afrikaans-tuned models, merged to ctranslate2 int8: large-v3 (andreoosthuizen LoRA) and our
+# own medium fine-tune on the afrikaans-30s dataset. Much better on Afrikaans, equal-or-better on
+# English, no Afrikaans leakage on pure-English audio (see SA-ASR-Model/corpus-strategy.md).
+# These are local-cache paths for now (the models are not yet hosted/bundled): _afrikaans_or()
+# falls back to the stock Whisper model when the path is absent, so this is safe as-is (machines
+# without the model just get stock until we host it). Set SA_LIVE_AF_MODEL=stock to force stock
+# even when present (A/B), or to a path/name to override.
+def _afrikaans_or(path, stock):
+    ov = os.environ.get("SA_LIVE_AF_MODEL")
+    if ov:
+        return stock if ov.lower() == "stock" else ov
+    return path if os.path.isdir(path) else stock
+
+_AF_MODEL = _afrikaans_or(r"C:\Users\seanf\.cache\af-lora-ct2-int8", "large-v3")
+_AF_MEDIUM = _afrikaans_or(r"C:\Users\seanf\.cache\af-lora-medium-ct2-int8", "medium")
+
 # Tiers. compute_type matters as much as the model:
-#  - "gpu"     large-v3 float16       , needs ~3GB+ VRAM (RTX 3090 etc.)
+#  - "gpu"     large-v3, int8_float16 (Afrikaans int8 model), needs ~3GB+ VRAM (RTX 3090 etc.)
 #  - "gpu-4gb" large-v3 int8_float16  , fits a 4GB card (GTX 1650 Mobile);
 #                                        near-float16 quality, int8 tensor cores
 #  - cpu tiers, fallback only. CPU ASR is memory-bandwidth-bound, so it can run
 #                slower than real-time while CPU usage looks moderate. Prefer a
 #                GPU tier whenever a CUDA device exists.
 TIER_CONFIG = {
-    "gpu":        {"model": "large-v3",       "device": "cuda", "compute_type": "float16"},
-    "gpu-4gb":    {"model": "large-v3",       "device": "cuda", "compute_type": "int8_float16"},
+    "gpu":        {"model": _AF_MODEL,        "device": "cuda", "compute_type": "int8_float16"},
+    "gpu-4gb":    {"model": _AF_MODEL,        "device": "cuda", "compute_type": "int8_float16"},
     # CPU tiers set the STARTING model. On CPU the engine measures its real-time
     # factor each chunk and auto-downgrades along CPU_LADDER if it can't keep up
     # (see _maybe_downgrade), so a fast CPU keeps the bigger model and a slow one
@@ -39,11 +56,11 @@ TIER_CONFIG = {
     "cpu":        {"model": "small",          "device": "cpu",  "compute_type": "int8"},
     "cpu-min":    {"model": "base",           "device": "cpu",  "compute_type": "int8"},
     "cpu-strong": {"model": "large-v3-turbo", "device": "cpu",  "compute_type": "int8"},
-    "cpu-mid":    {"model": "medium",         "device": "cpu",  "compute_type": "int8"},
+    "cpu-mid":    {"model": _AF_MEDIUM,        "device": "cpu",  "compute_type": "int8"},
     # large-v3 on CPU: too slow to hold real-time for LIVE on most machines (the
     # adaptive ladder downgrades it there), but the best-accuracy choice for an
     # uploaded recording / post-meeting pass, where there is no real-time constraint.
-    "cpu-large":  {"model": "large-v3",       "device": "cpu",  "compute_type": "int8"},
+    "cpu-large":  {"model": _AF_MODEL,        "device": "cpu",  "compute_type": "int8"},
 }
 
 
