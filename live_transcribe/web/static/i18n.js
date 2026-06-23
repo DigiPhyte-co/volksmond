@@ -21,7 +21,7 @@ window.VM_I18N = {
     "History": "Geskiedenis",
     "Settings": "Instellings",
     "Local only, no internet": "Net plaaslik, geen internet",
-    "Report a bug or idea": "Meld 'n fout of idee",
+    "Report a bug or idea": "Meld 'n gogga of idee",
 
     // First-run: welcome
     "Research Preview": "Navorsingsvoorskou",
@@ -36,8 +36,17 @@ window.VM_I18N = {
     "Next we download the transcription model to your computer, so your first meeting starts straight away. Summaries are an optional extra you can add after that.":
       "Vervolgens laai ons die transkripsiemodel na jou rekenaar af, sodat jou eerste vergadering dadelik begin. Opsommings is 'n opsionele ekstra wat jy daarna kan byvoeg.",
 
+    // First-run: languages
+    "Setup, languages": "Opstelling, tale",
+    "Which languages do you transcribe?": "Watter tale transkribeer jy?",
+    "Pick the languages you record in. Afrikaans uses Fluister, our Afrikaans-tuned model; English and the rest use standard Whisper. The size is chosen automatically for your computer.":
+      "Kies die tale waarin jy opneem. Afrikaans gebruik Fluister, ons Afrikaans-gestemde model; Engels en die res gebruik standaard Whisper. Die grootte word outomaties vir jou rekenaar gekies.",
+    "You can change this any time in Settings.": "Jy kan dit enige tyd in Instellings verander.",
+
     // First-run: transcription model
     "Setup, transcription model": "Opstelling, transkripsiemodel",
+    "Afrikaans uses Fluister, downloaded automatically the first time you transcribe Afrikaans. The model below is the standard Whisper model for English and other languages.":
+      "Afrikaans gebruik Fluister, outomaties afgelaai die eerste keer wat jy Afrikaans transkribeer. Die model hieronder is die standaard Whisper-model vir Engels en ander tale.",
     "Download the model that does the transcribing": "Laai die model af wat die transkripsie doen",
     "Volksmond transcribes on your own computer using a language model. Download the one that suits your machine now, so your first meeting starts straight away instead of waiting on a download. It runs offline afterwards.":
       "Volksmond transkribeer op jou eie rekenaar met 'n taalmodel. Laai nou die een af wat by jou masjien pas, sodat jou eerste vergadering dadelik begin in plaas daarvan om vir 'n aflaai te wag. Dit loop daarna vanlyn.",
@@ -62,7 +71,7 @@ window.VM_I18N = {
     "A summary model is already installed on this machine.":
       "'n Opsommingsmodel is reeds op hierdie masjien geïnstalleer.",
     "Needs a summary model file in your models folder. You can set this up in Settings.":
-      "Benodig 'n opsommingsmodel-lêer in jou models-vouer. Jy kan dit in Instellings opstel.",
+      "Benodig 'n opsommingsmodel-lêer in jou models-gids. Jy kan dit in Instellings opstel.",
     "Skip for now": "Slaan vir nou oor",
     "Continue": "Gaan voort",
     "Default": "Standaard",
@@ -117,6 +126,21 @@ window.VM_I18N = {
     "Language": "Taal",
     "Quality": "Gehalte",
     "Auto-detect": "Outomaties",
+    "Engine: ": "Enjin: ",
+    "Afrikaans-optimised model": "Afrikaans-geoptimeerde model",
+    "Afrikaans uses Fluister, our Afrikaans-tuned model. The size is chosen automatically for your computer.":
+      "Afrikaans gebruik Fluister, ons Afrikaans-gestemde model. Die grootte word outomaties vir jou rekenaar gekies.",
+    "Afrikaans currently uses standard Whisper. The Afrikaans-tuned Fluister model is not installed yet; it switches on automatically once it is.":
+      "Afrikaans gebruik tans standaard Whisper. Die Afrikaans-gestemde Fluister-model is nog nie geïnstalleer nie; dit skakel outomaties aan sodra dit wel is.",
+    "Auto-detect uses standard Whisper. The size is chosen automatically for your computer.":
+      "Outomaties gebruik standaard Whisper. Die grootte word outomaties vir jou rekenaar gekies.",
+    "English uses standard Whisper. The size is chosen automatically for your computer.":
+      "Engels gebruik standaard Whisper. Die grootte word outomaties vir jou rekenaar gekies.",
+    "Advanced": "Gevorderd",
+    "Model size": "Modelgrootte",
+    " (auto is recommended)": " (outo word aanbeveel)",
+    "Auto picks the best model your computer can run. Bigger is more accurate but slower.":
+      "Outo kies die beste model wat jou rekenaar kan hardloop. Groter is meer akkuraat maar stadiger.",
     "Auto": "Outo",
     "Fast": "Vinnig",
     "Balanced": "Gebalanseerd",
@@ -207,7 +231,7 @@ window.VM_I18N = {
     "Saved.": "Gestoor.",
     "Finished, with a warning": "Klaar, met 'n waarskuwing",
     "Saving may not have completed": "Stoor het dalk nie voltooi nie",
-    "Open folder": "Maak vouer oop",
+    "Open folder": "Maak gids oop",
     "Open transcript": "Maak transkripsie oop",
     "Copy": "Kopieer",
     "Done": "Klaar",
@@ -222,6 +246,7 @@ window.VM_I18N = {
       "Loop op hierdie rekenaar met jou geïnstalleerde model. Kies 'n styl, of skryf jou eie instruksies.",
     "Summarise": "Som op",
     "Summary": "Opsomming",
+    "Latest summary": "Jongste opsomming",
     "Ran on this computer, saved next to the transcript": "Het op hierdie rekenaar geloop, gestoor langs die transkripsie",
     "Regenerate": "Genereer weer",
     "Saved as ": "Gestoor as ",
@@ -245,13 +270,13 @@ window.VM_I18N = {
     "New meeting": "Nuwe vergadering",
     "No meetings yet.": "Nog geen vergaderings nie.",
     "Once you transcribe a meeting, it shows up here. Nothing is uploaded; your meetings live in your data folder.":
-      "Sodra jy 'n vergadering transkribeer, verskyn dit hier. Niks word opgelaai nie; jou vergaderings leef in jou data-vouer.",
+      "Sodra jy 'n vergadering transkribeer, verskyn dit hier. Niks word opgelaai nie; jou vergaderings leef in jou data-gids.",
     "Open": "Maak oop",
     "Saved in ": "Gestoor in ",
 
     // Reader
     "Back to history": "Terug na geskiedenis",
-    "Folder": "Vouer",
+    "Folder": "Gids",
 
     // Settings
     "Pro, activated": "Pro, geaktiveer",
@@ -270,12 +295,21 @@ window.VM_I18N = {
     "System": "Stelsel",
     "Light": "Lig",
     "Dark": "Donker",
-    "Interface language": "Koppelvlaktaal",
+    "Interface language": "Volksmond-toepassingstaal",
     "The language Volksmond shows you. It does not change what gets transcribed.":
       "Die taal waarin Volksmond vir jou wys. Dit verander nie wat getranskribeer word nie.",
     "Transcription": "Transkripsie",
     "Default language": "Verstektaal",
     "Used unless you change it for a meeting.": "Gebruik tensy jy dit vir 'n vergadering verander.",
+    "Languages you transcribe": "Tale wat jy transkribeer",
+    "Pick the languages you record in. The language you choose for a meeting picks the model; the size is chosen automatically.":
+      "Kies die tale waarin jy opneem. Die taal wat jy vir 'n vergadering kies, kies die model; die grootte word outomaties gekies.",
+    "Afrikaans uses Fluister, our Afrikaans-tuned model; English and other languages use standard Whisper.":
+      "Afrikaans gebruik Fluister, ons Afrikaans-gestemde model; Engels en ander tale gebruik standaard Whisper.",
+    "The Afrikaans-tuned Fluister model is not installed on this computer yet, so Afrikaans runs on standard Whisper for now.":
+      "Die Afrikaans-gestemde Fluister-model is nog nie op hierdie rekenaar geïnstalleer nie, so Afrikaans loop voorlopig op standaard Whisper.",
+    "Advanced. Auto picks the best model your hardware can run; you rarely need to change this.":
+      "Gevorderd. Outo kies die beste model wat jou hardeware kan hardloop; jy hoef dit selde te verander.",
     "Auto picks the best model your hardware can run.":
       "Outo kies die beste model wat jou hardeware kan loop.",
     "Best (GPU)": "Beste (GPU)",
@@ -304,6 +338,9 @@ window.VM_I18N = {
       "Opsommings is gereed op hierdie masjien. Jy kan hier van model wissel, of nog een byvoeg.",
     "Gemma 4 (2 billion)": "Gemma 4 (2 miljard)",
     "Gemma 4 (4 billion)": "Gemma 4 (4 miljard)",
+    "Gemma 4 (12 billion)": "Gemma 4 (12 miljard)",
+    "The most capable local summary. Needs a strong machine with plenty of memory, and takes a little longer.":
+      "Die kragtigste plaaslike opsomming. Benodig 'n sterk masjien met baie geheue, en neem 'n bietjie langer.",
     "Smaller and faster, light on memory. Works well on most machines.":
       "Kleiner en vinniger, lig op geheue. Werk goed op die meeste masjiene.",
     "Larger and more polished. Needs more memory and a little more time.":
@@ -321,13 +358,13 @@ window.VM_I18N = {
     "Loading model options...": "Laai modelopsies...",
     "Summary model ready. Summaries are on.": "Opsommingsmodel gereed. Opsommings is aan.",
     "Could not start the download.": "Kon nie die aflaai begin nie.",
-    "Open data folder": "Maak data-vouer oop",
+    "Open data folder": "Maak data-gids oop",
     "See the transcripts and any models stored on this computer.":
       "Sien die transkripsies en enige modelle wat op hierdie rekenaar gestoor is.",
     "Data and privacy": "Data en privaatheid",
     "Save transcripts and recordings to": "Stoor transkripsies en opnames na",
     "For maximum privacy, choose a folder that a cloud provider does not sync (OneDrive, Google Drive, Dropbox, and the like).":
-      "Vir maksimum privaatheid, kies 'n vouer wat 'n wolkverskaffer nie sinkroniseer nie (OneDrive, Google Drive, Dropbox, en dies meer).",
+      "Vir maksimum privaatheid, kies 'n gids wat 'n wolkverskaffer nie sinkroniseer nie (OneDrive, Google Drive, Dropbox, en dies meer).",
     "Audio is off by default": "Klank is standaard af",
     "Recording is only kept when you switch it on for a meeting. The privacy promise holds otherwise.":
       "Opname word net gehou wanneer jy dit vir 'n vergadering aanskakel. Andersins geld die privaatheidsbelofte.",
@@ -361,7 +398,7 @@ window.VM_I18N = {
       "Jou sleutel word op hierdie rekenaar nagegaan, nooit op 'n bediener nie. Geen rekening, geen tuisbel nie.",
 
     // Modal (paste path fallback)
-    "Type a folder path": "Tik 'n vouer-pad",
+    "Type a folder path": "Tik 'n gids-pad",
     "Type a file path": "Tik 'n lêer-pad",
     "No native file dialog is available here. Paste the full path on this computer.":
       "Geen inheemse lêer-dialoog is hier beskikbaar nie. Plak die volle pad op hierdie rekenaar.",
@@ -370,6 +407,11 @@ window.VM_I18N = {
     // About / credit
     "by DigiPhyte": "deur DigiPhyte",
     "About": "Oor",
+    "Check for updates": "Kyk vir opdaterings",
+    "Checking for updates": "Soek tans vir opdaterings",
+    "Could not check for updates.": "Kon nie vir opdaterings soek nie.",
+    "Update available": "Opdatering beskikbaar",
+    "You are up to date.": "Jy is op datum.",
     "Said Fawlks-mawnt. Afrikaans for the way people actually speak.":
       "Uitgespreek Fawlks-mawnt. Afrikaans vir hoe mense werklik praat.",
 
@@ -420,11 +462,11 @@ window.VM_I18N = {
     "Setup, where to save": "Opstelling, waar om te stoor",
     "Where should your transcripts go?": "Waarheen moet jou transkripsies gaan?",
     "Every meeting is saved as a Markdown file. Pick a folder you can find later, or keep the default.":
-      "Elke vergadering word as 'n Markdown-lêer gestoor. Kies 'n vouer wat jy later kan kry, of hou die verstek.",
-    "Your folder": "Jou vouer",
-    "Default folder (per user, on this computer)": "Verstekvouer (per gebruiker, op hierdie rekenaar)",
-    "Choose a different folder": "Kies 'n ander vouer",
-    "Choose another folder": "Kies 'n ander vouer",
+      "Elke vergadering word as 'n Markdown-lêer gestoor. Kies 'n gids wat jy later kan kry, of hou die verstek.",
+    "Your folder": "Jou gids",
+    "Default folder (per user, on this computer)": "Verstekgids (per gebruiker, op hierdie rekenaar)",
+    "Choose a different folder": "Kies 'n ander gids",
+    "Choose another folder": "Kies 'n ander gids",
 
     // Quality selector (meeting screen) + model storage
     "Not downloaded yet. Click to download.": "Nog nie afgelaai nie. Klik om af te laai.",
@@ -433,7 +475,7 @@ window.VM_I18N = {
     "Where models are stored": "Waar modelle gestoor word",
     "Where summary models are stored": "Waar opsommingsmodelle gestoor word",
     "You can delete these folders by hand to free space if you ever need to.":
-      "Jy kan hierdie vouers met die hand uitvee om spasie vry te maak as jy ooit moet.",
+      "Jy kan hierdie gidse met die hand uitvee om spasie vry te maak as jy ooit moet.",
     "You can delete these files by hand to free space if you ever need to.":
       "Jy kan hierdie lêers met die hand uitvee om spasie vry te maak as jy ooit moet.",
 
@@ -448,6 +490,9 @@ window.VM_I18N = {
     "It is a large download (about 1.5 GB). You can skip this and set it up later in Settings. After it downloads, restart Volksmond to use your GPU.":
       "Dit is 'n groot aflaai (omtrent 1.5 GB). Jy kan dit oorslaan en later in Instellings opstel. Nadat dit afgelaai is, herbegin Volksmond om jou GPU te gebruik.",
     "NVIDIA GPU acceleration": "NVIDIA GPU-versnelling",
+    "Detected": "Bespeur",
+    "Download the NVIDIA CUDA libraries to run the Best model on your GPU, much faster than the CPU. NVIDIA only.":
+      "Laai die NVIDIA CUDA-biblioteke af om die Beste model op jou GPU te loop, baie vinniger as die SVE. Slegs NVIDIA.",
     "An NVIDIA graphics card was detected. Download the NVIDIA CUDA libraries (about 1.5 GB) to run the Best model on your GPU, much faster than the CPU. NVIDIA only.":
       "'n NVIDIA-grafikakaart is bespeur. Laai die NVIDIA CUDA-biblioteke af (omtrent 1.5 GB) om die Beste model op jou GPU te loop, baie vinniger as die SVE. Slegs NVIDIA.",
     "Active": "Aktief",

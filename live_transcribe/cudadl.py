@@ -114,6 +114,7 @@ def _probe_vram():
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5,
+            creationflags=(subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0),
         )
         if out.returncode == 0:
             return int(out.stdout.strip().splitlines()[0])
@@ -136,6 +137,7 @@ def _probe_name():
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
             capture_output=True, text=True, timeout=5,
+            creationflags=(subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0),
         )
         if out.returncode == 0:
             lines = out.stdout.strip().splitlines()

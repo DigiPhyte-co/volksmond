@@ -135,7 +135,7 @@ function markSvg(size) {
 function freshLive() {
   return {
     running: false, recording: false, transcribing: false, sourceKind: null,
-    startedAt: null, outputPath: null, audioStem: null, tier: null, model: null,
+    startedAt: null, outputPath: null, audioStem: null, tier: null, model: null, family: null,
     language: null, stopping: false, segments: [], es: null, title: "", importName: "",
     micDevice: null, loopbackDevice: null, switching: false,
   };
@@ -146,7 +146,7 @@ var S = {
   sessions: [], sessionsFolder: "",
   live: freshLive(),
   starting: { active: false, kind: null, title: "", error: null, startedAt: null },
-  form: { title: "", language: "af", tier: "auto", device: "auto", participants: [], terms: [], record: false, mic: null, loopback: null },
+  form: { title: "", language: "af", tier: "auto", device: "auto", participants: [], terms: [], record: false, mic: null, loopback: null, advancedOpen: false },
   setup: { stage: "welcome", choice: "transcribe" },
   finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null },
   reader: { name: "", title: "", text: "", summarising: false, summary: null },
@@ -251,6 +251,9 @@ function go(route) {
   S.route = route;
   // Reaching a pre-meeting screen is the signal that a transcription is imminent: warm the model.
   if (route === "pre" || route === "importpre") warmUp();
+  // Always re-fetch the session list when opening History, so a just-finished or just-imported
+  // transcript appears even if the finish-time refresh raced the transcript's write to disk.
+  if (route === "history") refreshSessions();
   render();
 }
 function teardownLive() {
@@ -379,7 +382,7 @@ function liveAudioStrip() {
 // of an already-downloaded model, plus CUDA/AV cold start). We pre-load it in the background
 // the moment the user reaches a pre-meeting screen, so Begin reuses a warm model.
 function warmUp() {
-  api.post("/api/warm-up", { tier: S.form.tier || "auto", device: S.form.device || "auto" })
+  api.post("/api/warm-up", { tier: S.form.tier || "auto", device: S.form.device || "auto", language: S.form.language || "" })
     .then(function (st) {
       S.warm = st;
       if (st && st.state === "warming") pollWarm();
@@ -421,7 +424,7 @@ async function startLive() {
     S.live.running = true; S.live.transcribing = true; S.live.recording = !!resp.recording;
     S.live.sourceKind = "live"; S.live.startedAt = new Date().toISOString();
     S.live.outputPath = resp.output_path; S.live.audioStem = resp.audio_stem;
-    S.live.tier = resp.tier; S.live.model = resp.model; S.live.language = resp.language;
+    S.live.tier = resp.tier; S.live.model = resp.model; S.live.family = resp.family; S.live.language = resp.language;
     S.live.title = S.form.title || "Live meeting";
     S.live.micDevice = S.form.mic; S.live.loopbackDevice = S.form.loopback;
     go("live"); openStream(); startElapsed(); startLevels();
@@ -482,7 +485,7 @@ async function startImport(arg) {
     S.live = freshLive();
     S.live.running = true; S.live.transcribing = true; S.live.sourceKind = "file";
     S.live.startedAt = new Date().toISOString();
-    S.live.outputPath = resp.output_path; S.live.tier = resp.tier; S.live.model = resp.model;
+    S.live.outputPath = resp.output_path; S.live.tier = resp.tier; S.live.model = resp.model; S.live.family = resp.family;
     S.live.importName = baseName(arg.path) || (arg.topic || "recording");
     S.live.title = arg.topic || topicFromName(baseName(resp.output_path));
     go("importing"); openStream();
@@ -948,11 +951,45 @@ function setupView() {
         ]),
       ]),
       el("div", { class: "row gap-10" }, [
-        el("button", { class: "btn primary tall grow", onclick: function () { S.setup.stage = "voice"; render(); } }, "Get started"),
+        el("button", { class: "btn primary tall grow", onclick: function () { S.setup.stage = "languages"; render(); } }, "Get started"),
       ]),
       el("div", { class: "row", style: { justifyContent: "center" } },
         el("button", { class: "btn ghost sm", onclick: function () { finishSetup(); } }, "Skip setup for now")),
       el("p", { class: "ink-3", style: { fontSize: "11.5px" }, text: "Next we download the transcription model to your computer, so your first meeting starts straight away. Summaries are an optional extra you can add after that." }),
+    ]);
+  } else if (stage === "languages") {
+    // Ask which languages the user transcribes BEFORE the model download, so the engine copy on
+    // the next step is honest about what gets used (Afrikaans -> Fluister, the rest -> Whisper).
+    var setupLangs = (S.settings && S.settings.transcribe_languages) || ["af", "en"];
+    var toggleSetupLang = function (code) {
+      // Read the freshest saved list (not the render-time copy) so rapid toggles don't act on
+      // stale state.
+      var sel = ((S.settings && S.settings.transcribe_languages) || setupLangs).slice();
+      var i = sel.indexOf(code);
+      if (i >= 0) { if (sel.length <= 1) return; sel.splice(i, 1); }   // keep at least one language
+      else sel.push(code);
+      var patch = { transcribe_languages: sel };
+      // If the removed language was the saved default, move the default to a kept one, so an
+      // English-only first run does not still start in Afrikaans/Fluister (mirrors transcriptionCard).
+      var cur = S.settings && S.settings.transcription_language;
+      if (cur && cur !== "" && sel.indexOf(cur) < 0) patch.transcription_language = sel[0];
+      if (S.form && S.form.language && S.form.language !== "" && sel.indexOf(S.form.language) < 0) S.form.language = sel[0];
+      saveSettings(patch);
+    };
+    inner = el("div", { class: "col-narrow stack", style: { gap: "18px" } }, [
+      el("div", { class: "eyebrow", text: "Setup, languages" }),
+      el("h1", { text: "Which languages do you transcribe?" }),
+      el("p", { class: "ink-2", text: "Pick the languages you record in. Afrikaans uses Fluister, our Afrikaans-tuned model; English and the rest use standard Whisper. The size is chosen automatically for your computer." }),
+      el("div", { class: "card", style: { padding: "16px" } },
+        el("div", { class: "row gap-8", style: { flexWrap: "wrap" } }, SUPPORTED_LANGS.map(function (l) {
+          var on = setupLangs.indexOf(l.code) >= 0;
+          return el("button", { class: "btn sm" + (on ? " primary" : " ghost"), onclick: function () { toggleSetupLang(l.code); } }, [on ? icon("check", 12) : null, el("span", { text: l.name })]);
+        }))),
+      el("p", { class: "ink-3", style: { fontSize: "11.5px" }, text: "You can change this any time in Settings." }),
+      el("div", { class: "row gap-8", style: { justifyContent: "flex-end", marginTop: "4px" } }, [
+        el("button", { class: "btn ghost", onclick: function () { S.setup.stage = "welcome"; render(); } }, "Back"),
+        el("button", { class: "btn primary tall", onclick: function () { S.setup.stage = "voice"; render(); } }, "Continue"),
+      ]),
     ]);
   } else if (stage === "voice") {
     // Don't let Continue silently skip the whole point of this step. If nothing is
@@ -971,10 +1008,11 @@ function setupView() {
       el("div", { class: "eyebrow", text: "Setup, transcription model" }),
       el("h1", { text: "Download the model that does the transcribing" }),
       el("p", { class: "ink-2", text: "Volksmond transcribes on your own computer using a language model. Download the one that suits your machine now, so your first meeting starts straight away instead of waiting on a download. It runs offline afterwards." }),
+      ((S.settings && (S.settings.transcribe_languages || []).indexOf("af") >= 0)) ? el("p", { class: "ink-3", style: { fontSize: "12px", margin: "0" }, text: "Afrikaans uses Fluister, downloaded automatically the first time you transcribe Afrikaans. The model below is the standard Whisper model for English and other languages." }) : null,
       voiceDownloadPanel(),
       el("p", { class: "ink-3", style: { fontSize: "11.5px" }, text: "It downloads in the background. You can carry on with setup while it finishes; your first meeting waits for it to be ready." }),
       el("div", { class: "row gap-8", style: { justifyContent: "flex-end", marginTop: "4px" } }, [
-        el("button", { class: "btn ghost", onclick: function () { S.setup.stage = "welcome"; render(); } }, "Back"),
+        el("button", { class: "btn ghost", onclick: function () { S.setup.stage = "languages"; render(); } }, "Back"),
         voiceContinue,
       ]),
     ]);
@@ -1096,9 +1134,6 @@ function homeView() {
 
 /* ── pre-meeting (live start) ─────────────────────────────── */
 function preView() {
-  var langSeg = segmented([["af", "Afrikaans"], ["en", "English"], ["", "Auto-detect"]], S.form.language, function (v) { S.form.language = v; render(); });
-  var tierSeg = qualitySelector();
-
   var dev = S.devices || {};
 
   var recordCard = el("div", { class: "card", style: { padding: "16px", background: S.form.record ? "var(--record-soft)" : "var(--surface)", borderColor: S.form.record ? "color-mix(in oklch, var(--record) 30%, var(--line))" : "var(--line)" } }, [
@@ -1119,11 +1154,9 @@ function preView() {
   var left = el("div", {}, [
     formField("Meeting title", el("span", { class: "label-muted", text: " (optional)" }),
       el("input", { class: "field tall", value: S.form.title, placeholder: "e.g. Q3 strategy review", oninput: function (e) { S.form.title = e.target.value; } })),
-    el("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" } }, [
-      formField("Language", null, langSeg, true),
-      formField("Quality", null, tierSeg, true),
-    ]),
-    runOnField(),
+    languageField(),
+    engineLine(),
+    advancedTranscribeControls(),
     formField("Participants", el("span", { class: "label-muted", text: " (optional, helps accuracy)" }), termsBox(S.form.participants, "Add a name")),
     formField("Jargon and terms", el("span", { class: "label-muted", text: " (optional)" }), termsBox(S.form.terms, "Add a term")),
     defaultContextNote(),
@@ -1192,8 +1225,6 @@ function defaultContextNote() {
 
 /* ── import setup (context before transcribing a file) ──────── */
 function importPreView() {
-  var langSeg = segmented([["af", "Afrikaans"], ["en", "English"], ["", "Auto-detect"]], S.form.language, function (v) { S.form.language = v; render(); });
-  var tierSeg = qualitySelector();
   var fileLabel = S.importName || "the recording";
   function begin() { startImport({ path: S.importPath, stem: S.importStem, topic: S.form.title }); }
   return el("div", { class: "screen" }, el("div", { class: "screen-inner col-mid" }, [
@@ -1211,11 +1242,9 @@ function importPreView() {
     ]),
     formField("Title", el("span", { class: "label-muted", text: " (optional)" }),
       el("input", { class: "field tall", value: S.form.title, placeholder: "e.g. Physio discovery call", oninput: function (e) { S.form.title = e.target.value; } })),
-    el("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" } }, [
-      formField("Language", null, langSeg, true),
-      formField("Quality", null, tierSeg, true),
-    ]),
-    runOnField(),
+    languageField(),
+    engineLine(),
+    advancedTranscribeControls(),
     formField("Participants", el("span", { class: "label-muted", text: " (optional, helps accuracy)" }), termsBox(S.form.participants, "Add a name")),
     formField("Jargon and terms", el("span", { class: "label-muted", text: " (optional)" }), termsBox(S.form.terms, "Add a term")),
     defaultContextNote(),
@@ -1303,7 +1332,7 @@ function liveView() {
     ]),
     el("div", { class: "right" }, [
       deviceBadge(S.live.tier),
-      S.live.model ? el("span", { class: "chip" }, raw(String(S.live.model))) : null,
+      S.live.family ? familyChip(S.live.family, S.live.model) : null,
       statusChip,
     ]),
   ]);
@@ -1393,6 +1422,7 @@ function importingView() {
     ]),
     el("div", { class: "right" }, [
       deviceBadge(S.live.tier),
+      S.live.family ? familyChip(S.live.family, S.live.model) : null,
       el("button", { class: "btn ghost", onclick: function () { api.post("/api/stop?what=all").catch(function () {}); toast("Stopping."); go("home"); } }, "Cancel"),
     ]),
   ]);
@@ -1484,7 +1514,7 @@ function summaryResult(summary, savedAs, fileName, scope) {
     el("div", { class: "head" }, [
       el("div", { class: "tile" }, icon("sparkle", 15)),
       el("div", { class: "grow" }, [
-        el("div", { style: { fontWeight: "600" }, text: "Summary" }),
+        el("div", { style: { fontWeight: "600" }, text: "Latest summary" }),
         el("div", { class: "ink-3", style: { fontSize: "11.5px" }, text: "Ran on this computer, saved next to the transcript" }),
       ]),
       el("button", { class: "btn ghost sm", onclick: function () { copyText(summary); } }, [icon("copy", 13), "Copy"]),
@@ -1618,18 +1648,42 @@ function settingsView() {
     aboutCard(),
   ]));
 }
+var updateState = { state: "idle", info: null };
+// Manual, user-initiated update check. Posts to the localhost server, which makes ONE outbound
+// GET to the public GitHub releases API. Never automatic; nothing leaves the machine until the
+// user clicks Check for updates.
+function checkUpdates() {
+  updateState = { state: "checking", info: null }; render();
+  api.post("/api/check-updates").then(function (d) {
+    updateState = { state: "done", info: d }; render();
+  }).catch(function () {
+    updateState = { state: "error", info: null }; render();
+  });
+}
 function aboutCard() {
   var version = (S.appInfo && S.appInfo.version) || "?";
+  var u = updateState;
+  var updateLine =
+    u.state === "checking" ? el("div", { class: "s", style: { marginTop: "4px", display: "flex", gap: "6px", alignItems: "center" } }, [el("span", { class: "spinner" }), el("span", { text: "Checking for updates" })]) :
+    u.state === "error" ? el("div", { class: "s", style: { marginTop: "4px", color: "var(--warn)" }, text: "Could not check for updates." }) :
+    (u.state === "done" && u.info && u.info.update_available) ? el("div", { class: "s", style: { marginTop: "4px" } }, [el("span", { text: "Update available" }), raw(": v" + u.info.latest + "  "), el("span", { class: "link", onclick: function () { openExternal(u.info.url); } }, "Download")]) :
+    (u.state === "done") ? el("div", { class: "s ok-text", style: { marginTop: "4px" }, text: "You are up to date." }) : null;
   return el("div", { class: "card settings-card" }, [
     el("div", { class: "card-title section-label", text: "About" }),
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, markSvg(20)),
       el("div", { class: "body" }, [
         el("div", { class: "t" }, [el("span", { text: "Volksmond" }), el("span", { class: "chip", text: "Version " + version })]),
-        el("div", { class: "s", text: "Said Fawlks-mawnt. Afrikaans for the way people actually speak." }),
+        // The pronunciation note only helps an English speaker; an Afrikaans speaker already
+        // knows how to say it, so hide it when the interface is in Afrikaans.
+        (LANG === "af") ? null : el("div", { class: "s", text: "Said Fawlks-mawnt. Afrikaans for the way people actually speak." }),
         el("div", { class: "s", text: "A DigiPhyte product, built in South Africa. All transcription happens on this machine unless you explicitly opt in." }),
+        updateLine,
       ]),
-      el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: function () { openExternal("https://digiphyte.com"); } }, "digiphyte.com")),
+      el("div", { class: "ctl", style: { display: "flex", flexDirection: "column", gap: "6px", alignItems: "stretch" } }, [
+        el("button", { class: "btn ghost", disabled: u.state === "checking", onclick: function () { checkUpdates(); } }, "Check for updates"),
+        el("button", { class: "btn ghost", onclick: function () { openExternal("https://digiphyte.com"); } }, "digiphyte.com"),
+      ]),
     ]),
   ]);
 }
@@ -1671,16 +1725,39 @@ function appearanceCard() {
 function transcriptionCard(st) {
   var draft = S.settingsDraft || {};
   var ctxVal = draft.default_context != null ? draft.default_context : (st.default_context || "");
+  var sel = (st.transcribe_languages || ["af", "en"]).slice();
+  function toggleLang(code) {
+    var i = sel.indexOf(code);
+    if (i >= 0) { if (sel.length <= 1) return; sel.splice(i, 1); }   // keep at least one language
+    else sel.push(code);
+    var patch = { transcribe_languages: sel };
+    // Keep the default language valid if we just removed it.
+    if (st.transcription_language !== "" && sel.indexOf(st.transcription_language) < 0) patch.transcription_language = sel[0];
+    saveSettings(patch);
+  }
+  var afOn = sel.indexOf("af") >= 0;
+  var defOpts = sel.map(function (c) { return [c, langName(c)]; });
+  defOpts.push(["", "Auto-detect"]);
   return el("div", { class: "card settings-card" }, [
     el("div", { class: "card-title section-label", text: "Transcription" }),
+    el("div", { class: "set-row", style: { display: "block" } }, [
+      el("div", { class: "t", style: { marginBottom: "4px" }, text: "Languages you transcribe" }),
+      el("div", { class: "s", style: { marginBottom: "10px" }, text: "Pick the languages you record in. The language you choose for a meeting picks the model; the size is chosen automatically." }),
+      el("div", { class: "row gap-8", style: { flexWrap: "wrap" } }, SUPPORTED_LANGS.map(function (l) {
+        var on = sel.indexOf(l.code) >= 0;
+        return el("button", { class: "btn sm" + (on ? " primary" : " ghost"), onclick: function () { toggleLang(l.code); } }, [on ? icon("check", 12) : null, el("span", { text: l.name })]);
+      })),
+      el("div", { class: "s", style: { marginTop: "10px" }, text: "Afrikaans uses Fluister, our Afrikaans-tuned model; English and other languages use standard Whisper." }),
+      (afOn && !fluisterReady()) ? el("div", { class: "s", style: { marginTop: "4px" }, text: "The Afrikaans-tuned Fluister model is not installed on this computer yet, so Afrikaans runs on standard Whisper for now." }) : null,
+    ]),
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("globe", 18)),
       el("div", { class: "body" }, [el("div", { class: "t", text: "Default language" }), el("div", { class: "s", text: "Used unless you change it for a meeting." })]),
-      el("div", { class: "ctl" }, selectEl([["af", "Afrikaans"], ["en", "English"], ["", "Auto-detect"]], st.transcription_language || "af", function (v) { saveSettings({ transcription_language: v }); })),
+      el("div", { class: "ctl" }, selectEl(defOpts, st.transcription_language || "af", function (v) { saveSettings({ transcription_language: v }); })),
     ]),
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("cpu", 18)),
-      el("div", { class: "body" }, [el("div", { class: "t", text: "Quality" }), el("div", { class: "s", text: "Auto picks the best model your hardware can run." })]),
+      el("div", { class: "body" }, [el("div", { class: "t", text: "Model size" }), el("div", { class: "s", text: "Advanced. Auto picks the best model your hardware can run; you rarely need to change this." })]),
       el("div", { class: "ctl" }, selectEl([["auto", "Auto"], ["small", "Fast"], ["medium", "Balanced"], ["large-v3-turbo", "High quality"], ["large-v3", "Best"]], normalizeQuality(st.tier), function (v) { saveSettings({ tier: v }); })),
     ]),
     el("div", { class: "set-row", style: { display: "block" } }, [
@@ -1696,6 +1773,7 @@ function transcriptionCard(st) {
 var SUMMARY_LABELS = {
   "gemma-4-e2b": { title: "Gemma 4 (2 billion)", note: "Smaller and faster, light on memory. Works well on most machines." },
   "gemma-4-e4b": { title: "Gemma 4 (4 billion)", note: "Larger and more polished. Needs more memory and a little more time." },
+  "gemma-4-12b": { title: "Gemma 4 (12 billion)", note: "The most capable local summary. Needs a strong machine with plenty of memory, and takes a little longer." },
 };
 function fmtGB(bytes) { var g = (bytes || 0) / 1e9; return (g < 1 ? g.toFixed(2) : g.toFixed(1)) + " GB"; }
 var _dlTimer = null;
@@ -1933,8 +2011,11 @@ function cudaPanel(manage) {
   return el("div", { class: "card", style: { padding: "14px" } }, [
     el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "flex-start", gap: "12px" } }, [
       el("div", { class: "grow" }, [
-        el("div", { style: { fontWeight: "600" } }, [el("span", { text: "NVIDIA GPU acceleration" }), vram ? el("span", { class: "chip", style: { marginLeft: "8px" } }, raw(vram)) : null]),
-        el("div", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "2px" }, text: "An NVIDIA graphics card was detected. Download the NVIDIA CUDA libraries (about 1.5 GB) to run the Best model on your GPU, much faster than the CPU. NVIDIA only." }),
+        // The chip carries the DOWNLOAD size (like every other download bubble in the app). The
+        // detected card and its VRAM go in a separate line so the two are never confused.
+        el("div", { style: { fontWeight: "600" } }, [el("span", { text: "NVIDIA GPU acceleration" }), c.approx_bytes ? el("span", { class: "chip", style: { marginLeft: "8px" } }, raw(fmtGB(c.approx_bytes))) : null]),
+        (c.gpu_name || vram) ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "2px" } }, [el("span", { text: "Detected" }), raw(": " + (c.gpu_name || "NVIDIA GPU") + (vram ? " (" + vram + ")" : ""))]) : null,
+        el("div", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "4px" }, text: "Download the NVIDIA CUDA libraries to run the Best model on your GPU, much faster than the CPU. NVIDIA only." }),
       ]),
       action,
     ]),
@@ -2141,6 +2222,93 @@ function stopRow(what, recommended, title, sub, kb, finish) {
   ]);
 }
 
+/* ── transcription model family (language-first) ──────────── */
+// The spoken LANGUAGE picks the model family: Afrikaans -> Fluister (our Afrikaans-tuned
+// Whisper), everything else -> stock Whisper. The hardware picks the SIZE, so the user mostly
+// just picks a language. Mirrors transcribe.family_for_language on the server.
+var SUPPORTED_LANGS = [
+  { code: "af", name: "Afrikaans", family: "fluister" },
+  { code: "en", name: "English", family: "whisper" },
+];
+var LANG_NAMES = { "af": "Afrikaans", "en": "English", "": "Auto-detect" };
+function langName(code) { return LANG_NAMES[code] != null ? LANG_NAMES[code] : code; }
+function familyForLang(lang) { return /^af/i.test(lang || "") ? "fluister" : "whisper"; }
+// True once a Fluister model is actually installed; until then an Afrikaans session honestly
+// runs (and is labelled) as stock Whisper.
+function fluisterReady() { return !!(S.voiceModels && S.voiceModels.fluister_available); }
+function familyLabelFor(lang) { return (familyForLang(lang) === "fluister" && fluisterReady()) ? "Fluister" : "Whisper"; }
+// Friendly size label from the loaded model id/path (a stock name like "large-v3", a hosted
+// Fluister repo like "digiphyte/fluister-medium", or a local ct2 dir). Mirrors the Quality
+// vocabulary so the live chip can read "Fluister, Best".
+function sizeLabelFromModel(model) {
+  var m = (model || "").toLowerCase();
+  if (!m) return "";
+  if (m.indexOf("turbo") >= 0) return "High quality";
+  if (m.indexOf("medium") >= 0) return "Balanced";
+  if (m.indexOf("small") >= 0) return "Light";
+  if (m.indexOf("base") >= 0 || m.indexOf("tiny") >= 0) return "Lite";
+  if (m.indexOf("large") >= 0) return "Best";
+  if (m.indexOf("af-lora") >= 0 || m.indexOf("fluister") >= 0) return "Best"; // bare Fluister == large-v3
+  return "";
+}
+// The lean engine chip on the live / importing header: the family plus which size is running,
+// so the user can see it is e.g. Fluister at Balanced without opening anything.
+function familyChip(family, model) {
+  var size = sizeLabelFromModel(model);
+  var name = (family === "fluister") ? "Fluister" : "Whisper";
+  var label = size ? (name + ", " + tr(size)) : name;
+  if (family === "fluister") return el("span", { class: "chip accent", title: tr("Afrikaans-optimised model") }, [icon("sparkle", 12), el("span", {}, raw(label))]);
+  return el("span", { class: "chip" }, [el("span", {}, raw(label))]);
+}
+// The languages the user transcribes (Settings), plus Auto-detect, as picker options.
+function transcribeLangOpts() {
+  var ls = (S.settings && S.settings.transcribe_languages) || ["af", "en"];
+  var opts = ls.map(function (c) { return [c, langName(c)]; });
+  opts.push(["", "Auto-detect"]);
+  return opts;
+}
+// Language is the hero control on the pre-meeting screens. Switching it re-warms the matching
+// family so Begin stays instant.
+function languageField() {
+  return formField("Language", null, segmented(transcribeLangOpts(), S.form.language, function (v) {
+    S.form.language = v; warmUp(); render();
+  }), true);
+}
+// One honest line: which engine this language uses, and that the size is automatic.
+function engineLine() {
+  var lang = S.form.language;
+  var wantFluister = familyForLang(lang) === "fluister";
+  var label = familyLabelFor(lang);
+  var msg;
+  if (wantFluister && fluisterReady()) msg = "Afrikaans uses Fluister, our Afrikaans-tuned model. The size is chosen automatically for your computer.";
+  else if (wantFluister) msg = "Afrikaans currently uses standard Whisper. The Afrikaans-tuned Fluister model is not installed yet; it switches on automatically once it is.";
+  else if (lang === "") msg = "Auto-detect uses standard Whisper. The size is chosen automatically for your computer.";
+  else msg = "English uses standard Whisper. The size is chosen automatically for your computer.";
+  return el("div", { class: "card", style: { padding: "11px 13px", display: "flex", gap: "10px", alignItems: "center", marginBottom: "16px" } }, [
+    el("div", { class: "tone-tile" + (label === "Fluister" ? " accent" : ""), style: { width: "30px", height: "30px", flex: "0 0 auto" } }, icon(label === "Fluister" ? "sparkle" : "globe", 15)),
+    el("div", {}, [
+      el("div", { style: { fontWeight: "600", fontSize: "12.5px" } }, [el("span", { text: "Engine: " }), el("span", { text: label })]),
+      el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "1px" }, text: msg }),
+    ]),
+  ]);
+}
+// Size (Quality) and processor (GPU/CPU) are now advanced: the hardware picks the size by
+// default. Tucked behind a disclosure so the pre-meeting screen stays about the language.
+function advancedTranscribeControls() {
+  var open = !!S.form.advancedOpen;
+  var toggle = el("button", { class: "btn ghost sm", style: { padding: "5px 9px" }, onclick: function () { S.form.advancedOpen = !open; render(); } },
+    [icon(open ? "chevDown" : "chevRight", 14), el("span", { text: "Advanced" })]);
+  if (!open) return el("div", { style: { marginBottom: "16px" } }, toggle);
+  return el("div", { style: { marginBottom: "16px" } }, [toggle,
+    el("div", { class: "card", style: { padding: "14px", marginTop: "8px" } }, [
+      formField("Model size", el("span", { class: "label-muted", text: " (auto is recommended)" }),
+        el("div", {}, [qualitySelector(),
+          el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Auto picks the best model your computer can run. Bigger is more accurate but slower." })]), true),
+      runOnField(),
+    ]),
+  ]);
+}
+
 /* ── small shared builders ────────────────────────────────── */
 // Quality choices, keyed by the model each maps to (plus "auto"). The SAME set is
 // shown here and in the download panel, so the two never disagree. Auto is default.
@@ -2256,6 +2424,9 @@ async function boot() {
   LANG = afLang(S.settings);
   if (S.settings) {
     S.form.language = S.settings.transcription_language != null ? S.settings.transcription_language : "af";
+    // Keep the default within the languages the user transcribes, so the picker highlights it.
+    var tl = S.settings.transcribe_languages || ["af", "en"];
+    if (S.form.language !== "" && tl.indexOf(S.form.language) < 0) S.form.language = tl[0] || "af";
     S.form.tier = normalizeQuality(S.settings.tier);
     S.form.device = S.settings.device || "auto";
   }
@@ -2288,7 +2459,7 @@ function adoptRunning(status) {
   S.live.sourceKind = status.source_kind;
   S.live.startedAt = status.started_at || new Date().toISOString();
   S.live.outputPath = status.output_path;
-  S.live.tier = status.tier; S.live.model = status.model; S.live.language = status.language;
+  S.live.tier = status.tier; S.live.model = status.model; S.live.family = status.family; S.live.language = status.language;
   S.live.stopping = !!status.stopping;
   S.live.title = topicFromName(baseName(status.output_path));
   S.live.micDevice = status.mic_device != null ? status.mic_device : null;

@@ -57,6 +57,7 @@ def _gpu_vram_mb():
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5,
+            creationflags=(subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0),
         )
         if out.returncode == 0:
             return int(out.stdout.strip().splitlines()[0])

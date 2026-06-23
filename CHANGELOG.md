@@ -1,5 +1,66 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-22, v1.1.1: first-run language step + testing-feedback polish
+
+Round of fixes from testing the v1.1.0 build (`licensing.APP_VERSION` 1.1.0 -> 1.1.1).
+
+- **First-run asks your languages.** A new setup step (after Welcome, before the model download)
+  asks which languages you transcribe, so the download step is honest about what gets used:
+  Afrikaans -> Fluister (downloaded on first Afrikaans use), English and the rest -> stock Whisper.
+  (`web/static/app.js`, `i18n.js`.)
+- **Live engine chip shows the size.** The Fluister/Whisper chip on the live and importing headers
+  now reads e.g. "Fluister, Balanced" so you can see which model is running, not just the family.
+  (`web/static/app.js`.)
+- **No console-window flash.** The `nvidia-smi` hardware probes now run with `CREATE_NO_WINDOW` on
+  Windows, so no black console box flashes when the GPU is probed. (`cudadl.py`, `__main__.py`.)
+- **GPU panel: download size in the chip.** The chip beside "NVIDIA GPU acceleration" now shows the
+  download size (like every other download bubble), and the detected card + VRAM moved to a
+  "Detected:" line, so the two are no longer confused. (`web/static/app.js`, `i18n.js`.)
+- **Afrikaans code-switching prompt.** The Afrikaans anchor now tells the model the conversation is
+  primarily Afrikaans but may switch to English, and to write each as itself, so English in an
+  Afrikaans call is transcribed as English. Anti-Dutch anchoring kept. (`transcribe.py`.)
+- **Copy.** 12B summary model now has a name and description ("Gemma 4 (12 billion)"); summary card
+  reads "Latest summary"; Afrikaans "Meld 'n gogga of idee", interface-language label
+  "Volksmond-toepassingstaal", and the Volksmond pronunciation note now shows in English only.
+  (`web/static/app.js`, `i18n.js`.)
+- **Summary history.** Regenerating a summary no longer overwrites the previous one: the latest is
+  always `<transcript>-summary.md` (the one the app shows) and the prior latest is archived next to
+  it as `<transcript>-summary-N.md`. The history list hides all of them. (`web/app.py`.)
+- **Real "Check for updates".** The About button now does a manual, user-initiated check: one
+  outbound GET to the PUBLIC GitHub releases API (no user data sent), comparing the latest tag to
+  this build and showing up-to-date / update-available + a download link. CSRF-protected; the only
+  outbound call the app ever makes, and only on click. (`web/app.py` /api/check-updates,
+  `web/static/app.js`, `i18n.js`.)
+- **Afrikaans folder word.** Folder references now use "gids" (the correct Afrikaans for a
+  directory); "lêer" stays only where it means an actual file. (`i18n.js`.)
+- **History refresh.** The History list now re-fetches every time you open it, so a just-finished or
+  just-imported transcript always shows up. Previously it refreshed only on app-start and at the
+  instant a session finished, which could race the transcript's write to disk and leave the list
+  stale (the transcript was always safe on disk; it just was not shown until restart).
+  (`web/static/app.js`.)
+
+## 2026-06-22, v1.1.0: Fluister Afrikaans-tuned models + language-first model selection
+
+The Afrikaans-optimised models ship, and the model you transcribe with is now chosen by the
+LANGUAGE you pick rather than a quality dropdown (`licensing.APP_VERSION` 1.0.15 -> 1.1.0).
+
+- **Fluister models.** Afrikaans now transcribes on Fluister, our Afrikaans-tuned Whisper (LoRA
+  fine-tunes merged to ctranslate2 int8), published at huggingface.co/digiphyte/fluister-* and
+  downloaded on first use like the stock models. On real South African Afrikaans they produce clean
+  Afrikaans where stock Whisper drifts to Dutch spellings ("gebou" not "gebouw"), while keeping
+  English code-switching intact. English and other languages still use stock Whisper. On this dev
+  machine the locally-built ct2 dirs are reused so there is no re-download. (`transcribe.py`.)
+- **Language-first selection.** The spoken language picks the model family (Afrikaans -> Fluister,
+  else -> Whisper); the hardware still picks the size automatically. The pre-meeting screen leads
+  with Language and shows an honest "Engine: Fluister / Whisper" line; model size and GPU/CPU moved
+  behind an Advanced disclosure. Settings gains a "Languages you transcribe" picker. EN + AF strings
+  added. (`transcribe.py`, `web/app.py`, `config.py`, `web/static/app.js`, `i18n.js`.)
+- **Lean engine label on the live screen.** The live and importing headers show a clean
+  "Fluister"/"Whisper" chip instead of the raw model path. (`web/static/app.js`.)
+- **Internal:** TIER_CONFIG now holds stock size names; the engine resolves the Fluister variant
+  from the session language at load time (this also fixed a latent test break where a local
+  Fluister path leaked into TIER_CONFIG). Added `test_family_resolution`; web-API tests green.
+
 ## 2026-06-19, v1.0.15: summary styles, GPU summaries, live device switch + meters, faster first start
 
 Five user-facing features (`licensing.APP_VERSION` 1.0.14 -> 1.0.15).

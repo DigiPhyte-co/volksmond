@@ -35,6 +35,7 @@ _WRITE_LOCK = threading.RLock()
 DEFAULTS = {
     "interface_language": "en-ZA",    # language of the app's own UI (i18n later)
     "transcription_language": "af",   # default spoken language; "" == auto-detect
+    "transcribe_languages": ["af", "en"],  # languages the user transcribes; drives the per-session language picker and (later) which model families to provision. The chosen language picks the model FAMILY (Afrikaans -> Fluister), the hardware picks the size.
     "tier": "auto",                   # default hardware tier
     "save_location": "",              # "" == default folder (project sessions/ in dev, per-user app-data when frozen)
     "default_context": "",            # standing names/jargon seeded every session

@@ -135,6 +135,29 @@ def test_quality_resolution():
     print("  OK  quality resolution: model keys + auto + legacy all map to valid tiers")
 
 
+def test_family_resolution():
+    # Language picks the model FAMILY: Afrikaans -> Fluister, everything else (incl. auto-detect)
+    # -> stock Whisper. The tier holds a stock SIZE; the Engine pairs size + language at load time.
+    from live_transcribe import transcribe as T
+    assert T.family_for_language("af") == "fluister"
+    assert T.family_for_language("af-ZA") == "fluister"
+    assert T.family_for_language("en") == "whisper"
+    assert T.family_for_language("") == "whisper"
+    assert T.family_for_language(None) == "whisper"
+    # Non-Afrikaans always resolves to the plain stock size, never a Fluister model.
+    assert T.resolve_model("small", "en") == ("small", False)
+    assert T.resolve_model("large-v3", "") == ("large-v3", False)
+    # A size with no Fluister build falls back to stock even for Afrikaans (base/tiny have none).
+    assert T.resolve_model("base", "af") == ("base", False)
+    # Every tier now stores a stock size name, never a hardcoded Fluister path.
+    sizes = {"tiny", "base", "small", "medium", "large-v3-turbo", "large-v3"}
+    for t, cfg in T.TIER_CONFIG.items():
+        assert cfg["model"] in sizes, (t, cfg["model"])
+    # /api/voice-models exposes whether Fluister is installed, so the UI can be honest.
+    assert isinstance(client.get("/api/voice-models").json().get("fluister_available"), bool)
+    print("  OK  family resolution: af -> Fluister, others -> Whisper; tiers hold stock sizes")
+
+
 def test_model_delete_api():
     # Removing models to free space: both delete endpoints reject a bad id (400) and
     # are CSRF-protected (403 without the token). We deliberately never issue a valid
@@ -312,7 +335,7 @@ def test_warm_up():
     # a model; we are checking the endpoint contract, not loading weights.
     import live_transcribe.transcribe as T
     orig = T.warm_up_async
-    T.warm_up_async = lambda tier: {"state": "warming", "tier": tier}
+    T.warm_up_async = lambda tier, language=None: {"state": "warming", "tier": tier}
     try:
         r = client.post("/api/warm-up", json={"tier": "small", "device": "cpu"})
         assert r.status_code == 200 and r.json().get("state") in ("warming", "ready", "busy", "idle"), r.text
@@ -340,6 +363,7 @@ if __name__ == "__main__":
                test_voice_model_download_api,
                test_cuda_api,
                test_quality_resolution,
+               test_family_resolution,
                test_model_delete_api,
                test_summary_language_validated,
                test_settings_never_leak_secret,

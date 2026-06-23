@@ -22,33 +22,71 @@ cudadl.register_dll_dir()
 from faster_whisper import WhisperModel
 
 
-# Afrikaans-tuned models, merged to ctranslate2 int8: large-v3 (andreoosthuizen LoRA) and our
-# own medium fine-tune on the afrikaans-30s dataset. Much better on Afrikaans, equal-or-better on
-# English, no Afrikaans leakage on pure-English audio (see SA-ASR-Model/corpus-strategy.md).
-# These are local-cache paths for now (the models are not yet hosted/bundled): _afrikaans_or()
-# falls back to the stock Whisper model when the path is absent, so this is safe as-is (machines
-# without the model just get stock until we host it). Set SA_LIVE_AF_MODEL=stock to force stock
-# even when present (A/B), or to a path/name to override.
-def _afrikaans_or(path, stock):
+# Fluister: our Afrikaans-optimised Whisper models (LoRA fine-tunes merged to ctranslate2 int8).
+# Much better on Afrikaans, equal-or-better on English, no Afrikaans leakage on pure-English
+# audio (see SA-ASR-Model/corpus-strategy.md). The LANGUAGE chosen for a session decides the
+# model FAMILY (Afrikaans -> Fluister, everything else -> stock Whisper); the hardware tier
+# decides the SIZE. resolve_model() pairs the two.
+#
+# Published publicly at huggingface.co/digiphyte/fluister-*. faster-whisper downloads and caches a
+# repo id on first use, exactly like the stock models. On this dev machine the locally-built ct2
+# dirs are reused as-is (no re-download). Set SA_LIVE_AF_MODEL=stock to force the stock Whisper of
+# the same size (A/B), or to any path/name to override every Fluister size.
+def _fluister(repo, local, stock):
     ov = os.environ.get("SA_LIVE_AF_MODEL")
     if ov:
         return stock if ov.lower() == "stock" else ov
-    return path if os.path.isdir(path) else stock
+    return local if os.path.isdir(local) else repo
 
-_AF_MODEL = _afrikaans_or(r"C:\Users\seanf\.cache\af-lora-ct2-int8", "large-v3")
-_AF_MEDIUM = _afrikaans_or(r"C:\Users\seanf\.cache\af-lora-medium-ct2-int8", "medium")
+# size -> Fluister model id: the hosted HF repo (downloaded on first use), or the local ct2 build
+# when present on this machine. resolve_model treats anything != the stock size name as Fluister.
+_FLUISTER = {
+    "large-v3":       _fluister("digiphyte/fluister-large-v3", r"C:\Users\seanf\.cache\af-lora-ct2-int8", "large-v3"),
+    "large-v3-turbo": _fluister("digiphyte/fluister-turbo", r"C:\Users\seanf\.cache\af-lora-turbo-ct2-int8", "large-v3-turbo"),
+    "medium":         _fluister("digiphyte/fluister-medium", r"C:\Users\seanf\.cache\af-lora-medium-ct2-int8", "medium"),
+    "small":          _fluister("digiphyte/fluister-small", r"C:\Users\seanf\.cache\af-lora-small-ct2-int8", "small"),
+}
 
-# Tiers. compute_type matters as much as the model:
-#  - "gpu"     large-v3, int8_float16 (Afrikaans int8 model), needs ~3GB+ VRAM (RTX 3090 etc.)
-#  - "gpu-4gb" large-v3 int8_float16  , fits a 4GB card (GTX 1650 Mobile);
-#                                        near-float16 quality, int8 tensor cores
+
+def family_for_language(language):
+    """The model family that transcribes this language. Afrikaans -> our Fluister tune; everything
+    else (English, others, and auto-detect, which we cannot assume is Afrikaans) -> stock Whisper.
+    Bantu languages will map to a future za-anv family."""
+    return "fluister" if (language or "").lower().startswith("af") else "whisper"
+
+
+def resolve_model(size, language):
+    """Map a Whisper size + the spoken language to the concrete model id to load, and say whether
+    the result is actually a Fluister model. Afrikaans uses the Fluister tune of that size when it
+    is installed; any other language, or a size with no Fluister build, uses stock Whisper.
+    Returns (model_id, is_fluister)."""
+    if family_for_language(language) == "fluister":
+        tuned = _FLUISTER.get(size)
+        if tuned and tuned != size:        # a real Fluister path/repo, not the stock fallback
+            return tuned, True
+    return size, False
+
+
+def fluister_available():
+    """True if at least one Fluister model is installed (any size resolves to a tuned model rather
+    than its stock fallback), so the UI can tell the truth about whether an Afrikaans session will
+    actually run on Fluister yet."""
+    return any(v != k for k, v in _FLUISTER.items())
+
+
+# Tiers map hardware -> SIZE + device + compute_type. The model field is a stock Whisper size;
+# the Engine swaps it for the Fluister tune of that size when the session language is Afrikaans
+# (see resolve_model). compute_type matters as much as the size:
+#  - "gpu"     large-v3, int8_float16, needs ~3GB+ VRAM (RTX 3090 etc.)
+#  - "gpu-4gb" large-v3, int8_float16, fits a 4GB card (GTX 1650 Mobile);
+#                                       near-float16 quality, int8 tensor cores
 #  - cpu tiers, fallback only. CPU ASR is memory-bandwidth-bound, so it can run
 #                slower than real-time while CPU usage looks moderate. Prefer a
 #                GPU tier whenever a CUDA device exists.
 TIER_CONFIG = {
-    "gpu":        {"model": _AF_MODEL,        "device": "cuda", "compute_type": "int8_float16"},
-    "gpu-4gb":    {"model": _AF_MODEL,        "device": "cuda", "compute_type": "int8_float16"},
-    # CPU tiers set the STARTING model. On CPU the engine measures its real-time
+    "gpu":        {"model": "large-v3",       "device": "cuda", "compute_type": "int8_float16"},
+    "gpu-4gb":    {"model": "large-v3",       "device": "cuda", "compute_type": "int8_float16"},
+    # CPU tiers set the STARTING size. On CPU the engine measures its real-time
     # factor each chunk and auto-downgrades along CPU_LADDER if it can't keep up
     # (see _maybe_downgrade), so a fast CPU keeps the bigger model and a slow one
     # ratchets down on its own. Start ambitious; let it self-correct. Pair with
@@ -56,11 +94,11 @@ TIER_CONFIG = {
     "cpu":        {"model": "small",          "device": "cpu",  "compute_type": "int8"},
     "cpu-min":    {"model": "base",           "device": "cpu",  "compute_type": "int8"},
     "cpu-strong": {"model": "large-v3-turbo", "device": "cpu",  "compute_type": "int8"},
-    "cpu-mid":    {"model": _AF_MEDIUM,        "device": "cpu",  "compute_type": "int8"},
+    "cpu-mid":    {"model": "medium",         "device": "cpu",  "compute_type": "int8"},
     # large-v3 on CPU: too slow to hold real-time for LIVE on most machines (the
     # adaptive ladder downgrades it there), but the best-accuracy choice for an
     # uploaded recording / post-meeting pass, where there is no real-time constraint.
-    "cpu-large":  {"model": _AF_MODEL,        "device": "cpu",  "compute_type": "int8"},
+    "cpu-large":  {"model": "large-v3",       "device": "cpu",  "compute_type": "int8"},
 }
 
 
@@ -78,7 +116,7 @@ _MODEL_CACHE = {}                 # (model, device, compute_type) -> WhisperMode
 _CACHE_MAX = 3                    # bound memory; evicted entries stay alive while a session still references them
 _BUILD_LOCK = threading.RLock()   # serialise builds + warm-up, so a Begin during warm-up reuses the warm model
 _WARM_LOCK = threading.Lock()     # guards _WARM only (kept separate so status reads never wait on a long build)
-_WARM = {"state": "idle", "tier": None}   # state: idle | warming | ready | error
+_WARM = {"state": "idle", "tier": None, "model": None}   # state: idle|warming|ready|error; model = resolved id being warmed
 
 
 def _build_model(model_name, device, compute_type, cpu_threads):
@@ -117,43 +155,50 @@ def warm_status():
         return dict(_WARM)
 
 
-def warm_up_async(tier):
-    """Pre-load and lightly exercise the model for `tier` in the background, so the first
-    Begin is instant. Idempotent: a no-op while already warming, or once it is cached."""
+def warm_up_async(tier, language=None):
+    """Pre-load and lightly exercise the model for `tier` + `language` in the background, so the
+    first Begin is instant. The language matters: an Afrikaans session loads the Fluister model,
+    so warming the stock model would miss. Idempotent: a no-op while already warming, or once the
+    resolved model is cached."""
     cfg = TIER_CONFIG.get(tier)
     if not cfg:
         return {"state": "idle", "tier": None}
-    key = (cfg["model"], cfg["device"], cfg["compute_type"])
+    model_id, _ = resolve_model(cfg["model"], language)
+    key = (model_id, cfg["device"], cfg["compute_type"])
     with _WARM_LOCK:
-        if _WARM["state"] == "warming":
+        if key in _MODEL_CACHE:        # already built (GIL-safe membership read) -> ready
+            _WARM.update(state="ready", tier=tier, model=model_id)
             return dict(_WARM)
-        if key in _MODEL_CACHE:        # GIL-safe membership read; just an idempotency hint
-            _WARM.update(state="ready", tier=tier)
+        # Only treat an in-flight warm as a no-op when it is warming THIS model. A language switch
+        # selects a different family, so its warm must still be kicked off (it queues on _BUILD_LOCK).
+        if _WARM["state"] == "warming" and _WARM.get("model") == model_id:
             return dict(_WARM)
-        _WARM.update(state="warming", tier=tier)
-    threading.Thread(target=_warm_run, args=(tier, cfg), daemon=True, name="warmup").start()
+        _WARM.update(state="warming", tier=tier, model=model_id)
+    threading.Thread(target=_warm_run, args=(tier, cfg, model_id, language), daemon=True, name="warmup").start()
     return {"state": "warming", "tier": tier}
 
 
-def _warm_run(tier, cfg):
+def _warm_run(tier, cfg, model_id, language):
     import numpy as np
     try:
         with _BUILD_LOCK:   # hold across build + dummy so a concurrent Begin waits for a fully warm model
-            m = load_model(cfg["model"], cfg["device"], cfg["compute_type"])
+            m = load_model(model_id, cfg["device"], cfg["compute_type"])
             # A tiny dummy inference triggers CUDA/cuDNN init (and any first-call autotune) now,
             # off the user's critical path. vad_filter=False so the encoder actually runs on the
             # silence rather than the VAD discarding it.
             try:
-                list(m.transcribe(np.zeros(16000, dtype=np.float32), language="af",
+                list(m.transcribe(np.zeros(16000, dtype=np.float32), language=(language or "af"),
                                   vad_filter=False, beam_size=1)[0])
             except Exception:
                 pass
         with _WARM_LOCK:
-            _WARM.update(state="ready", tier=tier)
+            if _WARM.get("model") == model_id:   # don't clobber a newer warm (late language switch)
+                _WARM.update(state="ready", tier=tier)
     except Exception as e:
         print(f"[warmup] failed for {tier}: {e}", flush=True)
         with _WARM_LOCK:
-            _WARM.update(state="error", tier=tier)
+            if _WARM.get("model") == model_id:
+                _WARM.update(state="error", tier=tier)
 
 # Anti-Dutch anchor for Afrikaans transcription.
 #
@@ -167,7 +212,9 @@ def _warm_run(tier, cfg):
 # different between the two languages (julle/hulle, nie...nie double-negative,
 # baie/nogal/lekker), plus everyday SA business vocabulary.
 AF_ANCHOR_PROMPT = (
-    "Dit is 'n gesprek in Afrikaans. Ons praat Suid-Afrikaanse Afrikaans, "
+    "Dit is 'n gesprek hoofsaaklik in Afrikaans, maar die sprekers wissel soms "
+    "na Engels (kodewisseling). Skryf Afrikaans as Afrikaans en Engels as Engels, "
+    "net soos dit gepraat word. Ons praat Suid-Afrikaanse Afrikaans, "
     "nie Nederlands nie. Algemene woorde: baie, nogal, lekker, kuier, sjoe, "
     "eish, vandag, môre, gister, dankie tog, asseblief, julle, hulle, ons, "
     "kinders, kollegas, vergadering, besigheid."
@@ -311,11 +358,16 @@ class Engine:
         else:
             self.initial_prompt = initial_prompt
         cfg = TIER_CONFIG[tier]
-        self.model_name = cfg["model"]
+        # size = the stock Whisper size for this tier (drives the CPU downgrade ladder); model_name
+        # = the concrete model loaded, which is the Fluister tune of that size for an Afrikaans
+        # session and stock Whisper otherwise. family/is_fluister label the active engine honestly.
+        self.size = cfg["model"]
+        self.model_name, self.is_fluister = resolve_model(self.size, language)
+        self.family = "fluister" if self.is_fluister else "whisper"
 
         # Cached, local-only load (no network revalidation) and reused across sessions, so a
         # warmed model makes Begin instant. See load_model / warm_up_async above.
-        self.model = load_model(cfg["model"], cfg["device"], cfg["compute_type"], cpu_threads=cpu_threads)
+        self.model = load_model(self.model_name, cfg["device"], cfg["compute_type"], cpu_threads=cpu_threads)
         self._is_cpu = cfg["device"] == "cpu"
         self._compute_type = cfg["compute_type"]
         self._cpu_threads = cpu_threads
@@ -459,23 +511,29 @@ class Engine:
         if avg <= DOWNGRADE_RTF:
             return
         try:
-            idx = CPU_LADDER.index(self.model_name)
+            idx = CPU_LADDER.index(self.size)
         except ValueError:
-            idx = -1  # start model above the ladder (turbo/large-v3) -> first rung is next
+            idx = -1  # start size above the ladder (turbo/large-v3) -> first rung is next
         if idx + 1 >= len(CPU_LADDER):
             return  # already on the fastest rung; nothing more to give
-        new_model = CPU_LADDER[idx + 1]
+        new_size = CPU_LADDER[idx + 1]
+        # Keep the family: an Afrikaans session downgrades to the Fluister tune of the smaller size
+        # where one exists (medium, small), and to stock Whisper for the rungs that have none.
+        new_model, new_is_fluister = resolve_model(new_size, self.language)
         print(f"[engine] CPU RTF ~{avg:.2f} (> {DOWNGRADE_RTF}); "
-              f"downgrading {self.model_name} -> {new_model}", flush=True)
+              f"downgrading {self.size} -> {new_size}", flush=True)
         try:
             new = load_model(new_model, "cpu", self._compute_type, cpu_threads=self._cpu_threads)
         except Exception as e:
-            print(f"[engine] downgrade load failed ({new_model}): {e}", flush=True)
+            print(f"[engine] downgrade load failed ({new_size}): {e}", flush=True)
             return
         self.model = new
+        self.size = new_size
         self.model_name = new_model
+        self.is_fluister = new_is_fluister
+        self.family = "fluister" if new_is_fluister else "whisper"
         self._rtf.clear()
-        self._emit_notice(t_start, f"[engine: switched to '{new_model}' model to keep up with the audio]")
+        self._emit_notice(t_start, f"[engine: switched to '{new_size}' model to keep up with the audio]")
 
     def _run(self):
         # Loop until the sentinel, or (during shutdown) until the queue empties.

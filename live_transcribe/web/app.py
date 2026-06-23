@@ -119,6 +119,7 @@ class _State:
         self.started_at: Optional[datetime] = None
         self.tier: Optional[str] = None
         self.model: Optional[str] = None
+        self.family: Optional[str] = None    # "fluister" | "whisper", for the lean engine label
         self.output_path: Optional[Path] = None
         self.language: Optional[str] = None
         # Current capture device specs + chunk size, so a live device switch can rebuild
@@ -145,6 +146,7 @@ class _State:
         self.started_at = None
         self.tier = None
         self.model = None
+        self.family = None
         self.output_path = None
         self.language = None
         self.mic_device = None
@@ -281,6 +283,7 @@ def status():
             "source_kind": STATE.source_kind,
             "tier": STATE.tier,
             "model": STATE.model,
+            "family": STATE.family,
             "language": STATE.language,
             "output_path": str(STATE.output_path) if STATE.output_path else None,
             "started_at": STATE.started_at.isoformat() if STATE.started_at else None,
@@ -471,6 +474,7 @@ def switch_device(req: SwitchDeviceRequest):
 class WarmUpRequest(BaseModel):
     tier: str = "auto"
     device: str = "auto"
+    language: str = "af"          # warm the family the session will use (af -> Fluister)
 
 
 @app.get("/api/warm-up")
@@ -492,7 +496,8 @@ def warm_up(req: WarmUpRequest):
     quality = req.tier if (req.tier and req.tier != "auto") else (settings.get("tier") or "auto")
     device = (getattr(req, "device", None) or settings.get("device") or "auto")
     tier = resolve_tier(quality, device)
-    return transcribe.warm_up_async(tier)
+    language = req.language or None     # "" (auto-detect) -> None -> stock Whisper, matching Begin
+    return transcribe.warm_up_async(tier, language)
 
 
 def _resolve_tier_lang_prompt(req):
@@ -562,6 +567,7 @@ def start(req: StartRequest):
         STATE.started_at = datetime.now()
         STATE.tier = tier if transcribe_on else None
         STATE.model = engine.model_name if engine else None
+        STATE.family = engine.family if engine else None
         STATE.output_path = output_path
         STATE.language = (language or "auto") if transcribe_on else None
         STATE.source_kind = "live"
@@ -594,6 +600,7 @@ def start(req: StartRequest):
         return {
             "tier": tier if transcribe_on else None,
             "model": engine.model_name if engine else None,
+            "family": engine.family if engine else None,
             "language": STATE.language,
             "output_path": str(output_path),
             "chunk_seconds": chunk_seconds,
@@ -655,6 +662,7 @@ def transcribe_file(req: TranscribeFileRequest):
         STATE.started_at = datetime.now()
         STATE.tier = tier
         STATE.model = engine.model_name
+        STATE.family = engine.family
         STATE.output_path = output_path
         STATE.language = language or "auto"
         STATE.transcribing = True
@@ -716,6 +724,7 @@ def transcribe_file(req: TranscribeFileRequest):
     return {
         "tier": tier,
         "model": engine.model_name,
+        "family": engine.family,
         "output_path": str(output_path),
         "source_kind": "file",
         "files": files,
@@ -888,10 +897,28 @@ def sessions_list():
     files = []
     for p in sdir.glob("*.md"):
         name = p.name
-        # Hide a derived summary, but only when its transcript actually exists, so a
-        # meeting whose topic happens to end in "summary" is never wrongly suppressed.
-        if name.endswith("-summary.md") and (name[:-len("-summary.md")] + ".md") in names:
-            continue
+        # Hide derived summaries (the latest <stem>-summary.md and any archived
+        # <stem>-summary-N.md), but only when the transcript actually exists, so a meeting whose
+        # topic happens to end in "summary" is never wrongly suppressed.
+        if name.endswith(".md"):
+            base = name[:-3]
+            stem = None
+            if base.endswith("-summary"):
+                stem = base[:-len("-summary")]
+            else:
+                i = base.rfind("-summary-")
+                if i >= 0 and base[i + len("-summary-"):].isdigit():
+                    stem = base[:i]
+            if stem is not None and (stem + ".md") in names:
+                # Confirm it really is a derived summary (its content starts with the summary
+                # header) before hiding, so a real transcript that merely matches the name
+                # pattern is never wrongly suppressed (that would look like data loss).
+                try:
+                    with open(p, "r", encoding="utf-8") as fh:
+                        if fh.readline(64).startswith("# Summary:"):
+                            continue
+                except OSError:
+                    pass
         try:
             st = p.stat()
         except OSError:
@@ -960,6 +987,7 @@ def open_folder(which: str = "sessions"):
 class SettingsPatch(BaseModel):
     interface_language: Optional[str] = None
     transcription_language: Optional[str] = None
+    transcribe_languages: Optional[list] = None
     tier: Optional[str] = None
     device: Optional[str] = None
     summary_device: Optional[str] = None
@@ -1108,6 +1136,10 @@ def voice_models():
     from .. import voicedl
     cat = voicedl.catalogue_public()
     cat["progress"] = voicedl.progress()
+    # Whether an Afrikaans session will actually run on a Fluister (Afrikaans-tuned) model yet,
+    # so the UI can label the engine honestly (Fluister vs stock Whisper) before the tuned
+    # models are hosted/installed.
+    cat["fluister_available"] = transcribe.fluister_available()
     return cat
 
 
@@ -1203,6 +1235,52 @@ def cuda_self_test():
         raise HTTPException(status_code=400, detail="No NVIDIA GPU detected on this computer.")
     ok, err = cudadl.self_test()
     return {"ok": bool(ok), "error": err, "ready": cudadl.cuda_ready()}
+
+
+def _version_tuple(v):
+    """Numeric version tuple for comparison. Takes the leading digits of each dotted part, so
+    "1.1.1" -> (1,1,1) and "1.2.0-beta" -> (1,2,0); stops at a part with no leading digit."""
+    parts = []
+    for p in str(v or "").strip().lstrip("vV").split("."):
+        digits = ""
+        for ch in p:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+@app.post("/api/check-updates")
+def check_updates():
+    """Manual, user-initiated update check. Makes ONE outbound HTTPS GET to the PUBLIC GitHub
+    releases API for the latest published version and compares it to this build. It sends no
+    user data (only a generic User-Agent), runs only when the user clicks Check for updates, and
+    is the single outbound call the app ever makes. CSRF-protected like every other POST."""
+    import urllib.request
+    import json as _json
+    url = "https://api.github.com/repos/DigiPhyte-co/volksmond-releases/releases/latest"
+    current = licensing.APP_VERSION
+    try:
+        rq = urllib.request.Request(url, headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "Volksmond-update-check",
+        })
+        with urllib.request.urlopen(rq, timeout=8) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not reach the update server. Check your internet connection and try again.")
+    latest = (data.get("tag_name") or "").strip().lstrip("vV")
+    available = bool(latest) and _version_tuple(latest) > _version_tuple(current)
+    return {
+        "current": current,
+        "latest": latest or None,
+        "update_available": available,
+        "url": data.get("html_url") or "https://github.com/DigiPhyte-co/volksmond-releases/releases/latest",
+    }
 
 
 @app.get("/api/app-info")
@@ -1344,7 +1422,26 @@ def summarise_endpoint(req: SummariseRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Summarise failed: {e}")
 
+    # Keep a history of summaries: the latest is always <stem>-summary.md (the reader loads that),
+    # and any previous latest is archived as <stem>-summary-N.md (N = next free index) before the
+    # new one is written, so regenerating never destroys an earlier summary.
     out = target.with_name(target.stem + "-summary.md")
+    if out.exists():
+        n = 1
+        while out.with_name(f"{target.stem}-summary-{n}.md").exists():
+            n += 1
+        archive = out.with_name(f"{target.stem}-summary-{n}.md")
+        try:
+            out.rename(archive)
+        except OSError:
+            # Could not archive the previous summary (e.g. a file lock). Do NOT overwrite it and
+            # lose it: save the NEW summary under the fresh archive name and leave the old latest
+            # in place. Nothing is lost, and the user still sees this run's summary.
+            try:
+                archive.write_text(f"# Summary: {target.stem}\n\n{summary}\n", encoding="utf-8")
+            except OSError as e:
+                raise HTTPException(status_code=500, detail=f"Could not save the summary: {e}")
+            return {"summary": summary, "saved": str(archive)}
     out.write_text(f"# Summary: {target.stem}\n\n{summary}\n", encoding="utf-8")
     return {"summary": summary, "saved": str(out)}
 
