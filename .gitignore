@@ -57,3 +57,6 @@ codex-review-*.md
 
 # Local dev launcher (bare CLI; not part of the shipped app)
 transcribe-cli.bat
+
+# AEC test recordings + spike scripts (POPIA: contains real voice audio; local-only)
+AEC Recordings/

@@ -1,5 +1,10 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-23, v1.3.0: echo cancellation (opt-in)
+
+- **Cancel speaker echo on a re-transcribe (opt-in, off by default).** New `live_transcribe/aec.py` uses LiveKit's WebRTC APM (Chrome's AEC3, Apache-2.0) to subtract the speaker echo your microphone re-heard from the MIC channel before a re-transcribe, so the other side is not transcribed twice. Measured ~28 dB cancellation on echo-only audio with your own voice preserved. **Off by default**: it cleans echo-only / you-listening audio (a video, a one-sided talk) well, but during sustained double-talk (you and the other side speaking over each other, especially overlapping words) it can blur your own words, so it is a Settings toggle rather than the default for back-and-forth meetings. The far end is the system loopback we already capture; the MIC-vs-SYS delay is auto-estimated (AEC3 also self-aligns). `livekit` + protobuf + aiofiles + the native FFI lib are bundled into the frozen build (verified running in the packaged app). The safe `dedup.strip_mic_echoes` text-level pass remains the default. (`live_transcribe/aec.py`, `web/app.py`, `config.py`, `web/static/app.js`, `i18n.js`, `sa-live-transcribe.spec`.)
+- **Next release:** live echo cancellation (cleaning the echo during the meeting, not only on a re-transcribe). Needs a continuous-stream rework of the live audio path; planned for v1.4.
+
 ## 2026-06-23, v1.2.0: recording rework + engine override + async summaries
 
 A round centred on giving you control over the recordings and the summary lifecycle. `licensing.APP_VERSION` 1.1.1 -> 1.2.0.

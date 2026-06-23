@@ -1865,6 +1865,14 @@ function transcriptionCard(st) {
       el("div", { class: "body" }, [el("div", { class: "t", text: "Model size" }), el("div", { class: "s", text: "Advanced. Auto picks the best model your hardware can run; you rarely need to change this." })]),
       el("div", { class: "ctl" }, selectEl([["auto", "Auto"], ["small", "Fast"], ["medium", "Balanced"], ["large-v3-turbo", "High quality"], ["large-v3", "Best"]], normalizeQuality(st.tier), function (v) { saveSettings({ tier: v }); })),
     ]),
+    el("div", { class: "set-row" }, [
+      el("div", { class: "ic" }, icon("mic", 18)),
+      el("div", { class: "body" }, [
+        el("div", { class: "t", text: "Cancel speaker echo" }),
+        el("div", { class: "s", text: "Off by default. When you re-transcribe a recording, remove the other side's voice that your microphone re-heard through the speakers. Best when you are mostly listening (a video or a one-sided talk). It can blur your own words when you and the other side talk over each other, so leave it off for normal back-and-forth meetings. No effect on headphones." }),
+      ]),
+      el("div", { class: "ctl" }, toggleEl(st.aec === true, function () { saveSettings({ aec: !(st.aec === true) }); })),
+    ]),
     el("div", { class: "set-row", style: { display: "block" } }, [
       el("div", { class: "t", style: { marginBottom: "4px" }, text: "Default context, names and jargon" }),
       el("div", { class: "s", style: { marginBottom: "8px" }, text: "Applied to every meeting to help accuracy. Stored on this computer only." }),

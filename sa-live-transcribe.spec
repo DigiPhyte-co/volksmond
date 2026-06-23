@@ -12,16 +12,27 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 datas, binaries, hiddenimports = [], [], []
 # collect_all pulls each package's code, data, and native libs. webview + clr_loader
 # bring the pywebview backend and the pythonnet/.NET runtime for the native window;
-# llama_cpp brings the local summary engine; the rest are the ASR + server stack.
+# llama_cpp brings the local summary engine; livekit brings the WebRTC APM (echo
+# cancellation) native FFI lib; the rest are the ASR + server stack.
 for pkg in ("faster_whisper", "ctranslate2", "uvicorn", "pyaudiowpatch",
-            "llama_cpp", "webview", "clr_loader"):
+            "llama_cpp", "webview", "clr_loader", "livekit"):
+    d, b, h = collect_all(pkg)
+    datas += d
+    binaries += b
+    hiddenimports += h
+
+# livekit's APM import chain pulls protobuf (incl. the google._upb C extension) and aiofiles.
+# Our `import livekit` is lazy (inside aec.cancel_echo), so PyInstaller's static analysis never
+# traces these; collect them explicitly or the echo canceller fails to import in the frozen app.
+for pkg in ("google.protobuf", "aiofiles"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
     hiddenimports += h
 
 hiddenimports += collect_submodules("live_transcribe")
-hiddenimports += ["scipy.signal", "anyio", "h11", "sniffio", "clr"]
+hiddenimports += ["scipy.signal", "anyio", "h11", "sniffio", "clr",
+                  "livekit.rtc.apm", "google._upb._message"]
 
 # The web UI's static asset(s).
 datas += [(os.path.join("live_transcribe", "web", "static"),

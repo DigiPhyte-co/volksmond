@@ -47,6 +47,7 @@ DEFAULTS = {
     "device": "auto",                 # transcription device: "auto"/"gpu" use the GPU when ready, "cpu" forces CPU
     "engine": "auto",                 # model family override: "auto" (by language) | "fluister" | "whisper"
     "summary_device": "auto",         # summary device: "auto" uses the GPU when the build supports it and the model fits VRAM, "cpu" forces CPU
+    "aec": False,                     # echo cancellation when re-transcribing (off by default: it cleans echo-only/you-listening audio well, but can garble YOUR words during sustained double-talk, so it is opt-in)
 }
 
 

@@ -527,6 +527,8 @@ window.VM_I18N = {
     "Could not check the GPU.": "Kon nie die GPU toets nie.",
     "CPU": "SVE",
     "Transcript": "Transkripsie",
+    "Cancel speaker echo": "Kanselleer luidspreker-eggo",
+    "Off by default. When you re-transcribe a recording, remove the other side's voice that your microphone re-heard through the speakers. Best when you are mostly listening (a video or a one-sided talk). It can blur your own words when you and the other side talk over each other, so leave it off for normal back-and-forth meetings. No effect on headphones.": "Standaard af. Wanneer jy 'n opname hertranskribeer, verwyder die ander kant se stem wat jou mikrofoon deur die luidsprekers weer gehoor het. Beste wanneer jy meestal luister ('n video of 'n eensydige praatjie). Dit kan jou eie woorde vertroebel wanneer jy en die ander kant gelyktydig praat, so los dit af vir gewone heen-en-weer-vergaderings. Geen effek op oorfone nie.",
     "Recorded": "Opgeneem",
     "Transcribing": "Transkribeer tans",
     "Summarising": "Som tans op",

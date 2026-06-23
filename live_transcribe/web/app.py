@@ -644,6 +644,7 @@ class TranscribeFileRequest(BaseModel):
     language: str = "af"
     prompt: str = ""
     engine: str = "auto"           # model family override, mirrors StartRequest
+    aec: Optional[bool] = None     # echo cancellation on a re-transcribe (None -> settings default)
 
 
 @app.post("/api/transcribe-file")
@@ -681,6 +682,9 @@ def transcribe_file(req: TranscribeFileRequest):
         STATE.sink_error = None  # fresh session: clear any prior write error
         tier, language, prompt, engine_pref = _resolve_tier_lang_prompt(req)
         chunk_seconds = default_chunk_seconds(tier)
+        # Echo cancellation on a re-transcribe: only when both channels exist (we need the SYS
+        # reference). Default on (it cancels real echo and is a no-op on clean audio).
+        aec_on = req.aec if req.aec is not None else bool(config.load().get("aec", True))
         if base:
             # Re-transcribing a saved recording: write the transcript at the recording's own
             # stem so the single History session gains its transcript, instead of spawning a
@@ -728,11 +732,34 @@ def transcribe_file(req: TranscribeFileRequest):
         try:
             from faster_whisper.audio import decode_audio
             win = int(16000 * chunk_seconds)
+            # Echo cancellation: when re-transcribing a recording that has BOTH channels, subtract
+            # the SYS (speaker) echo from the MIC before transcribing, so the other side is not
+            # transcribed twice. The cleaned MIC + raw SYS still feed the engine with their source
+            # tags, so the you/other-side split is preserved. Best-effort: any failure falls back
+            # to the raw MIC. Decoded audio is cached so SYS is not decoded twice.
+            decoded = {}
+            if base and aec_on:
+                from .. import aec as _aec
+                if _aec.available():
+                    mic_fp = next((f for f in files if f.lower().endswith("-mic.wav")), None)
+                    sys_fp = next((f for f in files if f.lower().endswith("-sys.wav")), None)
+                    if mic_fp and sys_fp:
+                        try:
+                            mic_audio = decode_audio(mic_fp, sampling_rate=16000)
+                            sys_audio = decode_audio(sys_fp, sampling_rate=16000)
+                            decoded[sys_fp] = sys_audio
+                            decoded[mic_fp] = _aec.cancel_echo(mic_audio, sys_audio)
+                            print(f"[transcribe-file] echo cancellation applied to {Path(mic_fp).name}", flush=True)
+                        except Exception as e:
+                            decoded.clear()
+                            print(f"[transcribe-file] echo cancellation skipped: {e}", flush=True)
             items = []  # (t_start, source, window), merged across files by time
             for fp in files:
                 low = fp.lower()
                 src = "MIC" if low.endswith("-mic.wav") else ("SYS" if low.endswith("-sys.wav") else "FILE")
-                audio = decode_audio(fp, sampling_rate=16000)
+                audio = decoded.get(fp)
+                if audio is None:
+                    audio = decode_audio(fp, sampling_rate=16000)
                 for i in range(0, len(audio), win):
                     items.append((i / 16000.0, src, audio[i:i + win]))
             items.sort(key=lambda x: x[0])
@@ -1086,6 +1113,7 @@ class SettingsPatch(BaseModel):
     tier: Optional[str] = None
     device: Optional[str] = None
     engine: Optional[str] = None
+    aec: Optional[bool] = None
     summary_device: Optional[str] = None
     save_location: Optional[str] = None
     default_context: Optional[str] = None
