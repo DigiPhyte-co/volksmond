@@ -77,17 +77,23 @@ def _find_last_silence(audio: np.ndarray, sample_rate: int,
 
 
 class AudioCapture:
-    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None, t0=None):
+    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None, t0=None, aec=False):
         """on_chunk(source: str, audio_16k_mono: np.ndarray, t_start: float).
 
         t0: optional monotonic start time. When a live session switches its mic or
         loopback we tear this capture down and start a fresh one; passing the original
         t0 keeps transcript timestamps continuous across the switch instead of jumping
-        back to 00:00."""
+        back to 00:00.
+
+        aec: when True AND both a mic and a system loopback open, route both through the
+        WebRTC APM (live echo cancellation) before chunking. Needs the LiveKit binding;
+        silently runs without it when absent."""
         self.mic_device_spec = mic_device
         self.loopback_device_spec = loopback_device
         self.chunk_seconds = chunk_seconds
         self.on_chunk = on_chunk
+        self.aec = aec
+        self._live_aec = None     # set in start() when AEC engages; read by the audio callbacks
 
         self._stop_event = threading.Event()
         self._t0 = None
@@ -153,6 +159,47 @@ class AudioCapture:
                 "Run --list-devices from the CLI to enumerate what is available."
             )
 
+        # Live echo cancellation: only when requested AND both a mic and a system loopback
+        # opened (we need the loopback as the far-end reference). The APM worker resamples both
+        # to 16k and emits the cleaned mic + passthrough system into the chunk buffers, so the
+        # chunkers then treat both sources as 16k (no second resample in _emit).
+        if self.aec and "MIC" in self._buffers and "SYS" in self._buffers:
+            la = None
+            try:
+                from . import aec as _aec
+                if not _aec.available():
+                    raise RuntimeError("LiveKit binding unavailable")
+                from .aec_live import LiveAEC
+                la = LiveAEC(
+                    self._rates["MIC"], self._rates["SYS"],
+                    on_near=lambda x: self._append_16k("MIC", x),
+                    on_far=lambda x: self._append_16k("SYS", x),
+                )
+                la.start()   # builds the APM + worker thread; raises here if the lib is broken
+                # Commit to the AEC path ONLY now the worker is live (so a failed start never
+                # half-engages it). Set `_live_aec` BEFORE clearing/flipping so the callback's
+                # under-lock re-check sees it and routes to the worker; the clear (under each
+                # buffer lock) then drops the few native-rate samples captured before the switch,
+                # so a chunk buffer never mixes sample rates.
+                self._live_aec = la
+                self._rates["MIC"] = TARGET_RATE
+                self._rates["SYS"] = TARGET_RATE
+                for s in ("MIC", "SYS"):
+                    with self._buffer_locks[s]:
+                        self._buffers[s].clear()
+                        self._buffer_counts[s] = 0
+                print("[aec] live echo cancellation engaged (mic + system -> WebRTC APM)", flush=True)
+            except Exception as e:
+                # A missing or broken echo canceller must never stop the session: degrade to
+                # normal capture (native rate, no AEC).
+                if la is not None:
+                    try:
+                        la.stop()
+                    except Exception:
+                        pass
+                self._live_aec = None
+                print(f"[aec] live echo cancellation unavailable ({e}); running without it", flush=True)
+
         # Per-source chunker worker
         for source in list(self._buffers):
             t = threading.Thread(target=self._chunker, args=(source,), daemon=True, name=f"chunker-{source}")
@@ -160,13 +207,21 @@ class AudioCapture:
             self._workers.append(t)
 
     def stop(self):
-        self._stop_event.set()
+        # Stop the input streams first (no more native blocks arrive), then drain the AEC worker
+        # into the chunk buffers, and only then signal the chunkers to flush - otherwise the
+        # AEC could emit its tail after the chunkers had already flushed, losing the last words.
         for s in self._streams:
             try:
                 s.stop_stream()
                 s.close()
             except Exception:
                 pass
+        if self._live_aec is not None:
+            try:
+                self._live_aec.stop()
+            except Exception:
+                pass
+        self._stop_event.set()
         if self._pa is not None:
             try:
                 self._pa.terminate()
@@ -175,6 +230,22 @@ class AudioCapture:
             self._pa = None
         for w in self._workers:
             w.join(timeout=BLOCK_SECONDS + 1.5)
+
+    def _append_16k(self, source, mono):
+        """Append 16k mono float32 (from the live AEC worker) into the chunk buffer for `source`.
+        Mirrors what the callback does for the non-AEC path, but the audio is already 16k mono."""
+        # Once stop() has signalled shutdown, the chunkers are flushing/finishing; a late emit
+        # from a slow-to-exit worker must not append behind them (it would be lost or grow a
+        # buffer nobody reads). Drop it.
+        if self._stop_event.is_set():
+            return
+        a = np.asarray(mono, dtype=np.float32).reshape(-1, 1)
+        lock = self._buffer_locks.get(source)
+        if lock is None:
+            return
+        with lock:
+            self._buffers[source].append(a)
+            self._buffer_counts[source] += a.shape[0]
 
     def levels(self):
         """Latest per-source input level as {source: {"peak": x, "rms": y}}, 0..1, for a
@@ -224,7 +295,7 @@ class AudioCapture:
             lock = self._buffer_locks[source]
             ch = channels
 
-            def callback(in_data, frame_count, time_info, status, _ch=ch, _src=source, _buf=buf, _lock=lock, _levels=self._levels):
+            def callback(in_data, frame_count, time_info, status, _ch=ch, _src=source, _buf=buf, _lock=lock, _levels=self._levels, _self=self):
                 try:
                     arr = np.frombuffer(in_data, dtype=np.float32)
                     if _ch > 1:
@@ -235,9 +306,25 @@ class AudioCapture:
                     # dict assignment, so the reader (levels()) never sees a torn value.
                     if arr.size:
                         _levels[_src] = (float(np.max(np.abs(arr))), float(np.sqrt(np.mean(arr * arr))))
-                    with _lock:
-                        _buf.append(arr)
-                        counts[_src] = counts[_src] + arr.shape[0]
+                    # Live echo cancellation (when engaged): hand the mono block to the APM worker
+                    # instead of the native chunk buffer; the worker resamples + cancels and feeds
+                    # the (now 16k) chunk buffer itself.
+                    la = _self._live_aec
+                    if la is not None:
+                        mono = arr.mean(axis=1) if (arr.ndim > 1 and arr.shape[1] > 1) else arr[:, 0]
+                        (la.push_near if _src == "MIC" else la.push_far)(mono)
+                    else:
+                        # Re-check under the buffer lock: AEC may engage between the read above and
+                        # here, after which the buffer rate is 16k. Appending a native-rate block
+                        # then would mix sample rates in one buffer, so route to the worker instead.
+                        with _lock:
+                            la = _self._live_aec
+                            if la is not None:
+                                mono = arr.mean(axis=1) if (arr.ndim > 1 and arr.shape[1] > 1) else arr[:, 0]
+                                (la.push_near if _src == "MIC" else la.push_far)(mono)
+                            else:
+                                _buf.append(arr)
+                                counts[_src] = counts[_src] + arr.shape[0]
                 except Exception as e:
                     print(f"[{_src}] callback error: {e}", flush=True)
                 return (None, pa.paContinue)

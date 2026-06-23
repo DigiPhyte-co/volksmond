@@ -425,6 +425,7 @@ async function startLive() {
     prompt: S.form.participants.concat(S.form.terms).join(", "),
     record: !!S.form.record, transcribe: true,
     mic_device: S.form.mic, loopback_device: S.form.loopback,
+    aec_live: !!S.form.aecLive,
   };
   beginStarting("live", S.form.title || "Live meeting");
   try {
@@ -1194,7 +1195,7 @@ function preView() {
       el("input", { class: "field tall", value: S.form.title, placeholder: "e.g. Q3 strategy review", oninput: function (e) { S.form.title = e.target.value; } })),
     languageField(),
     engineLine(),
-    advancedTranscribeControls(),
+    advancedTranscribeControls(true),
     formField("Participants", el("span", { class: "label-muted", text: " (optional, helps accuracy)" }), termsBox(S.form.participants, "Add a name")),
     formField("Jargon and terms", el("span", { class: "label-muted", text: " (optional)" }), termsBox(S.form.terms, "Add a term")),
     defaultContextNote(),
@@ -2416,7 +2417,7 @@ function engineLine() {
 }
 // Size (Quality) and processor (GPU/CPU) are now advanced: the hardware picks the size by
 // default. Tucked behind a disclosure so the pre-meeting screen stays about the language.
-function advancedTranscribeControls() {
+function advancedTranscribeControls(live) {
   var open = !!S.form.advancedOpen;
   var toggle = el("button", { class: "btn ghost sm", style: { padding: "5px 9px" }, onclick: function () { S.form.advancedOpen = !open; render(); } },
     [icon(open ? "chevDown" : "chevRight", 14), el("span", { text: "Advanced" })]);
@@ -2430,8 +2431,20 @@ function advancedTranscribeControls() {
         el("div", { style: { marginTop: "12px" } }, [qualitySelector(),
           el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Auto picks the best model your computer can run. Bigger is more accurate but slower." })]), true),
       runOnField(),
+      live ? aecLiveControl() : null,
     ]),
   ]);
+}
+// Live echo cancellation toggle (live pre-meeting only; re-transcribe AEC has its own setting).
+function aecLiveControl() {
+  return el("div", { style: { marginTop: "12px", paddingTop: "12px", borderTop: "1px solid var(--line)" } },
+    el("div", { class: "row gap-10", style: { alignItems: "flex-start" } }, [
+      el("div", { class: "grow" }, [
+        el("div", { style: { fontWeight: "600", fontSize: "13px" } }, [el("span", { text: tr("Cancel echo live") }), el("span", { class: "chip", style: { marginLeft: "6px" }, text: tr("beta") })]),
+        el("p", { class: "ink-3", style: { fontSize: "11px", margin: "4px 0 0" }, text: tr("Remove the other side's voice that your speakers leak into your microphone, live as the meeting happens. Best on speakers when you are mostly listening; it can blur your words during heavy crosstalk, and does nothing on headphones.") }),
+      ]),
+      toggleEl(!!S.form.aecLive, function () { S.form.aecLive = !S.form.aecLive; saveSettings({ aec_live: S.form.aecLive }); }),
+    ]));
 }
 
 /* ── small shared builders ────────────────────────────────── */
@@ -2555,6 +2568,7 @@ async function boot() {
     S.form.tier = normalizeQuality(S.settings.tier);
     S.form.device = S.settings.device || "auto";
     S.form.engine = S.settings.engine || "auto";
+    S.form.aecLive = !!S.settings.aec_live;
   }
   if (S.devices) {
     if (S.devices.default_mic_index != null) S.form.mic = String(S.devices.default_mic_index);

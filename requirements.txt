@@ -19,6 +19,13 @@ PyAudioWPatch==0.2.12.8
 scipy==1.13.1
 numpy==1.26.4
 
+# Echo cancellation (optional, opt-in). livekit exposes Chrome's WebRTC APM (AEC3) for both the
+# re-transcribe canceller (live_transcribe/aec.py) and the live one (live_transcribe/aec_live.py);
+# soxr does the streaming resample for the live path. Both imported lazily, so the app runs
+# without them (echo cancellation just stays off). Native libs; bundled in the packaged build.
+livekit==1.1.11
+soxr==1.1.0
+
 # Tier auto-detect reads total RAM as a fallback when no CUDA device is found
 psutil==5.9.8
 

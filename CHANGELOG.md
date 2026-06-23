@@ -1,9 +1,13 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-23, v1.4.0: live echo cancellation (opt-in, beta)
+
+- **Cancel speaker echo DURING the meeting (opt-in, off by default).** New `live_transcribe/aec_live.py` runs the same WebRTC APM (Chrome AEC3) on the live capture: the two device streams (mic + system loopback, at different native rates) are streaming-resampled to 16k with `soxr`, fed to a persistent APM in 10ms frames on a dedicated worker thread (far-end via process_reverse_stream, near-end via process_stream), and the cleaned mic flows on to transcription + recording. The streams are decoupled, so if the system goes silent the mic still passes through. Toggle lives in the live meeting's Advanced controls ("Cancel echo live", beta). **Off by default**, same double-talk caveat as the re-transcribe canceller: great when you are mostly listening on speakers, can blur your own words during heavy crosstalk. When live AEC is on, the saved recording is the cleaned mic. Verified end-to-end on a simulated two-device feed (~28 dB cancellation, no dropped audio, exact length); real-hardware listening still wants a live test. `soxr` added to the bundle. (`live_transcribe/aec_live.py`, `capture.py`, `web/app.py`, `config.py`, `web/static/app.js`, `i18n.js`, `sa-live-transcribe.spec`.)
+
 ## 2026-06-23, v1.3.0: echo cancellation (opt-in)
 
 - **Cancel speaker echo on a re-transcribe (opt-in, off by default).** New `live_transcribe/aec.py` uses LiveKit's WebRTC APM (Chrome's AEC3, Apache-2.0) to subtract the speaker echo your microphone re-heard from the MIC channel before a re-transcribe, so the other side is not transcribed twice. Measured ~28 dB cancellation on echo-only audio with your own voice preserved. **Off by default**: it cleans echo-only / you-listening audio (a video, a one-sided talk) well, but during sustained double-talk (you and the other side speaking over each other, especially overlapping words) it can blur your own words, so it is a Settings toggle rather than the default for back-and-forth meetings. The far end is the system loopback we already capture; the MIC-vs-SYS delay is auto-estimated (AEC3 also self-aligns). `livekit` + protobuf + aiofiles + the native FFI lib are bundled into the frozen build (verified running in the packaged app). The safe `dedup.strip_mic_echoes` text-level pass remains the default. (`live_transcribe/aec.py`, `web/app.py`, `config.py`, `web/static/app.js`, `i18n.js`, `sa-live-transcribe.spec`.)
-- **Next release:** live echo cancellation (cleaning the echo during the meeting, not only on a re-transcribe). Needs a continuous-stream rework of the live audio path; planned for v1.4.
+  (Live echo cancellation - cleaning the echo during the meeting - followed in v1.4.0, below the next heading up.)
 
 ## 2026-06-23, v1.2.0: recording rework + engine override + async summaries
 

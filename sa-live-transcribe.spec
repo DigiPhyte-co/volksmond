@@ -24,7 +24,7 @@ for pkg in ("faster_whisper", "ctranslate2", "uvicorn", "pyaudiowpatch",
 # livekit's APM import chain pulls protobuf (incl. the google._upb C extension) and aiofiles.
 # Our `import livekit` is lazy (inside aec.cancel_echo), so PyInstaller's static analysis never
 # traces these; collect them explicitly or the echo canceller fails to import in the frozen app.
-for pkg in ("google.protobuf", "aiofiles"):
+for pkg in ("google.protobuf", "aiofiles", "soxr"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b

@@ -209,6 +209,7 @@ class StartRequest(BaseModel):
     loopback_device: Optional[str] = None
     record: bool = False          # also save the audio (POPIA: needs consent)
     transcribe: bool = True       # False == record-only (for machines too slow to keep up live)
+    aec_live: Optional[bool] = None  # live echo cancellation (None -> settings default)
 
 
 def _slugify(s: str) -> str:
@@ -453,8 +454,10 @@ def switch_device(req: SwitchDeviceRequest):
         chunk = STATE.chunk_seconds or 15
 
         def _build(m, l):
+            # Carry the session's live-AEC setting across the switch, else changing mic/loopback
+            # mid-meeting would silently turn echo cancellation off.
             return capture.AudioCapture(mic_device=m, loopback_device=l, chunk_seconds=chunk,
-                                        on_chunk=_feed, t0=old_cap._t0)
+                                        on_chunk=_feed, t0=old_cap._t0, aec=old_cap.aec)
 
         try:
             old_cap.stop()
@@ -603,11 +606,13 @@ def start(req: StartRequest):
 
         # Recorder is tapped BEFORE the engine (see _feed), so the recording stays complete
         # even when transcription drops chunks under load.
+        aec_live = req.aec_live if req.aec_live is not None else bool(config.load().get("aec_live", False))
         cap = capture.AudioCapture(
             mic_device=req.mic_device,
             loopback_device=req.loopback_device,
             chunk_seconds=chunk_seconds,
             on_chunk=_feed,
+            aec=aec_live,
         )
         try:
             cap.start()
@@ -1114,6 +1119,7 @@ class SettingsPatch(BaseModel):
     device: Optional[str] = None
     engine: Optional[str] = None
     aec: Optional[bool] = None
+    aec_live: Optional[bool] = None
     summary_device: Optional[str] = None
     save_location: Optional[str] = None
     default_context: Optional[str] = None
