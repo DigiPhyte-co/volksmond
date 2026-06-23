@@ -143,10 +143,10 @@ function freshLive() {
 var S = {
   route: "home", booted: false,
   settings: null, features: null, models: null, appInfo: null, license: null, devices: null,
-  sessions: [], sessionsFolder: "",
+  sessions: [], sessionsFolder: "", sessionsActive: null, sessionsSummarising: [],
   live: freshLive(),
   starting: { active: false, kind: null, title: "", error: null, startedAt: null },
-  form: { title: "", language: "af", tier: "auto", device: "auto", participants: [], terms: [], record: false, mic: null, loopback: null, advancedOpen: false },
+  form: { title: "", language: "af", tier: "auto", device: "auto", engine: "auto", participants: [], terms: [], record: false, mic: null, loopback: null, advancedOpen: false },
   setup: { stage: "welcome", choice: "transcribe" },
   finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null },
   reader: { name: "", title: "", text: "", summarising: false, summary: null },
@@ -160,7 +160,7 @@ var S = {
 
 // transient refs + timers (not part of render state)
 var liveDocEl = null, liveBodyEl = null, elapsedEl = null, recTimerEl = null;
-var pollTimer = null, elapsedTimer = null, toastTimer = null, levelTimer = null, warmTimer = null;
+var pollTimer = null, elapsedTimer = null, toastTimer = null, levelTimer = null, warmTimer = null, histTimer = null;
 var startingTimer = null, startingElapsedEl = null;
 
 /* ── api ──────────────────────────────────────────────────── */
@@ -253,9 +253,19 @@ function go(route) {
   if (route === "pre" || route === "importpre") warmUp();
   // Always re-fetch the session list when opening History, so a just-finished or just-imported
   // transcript appears even if the finish-time refresh raced the transcript's write to disk.
-  if (route === "history") refreshSessions();
+  // While on History, poll lightly so in-progress states (recording / transcribing / summarising)
+  // update live; leaving History stops the poll.
+  if (route === "history") { refreshSessions(); startHistoryPoll(); } else { stopHistoryPoll(); }
   render();
 }
+function startHistoryPoll() {
+  if (histTimer) return;
+  histTimer = setInterval(function () {
+    if (S.route !== "history") { stopHistoryPoll(); return; }
+    refreshSessions();
+  }, 2500);
+}
+function stopHistoryPoll() { if (histTimer) { clearInterval(histTimer); histTimer = null; } }
 function teardownLive() {
   closeStream();
   stopLevels();
@@ -382,7 +392,7 @@ function liveAudioStrip() {
 // of an already-downloaded model, plus CUDA/AV cold start). We pre-load it in the background
 // the moment the user reaches a pre-meeting screen, so Begin reuses a warm model.
 function warmUp() {
-  api.post("/api/warm-up", { tier: S.form.tier || "auto", device: S.form.device || "auto", language: S.form.language || "" })
+  api.post("/api/warm-up", { tier: S.form.tier || "auto", device: S.form.device || "auto", language: S.form.language || "", engine: S.form.engine || "auto" })
     .then(function (st) {
       S.warm = st;
       if (st && st.state === "warming") pollWarm();
@@ -411,7 +421,7 @@ function warmChip() {
 async function startLive() {
   var body = {
     topic: S.form.title || "",
-    tier: S.form.tier, device: S.form.device, language: S.form.language,
+    tier: S.form.tier, device: S.form.device, language: S.form.language, engine: S.form.engine,
     prompt: S.form.participants.concat(S.form.terms).join(", "),
     record: !!S.form.record, transcribe: true,
     mic_device: S.form.mic, loopback_device: S.form.loopback,
@@ -475,7 +485,7 @@ function recordPreView() {
   ]));
 }
 async function startImport(arg) {
-  var body = { topic: arg.topic || "", tier: S.form.tier, device: S.form.device, language: S.form.language, prompt: (S.form.participants || []).concat(S.form.terms || []).join(", ") };
+  var body = { topic: arg.topic || "", tier: S.form.tier, device: S.form.device, language: S.form.language, engine: S.form.engine, prompt: (S.form.participants || []).concat(S.form.terms || []).join(", ") };
   if (arg.path) body.paths = [arg.path];
   if (arg.stem) body.stem = arg.stem;
   beginStarting("file", arg.topic || S.importName || "Recording");
@@ -690,14 +700,36 @@ async function doSummarise(fileName, scope) {
     var body = { file: fileName, language: target.sumLang || "en" };
     var instruction = summaryInstructionFor(target);
     if (instruction) body.instruction = instruction;
-    var resp = await api.post("/api/summarise", body);
-    target.summary = resp.summary; target.savedAs = resp.saved; target.summarising = false;
-    if (scope === "reader") S.reader.tab = "summary";
-    render();
+    // The summary now runs as a server-side job (so it survives navigating away and shows up
+    // in History). POST starts it; poll /api/summary-status for the result.
+    await api.post("/api/summarise", body);
+    pollSummary(fileName, scope);
   } catch (e) {
     target.summarising = false; render();
     toast(e.message || "Summarise failed.", true);
   }
+}
+function pollSummary(fileName, scope) {
+  function tick() {
+    api.get("/api/summary-status?file=" + encodeURIComponent(fileName)).then(function (j) {
+      var target = scope === "reader" ? S.reader : S.finish;
+      // The reader may have moved to a different transcript while a summary ran; only apply the
+      // result if this scope is still looking at the same file.
+      if (scope === "reader" && S.reader.name !== fileName) return;
+      if (j.state === "running") { setTimeout(tick, 1500); return; }
+      if (j.state === "done") {
+        target.summary = j.summary || ""; target.savedAs = j.saved; target.summarising = false;
+        if (scope === "reader") S.reader.tab = "summary";
+        render();
+      } else if (j.state === "error") {
+        target.summarising = false; render();
+        toast(j.error || "Summarise failed.", true);
+      } else {           // idle: the job is gone (e.g. the app restarted); stop the spinner
+        target.summarising = false; render();
+      }
+    }).catch(function () { setTimeout(tick, 2000); });
+  }
+  setTimeout(tick, 1200);
 }
 // The style picker (a dropdown, plus a textarea when "Custom" is chosen). Shared by the
 // pre-summarise card and the regenerate controls so the two never drift.
@@ -753,11 +785,17 @@ function renderMarkdown(md) {
 }
 
 /* ── data loads ───────────────────────────────────────────── */
+var _sessionsSig = "";
 async function refreshSessions() {
   try {
     var d = await api.get("/api/sessions");
     S.sessions = d.files || []; S.sessionsFolder = d.folder || "";
-    if (S.route === "history") render();
+    S.sessionsActive = d.active || null; S.sessionsSummarising = d.summarising || [];
+    // Only re-render when the list or its in-progress state actually changed, so the History
+    // poll never steals focus from the search box mid-type when nothing has moved.
+    var sig = JSON.stringify([S.sessions, S.sessionsActive, S.sessionsSummarising]);
+    if (S.route === "history" && sig !== _sessionsSig) render();
+    _sessionsSig = sig;
   } catch (e) { /* ignore */ }
 }
 async function refreshSideData() {
@@ -1538,6 +1576,53 @@ function summaryResult(summary, savedAs, fileName, scope) {
 
 /* ── history ──────────────────────────────────────────────── */
 var histQuery = "";
+function statChip(label, ico, cls) {
+  return el("span", { class: "chip " + (cls || "muted") }, [icon(ico, 11), el("span", { text: label })]);
+}
+function busyChip(label, cls) {
+  return el("span", { class: "chip " + (cls || "accent") }, [el("span", { class: "spinner sm" }), el("span", { text: label })]);
+}
+// The three per-session indicators Sean asked for: recorded / transcribed / summarised, each with
+// an in-progress form (a live dot or spinner) when that step is happening right now.
+function sessionStatus(f, active, summarising) {
+  var chips = [];
+  if (active) {
+    if (active.recording) chips.push(el("span", { class: "chip live" }, [el("span", { class: "dot" }), el("span", { text: tr("Recording") })]));
+    if (active.transcribing) chips.push(busyChip(tr("Transcribing")));
+  } else {
+    if (f.recorded) chips.push(statChip(tr("Recorded"), "mic", "muted"));
+    if (f.transcribed) chips.push(statChip(tr("Transcript"), "note", "ok"));
+    if (summarising) chips.push(busyChip(tr("Summarising")));
+    else if (f.has_summary) chips.push(statChip(tr("Summary"), "sparkle", "accent"));
+  }
+  return chips.length ? el("div", { class: "stats" }, chips) : null;
+}
+function sessionActions(f, active) {
+  var acts = [];
+  if (f.size) acts.push(el("span", { class: "ink-3", style: { fontSize: "11.5px" }, text: fmtBytes(f.size) }));
+  if (active) {
+    // running right now: it lives on the live screen, nothing to do from History
+  } else if (f.transcribed) {
+    acts.push(el("button", { class: "btn ghost sm", onclick: function (e) { e.stopPropagation(); openReader(f.name); } }, tr("Open")));
+  } else if (f.recorded) {
+    // Record-only session (audio, no transcript yet): the primary action is to transcribe it.
+    acts.push(el("button", { class: "btn sm", onclick: function (e) { e.stopPropagation(); reTranscribe(f.stem, f.topic || topicFromName(f.name), false); } }, [icon("note", 13), tr("Transcribe")]));
+  }
+  return acts;
+}
+// Re-transcribe a saved recording through the file engine: both channels, time-merged, with the
+// MIC/SYS split kept as speaker separation (you vs the other side). Writes at the recording's own
+// stem, so the History row gains its transcript instead of spawning a second row.
+function reTranscribe(stem, topic, isRegen) {
+  confirmModal({
+    title: isRegen ? tr("Re-transcribe from the recording?") : tr("Transcribe this recording?"),
+    message: isRegen
+      ? tr("Re-transcribes both sides from the saved audio and replaces the current transcript. The audio is kept. Use it for a cleaner pass than the live one.")
+      : tr("Transcribes both sides (you and the other person) as separate speakers, using your current language and model settings. Change them in Settings first if needed."),
+    confirmLabel: isRegen ? tr("Re-transcribe") : tr("Transcribe"),
+    onConfirm: function () { startImport({ stem: stem, topic: topic }); },
+  });
+}
 function historyView() {
   var rows = S.sessions.filter(function (f) {
     if (!histQuery) return true;
@@ -1552,14 +1637,18 @@ function historyView() {
     ]);
   } else {
     list = el("div", { class: "card" }, rows.map(function (f) {
-      var openIt = function () { openReader(f.name); };
-      return el("div", { class: "hist-row", role: "button", tabindex: "0", onclick: openIt, onkeydown: keyActivate(openIt) }, [
+      var active = (S.sessionsActive && S.sessionsActive.stem === f.stem) ? S.sessionsActive : null;
+      var summarising = (S.sessionsSummarising || []).indexOf(f.stem) >= 0;
+      var canOpen = f.transcribed && !active;
+      var openIt = function () { if (canOpen) openReader(f.name); };
+      return el("div", { class: "hist-row", role: canOpen ? "button" : null, tabindex: canOpen ? "0" : null,
+        onclick: canOpen ? openIt : null, onkeydown: canOpen ? keyActivate(openIt) : null }, [
         el("div", { class: "when", text: f.date ? f.date + " · " + f.time : "" }),
-        el("div", { class: "topic" }, raw(f.topic || topicFromName(f.name))),
-        el("div", { class: "right" }, [
-          el("span", { class: "ink-3", style: { fontSize: "11.5px" }, text: fmtBytes(f.size) }),
-          el("button", { class: "btn ghost sm", onclick: function (e) { e.stopPropagation(); openReader(f.name); } }, "Open"),
+        el("div", { class: "topic" }, [
+          el("div", {}, raw(f.topic || topicFromName(f.name))),
+          sessionStatus(f, active, summarising),
         ]),
+        el("div", { class: "right" }, sessionActions(f, active)),
       ]);
     }));
   }
@@ -1578,17 +1667,32 @@ function historyView() {
   ]));
 }
 async function openReader(name) {
-  S.reader = { name: name, title: topicFromName(name), text: "Loading...", tab: "transcript", summarising: false, summary: null, savedAs: null };
+  var row = (S.sessions || []).filter(function (s) { return s.name === name; })[0] || {};
+  S.reader = { name: name, stem: row.stem || name.replace(/\.md$/, ""), recorded: !!row.recorded,
+    title: topicFromName(name), text: "Loading...", tab: "transcript", summarising: false, summary: null, savedAs: null };
   go("reader");
   try { S.reader.text = await api.text("/sessions/" + encodeURIComponent(name)); }
   catch (e) { S.reader.text = "Could not load this transcript: " + e.message; }
   // Always try the sibling summary file (ignore 404). Don't gate on cached has_summary: a
   // summary made this session may not be in S.sessions yet, which would hide the Summary tab.
+  // Header-verify it (matches the backend rule): a real transcript whose topic ends in
+  // "summary" (e.g. budget-summary.md) is NOT a sibling summary — accepting it would show that
+  // transcript as the current one's summary. Only treat it as a summary if it starts with
+  // "# Summary:".
   var sumName = name.replace(/\.md$/, "") + "-summary.md";
   try {
-    S.reader.summary = stripSummaryHeader(await api.text("/sessions/" + encodeURIComponent(sumName)));
-    S.reader.savedAs = sumName;
+    var raw = await api.text("/sessions/" + encodeURIComponent(sumName));
+    if (/^#\s*Summary:/.test(raw)) {
+      S.reader.summary = stripSummaryHeader(raw);
+      S.reader.savedAs = sumName;
+    }
   } catch (e) { /* no summary yet, or unreadable: the transcript still shows */ }
+  // If a summary is being generated right now (started before opening this reader), show the
+  // in-progress state and poll for it, rather than showing nothing.
+  if (!S.reader.summary && (S.sessionsSummarising || []).indexOf(S.reader.stem) >= 0) {
+    S.reader.summarising = true;
+    pollSummary(name, "reader");
+  }
   render();
 }
 function stripSummaryHeader(s) {
@@ -1627,6 +1731,7 @@ function readerView() {
       toggle,
       el("button", { class: "btn ghost sm", onclick: function () { copyText((hasSummary && tab === "summary") ? S.reader.summary : S.reader.text); } }, [icon("copy", 13), "Copy"]),
       el("button", { class: "btn ghost sm", onclick: function () { api.post("/api/open-folder").catch(function () {}); } }, [icon("folder", 13), "Folder"]),
+      S.reader.recorded ? el("button", { class: "btn ghost sm", onclick: function () { reTranscribe(S.reader.stem, S.reader.title, true); } }, [icon("mic", 13), tr("Re-transcribe")]) : null,
     ]),
     body,
   ]));
@@ -2232,7 +2337,7 @@ var SUPPORTED_LANGS = [
 ];
 var LANG_NAMES = { "af": "Afrikaans", "en": "English", "": "Auto-detect" };
 function langName(code) { return LANG_NAMES[code] != null ? LANG_NAMES[code] : code; }
-function familyForLang(lang) { return /^af/i.test(lang || "") ? "fluister" : "whisper"; }
+function familyForLang(lang) { var l = (lang || "").toLowerCase(); return (l === "" || l === "auto" || /^af/.test(l)) ? "fluister" : "whisper"; }
 // True once a Fluister model is actually installed; until then an Afrikaans session honestly
 // runs (and is labelled) as stock Whisper.
 function fluisterReady() { return !!(S.voiceModels && S.voiceModels.fluister_available); }
@@ -2274,15 +2379,24 @@ function languageField() {
     S.form.language = v; warmUp(); render();
   }), true);
 }
-// One honest line: which engine this language uses, and that the size is automatic.
+// One honest line: which engine this session will use (the language decides, unless the Advanced
+// Engine override forces a family), and that the size is automatic.
 function engineLine() {
   var lang = S.form.language;
-  var wantFluister = familyForLang(lang) === "fluister";
-  var label = familyLabelFor(lang);
+  var ov = S.form.engine || "auto";
+  var famWanted = (ov === "fluister") ? "fluister" : (ov === "whisper") ? "whisper" : familyForLang(lang);
+  var label = (famWanted === "fluister" && fluisterReady()) ? "Fluister" : "Whisper";
   var msg;
-  if (wantFluister && fluisterReady()) msg = "Afrikaans uses Fluister, our Afrikaans-tuned model. The size is chosen automatically for your computer.";
-  else if (wantFluister) msg = "Afrikaans currently uses standard Whisper. The Afrikaans-tuned Fluister model is not installed yet; it switches on automatically once it is.";
-  else if (lang === "") msg = "Auto-detect uses standard Whisper. The size is chosen automatically for your computer.";
+  if (famWanted === "fluister" && !fluisterReady())
+    msg = "Fluister (our Afrikaans-tuned model) is not installed on this computer yet, so this runs on standard Whisper for now.";
+  else if (ov === "fluister")
+    msg = "Forced to Fluister for every language. Handy when an English meeting has Afrikaans words mixed in.";
+  else if (ov === "whisper")
+    msg = "Forced to standard Whisper for every language.";
+  else if (famWanted === "fluister")
+    msg = (lang === "")
+      ? "Auto-detect uses Fluister, our Afrikaans-tuned model. The size is chosen automatically for your computer."
+      : "Afrikaans uses Fluister, our Afrikaans-tuned model. The size is chosen automatically for your computer.";
   else msg = "English uses standard Whisper. The size is chosen automatically for your computer.";
   return el("div", { class: "card", style: { padding: "11px 13px", display: "flex", gap: "10px", alignItems: "center", marginBottom: "16px" } }, [
     el("div", { class: "tone-tile" + (label === "Fluister" ? " accent" : ""), style: { width: "30px", height: "30px", flex: "0 0 auto" } }, icon(label === "Fluister" ? "sparkle" : "globe", 15)),
@@ -2301,8 +2415,11 @@ function advancedTranscribeControls() {
   if (!open) return el("div", { style: { marginBottom: "16px" } }, toggle);
   return el("div", { style: { marginBottom: "16px" } }, [toggle,
     el("div", { class: "card", style: { padding: "14px", marginTop: "8px" } }, [
+      formField("Engine", el("span", { class: "label-muted", text: " (auto follows the language)" }),
+        el("div", {}, [segmented([["auto", "Auto"], ["fluister", "Fluister"], ["whisper", "Whisper"]], S.form.engine || "auto", function (v) { S.form.engine = v; saveSettings({ engine: v }); warmUp(); render(); }),
+          el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Auto picks Fluister for Afrikaans and auto-detect, Whisper for English. Force one to override." })]), true),
       formField("Model size", el("span", { class: "label-muted", text: " (auto is recommended)" }),
-        el("div", {}, [qualitySelector(),
+        el("div", { style: { marginTop: "12px" } }, [qualitySelector(),
           el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Auto picks the best model your computer can run. Bigger is more accurate but slower." })]), true),
       runOnField(),
     ]),
@@ -2429,6 +2546,7 @@ async function boot() {
     if (S.form.language !== "" && tl.indexOf(S.form.language) < 0) S.form.language = tl[0] || "af";
     S.form.tier = normalizeQuality(S.settings.tier);
     S.form.device = S.settings.device || "auto";
+    S.form.engine = S.settings.engine || "auto";
   }
   if (S.devices) {
     if (S.devices.default_mic_index != null) S.form.mic = String(S.devices.default_mic_index);

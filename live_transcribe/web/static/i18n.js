@@ -136,6 +136,18 @@ window.VM_I18N = {
       "Outomaties gebruik standaard Whisper. Die grootte word outomaties vir jou rekenaar gekies.",
     "English uses standard Whisper. The size is chosen automatically for your computer.":
       "Engels gebruik standaard Whisper. Die grootte word outomaties vir jou rekenaar gekies.",
+    "Auto-detect uses Fluister, our Afrikaans-tuned model. The size is chosen automatically for your computer.":
+      "Outo-bespeur gebruik Fluister, ons Afrikaans-gestemde model. Die grootte word outomaties vir jou rekenaar gekies.",
+    "Fluister (our Afrikaans-tuned model) is not installed on this computer yet, so this runs on standard Whisper for now.":
+      "Fluister (ons Afrikaans-gestemde model) is nog nie op hierdie rekenaar geïnstalleer nie, so dit loop voorlopig op standaard Whisper.",
+    "Forced to Fluister for every language. Handy when an English meeting has Afrikaans words mixed in.":
+      "Gedwing na Fluister vir elke taal. Handig wanneer 'n Engelse vergadering Afrikaanse woorde inmeng.",
+    "Forced to standard Whisper for every language.":
+      "Gedwing na standaard Whisper vir elke taal.",
+    "Engine": "Enjin",
+    " (auto follows the language)": " (outo volg die taal)",
+    "Auto picks Fluister for Afrikaans and auto-detect, Whisper for English. Force one to override.":
+      "Outo kies Fluister vir Afrikaans en outo-bespeur, en Whisper vir Engels. Kies Fluister of Whisper om dit te oorskryf.",
     "Advanced": "Gevorderd",
     "Model size": "Modelgrootte",
     " (auto is recommended)": " (outo word aanbeveel)",
@@ -515,6 +527,14 @@ window.VM_I18N = {
     "Could not check the GPU.": "Kon nie die GPU toets nie.",
     "CPU": "SVE",
     "Transcript": "Transkripsie",
+    "Recorded": "Opgeneem",
+    "Transcribing": "Transkribeer tans",
+    "Summarising": "Som tans op",
+    "Re-transcribe": "Hertranskribeer",
+    "Transcribe this recording?": "Transkribeer hierdie opname?",
+    "Re-transcribe from the recording?": "Hertranskribeer vanaf die opname?",
+    "Transcribes both sides (you and the other person) as separate speakers, using your current language and model settings. Change them in Settings first if needed.": "Transkribeer albei kante (jy en die ander persoon) as aparte sprekers, met jou huidige taal- en modelinstellings. Verander dit eers in Instellings indien nodig.",
+    "Re-transcribes both sides from the saved audio and replaces the current transcript. The audio is kept. Use it for a cleaner pass than the live one.": "Hertranskribeer albei kante vanaf die gestoorde klank en vervang die huidige transkripsie. Die klank word behou. Gebruik dit vir 'n skoner weergawe as die lewendige een.",
     "Skip setup for now": "Slaan opstelling vir eers oor",
     "Run on": "Verwerk op",
     "On the GPU, Volksmond runs the Best model. The Quality choice applies on CPU.": "Op die GPU loop Volksmond die Beste model. Die Gehalte-keuse geld op die SVE.",

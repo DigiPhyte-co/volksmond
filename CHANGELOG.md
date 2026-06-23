@@ -1,5 +1,18 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-23, v1.2.0: recording rework + engine override + async summaries
+
+A round centred on giving you control over the recordings and the summary lifecycle. `licensing.APP_VERSION` 1.1.1 -> 1.2.0.
+
+- **Auto-detect uses Fluister.** When you let Volksmond auto-detect the language, the Afrikaans-tuned Fluister model is used (large-v3 on GPU, medium on CPU), the tiers where Fluister keeps English clean. Explicit `en` or other languages still use stock Whisper. (`transcribe.py`.)
+- **Engine override.** A new Advanced "Engine" selector (Auto / Fluister / Whisper) lets you force Fluister on an English meeting that has Afrikaans code-switched words, or force standard Whisper on an Afrikaans call. Default Auto follows the language. Falls back honestly to Whisper if Fluister is not installed. (`transcribe.py`, `config.py`, `web/app.py`, `web/static/app.js`, `i18n.js`.)
+- **Mixed WAV alongside the channels.** When you record a session, Volksmond still keeps the two channels (`-MIC.wav` + `-SYS.wav`) separately, but on close it also writes `-MIXED.wav`, a single playable file of the whole conversation. The mixed file is for listening back; re-transcribe still feeds the separated channels so the diarisation (you vs the other side) is preserved. (`sinks.py`.)
+- **Record-only sessions appear in History.** Previously a session that was recorded but not transcribed yet was invisible from the app (the file list only globbed transcripts). The session list now enumerates by stem, so a record-only session shows up immediately with a "Recorded" chip and a Transcribe button. (`web/app.py`.)
+- **History status chips.** Each session row shows three indicators: recorded (mic icon), transcribed (note icon), summarised (sparkle icon), each with an in-progress form (a red pulse for the live recording, a spinner for transcribing or summarising) when that step is happening right now. (`web/static/app.js`, `web/static/styles.css`, `i18n.js`.)
+- **Re-transcribe a saved recording, with speaker separation.** Sessions with kept audio get a Re-transcribe action (on the row for record-only sessions, in the reader toolbar otherwise). It feeds both channels through the file engine, time-merges them, tags MIC=you / SYS=the other side, and writes the new transcript at the recording's own stem so the History row gains its transcript rather than spawning a second row. Cleaner than the live pass (no real-time downgrade, full beam). (`web/app.py`, `web/static/app.js`, `i18n.js`.)
+- **Summaries now run as background jobs.** `/api/summarise` no longer blocks; it spawns a worker thread and the UI polls `/api/summary-status`. So you can navigate away from the reader while a summary runs, the History list shows "Summarising" on the right row, and the reader shows "in progress" when you open a session whose summary is still being made. One summary at a time (a second request returns 409, same as before). (`web/app.py`, `web/static/app.js`.)
+- **History updates while you watch.** While on the History screen, the session list refreshes every 2.5s so the indicators move from "Transcribing" to "Transcript + Summarising" to "+ Summary" without a manual refresh. The refresh is silent (no re-render unless something actually changed), so the search box does not lose focus. (`web/static/app.js`.)
+
 ## 2026-06-22, v1.1.1: first-run language step + testing-feedback polish
 
 Round of fixes from testing the v1.1.0 build (`licensing.APP_VERSION` 1.1.0 -> 1.1.1).

@@ -165,6 +165,25 @@ STATE = _State()
 # threads can hang or trip Tk's thread assumptions. A second pick returns 409.
 _PICK_LOCK = threading.Lock()
 
+# Async summary jobs: stem -> {"state": "running"|"done"|"error", "saved": str|None,
+# "summary": str|None, "error": str|None}. A summary runs in a worker thread so the UI can
+# show "in progress" on the reader AND in the History list and survive navigating away.
+_SUMMARY_JOBS = {}
+_SUMMARY_LOCK = threading.Lock()
+
+
+def _summarising_stems():
+    """Stems whose summary is currently being generated (for the sessions list)."""
+    with _SUMMARY_LOCK:
+        return sorted(stem for stem, j in _SUMMARY_JOBS.items() if j.get("state") == "running")
+
+
+def _summary_running():
+    """True iff a summary worker is currently running. Used to gate live ASR + file import,
+    so transcription and summary never compete for the machine (the design rule from v1.0)."""
+    with _SUMMARY_LOCK:
+        return any(j.get("state") == "running" for j in _SUMMARY_JOBS.values())
+
 
 def _feed(source, audio, t_start):
     """Route a captured chunk to the recorder and/or the engine, honouring the live flags.
@@ -184,6 +203,7 @@ class StartRequest(BaseModel):
     tier: str = "auto"            # "auto" | "gpu" | "cpu-strong" | "cpu-mid"
     device: str = "auto"          # "auto"/"gpu" use the GPU when ready; "cpu" forces CPU
     language: str = "af"          # "af" | "en" | "" (empty == auto-detect)
+    engine: str = "auto"          # model family: "auto" (by language) | "fluister" | "whisper"
     prompt: str = ""
     mic_device: Optional[str] = None
     loopback_device: Optional[str] = None
@@ -475,6 +495,7 @@ class WarmUpRequest(BaseModel):
     tier: str = "auto"
     device: str = "auto"
     language: str = "af"          # warm the family the session will use (af -> Fluister)
+    engine: str = "auto"          # model family override, mirrors StartRequest
 
 
 @app.get("/api/warm-up")
@@ -496,8 +517,9 @@ def warm_up(req: WarmUpRequest):
     quality = req.tier if (req.tier and req.tier != "auto") else (settings.get("tier") or "auto")
     device = (getattr(req, "device", None) or settings.get("device") or "auto")
     tier = resolve_tier(quality, device)
-    language = req.language or None     # "" (auto-detect) -> None -> stock Whisper, matching Begin
-    return transcribe.warm_up_async(tier, language)
+    language = req.language or None     # "" (auto-detect) -> None, matching Begin
+    engine_pref = (req.engine or settings.get("engine") or "auto")
+    return transcribe.warm_up_async(tier, language, engine_pref)
 
 
 def _resolve_tier_lang_prompt(req):
@@ -522,11 +544,14 @@ def _resolve_tier_lang_prompt(req):
     language = req.language if req.language else None  # "" -> None (auto-detect)
     parts = [p for p in (settings.get("default_context", "").strip(), req.prompt.strip()) if p]
     prompt = ", ".join(parts) or None
-    return tier, language, prompt
+    engine_pref = (getattr(req, "engine", None) or settings.get("engine") or "auto")
+    return tier, language, prompt, engine_pref
 
 
 @app.post("/api/start")
 def start(req: StartRequest):
+    if _summary_running():
+        raise HTTPException(status_code=409, detail="A summary is being generated. Wait for it to finish before starting a new session, so the two never compete for the machine.")
     with STATE.lock:
         if STATE.running:
             raise HTTPException(status_code=409, detail="Session already running")
@@ -537,7 +562,7 @@ def start(req: StartRequest):
         if not transcribe_on and not record_on:
             raise HTTPException(status_code=400, detail="Nothing to do: enable transcription or recording.")
 
-        tier, language, prompt = _resolve_tier_lang_prompt(req)
+        tier, language, prompt, engine_pref = _resolve_tier_lang_prompt(req)
         chunk_seconds = default_chunk_seconds(tier)
         output_path = _build_output_path(req.topic)
 
@@ -547,7 +572,7 @@ def start(req: StartRequest):
         if transcribe_on:
             # Load model (synchronous; takes a few seconds even when cached)
             try:
-                engine = transcribe.Engine(tier=tier, language=language, initial_prompt=prompt)
+                engine = transcribe.Engine(tier=tier, language=language, initial_prompt=prompt, engine=engine_pref)
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Could not load model ({tier}): {e}")
             md_sink = sinks.MarkdownSink(output_path)
@@ -618,6 +643,7 @@ class TranscribeFileRequest(BaseModel):
     device: str = "auto"
     language: str = "af"
     prompt: str = ""
+    engine: str = "auto"           # model family override, mirrors StartRequest
 
 
 @app.post("/api/transcribe-file")
@@ -628,10 +654,23 @@ def transcribe_file(req: TranscribeFileRequest):
     (the MIC/SYS WAVs of a record-only session, passed via stem). Streams to the
     same SSE transcript view and saves a Markdown transcript.
     """
+    if _summary_running():
+        raise HTTPException(status_code=409, detail="A summary is being generated. Wait for it to finish before starting a transcription, so the two never compete for the machine.")
+    sdir = _sessions_dir()
     files = list(req.paths or [])
+    base = None
     if req.stem:
-        stem = Path(req.stem)
-        files += sorted(str(p) for p in stem.parent.glob(stem.name + "-*.wav"))
+        # Validate the stem against the same allow-list used for transcript filenames, so glob
+        # metacharacters (* ? [), Windows-reserved names, ADS streams, and traversal segments
+        # all get rejected the same way as a malformed transcript name. The validator wants a
+        # ".md" filename, so we round-trip through that and strip the suffix.
+        candidate = Path(req.stem).name + ".md"
+        _validate_session_filename(candidate)
+        base = candidate[:-3]
+        # Feed the per-source channels (-MIC/-SYS), never the convenience -MIXED.wav:
+        # the mix is the same audio summed, so including it would double-count.
+        files += sorted(str(p) for p in sdir.glob(base + "-*.wav")
+                        if not p.name.lower().endswith("-mixed.wav"))
     files = [f for f in files if Path(f).is_file()]
     if not files:
         raise HTTPException(status_code=400, detail="No readable audio files found to transcribe.")
@@ -640,16 +679,30 @@ def transcribe_file(req: TranscribeFileRequest):
         if STATE.running:
             raise HTTPException(status_code=409, detail="A session is already running")
         STATE.sink_error = None  # fresh session: clear any prior write error
-        tier, language, prompt = _resolve_tier_lang_prompt(req)
+        tier, language, prompt, engine_pref = _resolve_tier_lang_prompt(req)
         chunk_seconds = default_chunk_seconds(tier)
-        topic = req.topic or Path(files[0]).stem
-        output_path = _build_output_path(topic)
+        if base:
+            # Re-transcribing a saved recording: write the transcript at the recording's own
+            # stem so the single History session gains its transcript, instead of spawning a
+            # second, differently-timestamped row.
+            output_path = sdir / (base + ".md")
+        else:
+            topic = req.topic or Path(files[0]).stem
+            output_path = _build_output_path(topic)
         try:
             # adaptive=False: a file is not real-time, so never downgrade the model
             # or cut the beam to "keep up" — keep the chosen quality and take longer.
-            engine = transcribe.Engine(tier=tier, language=language, initial_prompt=prompt, adaptive=False)
+            engine = transcribe.Engine(tier=tier, language=language, initial_prompt=prompt, adaptive=False, engine=engine_pref)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Could not load model ({tier}): {e}")
+        if base and output_path.exists():
+            # Regenerating replaces the prior transcript (the audio is kept as the source of
+            # truth). Remove it only now the engine has loaded, so a load failure never loses
+            # it, and the append-mode sink then writes a clean file.
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
         md_sink = sinks.MarkdownSink(output_path)
         browser_sink = BrowserSink()
         engine.subscribe(md_sink)
@@ -886,53 +939,95 @@ def _parse_session_filename(name: str) -> dict:
 
 @app.get("/api/sessions")
 def sessions_list():
-    """List session transcripts in the active save location, newest first.
+    """List sessions in the active save location, newest first.
 
-    A summary is saved next to its transcript as `<transcript>-summary.md`. That is a
-    derived artifact, not its own session, so it is hidden from the list (it was showing
-    up as a separate row and, when opened, masqueraded as a transcript). Each transcript
-    instead carries `has_summary` so the reader can surface the saved summary."""
+    A "session" is a stem that has a transcript (`<stem>.md`) and/or a recording
+    (`<stem>-MIC/SYS/MIXED.wav`). Enumerating by stem means a record-only session
+    (audio captured but not transcribed yet) still appears, ready to re-transcribe.
+    Each row carries status flags: `recorded`, `transcribed`, `has_summary`.
+
+    Derived summaries (`<stem>-summary.md`, `<stem>-summary-N.md`) are not their own
+    sessions; they are folded into `has_summary`, confirmed by the summary header so a
+    real transcript whose topic merely ends in "summary" is never wrongly suppressed.
+
+    `active` names the currently-running session's stem (when its output is in this
+    folder) so the list can show recording/transcribing in progress."""
     sdir = _sessions_dir()
-    names = {p.name for p in sdir.glob("*.md")}
-    files = []
-    for p in sdir.glob("*.md"):
-        name = p.name
-        # Hide derived summaries (the latest <stem>-summary.md and any archived
-        # <stem>-summary-N.md), but only when the transcript actually exists, so a meeting whose
-        # topic happens to end in "summary" is never wrongly suppressed.
-        if name.endswith(".md"):
-            base = name[:-3]
-            stem = None
-            if base.endswith("-summary"):
-                stem = base[:-len("-summary")]
-            else:
-                i = base.rfind("-summary-")
-                if i >= 0 and base[i + len("-summary-"):].isdigit():
-                    stem = base[:i]
-            if stem is not None and (stem + ".md") in names:
-                # Confirm it really is a derived summary (its content starts with the summary
-                # header) before hiding, so a real transcript that merely matches the name
-                # pattern is never wrongly suppressed (that would look like data loss).
-                try:
-                    with open(p, "r", encoding="utf-8") as fh:
-                        if fh.readline(64).startswith("# Summary:"):
-                            continue
-                except OSError:
-                    pass
-        try:
-            st = p.stat()
-        except OSError:
+    md_names = {p.name for p in sdir.glob("*.md")}
+
+    def _summary_stem(base):
+        if base.endswith("-summary"):
+            return base[:-len("-summary")]
+        i = base.rfind("-summary-")
+        if i >= 0 and base[i + len("-summary-"):].isdigit():
+            return base[:i]
+        return None
+
+    # Which .md files are derived summaries (header-verified) -> neither a session nor a transcript.
+    summary_mds = set()
+    for name in md_names:
+        stem = _summary_stem(name[:-3])
+        if stem is not None and (stem + ".md") in md_names:
+            try:
+                with open(sdir / name, "r", encoding="utf-8") as fh:
+                    if fh.readline(64).startswith("# Summary:"):
+                        summary_mds.add(name)
+            except OSError:
+                pass
+
+    sessions = {}
+
+    def _row(stem):
+        r = sessions.get(stem)
+        if r is None:
+            r = {"name": stem + ".md", "stem": stem, "recorded": False, "transcribed": False,
+                 "has_summary": False, "size": 0, "mtime": 0.0, **_parse_session_filename(stem)}
+            sessions[stem] = r
+        return r
+
+    for name in md_names:
+        if name in summary_mds:
             continue
-        meta = _parse_session_filename(name)
-        files.append({
-            "name": name,
-            "size": st.st_size,
-            "mtime": st.st_mtime,
-            "has_summary": (name[:-3] + "-summary.md") in names,
-            **meta,
-        })
-    files.sort(key=lambda f: f["mtime"], reverse=True)
-    return {"files": files, "folder": str(sdir)}
+        r = _row(name[:-3])
+        r["transcribed"] = True
+        try:
+            st = (sdir / name).stat()
+            r["size"] = st.st_size
+            r["mtime"] = max(r["mtime"], st.st_mtime)
+        except OSError:
+            pass
+
+    for p in sdir.glob("*.wav"):
+        low = p.name.lower()
+        suff = next((s for s in ("-mic.wav", "-sys.wav", "-mixed.wav") if low.endswith(s)), None)
+        if suff is None:
+            continue
+        r = _row(p.name[:-len(suff)])
+        r["recorded"] = True
+        try:
+            r["mtime"] = max(r["mtime"], p.stat().st_mtime)
+        except OSError:
+            pass
+
+    for stem, r in sessions.items():
+        if (stem + "-summary.md") in md_names:
+            r["has_summary"] = True
+
+    files = sorted(sessions.values(), key=lambda f: f["mtime"], reverse=True)
+
+    active = None
+    with STATE.lock:
+        if STATE.running and STATE.output_path:
+            ap = Path(STATE.output_path)
+            try:
+                same = ap.parent.resolve() == sdir.resolve()
+            except OSError:
+                same = False
+            if same:
+                active = {"stem": ap.stem, "transcribing": bool(STATE.transcribing),
+                          "recording": bool(STATE.recording)}
+    return {"files": files, "folder": str(sdir), "active": active,
+            "summarising": _summarising_stems()}
 
 
 @app.get("/sessions/{filename}", response_class=PlainTextResponse)
@@ -990,6 +1085,7 @@ class SettingsPatch(BaseModel):
     transcribe_languages: Optional[list] = None
     tier: Optional[str] = None
     device: Optional[str] = None
+    engine: Optional[str] = None
     summary_device: Optional[str] = None
     save_location: Optional[str] = None
     default_context: Optional[str] = None
@@ -1362,10 +1458,61 @@ class SummariseRequest(BaseModel):
     language: Optional[Literal["af", "en"]] = None  # output language for the summary
 
 
+def _generate_summary(model_path, transcript, instruction, language):
+    """Run the local summariser, preferring the GPU when it is usable, falling back to CPU."""
+    from .. import summarise as _summarise, cudadl
+    # GPU only when: the user has not forced CPU, an NVIDIA GPU is present, this build's
+    # llama.cpp can offload (the CPU wheel cannot), and the model fits in VRAM with headroom.
+    device = (config.load().get("summary_device") or "auto").strip().lower()
+    n_gpu_layers = 0
+    if (device != "cpu" and _summarise.gpu_offload_supported() and cudadl.gpu_present()
+            and _summarise.fits_on_gpu(model_path, cudadl.vram_mb())):
+        n_gpu_layers = -1
+    print(f"[summarise] device={device!r} offload={_summarise.gpu_offload_supported()} "
+          f"gpu_present={cudadl.gpu_present()} vram={cudadl.vram_mb()} -> n_gpu_layers={n_gpu_layers}", flush=True)
+
+    def _run(layers):
+        s = _summarise.Summariser(model_path, n_gpu_layers=layers)
+        return s.summarise(transcript, instruction=instruction, language=language)
+    try:
+        return _run(n_gpu_layers)
+    except Exception as e:
+        # A GPU run can fail (e.g. CUDA out of memory on a big KV cache). Fall back to CPU.
+        if n_gpu_layers != 0:
+            print(f"[summarise] GPU run failed ({e}); retrying on CPU", flush=True)
+            return _run(0)
+        raise
+
+
+def _save_summary(target, summary):
+    """Write <stem>-summary.md (the latest, which the reader loads), archiving any previous
+    latest to <stem>-summary-N.md first so regenerating never destroys an earlier summary.
+    Returns the path actually written."""
+    out = target.with_name(target.stem + "-summary.md")
+    if out.exists():
+        n = 1
+        while out.with_name(f"{target.stem}-summary-{n}.md").exists():
+            n += 1
+        archive = out.with_name(f"{target.stem}-summary-{n}.md")
+        try:
+            out.rename(archive)
+        except OSError:
+            # Could not archive the previous latest (e.g. a file lock). Do NOT overwrite and
+            # lose it: save THIS run under the fresh archive name, leave the old latest in place.
+            archive.write_text(f"# Summary: {target.stem}\n\n{summary}\n", encoding="utf-8")
+            return archive
+    out.write_text(f"# Summary: {target.stem}\n\n{summary}\n", encoding="utf-8")
+    return out
+
+
 @app.post("/api/summarise")
 def summarise_endpoint(req: SummariseRequest):
-    """Summarise a finished transcript locally. Free: it runs on this machine, so
-    it is never gated. Needs a summary model installed (chosen in Settings)."""
+    """Start a local summary of a finished transcript, in a worker thread.
+
+    Tracked as a job (poll /api/summary-status), so the UI can show "in progress" on the
+    reader AND in the History list and survive navigating away. Free + fully on-device.
+    One summary at a time: a second request while one is running returns 409, matching the
+    old synchronous behaviour and keeping two summariser models off the machine at once."""
     with STATE.lock:
         if STATE.running:
             raise HTTPException(
@@ -1389,61 +1536,52 @@ def summarise_endpoint(req: SummariseRequest):
     if not model_path:
         raise HTTPException(status_code=409, detail="No summary model installed. Choose one in Settings.")
 
-    transcript = target.read_text(encoding="utf-8")
+    # Read the transcript + resolve the instruction BEFORE marking a job running, so any failure
+    # here surfaces as a real HTTP error instead of leaving the job dict permanently stuck.
+    try:
+        transcript = target.read_text(encoding="utf-8")
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not read the transcript: {e}")
     instruction = (req.instruction or config.active_instruction()) or None
-    from .. import summarise as _summarise, cudadl
+    language = req.language
 
-    # Decide where to run. GPU only when: the user has not forced CPU, an NVIDIA GPU is
-    # present, this build's llama.cpp can offload (the CPU wheel cannot), and the model
-    # fits in VRAM with headroom. Anything else stays on the CPU.
-    device = (config.load().get("summary_device") or "auto").strip().lower()
-    n_gpu_layers = 0
-    if (device != "cpu" and _summarise.gpu_offload_supported() and cudadl.gpu_present()
-            and _summarise.fits_on_gpu(model_path, cudadl.vram_mb())):
-        n_gpu_layers = -1
-    print(f"[summarise] device={device!r} offload={_summarise.gpu_offload_supported()} "
-          f"gpu_present={cudadl.gpu_present()} vram={cudadl.vram_mb()} -> n_gpu_layers={n_gpu_layers}", flush=True)
+    stem = target.stem
+    with _SUMMARY_LOCK:
+        if any(j.get("state") == "running" for j in _SUMMARY_JOBS.values()):
+            raise HTTPException(status_code=409, detail="A summary is already being generated. Let it finish first.")
+        _SUMMARY_JOBS[stem] = {"state": "running", "saved": None, "summary": None, "error": None}
 
-    def _run(layers):
-        s = _summarise.Summariser(model_path, n_gpu_layers=layers)
-        return s.summarise(transcript, instruction=instruction, language=req.language)
+    def _worker():
+        try:
+            summary = _generate_summary(model_path, transcript, instruction, language)
+            saved = _save_summary(target, summary)
+            with _SUMMARY_LOCK:
+                _SUMMARY_JOBS[stem] = {"state": "done", "saved": str(saved), "summary": summary, "error": None}
+        except Exception as e:
+            with _SUMMARY_LOCK:
+                _SUMMARY_JOBS[stem] = {"state": "error", "saved": None, "summary": None, "error": str(e)}
+            print(f"[summarise] job failed for {stem}: {e}", flush=True)
 
     try:
-        try:
-            summary = _run(n_gpu_layers)
-        except Exception as e:
-            # A GPU run can fail (e.g. CUDA out of memory on a transcript with a big
-            # KV cache). Fall back to the CPU rather than failing the summary outright.
-            if n_gpu_layers != 0:
-                print(f"[summarise] GPU run failed ({e}); retrying on CPU", flush=True)
-                summary = _run(0)
-            else:
-                raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Summarise failed: {e}")
+        threading.Thread(target=_worker, daemon=True, name="summarise").start()
+    except RuntimeError as e:
+        # Could not spawn the worker (very rare). Roll back the running flag so the next request
+        # is not blocked forever, then surface the failure.
+        with _SUMMARY_LOCK:
+            _SUMMARY_JOBS.pop(stem, None)
+        raise HTTPException(status_code=500, detail=f"Could not start summary worker: {e}")
+    return {"status": "started", "stem": stem}
 
-    # Keep a history of summaries: the latest is always <stem>-summary.md (the reader loads that),
-    # and any previous latest is archived as <stem>-summary-N.md (N = next free index) before the
-    # new one is written, so regenerating never destroys an earlier summary.
-    out = target.with_name(target.stem + "-summary.md")
-    if out.exists():
-        n = 1
-        while out.with_name(f"{target.stem}-summary-{n}.md").exists():
-            n += 1
-        archive = out.with_name(f"{target.stem}-summary-{n}.md")
-        try:
-            out.rename(archive)
-        except OSError:
-            # Could not archive the previous summary (e.g. a file lock). Do NOT overwrite it and
-            # lose it: save the NEW summary under the fresh archive name and leave the old latest
-            # in place. Nothing is lost, and the user still sees this run's summary.
-            try:
-                archive.write_text(f"# Summary: {target.stem}\n\n{summary}\n", encoding="utf-8")
-            except OSError as e:
-                raise HTTPException(status_code=500, detail=f"Could not save the summary: {e}")
-            return {"summary": summary, "saved": str(archive)}
-    out.write_text(f"# Summary: {target.stem}\n\n{summary}\n", encoding="utf-8")
-    return {"summary": summary, "saved": str(out)}
+
+@app.get("/api/summary-status")
+def summary_status(file: str):
+    """Poll a summary job by transcript filename. Returns the job state for that stem:
+    state in {running, done, error, idle}, plus saved/summary/error when present."""
+    _validate_session_filename(file)
+    stem = file[:-3] if file.endswith(".md") else file
+    with _SUMMARY_LOCK:
+        job = _SUMMARY_JOBS.get(stem)
+        return dict(job) if job else {"state": "idle"}
 
 
 @app.get("/api/stream")

@@ -49,18 +49,28 @@ _FLUISTER = {
 
 
 def family_for_language(language):
-    """The model family that transcribes this language. Afrikaans -> our Fluister tune; everything
-    else (English, others, and auto-detect, which we cannot assume is Afrikaans) -> stock Whisper.
-    Bantu languages will map to a future za-anv family."""
-    return "fluister" if (language or "").lower().startswith("af") else "whisper"
+    """The model family that transcribes this language. Afrikaans AND auto-detect ("") -> our
+    Fluister tune (auto is most likely SA content, and Fluister keeps English clean at the sizes
+    auto actually picks); explicit English/other -> stock Whisper. A manual engine override
+    (resolve_model) can still force either family. Bantu maps to a future za-anv family."""
+    lang = (language or "").lower()
+    return "fluister" if (lang == "" or lang == "auto" or lang.startswith("af")) else "whisper"
 
 
-def resolve_model(size, language):
+def resolve_model(size, language, engine="auto"):
     """Map a Whisper size + the spoken language to the concrete model id to load, and say whether
-    the result is actually a Fluister model. Afrikaans uses the Fluister tune of that size when it
-    is installed; any other language, or a size with no Fluister build, uses stock Whisper.
-    Returns (model_id, is_fluister)."""
-    if family_for_language(language) == "fluister":
+    the result is actually a Fluister model. `engine` overrides the family: "auto" follows the
+    language (family_for_language), "fluister" forces the tune, "whisper" forces stock. A forced
+    Fluister still falls back to stock for a size with no Fluister build (honest). Returns
+    (model_id, is_fluister)."""
+    eng = (engine or "auto").lower()
+    if eng == "whisper":
+        want_fluister = False
+    elif eng == "fluister":
+        want_fluister = True
+    else:
+        want_fluister = family_for_language(language) == "fluister"
+    if want_fluister:
         tuned = _FLUISTER.get(size)
         if tuned and tuned != size:        # a real Fluister path/repo, not the stock fallback
             return tuned, True
@@ -155,7 +165,7 @@ def warm_status():
         return dict(_WARM)
 
 
-def warm_up_async(tier, language=None):
+def warm_up_async(tier, language=None, engine="auto"):
     """Pre-load and lightly exercise the model for `tier` + `language` in the background, so the
     first Begin is instant. The language matters: an Afrikaans session loads the Fluister model,
     so warming the stock model would miss. Idempotent: a no-op while already warming, or once the
@@ -163,7 +173,7 @@ def warm_up_async(tier, language=None):
     cfg = TIER_CONFIG.get(tier)
     if not cfg:
         return {"state": "idle", "tier": None}
-    model_id, _ = resolve_model(cfg["model"], language)
+    model_id, _ = resolve_model(cfg["model"], language, engine)
     key = (model_id, cfg["device"], cfg["compute_type"])
     with _WARM_LOCK:
         if key in _MODEL_CACHE:        # already built (GIL-safe membership read) -> ready
@@ -339,7 +349,8 @@ class Segment:
 
 
 class Engine:
-    def __init__(self, tier, language="af", initial_prompt=None, cpu_threads=8, beam_size=5, adaptive=True):
+    def __init__(self, tier, language="af", initial_prompt=None, cpu_threads=8, beam_size=5, adaptive=True, engine="auto"):
+        self.engine = (engine or "auto").lower()
         if tier not in TIER_CONFIG:
             raise ValueError(f"Unknown tier {tier!r}; choose from {list(TIER_CONFIG)}")
         self.tier = tier
@@ -362,7 +373,7 @@ class Engine:
         # = the concrete model loaded, which is the Fluister tune of that size for an Afrikaans
         # session and stock Whisper otherwise. family/is_fluister label the active engine honestly.
         self.size = cfg["model"]
-        self.model_name, self.is_fluister = resolve_model(self.size, language)
+        self.model_name, self.is_fluister = resolve_model(self.size, language, engine)
         self.family = "fluister" if self.is_fluister else "whisper"
 
         # Cached, local-only load (no network revalidation) and reused across sessions, so a
@@ -517,9 +528,9 @@ class Engine:
         if idx + 1 >= len(CPU_LADDER):
             return  # already on the fastest rung; nothing more to give
         new_size = CPU_LADDER[idx + 1]
-        # Keep the family: an Afrikaans session downgrades to the Fluister tune of the smaller size
-        # where one exists (medium, small), and to stock Whisper for the rungs that have none.
-        new_model, new_is_fluister = resolve_model(new_size, self.language)
+        # Keep the family AND the user's engine choice: a forced-Fluister or forced-Whisper session
+        # must NOT silently flip to language-based auto when the model size drops a rung.
+        new_model, new_is_fluister = resolve_model(new_size, self.language, self.engine)
         print(f"[engine] CPU RTF ~{avg:.2f} (> {DOWNGRADE_RTF}); "
               f"downgrading {self.size} -> {new_size}", flush=True)
         try:

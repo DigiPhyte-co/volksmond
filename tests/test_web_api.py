@@ -136,19 +136,24 @@ def test_quality_resolution():
 
 
 def test_family_resolution():
-    # Language picks the model FAMILY: Afrikaans -> Fluister, everything else (incl. auto-detect)
-    # -> stock Whisper. The tier holds a stock SIZE; the Engine pairs size + language at load time.
+    # Language picks the model FAMILY: Afrikaans AND auto-detect -> Fluister; explicit English/other
+    # -> stock Whisper. A manual engine override forces either family. The tier holds a stock SIZE;
+    # the Engine pairs size + language + engine at load time.
     from live_transcribe import transcribe as T
     assert T.family_for_language("af") == "fluister"
     assert T.family_for_language("af-ZA") == "fluister"
     assert T.family_for_language("en") == "whisper"
-    assert T.family_for_language("") == "whisper"
-    assert T.family_for_language(None) == "whisper"
-    # Non-Afrikaans always resolves to the plain stock size, never a Fluister model.
+    assert T.family_for_language("") == "fluister"      # auto-detect -> Fluister
+    assert T.family_for_language(None) == "fluister"    # None == auto -> Fluister
+    # Explicit English resolves to the plain stock size; a size with no Fluister build stays stock
+    # even for Afrikaans (base/tiny have no app-side Fluister entry).
     assert T.resolve_model("small", "en") == ("small", False)
-    assert T.resolve_model("large-v3", "") == ("large-v3", False)
-    # A size with no Fluister build falls back to stock even for Afrikaans (base/tiny have none).
     assert T.resolve_model("base", "af") == ("base", False)
+    # Auto-detect ("") now resolves to a Fluister build when one exists for that size.
+    assert T.resolve_model("large-v3", "")[1] is True
+    # Engine override forces the family regardless of language.
+    assert T.resolve_model("small", "en", "fluister")[1] is True
+    assert T.resolve_model("small", "af", "whisper") == ("small", False)
     # Every tier now stores a stock size name, never a hardcoded Fluister path.
     sizes = {"tiny", "base", "small", "medium", "large-v3-turbo", "large-v3"}
     for t, cfg in T.TIER_CONFIG.items():
@@ -335,7 +340,7 @@ def test_warm_up():
     # a model; we are checking the endpoint contract, not loading weights.
     import live_transcribe.transcribe as T
     orig = T.warm_up_async
-    T.warm_up_async = lambda tier, language=None: {"state": "warming", "tier": tier}
+    T.warm_up_async = lambda tier, language=None, engine="auto": {"state": "warming", "tier": tier}
     try:
         r = client.post("/api/warm-up", json={"tier": "small", "device": "cpu"})
         assert r.status_code == 200 and r.json().get("state") in ("warming", "ready", "busy", "idle"), r.text

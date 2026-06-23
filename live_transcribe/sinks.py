@@ -21,6 +21,13 @@ def _fmt_ts(t):
     return f"{m:02d}:{s:02d}"
 
 
+def _read_wav_i16(path):
+    """Read a mono 16-bit PCM WAV into an int16 numpy array."""
+    with wave.open(str(path), "rb") as r:
+        frames = r.readframes(r.getnframes())
+    return np.frombuffer(frames, dtype="<i2")
+
+
 class StdoutSink:
     """Prints segments to stdout, one per line."""
     def __call__(self, segment):
@@ -122,7 +129,9 @@ class AudioRecorder:
 
     One file per source (`<stem>-MIC.wav`, `<stem>-SYS.wav`), kept separate to
     match the capture pipeline (never mixed in the audio domain) and to preserve
-    the free MIC/SYS diarisation split for a later re-transcribe.
+    the free MIC/SYS diarisation split for a later re-transcribe. On close, when
+    both channels exist, a convenience `<stem>-MIXED.wav` is also written so there
+    is one playable file of the whole session (for listening, not re-transcribe).
 
     POPIA: only instantiated when the user passes --keep-audio, which requires
     consent from everyone recorded. Audio is the highest-sensitivity artefact;
@@ -170,3 +179,39 @@ class AudioRecorder:
                 except Exception as e:
                     self.last_error = f"Could not finalise the recording: {e}"
                     print(f"[recorder] close error: {e}", flush=True)
+        # Channels are now flushed to disk. Write the convenience mix outside the
+        # lock; it is best-effort and must never lose the per-source channels.
+        self._write_mixed()
+
+    def _write_mixed(self):
+        """Sum MIC + SYS into a single `<stem>-MIXED.wav` for listening back.
+
+        Only when both channels exist (a single-channel recording already *is* that
+        one file). Re-transcribe ignores this file (it feeds the separate channels),
+        so it never affects the diarised transcript. Best-effort: on any failure the
+        two channels are left untouched.
+        """
+        mic = self.stem.with_name(f"{self.stem.name}-MIC.wav")
+        sys_ = self.stem.with_name(f"{self.stem.name}-SYS.wav")
+        if not (mic.is_file() and sys_.is_file()):
+            return
+        try:
+            a, b = _read_wav_i16(mic), _read_wav_i16(sys_)
+            n = max(len(a), len(b))
+            a = np.pad(a, (0, n - len(a)))
+            b = np.pad(b, (0, n - len(b)))
+            # Sum then clip: in a conversation the two channels rarely peak together,
+            # so summing keeps each speaker at natural level; clip guards the overlap.
+            mixed = np.clip(a.astype(np.int32) + b.astype(np.int32), -32768, 32767).astype("<i2")
+            out = self.stem.with_name(f"{self.stem.name}-MIXED.wav")
+            # `with` guarantees the writer is closed even if writeframes raises mid-write,
+            # so a partial-write failure leaves no leaked handle (and the per-source channels
+            # remain the source of truth).
+            with wave.open(str(out), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(self.TARGET_RATE)
+                w.writeframes(mixed.tobytes())
+            print(f"[recorder] wrote {out.name}", flush=True)
+        except Exception as e:
+            print(f"[recorder] mix skipped: {e}", flush=True)

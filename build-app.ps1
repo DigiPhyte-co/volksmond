@@ -11,7 +11,11 @@
 [CmdletBinding()]
 param()
 
-$ErrorActionPreference = "Stop"
+# NOT "Stop": PyInstaller writes its INFO lines to stderr, and under "Stop" the first one
+# trips PowerShell's NativeCommandError trap and aborts the script before $LASTEXITCODE is
+# read. The script already gates every step on $LASTEXITCODE explicitly, so "Continue" gives
+# the same safety without the brittleness.
+$ErrorActionPreference = "Continue"
 $here = $PSScriptRoot
 $pyexe = Join-Path $env:LOCALAPPDATA "sa-live-transcribe\.venv\Scripts\python.exe"
 # Build outside OneDrive (see header): avoids sync locks + a pointless 400 MB sync.

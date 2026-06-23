@@ -244,6 +244,8 @@ html, body { margin: 0; padding: 0; height: 100%; }
 .vm .chip.warn { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
 .vm .chip.accent { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
 .vm .chip.muted { color: var(--ink-3); }
+.vm .spinner.sm { width: 11px; height: 11px; border-width: 2px; }
+.vm .hist-row .stats { display: inline-flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
 
 @keyframes vm-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
