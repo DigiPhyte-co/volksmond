@@ -2069,7 +2069,7 @@ function pollVoiceDownload() {
       var p = (d && d.progress) || {};
       if (p.state === "downloading") { updateVoiceProgress(p); return; }
       clearInterval(_vdlTimer); _vdlTimer = null;
-      if (p.state === "done") { toast("Transcription model ready."); }
+      if (p.state === "done") { toast("Transcription model ready."); if (p.kind === "fluister") { S.modelUpdates = null; } }
       else if (p.state === "error") { toast("Download failed: " + (p.error || ""), true); }
       render();
     }).catch(function () {});
@@ -2151,6 +2151,73 @@ function modelFamiliesNote() {
     ]),
   ]);
 }
+// The Afrikaans (Fluister) model is OURS, so unlike stock Whisper it improves over time and can have
+// a newer version. This panel shows what is installed and, after a MANUAL check, offers an opt-in
+// update. The check and the update are the only times the app reaches our server about models, and
+// only when the user clicks: same no-phone-home stance as the app-version check. The model loads
+// from the local cache (local_files_only), so a newer Fluister can ONLY arrive through this opt-in.
+function fluisterUpdatePanel() {
+  var d = S.voiceModels;
+  if (!d) return null;
+  var installed = (d.fluister || []).filter(function (m) { return m.present; });
+  var ups = {};
+  ((S.modelUpdates && S.modelUpdates.updates) || []).forEach(function (u) { ups[u.repo] = u; });
+  var checking = S._checkingModelUpdates;
+  var p = d.progress || {};
+  var downloading = p.state === "downloading";
+  var header = el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "center", marginBottom: installed.length ? "8px" : "0" } }, [
+    el("div", { style: { fontWeight: "600", fontSize: "13px" }, text: "Afrikaans model (Fluister)" }),
+    installed.length ? el("button", { class: "btn ghost sm", disabled: checking, onclick: function () { checkModelUpdates(); } }, checking ? "Checking" : "Check for updates") : null,
+  ]);
+  var body;
+  if (!installed.length) {
+    body = el("div", { class: "ink-3", style: { fontSize: "12px" }, text: "Not installed yet. The Afrikaans model downloads automatically the first time you transcribe Afrikaans." });
+  } else {
+    body = el("div", { class: "stack", style: { gap: "8px" } }, installed.map(function (m) {
+      var meta = VOICE_LABELS[m.size] || { title: m.size };
+      var u = ups[m.repo];
+      var isThis = downloading && p.model === m.size;
+      var pct = (isThis && p.total) ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0;
+      var right;
+      if (u && u.update_available) {
+        right = el("div", { class: "row gap-8", style: { alignItems: "center" } }, [
+          el("span", { class: "chip accent" }, [el("span", { text: "Update available" }), raw(" → v" + u.latest)]),
+          el("button", { class: "btn sm", disabled: downloading, onclick: function () { if (downloading) return; startFluisterUpdate(m.size); } }, isThis ? "Updating" : "Update"),
+        ]);
+      } else if (S.modelUpdates) {
+        right = el("span", { class: "chip ok" }, [icon("check", 12), "Up to date"]);
+      } else {
+        right = el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]);
+      }
+      return el("div", { class: "card", style: { padding: "12px 14px" } }, [
+        el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "center", gap: "10px" } }, [
+          el("div", {}, [
+            el("span", { style: { fontWeight: "600" }, text: meta.title }),
+            el("span", { class: "ink-3", style: { fontSize: "11.5px", marginLeft: "8px" } }, raw("v" + (m.installed_version || "?"))),
+          ]),
+          right,
+        ]),
+        isThis ? voiceProgressBar(pct) : null,
+      ]);
+    }));
+  }
+  return el("div", { class: "card", style: { padding: "12px 14px", marginBottom: "12px", background: "var(--surface-2)" } }, [header, body]);
+}
+function checkModelUpdates() {
+  S._checkingModelUpdates = true; render();
+  api.post("/api/model-updates").then(function (d) {
+    S.modelUpdates = d; S._checkingModelUpdates = false; render();
+    if (!d.any_update) { toast("Your Afrikaans model is up to date."); }
+  }).catch(function () {
+    S._checkingModelUpdates = false; render();
+    toast("Could not check for model updates.", true);
+  });
+}
+function startFluisterUpdate(size) {
+  api.post("/api/voice-model/update", { size: size })
+    .then(function () { pollVoiceDownload(); render(); })
+    .catch(function (e) { toast(e.message || "Could not start the update.", true); });
+}
 function voiceModelCard() {
   return el("div", { class: "card settings-card" }, [
     el("div", { class: "card-title section-label", text: "Transcription model, on this machine" }),
@@ -2158,6 +2225,7 @@ function voiceModelCard() {
       el("div", { class: "t", style: { marginBottom: "4px" }, text: "Download or switch model" }),
       el("div", { class: "s", style: { marginBottom: "10px" }, text: "Volksmond transcribes on this computer. Download the model that suits your machine; the recommended one is marked. Bigger is more accurate, but slower and larger to download. Remove any you no longer need to free space." }),
       modelFamiliesNote(),
+      fluisterUpdatePanel(),
       voiceDownloadPanel(true),
     ]),
     el("div", { class: "set-row" }, [

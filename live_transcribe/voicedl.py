@@ -24,8 +24,9 @@ import shutil
 import threading
 from pathlib import Path
 
+from . import config
 from .__main__ import pick_tier
-from .transcribe import TIER_CONFIG
+from .transcribe import TIER_CONFIG, FLUISTER_REPOS
 
 # Approx on-disk sizes (bytes) of the faster-whisper (CTranslate2) repos, dominated
 # by model.bin. Used only for the progress estimate; HuggingFace verifies the real
@@ -41,6 +42,29 @@ _SIZES = {
 # highest accuracy: Fast=small, Balanced=medium, High quality=large-v3-turbo,
 # Best=large-v3. tiny/base are internal live-downgrade rungs only, not offered here.
 _OFFER = ["small", "medium", "large-v3-turbo", "large-v3"]
+
+# ── our own (versioned) models: Fluister ───────────────────────────────────
+# Stock Whisper above is upstream and unversioned. Fluister is OURS, so it improves over time
+# (Fluister v2, ...). load_model() reads the local cache with local_files_only=True, so a newer
+# Fluister pushed to the same repo does NOT silently reach an existing install. The manual update
+# check closes that gap: the app fetches our own models.json, compares the published version to
+# what is recorded as installed here, and offers an opt-in update. Nothing is sent and nothing is
+# fetched until the user clicks (same privacy stance as the app-version check).
+MODELS_MANIFEST_URL = "https://volksmond.digiphyte.com/models.json"
+
+# Approx on-disk sizes (bytes) of the Fluister ct2-int8 repos, for the progress estimate only;
+# HuggingFace verifies the real file hashes. The live manifest's approx_bytes overrides these.
+_FLUISTER_SIZES = {
+    "large-v3":       1_530_000_000,
+    "large-v3-turbo":   819_000_000,
+    "medium":           774_000_000,
+    "small":            250_000_000,
+}
+
+# The Fluister version shipped with THIS build. Used as the floor for a model that is in the cache
+# but has no install record yet (downloaded before version tracking existed), so a later manifest
+# that raises the version is still seen as an update. The live manifest is the real source of truth.
+_FLUISTER_BASELINE = "1.0.0"
 
 # Cache the (subprocess-backed) hardware probe: it cannot change during a run, and
 # catalogue_public() is polled once a second while a download runs.
@@ -126,7 +150,11 @@ def _present(model):
 
 
 _LOCK = threading.Lock()
-_STATE = {"state": "idle", "model": None, "downloaded": 0, "total": 0, "error": None}
+# `repo` is the HuggingFace cache folder to measure for progress (a stock _repo_id, or a Fluister
+# repo). `kind` is "whisper" | "fluister"; `version`/`revision` carry the Fluister update being
+# applied so _run_fluister can record it on success. One global download at a time, so one slot.
+_STATE = {"state": "idle", "model": None, "repo": None, "kind": None,
+          "version": None, "revision": None, "downloaded": 0, "total": 0, "error": None}
 
 
 def _set(**kw):
@@ -141,7 +169,7 @@ def progress():
     # (snapshot_download streams into it, including *.incomplete blobs), so the bar
     # moves without depending on a tqdm hook.
     if snap["state"] == "downloading" and snap.get("model"):
-        live = _dir_size(_repo_dir(_repo_id(snap["model"])))
+        live = _dir_size(_repo_dir(snap.get("repo") or _repo_id(snap["model"])))
         if live > snap["downloaded"]:
             snap["downloaded"] = live
             with _LOCK:
@@ -191,8 +219,9 @@ def start_download(model):
     with _LOCK:
         if _STATE["state"] == "downloading":
             raise RuntimeError("A model is already downloading.")
-        _STATE.update({"state": "downloading", "model": model, "downloaded": 0,
-                       "total": _SIZES[model], "error": None})
+        _STATE.update({"state": "downloading", "model": model, "repo": _repo_id(model),
+                       "kind": "whisper", "version": None, "revision": None,
+                       "downloaded": 0, "total": _SIZES[model], "error": None})
     threading.Thread(target=_run, args=(model,), daemon=True).start()
 
 
@@ -226,6 +255,170 @@ def _run(model):
         # reads, so the first Begin loads without a network round-trip. faster-whisper
         # (via HuggingFace) verifies each file as it goes.
         _download_model(model, local_only=False)
+        _set(state="done", downloaded=total)
+    except Exception as e:
+        _set(state="error", error=str(e))
+
+
+# ── Fluister: versioning, manifest, and opt-in update ──────────────────────
+
+def _vtuple(v):
+    """Numeric version tuple for comparison: "1.10.0" -> (1,10,0), "v2.0-beta" -> (2,0). Takes the
+    leading digits of each dotted part and stops at the first part with no leading digit, so a
+    pre-release suffix never makes a newer version sort older. Mirrors app.py's _version_tuple."""
+    parts = []
+    for p in str(v or "").strip().lstrip("vV").split("."):
+        digits = ""
+        for ch in p:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _installed_versions():
+    """The {repo_id: {"version","revision"}} record of versioned models installed on this machine,
+    read from settings. Empty (not an error) before anything has been recorded."""
+    v = config.load().get("installed_models")
+    return v if isinstance(v, dict) else {}
+
+
+def record_installed(repo, version, revision=None):
+    """Persist that `repo` is installed at `version` (and the commit we resolved), so a later manual
+    update check can tell this is older than a newly published one. Atomic via config's write lock."""
+    cur = dict(_installed_versions())
+    cur[repo] = {"version": str(version or ""), "revision": str(revision or "")}
+    config.update({"installed_models": cur})
+
+
+def _ref_main_sha(repo):
+    """The commit sha the local HF cache currently resolves 'main' to for this repo (i.e. what a
+    local_files_only load will actually read), or '' if it cannot be determined."""
+    try:
+        return (_repo_dir(repo) / "refs" / "main").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _effective_version(repo, present, rec=None):
+    """The version we believe is installed for `repo`: the recorded version, else the build baseline
+    when the model is present (a pre-tracking install), else None when it is not installed at all."""
+    rec = _installed_versions() if rec is None else rec
+    recorded = (rec.get(repo) or {}).get("version")
+    if recorded:
+        return recorded
+    return _FLUISTER_BASELINE if present else None
+
+
+def fluister_catalogue():
+    """Local-only install state of each Fluister (Afrikaans-tuned) model: size, repo, whether it is
+    in the cache, the version we believe is installed, and on-disk size. Never touches the network
+    (the manual update check does that). NOTE: on a dev machine that overrides Fluister to a local
+    ct2 folder (SA_LIVE_AF_MODEL / an af-lora-* dir), the HF repo may read as not-present here even
+    though Afrikaans transcription works from the local build; the update flow manages the HF repo."""
+    rec = _installed_versions()
+    out = []
+    for size, repo in FLUISTER_REPOS.items():
+        present = _present(repo)
+        out.append({
+            "size": size,
+            "repo": repo,
+            "present": present,
+            "installed_version": _effective_version(repo, present, rec),
+            "approx_bytes": _FLUISTER_SIZES.get(size, 0),
+            "size_on_disk": _dir_size(_repo_dir(repo)) if present else 0,
+        })
+    return out
+
+
+def fetch_manifest(timeout=8):
+    """Fetch our published models.json (ONE outbound GET, generic User-Agent, no user data). Returns
+    the parsed dict; raises on any network/parse error for the caller to turn into a friendly 502.
+    Only ever called from a user-initiated action (Check for updates / Update), never automatically."""
+    import json as _json
+    import urllib.request
+    rq = urllib.request.Request(MODELS_MANIFEST_URL, headers={
+        "Accept": "application/json",
+        "User-Agent": "Volksmond-update-check",
+    })
+    with urllib.request.urlopen(rq, timeout=timeout) as resp:
+        return _json.loads(resp.read().decode("utf-8"))
+
+
+def model_update_status(manifest):
+    """Given a fetched models.json, the per-Fluister-model update state for THIS machine. Only models
+    that are actually installed here are considered (we never nag about a model you do not have).
+    update_available = the manifest version is newer than the installed (recorded, else baseline)
+    one. A pure function of (manifest, local state), so it is unit-testable without the network."""
+    by_repo = {m.get("repo"): m for m in (manifest.get("models") or []) if m.get("repo")}
+    rec = _installed_versions()
+    updates = []
+    for size, repo in FLUISTER_REPOS.items():
+        if not _present(repo):
+            continue
+        man = by_repo.get(repo)
+        if not man or not man.get("version"):
+            continue
+        installed = _effective_version(repo, True, rec)
+        latest = str(man.get("version"))
+        updates.append({
+            "size": size,
+            "repo": repo,
+            "installed": installed,
+            "latest": latest,
+            "revision": man.get("revision") or "",
+            "approx_bytes": man.get("approx_bytes") or _FLUISTER_SIZES.get(size, 0),
+            "update_available": _vtuple(latest) > _vtuple(installed or ""),
+        })
+    return updates
+
+
+def start_fluister_update(size):
+    """Begin a background download of the newest published version of one Fluister model, recording
+    it as installed on success. Fetches the manifest first (the user clicked Update, itself a manual
+    network action) to learn the version + pinned revision. Raises ValueError (unknown size / not in
+    the manifest), RuntimeError (a download is already running), or a network error (let the caller
+    map it to 502)."""
+    repo = FLUISTER_REPOS.get(size)
+    if not repo:
+        raise ValueError("Unknown model")
+    man = None
+    for m in (fetch_manifest().get("models") or []):
+        if m.get("repo") == repo:
+            man = m
+            break
+    if not man:
+        raise ValueError("That model is not in the update manifest.")
+    version = str(man.get("version") or "")
+    revision = man.get("revision") or ""
+    total = man.get("approx_bytes") or _FLUISTER_SIZES.get(size, 0)
+    with _LOCK:
+        if _STATE["state"] == "downloading":
+            raise RuntimeError("A model is already downloading.")
+        _STATE.update({"state": "downloading", "model": size, "repo": repo, "kind": "fluister",
+                       "version": version, "revision": revision,
+                       "downloaded": 0, "total": total, "error": None})
+    threading.Thread(target=_run_fluister, args=(repo, revision, version, total), daemon=True).start()
+
+
+def _run_fluister(repo, revision, version, total):
+    try:
+        # Sync the repo's main ref to the latest published files. snapshot_download re-fetches only
+        # the files whose hash changed (e.g. a new model.bin for v2). Because load_model() reads the
+        # cache with local_files_only (no revision), syncing refs/main is what lets the offline load
+        # pick up the update WITHOUT threading a revision through the whole engine.
+        _download_model(repo, local_only=False)
+        got = _ref_main_sha(repo)
+        # Pin verification (supply-chain guard): when the manifest names a specific commit, refuse to
+        # record the update if the bytes we got are not that commit. A "main"/blank pin accepts main.
+        if revision and revision not in ("main", "") and got and got != revision:
+            _set(state="error", error="The downloaded model did not match the published version. Please try again later.")
+            return
+        record_installed(repo, version, got or revision)
         _set(state="done", downloaded=total)
     except Exception as e:
         _set(state="error", error=str(e))

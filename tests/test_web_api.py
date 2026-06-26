@@ -420,6 +420,73 @@ def test_summarise_accepts_instruction():
     print("  OK  /api/summarise accepts a custom instruction (bogus file -> 404, not 422)")
 
 
+def test_model_update_status_logic():
+    # Pure version logic (no network): _vtuple compares dotted versions numerically, and
+    # model_update_status flags an update only for a PRESENT model whose manifest version beats the
+    # installed (recorded, else baseline) one. Stub _present + the install record so nothing touches
+    # HuggingFace or settings.
+    from live_transcribe import voicedl as V
+    from live_transcribe.transcribe import FLUISTER_REPOS
+    assert V._vtuple("2.0.0") > V._vtuple("1.9.9")
+    assert V._vtuple("v1.2") == (1, 2)
+    repo = FLUISTER_REPOS["large-v3"]
+    orig_present, orig_inst = V._present, V._installed_versions
+    try:
+        V._present = lambda m: m == repo          # only this Fluister model is "installed"
+        V._installed_versions = lambda: {}         # nothing recorded -> baseline floor
+        man = {"models": [{"repo": repo, "version": "2.0.0", "revision": "abc", "approx_bytes": 123}]}
+        ups = V.model_update_status(man)
+        assert len(ups) == 1 and ups[0]["repo"] == repo, ups
+        assert ups[0]["installed"] == V._FLUISTER_BASELINE and ups[0]["latest"] == "2.0.0", ups
+        assert ups[0]["update_available"] is True, ups
+        # Same version as the baseline -> not an update.
+        same = {"models": [{"repo": repo, "version": V._FLUISTER_BASELINE}]}
+        assert V.model_update_status(same)[0]["update_available"] is False
+        # A model that is not installed is never reported (we don't nag about models you lack).
+        V._present = lambda m: False
+        assert V.model_update_status(man) == []
+    finally:
+        V._present, V._installed_versions = orig_present, orig_inst
+    print("  OK  model_update_status: present+versioned only; update when manifest > installed baseline")
+
+
+def test_model_update_endpoints():
+    # /api/voice-models now carries the local Fluister install catalogue (no network), and the manual
+    # update endpoints mirror /api/check-updates: CSRF-protected, session-gated, and the network fetch
+    # is stubbed so the test never reaches HuggingFace or our site.
+    from live_transcribe import voicedl as V
+    from live_transcribe.transcribe import FLUISTER_REPOS
+    j = client.get("/api/voice-models").json()
+    assert isinstance(j.get("fluister"), list) and j["fluister"], j
+    for m in j["fluister"]:
+        for k in ("size", "repo", "present", "installed_version", "approx_bytes", "size_on_disk"):
+            assert k in m, (k, m)
+    repo = FLUISTER_REPOS["small"]
+    orig_fetch, orig_present, orig_inst = V.fetch_manifest, V._present, V._installed_versions
+    try:
+        V.fetch_manifest = lambda timeout=8: {"models": [{"repo": repo, "version": "9.9.9", "revision": "main"}]}
+        V._present = lambda m: m == repo
+        V._installed_versions = lambda: {}
+        d = client.post("/api/model-updates").json()
+        assert d["checked"] is True and d["any_update"] is True, d
+        assert any(u["repo"] == repo and u["update_available"] for u in d["updates"]), d
+    finally:
+        V.fetch_manifest, V._present, V._installed_versions = orig_fetch, orig_present, orig_inst
+    # CSRF: both update endpoints reject a tokenless request before doing anything.
+    bare = TestClient(app, base_url="http://localhost")
+    assert bare.post("/api/model-updates").status_code == 403, "model-updates not CSRF-protected"
+    assert bare.post("/api/voice-model/update", json={"size": "small"}).status_code == 403, "voice-model update not CSRF-protected"
+    # Unknown size -> 400 (rejected before any network). A running session -> 409.
+    assert client.post("/api/voice-model/update", json={"size": "nope"}).status_code == 400
+    saved = webapp.STATE.engine
+    try:
+        webapp.STATE.engine = object()
+        assert client.post("/api/voice-model/update", json={"size": "small"}).status_code == 409
+    finally:
+        webapp.STATE.engine = saved
+    print("  OK  model updates: voice-models carries fluister catalogue; /api/model-updates + update CSRF + session-gated; bad size 400")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_app_info,
@@ -446,7 +513,9 @@ if __name__ == "__main__":
                test_feed_raw_mic_routing,
                test_reconfigure_session_gated,
                test_warm_up,
-               test_summarise_accepts_instruction):
+               test_summarise_accepts_instruction,
+               test_model_update_status_logic,
+               test_model_update_endpoints):
         try:
             fn()
         except AssertionError as e:

@@ -1406,6 +1406,9 @@ def voice_models():
     # so the UI can label the engine honestly (Fluister vs stock Whisper) before the tuned
     # models are hosted/installed.
     cat["fluister_available"] = transcribe.fluister_available()
+    # Install state + version of each Fluister model on this machine (local only, no network), so the
+    # voice-model card can show "installed v1.0.0" and, after a manual check, "update available".
+    cat["fluister"] = voicedl.fluister_catalogue()
     return cat
 
 
@@ -1445,6 +1448,50 @@ def voice_model_delete(req: VoiceDownloadRequest):
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
     return {"ok": True}
+
+
+@app.post("/api/model-updates")
+def model_updates():
+    """Manual, user-initiated check for a newer transcription model (e.g. an improved Fluister).
+    Makes ONE outbound HTTPS GET to our OWN models.json manifest and compares it to the model
+    versions installed on this machine. Sends no user data, runs only when the user clicks, and is
+    CSRF-protected. The model-version twin of /api/check-updates (which checks the app version).
+    Because load_model() reads the local cache with local_files_only, an improved model can only
+    reach an existing install through this opt-in path; the app never revalidates against HF on its
+    own."""
+    from .. import voicedl
+    try:
+        manifest = voicedl.fetch_manifest()
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not reach the update server. Check your internet connection and try again.")
+    updates = voicedl.model_update_status(manifest)
+    return {"checked": True, "updates": updates,
+            "any_update": any(u["update_available"] for u in updates)}
+
+
+class VoiceUpdateRequest(BaseModel):
+    size: str
+
+
+@app.post("/api/voice-model/update")
+def voice_model_update(req: VoiceUpdateRequest):
+    """Download the newest published version of one Afrikaans (Fluister) model and record it as
+    installed, so an existing user can opt in to an improved model. Background; the UI polls
+    /api/voice-models for progress (shared with the normal download). Refused while a session runs,
+    since updating swaps the files a live engine may load."""
+    from .. import voicedl
+    with STATE.lock:
+        if STATE.engine is not None:
+            raise HTTPException(status_code=409, detail="A transcription session is running. Stop it before updating a model.")
+    try:
+        voicedl.start_fluister_update(req.size)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not reach the update server. Check your internet connection and try again.")
+    return voicedl.progress()
 
 
 @app.get("/api/cuda")

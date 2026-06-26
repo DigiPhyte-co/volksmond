@@ -38,13 +38,22 @@ def _fluister(repo, local, stock):
         return stock if ov.lower() == "stock" else ov
     return local if os.path.isdir(local) else repo
 
+# size -> canonical Fluister HuggingFace repo. The single source of truth for the repo ids, so the
+# voice-model catalogue and the update manifest (voicedl) resolve exactly the repos this engine loads.
+FLUISTER_REPOS = {
+    "large-v3":       "digiphyte/fluister-large-v3",
+    "large-v3-turbo": "digiphyte/fluister-turbo",
+    "medium":         "digiphyte/fluister-medium",
+    "small":          "digiphyte/fluister-small",
+}
+
 # size -> Fluister model id: the hosted HF repo (downloaded on first use), or the local ct2 build
 # when present on this machine. resolve_model treats anything != the stock size name as Fluister.
 _FLUISTER = {
-    "large-v3":       _fluister("digiphyte/fluister-large-v3", r"C:\Users\seanf\.cache\af-lora-ct2-int8", "large-v3"),
-    "large-v3-turbo": _fluister("digiphyte/fluister-turbo", r"C:\Users\seanf\.cache\af-lora-turbo-ct2-int8", "large-v3-turbo"),
-    "medium":         _fluister("digiphyte/fluister-medium", r"C:\Users\seanf\.cache\af-lora-medium-ct2-int8", "medium"),
-    "small":          _fluister("digiphyte/fluister-small", r"C:\Users\seanf\.cache\af-lora-small-ct2-int8", "small"),
+    "large-v3":       _fluister(FLUISTER_REPOS["large-v3"], r"C:\Users\seanf\.cache\af-lora-ct2-int8", "large-v3"),
+    "large-v3-turbo": _fluister(FLUISTER_REPOS["large-v3-turbo"], r"C:\Users\seanf\.cache\af-lora-turbo-ct2-int8", "large-v3-turbo"),
+    "medium":         _fluister(FLUISTER_REPOS["medium"], r"C:\Users\seanf\.cache\af-lora-medium-ct2-int8", "medium"),
+    "small":          _fluister(FLUISTER_REPOS["small"], r"C:\Users\seanf\.cache\af-lora-small-ct2-int8", "small"),
 }
 
 

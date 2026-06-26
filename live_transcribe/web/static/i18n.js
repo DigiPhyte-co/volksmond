@@ -459,6 +459,17 @@ window.VM_I18N = {
       "Engels en ander tale gebruik standaard Whisper, die model wat jy hieronder aflaai.",
     "The size you pick (speed against accuracy) applies to whichever family your language needs.":
       "Die grootte wat jy kies (spoed teenoor akkuraatheid) geld vir watter familie jou taal ook al nodig het.",
+    // Afrikaans (Fluister) model update panel
+    "Afrikaans model (Fluister)": "Afrikaanse model (Fluister)",
+    "Checking": "Soek tans",
+    "Up to date": "Op datum",
+    "Update": "Opdateer",
+    "Updating": "Opdateer tans",
+    "Not installed yet. The Afrikaans model downloads automatically the first time you transcribe Afrikaans.":
+      "Nog nie geïnstalleer nie. Die Afrikaanse model laai outomaties af die eerste keer wat jy Afrikaans transkribeer.",
+    "Your Afrikaans model is up to date.": "Jou Afrikaanse model is op datum.",
+    "Could not check for model updates.": "Kon nie vir modelopdaterings soek nie.",
+    "Could not start the update.": "Kon nie die opdatering begin nie.",
     "Needs a graphics card (GPU). Choose another for this computer.":
       "Benodig 'n grafikakaart (GPU). Kies 'n ander een vir hierdie rekenaar.",
     "Transcription model ready.": "Transkripsiemodel gereed.",
