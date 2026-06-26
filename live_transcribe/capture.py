@@ -77,7 +77,7 @@ def _find_last_silence(audio: np.ndarray, sample_rate: int,
 
 
 class AudioCapture:
-    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None, t0=None, aec=False):
+    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None, t0=None, aec=False, record_raw_mic=False):
         """on_chunk(source: str, audio_16k_mono: np.ndarray, t_start: float).
 
         t0: optional monotonic start time. When a live session switches its mic or
@@ -87,12 +87,17 @@ class AudioCapture:
 
         aec: when True AND both a mic and a system loopback open, route both through the
         WebRTC APM (live echo cancellation) before chunking. Needs the LiveKit binding;
-        silently runs without it when absent."""
+        silently runs without it when absent.
+
+        record_raw_mic: when True AND live AEC engages, ALSO chunk the RAW (pre-AEC) mic on a
+        side "MIC_RAW" source, so a recording made with live AEC on stays raw (the engine still
+        transcribes the cleaned mic). No effect when AEC does not engage."""
         self.mic_device_spec = mic_device
         self.loopback_device_spec = loopback_device
         self.chunk_seconds = chunk_seconds
         self.on_chunk = on_chunk
         self.aec = aec
+        self.record_raw_mic = record_raw_mic
         self._live_aec = None     # set in start() when AEC engages; read by the audio callbacks
 
         self._stop_event = threading.Event()
@@ -181,6 +186,16 @@ class AudioCapture:
                 # under-lock re-check sees it and routes to the worker; the clear (under each
                 # buffer lock) then drops the few native-rate samples captured before the switch,
                 # so a chunk buffer never mixes sample rates.
+                # Recording with live AEC: also chunk the RAW mic on a side "MIC_RAW" source so the
+                # SAVED recording stays raw (the engine still gets the cleaned MIC). Set up BEFORE
+                # MIC's rate is flipped to 16k below, so MIC_RAW keeps the mic's native rate and the
+                # generic chunker/_emit resample it like any other source.
+                if self.record_raw_mic:
+                    self._buffers["MIC_RAW"] = []
+                    self._buffer_counts["MIC_RAW"] = 0
+                    self._buffer_locks["MIC_RAW"] = threading.Lock()
+                    self._rates["MIC_RAW"] = self._rates["MIC"]        # native rate (pre-flip)
+                    self._channels["MIC_RAW"] = self._channels["MIC"]
                 self._live_aec = la
                 self._rates["MIC"] = TARGET_RATE
                 self._rates["SYS"] = TARGET_RATE
@@ -246,6 +261,11 @@ class AudioCapture:
         with lock:
             self._buffers[source].append(a)
             self._buffer_counts[source] += a.shape[0]
+
+    def has_raw_mic(self):
+        """True once the raw-mic side channel is live (record_raw_mic AND live AEC engaged), so the
+        caller records MIC_RAW as the raw mic and routes the cleaned MIC only to the engine."""
+        return "MIC_RAW" in self._buffers
 
     def levels(self):
         """Latest per-source input level as {source: {"peak": x, "rms": y}}, 0..1, for a
@@ -313,6 +333,14 @@ class AudioCapture:
                     if la is not None:
                         mono = arr.mean(axis=1) if (arr.ndim > 1 and arr.shape[1] > 1) else arr[:, 0]
                         (la.push_near if _src == "MIC" else la.push_far)(mono)
+                        # Tap the RAW mic (pre-AEC) into MIC_RAW for the recorder, so a recording
+                        # made with live AEC on stays raw. The engine still gets the cleaned MIC.
+                        if _src == "MIC":
+                            rawbuf = _self._buffers.get("MIC_RAW")
+                            if rawbuf is not None:
+                                with _self._buffer_locks["MIC_RAW"]:
+                                    rawbuf.append(arr)
+                                    _self._buffer_counts["MIC_RAW"] += arr.shape[0]
                     else:
                         # Re-check under the buffer lock: AEC may engage between the read above and
                         # here, after which the buffer rate is 16k. Appending a native-rate block

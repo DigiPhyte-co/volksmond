@@ -129,6 +129,8 @@ class _State:
         self.chunk_seconds: Optional[int] = None
         self.running: bool = False
         self.recording: bool = False
+        self.record_raw_mic: bool = False   # live AEC + recording: recorder takes the raw MIC_RAW,
+                                             # engine takes the cleaned MIC, so the recording stays raw
         self.transcribing: bool = False
         self.source_kind: Optional[str] = None   # "live" | "file"
         self.stopping: bool = False  # True while draining the backlog after Stop
@@ -154,6 +156,7 @@ class _State:
         self.chunk_seconds = None
         self.running = False
         self.recording = False
+        self.record_raw_mic = False
         self.transcribing = False
         self.source_kind = None
         self.stopping = False
@@ -191,11 +194,22 @@ def _feed(source, audio, t_start):
     Tapped before the engine so a recording stays complete even if transcription drops
     chunks under load. Module-level (not a closure) so /api/switch-device can rebuild the
     capture with the same feed without re-deriving it; the flags and targets are read live
-    off STATE, so a three-way stop or a device switch is picked up without rewiring."""
-    if STATE.recording and STATE.recorder is not None:
-        STATE.recorder.on_chunk(source, audio, t_start)
-    if STATE.transcribing and STATE.engine is not None:
-        STATE.engine.on_chunk(source, audio, t_start)
+    off STATE, so a three-way stop or a device switch is picked up without rewiring.
+
+    Live AEC + recording (STATE.record_raw_mic): capture emits the RAW mic on a "MIC_RAW" source for
+    the recorder (saved as the -MIC channel) and the cleaned mic on "MIC" for the engine, so the
+    recording stays raw while the live transcript still benefits from echo cancellation."""
+    rec = STATE.recorder if (STATE.recording and STATE.recorder is not None) else None
+    eng = STATE.engine if (STATE.transcribing and STATE.engine is not None) else None
+    if source == "MIC_RAW":
+        if rec is not None:
+            rec.on_chunk("MIC", audio, t_start)   # raw mic -> recording only; never the engine
+        return
+    # With live AEC recording the raw mic via MIC_RAW, the cleaned "MIC" here is for the engine only.
+    if rec is not None and not (source == "MIC" and STATE.record_raw_mic):
+        rec.on_chunk(source, audio, t_start)
+    if eng is not None:
+        eng.on_chunk(source, audio, t_start)
 
 
 class StartRequest(BaseModel):
@@ -455,10 +469,12 @@ def switch_device(req: SwitchDeviceRequest):
         chunk = STATE.chunk_seconds or 15
 
         def _build(m, l):
-            # Carry the session's live-AEC setting across the switch, else changing mic/loopback
-            # mid-meeting would silently turn echo cancellation off.
+            # Carry the session's live-AEC + raw-mic-recording settings across the switch, else
+            # changing mic/loopback mid-meeting would silently turn echo cancellation (or the raw
+            # recording side channel) off.
             return capture.AudioCapture(mic_device=m, loopback_device=l, chunk_seconds=chunk,
-                                        on_chunk=_feed, t0=old_cap._t0, aec=old_cap.aec)
+                                        on_chunk=_feed, t0=old_cap._t0, aec=old_cap.aec,
+                                        record_raw_mic=old_cap.record_raw_mic)
 
         try:
             old_cap.stop()
@@ -491,6 +507,7 @@ def switch_device(req: SwitchDeviceRequest):
                 STATE.capture = None  # both failed: session stays running with no capture; the user can Stop
             raise HTTPException(status_code=500, detail=f"Could not switch the {req.which}: {e}")
         STATE.capture = new_cap
+        STATE.record_raw_mic = new_cap.has_raw_mic()   # AEC may re-engage (or not) on the new device
         STATE.mic_device, STATE.loopback_device = mic, loop
         return {"which": req.which, "device": req.device, "mic_device": mic, "loopback_device": loop}
 
@@ -689,6 +706,7 @@ def start(req: StartRequest):
             chunk_seconds=chunk_seconds,
             on_chunk=_feed,
             aec=aec_live,
+            record_raw_mic=(record_on and aec_live),
         )
         try:
             cap.start()
@@ -702,6 +720,9 @@ def start(req: StartRequest):
             STATE.reset()
             raise HTTPException(status_code=500, detail=f"Could not start audio capture: {e}")
         STATE.capture = cap
+        # True only if live AEC actually engaged (the raw side channel exists). If AEC could not
+        # start, this stays False and the recorder takes the normal MIC, which is already raw.
+        STATE.record_raw_mic = cap.has_raw_mic()
 
         return {
             "tier": tier if transcribe_on else None,

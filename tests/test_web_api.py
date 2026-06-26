@@ -347,6 +347,35 @@ def test_recording_channel_bundling():
     print("  OK  upload of one recording channel bundles MIC+SYS (drops MIXED); external file untouched")
 
 
+def test_feed_raw_mic_routing():
+    # Live AEC + recording: the recorder must get the RAW mic (MIC_RAW, saved as the -MIC channel)
+    # while the engine transcribes the cleaned MIC, so recordings stay raw. SYS goes to both. This
+    # pins the _feed routing; the capture-side MIC_RAW production needs a real-audio test.
+    class _Sink:
+        def __init__(self):
+            self.calls = []
+        def on_chunk(self, source, audio, t):
+            self.calls.append((source, audio))
+    rec, eng = _Sink(), _Sink()
+    st = webapp.STATE
+    saved = (st.recording, st.transcribing, st.recorder, st.engine, st.record_raw_mic)
+    try:
+        st.recording = True; st.transcribing = True; st.recorder = rec; st.engine = eng
+        st.record_raw_mic = True
+        webapp._feed("MIC", "cleaned", 1.0)     # cleaned mic -> engine only
+        webapp._feed("MIC_RAW", "raw", 1.0)     # raw mic -> recorder as -MIC only
+        webapp._feed("SYS", "sys", 1.0)         # system -> both
+        assert eng.calls == [("MIC", "cleaned"), ("SYS", "sys")], eng.calls
+        assert rec.calls == [("MIC", "raw"), ("SYS", "sys")], rec.calls
+        # AEC off (no raw side channel): MIC goes to both, unchanged behaviour.
+        rec.calls.clear(); eng.calls.clear(); st.record_raw_mic = False
+        webapp._feed("MIC", "raw", 2.0)
+        assert rec.calls == [("MIC", "raw")] and eng.calls == [("MIC", "raw")], (rec.calls, eng.calls)
+    finally:
+        st.recording, st.transcribing, st.recorder, st.engine, st.record_raw_mic = saved
+    print("  OK  _feed: live-AEC recording saves raw MIC_RAW as -MIC, engine gets the cleaned MIC")
+
+
 def test_reconfigure_session_gated():
     # Changing language/model mid-session is only valid during a live transcription.
     # An empty patch (nothing to change) is rejected up front with 400, before the session check.
@@ -414,6 +443,7 @@ if __name__ == "__main__":
                test_fits_on_gpu_logic,
                test_levels_and_switch_device,
                test_recording_channel_bundling,
+               test_feed_raw_mic_routing,
                test_reconfigure_session_gated,
                test_warm_up,
                test_summarise_accepts_instruction):
