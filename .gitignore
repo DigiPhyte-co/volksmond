@@ -55,6 +55,9 @@ landing/build/readable.html
 .codex-reviews/
 codex-review-*.md
 
+# Cloudflare wrangler local cache/state (Pages deploys)
+.wrangler/
+
 # Local dev launcher (bare CLI; not part of the shipped app)
 transcribe-cli.bat
 
