@@ -1,5 +1,18 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-26, v1.6.0: voice model management (manifest + opt-in updates)
+
+`licensing.APP_VERSION` 1.5.0 -> 1.6.0.
+
+- **Your Afrikaans model can update itself, on your say-so.** Fluister is ours, so it keeps improving (a v2 is coming). The app loads models offline (no silent revalidation against HuggingFace), so a better model pushed to the same place would never reach an existing install on its own. New: a published `models.json` manifest (the model twin of the app's `latest.json`) and an "Afrikaans model (Fluister)" panel in Settings -> Transcription model. A **Check for updates** button (manual, never automatic) compares what you have installed to what is published; when a newer version exists it shows "Update available -> v2" with an opt-in **Update** button that downloads it and records the version. Manual-only, never phones home: the check and the update run only when you click. A per-model `access` field leaves room to gate a premium model later without shipping a new app. (`transcribe.py`, `config.py`, `voicedl.py`, `web/app.py`, `web/static/app.js`, `i18n.js`, `site/models.json`.)
+
+## 2026-06-25, v1.5.0: live language/model switching + re-transcribe controls
+
+`licensing.APP_VERSION` 1.4.0 -> 1.5.0.
+
+- **Change the language or model mid-meeting.** A live meeting's Advanced controls gained Language / Engine / Quality switchers via a new `/api/reconfigure`. Changing the language alone KEEPS the loaded model: the fix for the bilingual-garble case, where an Afrikaans meeting that an English speaker joined was forcing English through an Afrikaans-pinned decode. Changing the model swaps it on the worker thread, the same single-threaded discipline as the CPU auto-downgrade. (`transcribe.py`, `web/app.py`, `web/static/app.js`, `i18n.js`.)
+- **Re-transcribe got language/engine/quality pickers, and echo cancellation.** The re-transcribe dialog now lets you choose language, engine and quality, exposes the echo-cancellation toggle, and a single-file upload auto-bundles its `-MIC`/`-SYS` siblings so both sides transcribe (and echo can cancel) from one pick. Also fixed: with live AEC on, the saved recording keeps the raw mic, not the cleaned one. (`web/app.py`, `web/static/app.js`, `capture.py`, `i18n.js`.)
+
 ## 2026-06-23, v1.4.0: live echo cancellation (opt-in, beta)
 
 - **Cancel speaker echo DURING the meeting (opt-in, off by default).** New `live_transcribe/aec_live.py` runs the same WebRTC APM (Chrome AEC3) on the live capture: the two device streams (mic + system loopback, at different native rates) are streaming-resampled to 16k with `soxr`, fed to a persistent APM in 10ms frames on a dedicated worker thread (far-end via process_reverse_stream, near-end via process_stream), and the cleaned mic flows on to transcription + recording. The streams are decoupled, so if the system goes silent the mic still passes through. Toggle lives in the live meeting's Advanced controls ("Cancel echo live", beta). **Off by default**, same double-talk caveat as the re-transcribe canceller: great when you are mostly listening on speakers, can blur your own words during heavy crosstalk. When live AEC is on, the saved recording is the cleaned mic. Verified end-to-end on a simulated two-device feed (~28 dB cancellation, no dropped audio, exact length); real-hardware listening still wants a live test. `soxr` added to the bundle. (`live_transcribe/aec_live.py`, `capture.py`, `web/app.py`, `config.py`, `web/static/app.js`, `i18n.js`, `sa-live-transcribe.spec`.)
