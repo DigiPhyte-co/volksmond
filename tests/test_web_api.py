@@ -329,6 +329,38 @@ def test_levels_and_switch_device():
     print("  OK  /api/levels idle-safe; /api/switch-device session-gated + validated + CSRF; capture keeps t0")
 
 
+def test_recording_channel_bundling():
+    # Uploading ONE channel of a saved recording must pull in its MIC+SYS pair (so a single-file
+    # upload still transcribes both sides and can cancel echo), and drop the summed -MIXED. A normal
+    # media file with no sibling channels is left exactly as-is.
+    import tempfile, pathlib
+    d = pathlib.Path(tempfile.mkdtemp())
+    for suff in ("MIC", "SYS", "MIXED"):
+        (d / f"call-{suff}.wav").write_bytes(b"\0")
+    (d / "external.mp3").write_bytes(b"\0")
+    exp = webapp._expand_recording_channels
+    assert sorted(pathlib.Path(p).name for p in exp([str(d / "call-MIC.wav")])) == ["call-MIC.wav", "call-SYS.wav"]
+    # Picking the MIXED also resolves to the two real channels, never the summed mix.
+    assert sorted(pathlib.Path(p).name for p in exp([str(d / "call-MIXED.wav")])) == ["call-MIC.wav", "call-SYS.wav"]
+    # A normal external file (no -MIC/-SYS sibling) is untouched.
+    assert exp([str(d / "external.mp3")]) == [str(d / "external.mp3")]
+    print("  OK  upload of one recording channel bundles MIC+SYS (drops MIXED); external file untouched")
+
+
+def test_reconfigure_session_gated():
+    # Changing language/model mid-session is only valid during a live transcription.
+    # An empty patch (nothing to change) is rejected up front with 400, before the session check.
+    assert client.post("/api/reconfigure", json={}).status_code == 400
+    # A real change while idle -> 409 (no live session), not a crash.
+    assert client.post("/api/reconfigure", json={"language": "en"}).status_code == 409
+    assert client.post("/api/reconfigure", json={"tier": "small"}).status_code == 409
+    assert client.post("/api/reconfigure", json={"engine": "fluister"}).status_code == 409
+    # State-changing, so CSRF-protected.
+    bare = TestClient(app, base_url="http://localhost")
+    assert bare.post("/api/reconfigure", json={"language": "en"}).status_code == 403
+    print("  OK  /api/reconfigure: empty patch 400, idle 409, CSRF-protected")
+
+
 def test_warm_up():
     # Warm-up status is always readable, and shaped for the UI.
     st = client.get("/api/warm-up").json()
@@ -381,6 +413,8 @@ if __name__ == "__main__":
                test_summary_device_and_capability,
                test_fits_on_gpu_logic,
                test_levels_and_switch_device,
+               test_recording_channel_bundling,
+               test_reconfigure_session_gated,
                test_warm_up,
                test_summarise_accepts_instruction):
         try:

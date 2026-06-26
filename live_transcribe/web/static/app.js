@@ -136,8 +136,8 @@ function freshLive() {
   return {
     running: false, recording: false, transcribing: false, sourceKind: null,
     startedAt: null, outputPath: null, audioStem: null, tier: null, model: null, family: null,
-    language: null, stopping: false, segments: [], es: null, title: "", importName: "",
-    micDevice: null, loopbackDevice: null, switching: false,
+    language: null, engine: null, stopping: false, segments: [], es: null, title: "", importName: "",
+    micDevice: null, loopbackDevice: null, switching: false, reconfiguring: false,
   };
 }
 var S = {
@@ -146,7 +146,7 @@ var S = {
   sessions: [], sessionsFolder: "", sessionsActive: null, sessionsSummarising: [],
   live: freshLive(),
   starting: { active: false, kind: null, title: "", error: null, startedAt: null },
-  form: { title: "", language: "af", tier: "auto", device: "auto", engine: "auto", participants: [], terms: [], record: false, mic: null, loopback: null, advancedOpen: false },
+  form: { title: "", language: "af", tier: "auto", device: "auto", engine: "auto", participants: [], terms: [], record: false, aec: false, mic: null, loopback: null, advancedOpen: false },
   setup: { stage: "welcome", choice: "transcribe" },
   finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null },
   reader: { name: "", title: "", text: "", summarising: false, summary: null },
@@ -357,6 +357,30 @@ async function switchDevice(which, value) {
     S.live.switching = false; render();
   }
 }
+// Change the transcription language and/or model mid-meeting. A language-only patch keeps the
+// loaded model (instant; the fix for a room that switches Afrikaans <-> English on a both-capable
+// model); a tier/engine patch reloads it. The server resolves and confirms the running model.
+async function reconfigureLive(patch, okMsg) {
+  var prev = { language: S.live.language, model: S.live.model, family: S.live.family, tier: S.live.tier, engine: S.live.engine };
+  if (patch.language != null) S.live.language = patch.language === "" ? "auto" : patch.language;
+  if (patch.engine != null) S.live.engine = patch.engine;
+  S.live.reconfiguring = true; render();
+  try {
+    var resp = await api.post("/api/reconfigure", patch);
+    S.live.language = resp.language;
+    if (resp.tier) S.live.tier = resp.tier;
+    if (resp.model) S.live.model = resp.model;
+    if (resp.family) S.live.family = resp.family;
+    if (resp.engine) S.live.engine = resp.engine;
+    toast(okMsg || "Updated.");
+  } catch (e) {
+    S.live.language = prev.language; S.live.model = prev.model; S.live.family = prev.family;
+    S.live.tier = prev.tier; S.live.engine = prev.engine;
+    toast(e.message || "Could not change the settings.", true);
+  } finally {
+    S.live.reconfiguring = false; render();
+  }
+}
 // Compact strip for the live + record-only screens: per source, a dropdown to switch the
 // device on the fly and a level meter. An empty device list degrades to "not detected".
 function liveAudioStrip() {
@@ -385,6 +409,33 @@ function liveAudioStrip() {
     channel("mic", "mic", dev.mics, S.live.micDevice, dev.default_mic_index, "vm-meter-mic"),
     channel("loopback", "speaker", dev.loopbacks, S.live.loopbackDevice, dev.default_loopback_index, "vm-meter-sys"),
   ]);
+}
+// Compact strip on the live screen to change the LANGUAGE and MODEL mid-meeting. Language alone
+// keeps the loaded model; Engine/Quality reload it. Quality shows only on CPU, where the size is
+// the user's to pick (on the GPU the best model always runs).
+function liveTuneStrip() {
+  if (!S.live.transcribing || S.live.stopping) return null;
+  var isGpu = (S.live.tier === "gpu" || S.live.tier === "gpu-4gb");
+  var langVal = (S.live.language === "auto" || !S.live.language) ? "" : S.live.language;
+  function tuneSelect(opts, value, fn) {
+    var s = el("select", {
+      class: "field", style: { width: "auto", maxWidth: "150px", fontSize: "12px", padding: "5px 8px" },
+      disabled: S.live.reconfiguring, onchange: function (e) { fn(e.target.value); },
+    }, opts.map(function (o) { return el("option", { value: o[0], text: o[1] }); }));
+    s.value = value;
+    return s;
+  }
+  function field(label, control) {
+    return el("div", { class: "row gap-6", style: { alignItems: "center", minWidth: "0" } }, [
+      el("span", { class: "ink-3", style: { fontSize: "11.5px", flex: "0 0 auto" }, text: label }), control,
+    ]);
+  }
+  var items = [
+    field("Language", tuneSelect(transcribeLangOpts(), langVal, function (v) { reconfigureLive({ language: v }, "Language switched."); })),
+    field("Engine", tuneSelect([["auto", "Auto"], ["fluister", "Fluister"], ["whisper", "Whisper"]], S.live.engine || "auto", function (v) { reconfigureLive({ engine: v }, "Model switched."); })),
+  ];
+  if (!isGpu) items.push(field("Quality", tuneSelect(QUALITY_OPTS, normalizeQuality(S.live.tier), function (v) { reconfigureLive({ tier: v }, "Model switched."); })));
+  return el("div", { class: "row gap-16", style: { flexWrap: "wrap", padding: "8px 16px", borderBottom: "1px solid var(--line)", background: "var(--surface-2)", alignItems: "center" } }, items);
 }
 
 /* ── model warm-up (kill the first-use stall) ─────────────── */
@@ -436,6 +487,7 @@ async function startLive() {
     S.live.sourceKind = "live"; S.live.startedAt = new Date().toISOString();
     S.live.outputPath = resp.output_path; S.live.audioStem = resp.audio_stem;
     S.live.tier = resp.tier; S.live.model = resp.model; S.live.family = resp.family; S.live.language = resp.language;
+    S.live.engine = S.form.engine;
     S.live.title = S.form.title || "Live meeting";
     S.live.micDevice = S.form.mic; S.live.loopbackDevice = S.form.loopback;
     go("live"); openStream(); startElapsed(); startLevels();
@@ -486,7 +538,7 @@ function recordPreView() {
   ]));
 }
 async function startImport(arg) {
-  var body = { topic: arg.topic || "", tier: S.form.tier, device: S.form.device, language: S.form.language, engine: S.form.engine, prompt: (S.form.participants || []).concat(S.form.terms || []).join(", ") };
+  var body = { topic: arg.topic || "", tier: S.form.tier, device: S.form.device, language: S.form.language, engine: S.form.engine, aec: !!S.form.aec, prompt: (S.form.participants || []).concat(S.form.terms || []).join(", ") };
   if (arg.path) body.paths = [arg.path];
   if (arg.stem) body.stem = arg.stem;
   beginStarting("file", arg.topic || S.importName || "Recording");
@@ -554,6 +606,7 @@ function confirmModal(opts) {
       el("h2", { text: opts.title || "Are you sure?" }),
       opts.message ? el("p", { class: "ink-2", style: { margin: "8px 0 4px", fontSize: "13px" }, text: opts.message }) : null,
       opts.detail ? el("p", { class: "ink-3 mono", style: { margin: "0 0 4px", fontSize: "12.5px" } }, raw(opts.detail)) : null,
+      opts.body ? el("div", { style: { marginTop: "10px" } }, opts.body) : null,
       el("div", { class: "row gap-8", style: { justifyContent: "flex-end", marginTop: "16px" } }, [
         el("button", { class: "btn ghost", onclick: function () { modal.remove(); } }, "Cancel"),
         el("button", { class: "btn " + (opts.danger ? "record" : "primary"), onclick: function () { modal.remove(); if (opts.onConfirm) opts.onConfirm(); } }, opts.confirmLabel || "Confirm"),
@@ -1398,7 +1451,7 @@ function liveView() {
     S.live.outputPath ? el("span", { class: "saving" }, ["Saving to ", el("span", { class: "mono", text: baseName(S.live.outputPath) })]) : null,
   ]);
 
-  return el("div", { class: "live" }, [header, liveAudioStrip(), liveBodyEl, footer]);
+  return el("div", { class: "live" }, [header, liveAudioStrip(), liveTuneStrip(), liveBodyEl, footer]);
 }
 
 /* ── record only ──────────────────────────────────────────── */
@@ -1619,10 +1672,33 @@ function reTranscribe(stem, topic, isRegen) {
     title: isRegen ? tr("Re-transcribe from the recording?") : tr("Transcribe this recording?"),
     message: isRegen
       ? tr("Re-transcribes both sides from the saved audio and replaces the current transcript. The audio is kept. Use it for a cleaner pass than the live one.")
-      : tr("Transcribes both sides (you and the other person) as separate speakers, using your current language and model settings. Change them in Settings first if needed."),
+      : tr("Transcribes both sides (you and the other person) as separate speakers. Pick the language and model for this pass below."),
+    body: reTranscribeOptions(),
     confirmLabel: isRegen ? tr("Re-transcribe") : tr("Transcribe"),
     onConfirm: function () { startImport({ stem: stem, topic: topic }); },
   });
+}
+// Language + model pickers for the re-transcribe dialog. Native selects that mutate S.form
+// silently (a render() here would clear the modal); startImport already sends S.form.language /
+// tier / engine to /api/transcribe-file, so the choices take effect on the next pass.
+function reTranscribeOptions() {
+  return el("div", { class: "stack", style: { gap: "12px" } }, [
+    formField("Language", null, selectEl(transcribeLangOpts(), S.form.language, function (v) { S.form.language = v; }), true),
+    formField("Engine", el("span", { class: "label-muted", text: " (auto follows the language)" }),
+      selectEl([["auto", "Auto"], ["fluister", "Fluister"], ["whisper", "Whisper"]], S.form.engine || "auto", function (v) { S.form.engine = v; }), true),
+    formField("Model size", el("span", { class: "label-muted", text: " (auto is recommended)" }),
+      selectEl(QUALITY_OPTS, normalizeQuality(S.form.tier), function (v) { S.form.tier = v; }), true),
+    // Plain checkbox (NOT toggleEl/saveSettings): a render() in the modal would clear it. Sets
+    // S.form.aec for this pass; startImport sends it. Only does anything when the recording has
+    // both a MIC and a SYS channel (a saved Volksmond recording, or its siblings auto-bundled).
+    el("label", { class: "row gap-8", style: { alignItems: "flex-start", cursor: "pointer", marginTop: "2px" } }, [
+      el("input", { type: "checkbox", checked: !!S.form.aec, style: { marginTop: "3px", flex: "0 0 auto" }, onchange: function (e) { S.form.aec = e.target.checked; } }),
+      el("div", {}, [
+        el("div", { style: { fontWeight: "600", fontSize: "13px" }, text: "Cancel speaker echo" }),
+        el("p", { class: "ink-3", style: { fontSize: "11px", margin: "2px 0 0" }, text: "Off by default. When you re-transcribe a recording, remove the other side's voice that your microphone re-heard through the speakers. Best when you are mostly listening (a video or a one-sided talk). It can blur your own words when you and the other side talk over each other, so leave it off for normal back-and-forth meetings. No effect on headphones." }),
+      ]),
+    ]),
+  ]);
 }
 function historyView() {
   var rows = S.sessions.filter(function (f) {
@@ -2431,9 +2507,22 @@ function advancedTranscribeControls(live) {
         el("div", { style: { marginTop: "12px" } }, [qualitySelector(),
           el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Auto picks the best model your computer can run. Bigger is more accurate but slower." })]), true),
       runOnField(),
-      live ? aecLiveControl() : null,
+      live ? aecLiveControl() : aecRetranscribeControl(),
     ]),
   ]);
+}
+// Echo cancellation for a re-transcribe / upload (the non-live Advanced panel). Mirrors
+// aecLiveControl but persists the `aec` setting; only does anything when the file set has both a
+// MIC and a SYS channel. Full screen, so saveSettings()'s render() is fine here.
+function aecRetranscribeControl() {
+  return el("div", { style: { marginTop: "12px", paddingTop: "12px", borderTop: "1px solid var(--line)" } },
+    el("div", { class: "row gap-10", style: { alignItems: "flex-start" } }, [
+      el("div", { class: "grow" }, [
+        el("div", { style: { fontWeight: "600", fontSize: "13px" }, text: "Cancel speaker echo" }),
+        el("p", { class: "ink-3", style: { fontSize: "11px", margin: "4px 0 0" }, text: "Off by default. When you re-transcribe a recording, remove the other side's voice that your microphone re-heard through the speakers. Best when you are mostly listening (a video or a one-sided talk). It can blur your own words when you and the other side talk over each other, so leave it off for normal back-and-forth meetings. No effect on headphones." }),
+      ]),
+      toggleEl(!!S.form.aec, function () { S.form.aec = !S.form.aec; saveSettings({ aec: S.form.aec }); }),
+    ]));
 }
 // Live echo cancellation toggle (live pre-meeting only; re-transcribe AEC has its own setting).
 function aecLiveControl() {
@@ -2569,6 +2658,7 @@ async function boot() {
     S.form.device = S.settings.device || "auto";
     S.form.engine = S.settings.engine || "auto";
     S.form.aecLive = !!S.settings.aec_live;
+    S.form.aec = !!S.settings.aec;
   }
   if (S.devices) {
     if (S.devices.default_mic_index != null) S.form.mic = String(S.devices.default_mic_index);
@@ -2600,6 +2690,7 @@ function adoptRunning(status) {
   S.live.startedAt = status.started_at || new Date().toISOString();
   S.live.outputPath = status.output_path;
   S.live.tier = status.tier; S.live.model = status.model; S.live.family = status.family; S.live.language = status.language;
+  S.live.engine = status.engine || "auto";
   S.live.stopping = !!status.stopping;
   S.live.title = topicFromName(baseName(status.output_path));
   S.live.micDevice = status.mic_device != null ? status.mic_device : null;

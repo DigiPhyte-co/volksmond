@@ -157,6 +157,36 @@ def test_no_sys_means_all_mic_published():
     print("  OK  mic-only: all MIC lines published (delay never drops without a SYS twin)")
 
 
+def test_live_language_change_keeps_model():
+    # A language-only change (the bilingual-meeting fix) keeps the loaded model and only re-points
+    # the decoder, dropping the Afrikaans anchor for English. Whitebox: apply the queued change
+    # directly instead of running the worker.
+    engine, collected = _make_engine()             # default language "af"
+    model_before = engine.model
+    assert engine.language == "af"
+    assert engine.initial_prompt == transcribe.AF_ANCHOR_PROMPT
+    engine.request_change(language="en", engine="auto")   # no model -> keep the current one
+    engine._apply_pending_change(0.0)
+    assert engine.language == "en", engine.language
+    assert engine.model is model_before, "language-only change must NOT swap the model"
+    assert engine.initial_prompt is None, f"en should drop the af anchor, got {engine.initial_prompt!r}"
+    print("  OK  live language change keeps the model and recomposes the prompt")
+
+
+def test_live_model_change_swaps_model():
+    # A model change hands the engine a pre-built model + its labels; the worker swaps it in.
+    engine, collected = _make_engine()
+    model_before = engine.model
+    new_model = _FakeModel()
+    engine.request_change(language="af", engine="auto", model=new_model,
+                          model_name="digiphyte/fluister-small", size="small", is_fluister=True)
+    engine._apply_pending_change(0.0)
+    assert engine.model is new_model and engine.model is not model_before, "model change must swap the model"
+    assert engine.size == "small" and engine.model_name == "digiphyte/fluister-small", (engine.size, engine.model_name)
+    assert engine.is_fluister is True and engine.family == "fluister"
+    print("  OK  live model change swaps the model and updates the engine labels")
+
+
 if __name__ == "__main__":
     transcribe.WhisperModel = _FakeModel       # patch before any Engine is built
     failures = 0
@@ -166,7 +196,9 @@ if __name__ == "__main__":
                test_blocking_feed_drops_nothing,
                test_hallucination_filter,
                test_mic_published_after_delay_no_live_dedup,
-               test_no_sys_means_all_mic_published):
+               test_no_sys_means_all_mic_published,
+               test_live_language_change_keeps_model,
+               test_live_model_change_swaps_model):
         try:
             fn()
         except AssertionError as e:

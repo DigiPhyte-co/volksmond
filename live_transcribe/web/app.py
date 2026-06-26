@@ -306,6 +306,7 @@ def status():
             "model": STATE.model,
             "family": STATE.family,
             "language": STATE.language,
+            "engine": STATE.engine.engine if STATE.engine else None,  # family override pref, so a reload restores the live picker
             "output_path": str(STATE.output_path) if STATE.output_path else None,
             "started_at": STATE.started_at.isoformat() if STATE.started_at else None,
             "sink_error": live_err or STATE.sink_error,
@@ -494,6 +495,81 @@ def switch_device(req: SwitchDeviceRequest):
         return {"which": req.which, "device": req.device, "mic_device": mic, "loopback_device": loop}
 
 
+class ReconfigureRequest(BaseModel):
+    # All optional; omit a field to leave it unchanged. language "" == auto-detect.
+    language: Optional[str] = None    # "af" | "en" | ""
+    tier: Optional[str] = None        # quality/model key (a model size like "medium", or "auto")
+    engine: Optional[str] = None      # "auto" | "fluister" | "whisper"
+
+
+@app.post("/api/reconfigure")
+def reconfigure(req: ReconfigureRequest):
+    """Change the transcription LANGUAGE and/or MODEL during a live session, without ending it.
+
+    A language-only change keeps the loaded model and only re-points the decoder (instant): a meeting
+    that started in Afrikaans on Fluister can flip to English on the SAME model when the room switches,
+    instead of force-decoding English as Afrikaans. Changing the model (a different quality size, or
+    forcing the Fluister/Whisper family) reloads it, cached after the first time. The model loads
+    OUTSIDE the state lock so /api/status and /api/levels keep responding, and the engine applies the
+    swap between chunks so no live audio is dropped. The device (CPU/GPU) and chunk size are kept; only
+    a live session can be reconfigured (a file import is re-run with new settings instead)."""
+    data = req.model_dump(exclude_unset=True)
+    change_lang = "language" in data
+    change_model = bool(data.get("tier")) or bool(data.get("engine"))
+    if not change_lang and not change_model:
+        raise HTTPException(status_code=400, detail="Nothing to change.")
+
+    with STATE.lock:
+        if not (STATE.running and STATE.transcribing and not STATE.stopping
+                and STATE.source_kind == "live" and STATE.engine is not None):
+            raise HTTPException(status_code=409, detail="Changing the language or model is only available during a live transcription.")
+        engine = STATE.engine
+        cur_is_cpu = engine._is_cpu
+        compute = engine._compute_type
+        threads = engine._cpu_threads
+        cur_size = engine.size
+        cur_language = engine.language            # None (auto) | "af" | "en"
+        cur_engine_pref = engine.engine
+
+    new_lang = (data["language"] or None) if change_lang else cur_language   # "" -> None (auto-detect)
+    new_engine_pref = (data.get("engine") or cur_engine_pref)
+
+    # Resolve + build a new model only when the model is actually changing; a language-only change
+    # keeps the current model (the whole point for a bilingual meeting on a both-capable model).
+    model = model_name = is_fluister = None
+    new_tier = None
+    new_size = cur_size
+    if change_model:
+        if data.get("tier"):
+            # A quality change: map the key to a size on THIS device (never flip CPU<->GPU live).
+            new_tier = resolve_tier(data["tier"], "cpu" if cur_is_cpu else "auto")
+            new_size = transcribe.TIER_CONFIG[new_tier]["model"]
+        else:
+            new_size = cur_size                   # engine-only change: keep the running size
+        model_name, is_fluister = transcribe.resolve_model(new_size, new_lang, new_engine_pref)
+        device_str = "cpu" if cur_is_cpu else "cuda"
+        try:
+            model = transcribe.load_model(model_name, device_str, compute, cpu_threads=threads)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not load the {new_size} model: {e}")
+
+    with STATE.lock:
+        # The session could have ended while the model loaded outside the lock.
+        if not (STATE.running and STATE.transcribing and not STATE.stopping
+                and STATE.source_kind == "live" and STATE.engine is engine):
+            raise HTTPException(status_code=409, detail="The session changed before the new settings could apply.")
+        engine.request_change(language=new_lang, engine=new_engine_pref,
+                              model=model, model_name=model_name, size=new_size, is_fluister=is_fluister)
+        STATE.language = (new_lang or "auto")
+        if change_model:
+            if new_tier is not None:
+                STATE.tier = new_tier
+            STATE.model = model_name
+            STATE.family = "fluister" if is_fluister else "whisper"
+        return {"language": STATE.language, "tier": STATE.tier, "model": STATE.model,
+                "family": STATE.family, "engine": new_engine_pref}
+
+
 class WarmUpRequest(BaseModel):
     tier: str = "auto"
     device: str = "auto"
@@ -640,6 +716,39 @@ def start(req: StartRequest):
         }
 
 
+def _expand_recording_channels(files):
+    """When an uploaded file is ONE channel of a saved Volksmond recording (named
+    <stem>-MIC/-SYS/-MIXED.wav), pull in its sibling channels from the same folder, so a single-file
+    upload still transcribes BOTH sides (and can cancel echo, which needs the MIC + SYS pair). The
+    summed -MIXED is dropped to avoid double-counting once the separate channels are present. A
+    normal media file with no such sibling is returned unchanged. Read-only; the caller's own
+    is_file() filter still applies afterwards."""
+    extra = []
+    for f in list(files):
+        m = re.match(r"^(.+)-(?:mic|sys|mixed)\.wav$", Path(f).name, re.IGNORECASE)
+        if not m:
+            continue
+        prefix = m.group(1).lower() + "-"
+        try:
+            for p in sorted(Path(f).parent.iterdir()):
+                n = p.name.lower()
+                if p.is_file() and n.startswith(prefix) and n.endswith(".wav") and not n.endswith("-mixed.wav"):
+                    extra.append(str(p))
+        except OSError:
+            pass
+    if not extra:
+        return files
+    seen, merged = set(), []
+    for f in files + extra:
+        if Path(f).name.lower().endswith("-mixed.wav"):
+            continue   # the summed track double-counts once we have the separate channels
+        key = os.path.normcase(os.path.abspath(f))
+        if key not in seen:
+            seen.add(key)
+            merged.append(f)
+    return merged
+
+
 class TranscribeFileRequest(BaseModel):
     paths: list[str] = []          # explicit file paths (one for import, several for a recording)
     stem: Optional[str] = None     # alternatively a recording stem; globs <stem>-*.wav
@@ -677,6 +786,8 @@ def transcribe_file(req: TranscribeFileRequest):
         # the mix is the same audio summed, so including it would double-count.
         files += sorted(str(p) for p in sdir.glob(base + "-*.wav")
                         if not p.name.lower().endswith("-mixed.wav"))
+    elif files:
+        files = _expand_recording_channels(files)
     files = [f for f in files if Path(f).is_file()]
     if not files:
         raise HTTPException(status_code=400, detail="No readable audio files found to transcribe.")
@@ -687,9 +798,10 @@ def transcribe_file(req: TranscribeFileRequest):
         STATE.sink_error = None  # fresh session: clear any prior write error
         tier, language, prompt, engine_pref = _resolve_tier_lang_prompt(req)
         chunk_seconds = default_chunk_seconds(tier)
-        # Echo cancellation on a re-transcribe: only when both channels exist (we need the SYS
-        # reference). Default on (it cancels real echo and is a no-op on clean audio).
-        aec_on = req.aec if req.aec is not None else bool(config.load().get("aec", True))
+        # Echo cancellation on a re-transcribe: only when both channels (MIC + SYS) are present
+        # (the SYS channel is the echo reference). Opt-in / OFF by default: it cleans echo-only or
+        # one-sided audio well, but can blur the near speaker during sustained double-talk.
+        aec_on = req.aec if req.aec is not None else bool(config.load().get("aec", False))
         if base:
             # Re-transcribing a saved recording: write the transcript at the recording's own
             # stem so the single History session gains its transcript, instead of spawning a
@@ -743,7 +855,10 @@ def transcribe_file(req: TranscribeFileRequest):
             # tags, so the you/other-side split is preserved. Best-effort: any failure falls back
             # to the raw MIC. Decoded audio is cached so SYS is not decoded twice.
             decoded = {}
-            if base and aec_on:
+            # Run on ANY file set that has both a MIC and a SYS channel (a History re-transcribe via
+            # stem, OR an uploaded recording whose siblings were pulled in above), not just the stem
+            # path. The inner mic_fp/sys_fp check is the real guard that both channels are present.
+            if aec_on:
                 from .. import aec as _aec
                 if _aec.available():
                     mic_fp = next((f for f in files if f.lower().endswith("-mic.wav")), None)
@@ -1386,30 +1501,36 @@ def _version_tuple(v):
 
 @app.post("/api/check-updates")
 def check_updates():
-    """Manual, user-initiated update check. Makes ONE outbound HTTPS GET to the PUBLIC GitHub
-    releases API for the latest published version and compares it to this build. It sends no
-    user data (only a generic User-Agent), runs only when the user clicks Check for updates, and
-    is the single outbound call the app ever makes. CSRF-protected like every other POST."""
+    """Manual, user-initiated update check. Makes ONE outbound HTTPS GET to our OWN published
+    version manifest (latest.json on the Volksmond site, served by Cloudflare) and compares it to
+    this build. It sends no user data (only a generic User-Agent), runs only when the user clicks
+    Check for updates, and is the single outbound call the app ever makes. CSRF-protected like
+    every other POST. We host the manifest ourselves rather than a third-party release feed, so the
+    only server that ever sees an update check is ours, and a release is a one-line manifest edit."""
     import urllib.request
     import json as _json
-    url = "https://api.github.com/repos/DigiPhyte-co/volksmond-releases/releases/latest"
+    manifest = "https://volksmond.digiphyte.com/latest.json"
+    site = "https://volksmond.digiphyte.com/"
     current = licensing.APP_VERSION
     try:
-        rq = urllib.request.Request(url, headers={
-            "Accept": "application/vnd.github+json",
+        rq = urllib.request.Request(manifest, headers={
+            "Accept": "application/json",
             "User-Agent": "Volksmond-update-check",
         })
         with urllib.request.urlopen(rq, timeout=8) as resp:
             data = _json.loads(resp.read().decode("utf-8"))
     except Exception:
         raise HTTPException(status_code=502, detail="Could not reach the update server. Check your internet connection and try again.")
-    latest = (data.get("tag_name") or "").strip().lstrip("vV")
+    latest = (data.get("version") or "").strip().lstrip("vV")
     available = bool(latest) and _version_tuple(latest) > _version_tuple(current)
     return {
         "current": current,
         "latest": latest or None,
         "update_available": available,
-        "url": data.get("html_url") or "https://github.com/DigiPhyte-co/volksmond-releases/releases/latest",
+        # Where the in-app "Download" link sends the user. The manifest points it at the gated
+        # download page (every download stays a captured lead); switch it to a direct link in
+        # latest.json if existing-user update friction ever outweighs the capture.
+        "url": data.get("url") or site,
     }
 
 

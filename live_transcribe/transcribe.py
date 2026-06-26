@@ -230,6 +230,18 @@ AF_ANCHOR_PROMPT = (
     "kinders, kollegas, vergadering, besigheid."
 )
 
+
+def _compose_prompt(language, user_prompt):
+    """The initial_prompt for a session: the anti-Dutch anchor (Afrikaans only) with any user
+    prompt (names, jargon) appended so client terms still bias the model, else the user prompt
+    alone. A standalone function so a live language change can recompose it exactly as the
+    constructor first did."""
+    if language == "af":
+        user = (user_prompt or "").strip()
+        return f"{AF_ANCHOR_PROMPT} {user}".strip() if user else AF_ANCHOR_PROMPT
+    return user_prompt
+
+
 # Hallucination guards. Whisper invents text on silence, noise, and low-
 # confidence audio. CPU testing showed two failure modes: (a) a single token
 # repeated on near-silence ("Hekkaan." x20), and (b) looping phrases
@@ -361,13 +373,10 @@ class Engine:
         # trade quality for speed - keep the chosen model and full beam size.
         self.adaptive = adaptive
 
-        # Apply the Afrikaans anchor when transcribing in af. User prompt (if any)
-        # follows the anchor so client-specific terms still bias the model.
-        if language == "af":
-            user = (initial_prompt or "").strip()
-            self.initial_prompt = f"{AF_ANCHOR_PROMPT} {user}".strip() if user else AF_ANCHOR_PROMPT
-        else:
-            self.initial_prompt = initial_prompt
+        # The Afrikaans anchor (af only) plus any user prompt. Keep the raw user prompt too, so a
+        # live language change (request_change) can recompose the anchor for the new language.
+        self._user_prompt = initial_prompt
+        self.initial_prompt = _compose_prompt(language, initial_prompt)
         cfg = TIER_CONFIG[tier]
         # size = the stock Whisper size for this tier (drives the CPU downgrade ladder); model_name
         # = the concrete model loaded, which is the Fluister tune of that size for an Afrikaans
@@ -390,6 +399,8 @@ class Engine:
         self._abort = threading.Event()   # hard abort: discard the backlog instead of draining
         self._busy = False                # True while a chunk is mid-transcription (for pending())
         self._dropped = 0                 # chunks dropped to backpressure since last reported
+        self._change_lock = threading.Lock()  # guards _pending_change (API thread queues, worker applies)
+        self._pending_change = None           # a live language/model change to apply between chunks
         self._worker = threading.Thread(target=self._run, daemon=True, name="transcribe")
 
     def subscribe(self, fn):
@@ -457,6 +468,42 @@ class Engine:
         pass the full string. Each subsequent chunk picks this up immediately.
         """
         self.initial_prompt = prompt
+
+    def request_change(self, *, language, engine, model=None, model_name=None, size=None, is_fluister=None):
+        """Queue a live language and/or model change, applied by the worker between chunks.
+
+        Pass `model` (a WhisperModel the CALLER already built via load_model, off the worker, so
+        the swap never stalls transcription) together with model_name + size + is_fluister to swap
+        the model; omit them to keep the current model and change only the decode language - instant,
+        no reload, and the right move for a bilingual meeting on a both-capable model. `language` is
+        the next decode language (None == auto-detect, "af"/"en" otherwise); the prompt is recomposed
+        for it. A second request before the worker applies the first simply replaces it."""
+        with self._change_lock:
+            self._pending_change = {
+                "language": language, "engine": engine,
+                "model": model, "model_name": model_name, "size": size, "is_fluister": is_fluister,
+            }
+
+    def _apply_pending_change(self, t_start):
+        """Apply a queued request_change. Called only from the worker loop, so self.model is read
+        and written on a single thread, the same discipline _maybe_downgrade relies on."""
+        with self._change_lock:
+            ch = self._pending_change
+            self._pending_change = None
+        if not ch:
+            return
+        self.language = ch["language"]
+        self.engine = ch["engine"]
+        if ch["model"] is not None:
+            self.model = ch["model"]
+            self.model_name = ch["model_name"]
+            self.size = ch["size"]
+            self.is_fluister = ch["is_fluister"]
+            self.family = "fluister" if ch["is_fluister"] else "whisper"
+        self.initial_prompt = _compose_prompt(self.language, self._user_prompt)
+        self._rtf.clear()   # judge the (possibly new) model fresh; never downgrade on the old RTF
+        lang_name = {"af": "Afrikaans", "en": "English"}.get(self.language, "auto-detect")
+        self._emit_notice(t_start, f"[engine: now {self.family} {self.size}, language {lang_name}]")
 
     def _fanout(self, seg):
         """Deliver a finished segment to every subscriber. Single point of delivery."""
@@ -563,6 +610,10 @@ class Engine:
             if self._abort.is_set():
                 continue  # hard abort: discard remaining items without transcribing
             source, audio, t_start = item
+
+            # Apply a queued live language/model change before this chunk (worker-thread only, so
+            # self.model stays single-writer, like the adaptive downgrade further down).
+            self._apply_pending_change(t_start)
 
             # If chunks were dropped to backpressure before this one, record the
             # gap in the transcript so the reader knows audio is missing here.
