@@ -2049,11 +2049,11 @@ function summaryDownloadPanel(manage) {
 }
 /* ── voice (transcription) model download, shared by setup and settings ─── */
 var VOICE_LABELS = {
-  "base":   { title: "Lite",         note: "Fastest and smallest, roughest accuracy. For very modest computers." },
-  "small":  { title: "Light",        note: "Light and quick. Good on older or low-power machines." },
-  "medium": { title: "Balanced",     note: "A solid balance of speed and accuracy on a typical computer." },
-  "large-v3-turbo": { title: "High quality", note: "Near-best accuracy, lighter and faster than the largest model." },
-  "large-v3": { title: "Best",       note: "Most accurate. Best on a computer with a graphics card (GPU)." },
+  "base":   { title: "Lite",         note: "The smallest and fastest, but the roughest. Only for very old or low-power computers." },
+  "small":  { title: "Light",        note: "Light and quick, easy on memory. Good everyday accuracy on most laptops." },
+  "medium": { title: "Balanced",     note: "A good balance of speed and accuracy on a typical computer. The usual sweet spot." },
+  "large-v3-turbo": { title: "High quality", note: "Near the best accuracy, but lighter and faster. Great on a strong CPU or any GPU." },
+  "large-v3": { title: "Best",       note: "The most accurate. Needs a graphics card (GPU) to be quick; slow on CPU alone." },
 };
 var _vdlTimer = null;
 function startVoiceDownload(model) {
@@ -2134,12 +2134,30 @@ function voiceDownloadPanel(manage) {
     ]);
   }));
 }
+// A short, honest "what am I getting" explanation of the model families, so a person who does not
+// want to think about models understands what runs for their language. The SIZE they download below
+// applies to whichever family their language uses (Afrikaans -> Fluister, else -> Whisper).
+function modelFamiliesNote() {
+  function li(text) { return el("li", { style: { marginBottom: "3px" }, text: text }); }
+  return el("div", { class: "card", style: { padding: "12px 14px", marginBottom: "12px", background: "var(--surface-2)" } }, [
+    el("div", { class: "row gap-8", style: { alignItems: "center", marginBottom: "6px" } }, [
+      el("span", { class: "tone-tile accent", style: { width: "26px", height: "26px", flex: "0 0 auto" } }, icon("sparkle", 13)),
+      el("div", { style: { fontWeight: "600", fontSize: "13px" }, text: "Two model families, chosen by language" }),
+    ]),
+    el("ul", { style: { margin: "0", paddingLeft: "18px", fontSize: "12px", lineHeight: "1.55", color: "var(--ink-2)" } }, [
+      li("Afrikaans uses Fluister, our Afrikaans-tuned model: much better on Afrikaans and the Afrikaans-English mix. It downloads automatically the first time you transcribe Afrikaans."),
+      li("English and other languages use standard Whisper, the model you download below."),
+      li("The size you pick (speed against accuracy) applies to whichever family your language needs."),
+    ]),
+  ]);
+}
 function voiceModelCard() {
   return el("div", { class: "card settings-card" }, [
     el("div", { class: "card-title section-label", text: "Transcription model, on this machine" }),
     el("div", { class: "set-row", style: { display: "block" } }, [
       el("div", { class: "t", style: { marginBottom: "4px" }, text: "Download or switch model" }),
       el("div", { class: "s", style: { marginBottom: "10px" }, text: "Volksmond transcribes on this computer. Download the model that suits your machine; the recommended one is marked. Bigger is more accurate, but slower and larger to download. Remove any you no longer need to free space." }),
+      modelFamiliesNote(),
       voiceDownloadPanel(true),
     ]),
     el("div", { class: "set-row" }, [

@@ -441,16 +441,24 @@ window.VM_I18N = {
     "Lite": "Lig (basies)",
     "Light": "Lig",
     "High quality": "Hoë gehalte",
-    "Fastest and smallest, roughest accuracy. For very modest computers.":
-      "Vinnigste en kleinste, growwe akkuraatheid. Vir baie beskeie rekenaars.",
-    "Light and quick. Good on older or low-power machines.":
-      "Lig en vinnig. Goed op ouer of lae-krag masjiene.",
-    "A solid balance of speed and accuracy on a typical computer.":
-      "'n Goeie balans van spoed en akkuraatheid op 'n tipiese rekenaar.",
-    "Near-best accuracy, lighter and faster than the largest model.":
-      "Naaste aan die beste akkuraatheid, ligter en vinniger as die grootste model.",
-    "Most accurate. Best on a computer with a graphics card (GPU).":
-      "Mees akkuraat. Beste op 'n rekenaar met 'n grafikakaart (GPU).",
+    "The smallest and fastest, but the roughest. Only for very old or low-power computers.":
+      "Die kleinste en vinnigste, maar die growwe. Net vir baie ou of lae-krag rekenaars.",
+    "Light and quick, easy on memory. Good everyday accuracy on most laptops.":
+      "Lig en vinnig, maklik op geheue. Goeie alledaagse akkuraatheid op die meeste skootrekenaars.",
+    "A good balance of speed and accuracy on a typical computer. The usual sweet spot.":
+      "'n Goeie balans van spoed en akkuraatheid op 'n tipiese rekenaar. Die gewone goeie keuse.",
+    "Near the best accuracy, but lighter and faster. Great on a strong CPU or any GPU.":
+      "Naby die beste akkuraatheid, maar ligter en vinniger. Wonderlik op 'n sterk SVE of enige GPU.",
+    "The most accurate. Needs a graphics card (GPU) to be quick; slow on CPU alone.":
+      "Die akkuraatste. Benodig 'n grafikakaart (GPU) om vinnig te wees; stadig op die SVE alleen.",
+    // Model families explainer (Settings, voice model card)
+    "Two model families, chosen by language": "Twee modelfamilies, gekies volgens taal",
+    "Afrikaans uses Fluister, our Afrikaans-tuned model: much better on Afrikaans and the Afrikaans-English mix. It downloads automatically the first time you transcribe Afrikaans.":
+      "Afrikaans gebruik Fluister, ons Afrikaans-gestemde model: baie beter op Afrikaans en die Afrikaans-Engels-mengsel. Dit laai outomaties af die eerste keer wat jy Afrikaans transkribeer.",
+    "English and other languages use standard Whisper, the model you download below.":
+      "Engels en ander tale gebruik standaard Whisper, die model wat jy hieronder aflaai.",
+    "The size you pick (speed against accuracy) applies to whichever family your language needs.":
+      "Die grootte wat jy kies (spoed teenoor akkuraatheid) geld vir watter familie jou taal ook al nodig het.",
     "Needs a graphics card (GPU). Choose another for this computer.":
       "Benodig 'n grafikakaart (GPU). Kies 'n ander een vir hierdie rekenaar.",
     "Transcription model ready.": "Transkripsiemodel gereed.",
