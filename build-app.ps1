@@ -89,4 +89,30 @@ Write-Host "  Zipped: $zip  ($zmb MB)" -ForegroundColor Green
 $synced = Join-Path $here $zipName
 Copy-Item $zip $synced -Force
 Write-Host "  Synced copy (OneDrive): $synced" -ForegroundColor Green
-Write-Host "  On the test laptop, open it from the synced Cowork folder, unzip, run Volksmond.exe." -ForegroundColor Green
+
+# Build a single-file installer (Inno Setup) from the one-folder app: a proper installed app
+# (Start menu + Add/Remove Programs + uninstaller, per-user, no admin) and one .exe to hand out.
+# Skipped with a note if Inno Setup is not installed (winget install JRSoftware.InnoSetup).
+$iscc = @("$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe", "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") |
+    Where-Object { Test-Path $_ } | Select-Object -First 1
+$iss = Join-Path $here "volksmond.iss"
+if ($iscc -and (Test-Path $iss)) {
+    & $iscc "/DMyAppVersion=$ver" "/DMySourceDir=$dist" "/DMyOutputDir=$out" $iss
+    if ($LASTEXITCODE -eq 0) {
+        $setup = Join-Path $out ("Volksmond-Setup-" + $ver + ".exe")
+        if (Test-Path $setup) {
+            $smb = [math]::Round((Get-Item $setup).Length / 1MB, 0)
+            Write-Host "  Installer: $setup  ($smb MB)" -ForegroundColor Green
+            $setupSynced = Join-Path $here ("Volksmond-Setup-" + $ver + ".exe")
+            Copy-Item $setup $setupSynced -Force
+            Write-Host "  Synced installer (OneDrive): $setupSynced" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "  Inno Setup compile failed (rc=$LASTEXITCODE); the zip is still available." -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "  Inno Setup not found; skipped the installer (zip still built). Add it with: winget install JRSoftware.InnoSetup" -ForegroundColor Yellow
+}
+
+Write-Host ""
+Write-Host "  On the test laptop: run Volksmond-Setup-$ver.exe to install, or unzip $zipName and run Volksmond.exe." -ForegroundColor Green
