@@ -57,33 +57,59 @@ _FLUISTER = {
 }
 
 
+# Swivuriso: the South African Next Voices (DSFSI) multilingual model, used UNDER ITS OWN NAME (we
+# did not train it; MIT). One model covers seven SA Bantu languages. faster-whisper has no codes for
+# them and DSFSI forces none, so the engine runs it on auto-detect (language=None). ct2-converted
+# from dsfsi-anv/za-anv-multilingual-whisper-v3-turbo; a local ct2 build is reused if present, just
+# like Fluister. Credit DSFSI / African Next Voices (model card + NOTICE on the hosted repo).
+SWIVURISO_LANGS = ("zu", "xh", "st", "tn", "ts", "nr", "ve")  # isiZulu isiXhosa Sesotho Setswana Xitsonga isiNdebele Tshivenda
+SWIVURISO_REPO = "digiphyte/swivuriso-turbo"          # our hosted ct2 (publish pending)
+SWIVURISO_LOCAL = r"C:\Users\seanf\.cache\swivuriso-turbo-ct2-int8"
+SWIVURISO_HOSTED = False                               # flip True once SWIVURISO_REPO is published
+
+
+def swivuriso_model():
+    """The Swivuriso model id to load: the local ct2 build if present, else the hosted repo once
+    published, else None (not available on this machine yet)."""
+    if os.path.isdir(SWIVURISO_LOCAL):
+        return SWIVURISO_LOCAL
+    return SWIVURISO_REPO if SWIVURISO_HOSTED else None
+
+
+def swivuriso_available():
+    """True if a Swivuriso model can actually load here (local build present, or hosted)."""
+    return swivuriso_model() is not None
+
+
 def family_for_language(language):
-    """The model family that transcribes this language. Afrikaans AND auto-detect ("") -> our
-    Fluister tune (auto is most likely SA content, and Fluister keeps English clean at the sizes
-    auto actually picks); explicit English/other -> stock Whisper. A manual engine override
-    (resolve_model) can still force either family. Bantu maps to a future za-anv family."""
+    """The model family that transcribes this language. The seven SA Bantu languages -> Swivuriso
+    (the DSFSI model); Afrikaans AND auto-detect ("") -> our Fluister tune; explicit English/other ->
+    stock Whisper. A manual engine override (resolve_model) can still force any family."""
     lang = (language or "").lower()
+    if lang.split("-")[0] in SWIVURISO_LANGS:
+        return "swivuriso"
     return "fluister" if (lang == "" or lang == "auto" or lang.startswith("af")) else "whisper"
 
 
 def resolve_model(size, language, engine="auto"):
-    """Map a Whisper size + the spoken language to the concrete model id to load, and say whether
-    the result is actually a Fluister model. `engine` overrides the family: "auto" follows the
-    language (family_for_language), "fluister" forces the tune, "whisper" forces stock. A forced
-    Fluister still falls back to stock for a size with no Fluister build (honest). Returns
-    (model_id, is_fluister)."""
+    """Map a Whisper size + the spoken language to the concrete model id to load, and the FAMILY it
+    belongs to. `engine` overrides the family: "auto" follows the language (family_for_language);
+    "fluister"/"whisper"/"swivuriso" force that family. A forced family falls back honestly to stock
+    Whisper when its model is not available (a size with no Fluister build, or Swivuriso not yet
+    installed). Returns (model_id, family) where family is "fluister" | "whisper" | "swivuriso"."""
     eng = (engine or "auto").lower()
-    if eng == "whisper":
-        want_fluister = False
-    elif eng == "fluister":
-        want_fluister = True
-    else:
-        want_fluister = family_for_language(language) == "fluister"
-    if want_fluister:
+    fam = eng if eng in ("fluister", "whisper", "swivuriso") else family_for_language(language)
+    if fam == "swivuriso":
+        sv = swivuriso_model()
+        if sv:
+            return sv, "swivuriso"          # one model, size-independent
+        return size, "whisper"              # not installed/hosted yet -> honest stock fallback
+    if fam == "fluister":
         tuned = _FLUISTER.get(size)
-        if tuned and tuned != size:        # a real Fluister path/repo, not the stock fallback
-            return tuned, True
-    return size, False
+        if tuned and tuned != size:         # a real Fluister path/repo, not the stock fallback
+            return tuned, "fluister"
+        return size, "whisper"
+    return size, "whisper"
 
 
 def fluister_available():
@@ -182,7 +208,7 @@ def warm_up_async(tier, language=None, engine="auto"):
     cfg = TIER_CONFIG.get(tier)
     if not cfg:
         return {"state": "idle", "tier": None}
-    model_id, _ = resolve_model(cfg["model"], language, engine)
+    model_id, fam = resolve_model(cfg["model"], language, engine)
     key = (model_id, cfg["device"], cfg["compute_type"])
     with _WARM_LOCK:
         if key in _MODEL_CACHE:        # already built (GIL-safe membership read) -> ready
@@ -193,11 +219,11 @@ def warm_up_async(tier, language=None, engine="auto"):
         if _WARM["state"] == "warming" and _WARM.get("model") == model_id:
             return dict(_WARM)
         _WARM.update(state="warming", tier=tier, model=model_id)
-    threading.Thread(target=_warm_run, args=(tier, cfg, model_id, language), daemon=True, name="warmup").start()
+    threading.Thread(target=_warm_run, args=(tier, cfg, model_id, language, fam), daemon=True, name="warmup").start()
     return {"state": "warming", "tier": tier}
 
 
-def _warm_run(tier, cfg, model_id, language):
+def _warm_run(tier, cfg, model_id, language, fam):
     import numpy as np
     try:
         with _BUILD_LOCK:   # hold across build + dummy so a concurrent Begin waits for a fully warm model
@@ -206,7 +232,7 @@ def _warm_run(tier, cfg, model_id, language):
             # off the user's critical path. vad_filter=False so the encoder actually runs on the
             # silence rather than the VAD discarding it.
             try:
-                list(m.transcribe(np.zeros(16000, dtype=np.float32), language=(language or "af"),
+                list(m.transcribe(np.zeros(16000, dtype=np.float32), language=(None if fam == "swivuriso" else (language or "af")),
                                   vad_filter=False, beam_size=1)[0])
             except Exception:
                 pass
@@ -391,8 +417,11 @@ class Engine:
         # = the concrete model loaded, which is the Fluister tune of that size for an Afrikaans
         # session and stock Whisper otherwise. family/is_fluister label the active engine honestly.
         self.size = cfg["model"]
-        self.model_name, self.is_fluister = resolve_model(self.size, language, engine)
-        self.family = "fluister" if self.is_fluister else "whisper"
+        self.model_name, self.family = resolve_model(self.size, language, engine)
+        self.is_fluister = self.family == "fluister"
+        # Swivuriso has no faster-whisper codes for the SA Bantu languages and DSFSI forces none, so
+        # run it on auto-detect; every other family keeps the chosen decode language.
+        self.language = None if self.family == "swivuriso" else language
 
         # Cached, local-only load (no network revalidation) and reused across sessions, so a
         # warmed model makes Begin instant. See load_model / warm_up_async above.
@@ -478,11 +507,11 @@ class Engine:
         """
         self.initial_prompt = prompt
 
-    def request_change(self, *, language, engine, model=None, model_name=None, size=None, is_fluister=None):
+    def request_change(self, *, language, engine, model=None, model_name=None, size=None, family=None):
         """Queue a live language and/or model change, applied by the worker between chunks.
 
         Pass `model` (a WhisperModel the CALLER already built via load_model, off the worker, so
-        the swap never stalls transcription) together with model_name + size + is_fluister to swap
+        the swap never stalls transcription) together with model_name + size + family to swap
         the model; omit them to keep the current model and change only the decode language - instant,
         no reload, and the right move for a bilingual meeting on a both-capable model. `language` is
         the next decode language (None == auto-detect, "af"/"en" otherwise); the prompt is recomposed
@@ -490,7 +519,7 @@ class Engine:
         with self._change_lock:
             self._pending_change = {
                 "language": language, "engine": engine,
-                "model": model, "model_name": model_name, "size": size, "is_fluister": is_fluister,
+                "model": model, "model_name": model_name, "size": size, "family": family,
             }
 
     def _apply_pending_change(self, t_start):
@@ -507,8 +536,8 @@ class Engine:
             self.model = ch["model"]
             self.model_name = ch["model_name"]
             self.size = ch["size"]
-            self.is_fluister = ch["is_fluister"]
-            self.family = "fluister" if ch["is_fluister"] else "whisper"
+            self.family = ch["family"]
+            self.is_fluister = ch["family"] == "fluister"
         self.initial_prompt = _compose_prompt(self.language, self._user_prompt)
         self._rtf.clear()   # judge the (possibly new) model fresh; never downgrade on the old RTF
         lang_name = {"af": "Afrikaans", "en": "English"}.get(self.language, "auto-detect")
@@ -572,6 +601,10 @@ class Engine:
         oscillation. The new (smaller) model also chews through the queued
         backlog faster, which is how the session catches back up.
         """
+        # Swivuriso is a single fixed model (size-independent), so there is no smaller rung to drop
+        # to; never downgrade it.
+        if self.family == "swivuriso":
+            return
         if not self.adaptive or not self._is_cpu or len(self._rtf) < self._rtf.maxlen:
             return
         avg = sum(self._rtf) / len(self._rtf)
@@ -586,7 +619,7 @@ class Engine:
         new_size = CPU_LADDER[idx + 1]
         # Keep the family AND the user's engine choice: a forced-Fluister or forced-Whisper session
         # must NOT silently flip to language-based auto when the model size drops a rung.
-        new_model, new_is_fluister = resolve_model(new_size, self.language, self.engine)
+        new_model, new_family = resolve_model(new_size, self.language, self.engine)
         print(f"[engine] CPU RTF ~{avg:.2f} (> {DOWNGRADE_RTF}); "
               f"downgrading {self.size} -> {new_size}", flush=True)
         try:
@@ -597,8 +630,8 @@ class Engine:
         self.model = new
         self.size = new_size
         self.model_name = new_model
-        self.is_fluister = new_is_fluister
-        self.family = "fluister" if new_is_fluister else "whisper"
+        self.family = new_family
+        self.is_fluister = new_family == "fluister"
         self._rtf.clear()
         self._emit_notice(t_start, f"[engine: switched to '{new_size}' model to keep up with the audio]")
 

@@ -179,7 +179,7 @@ def test_live_model_change_swaps_model():
     model_before = engine.model
     new_model = _FakeModel()
     engine.request_change(language="af", engine="auto", model=new_model,
-                          model_name="digiphyte/fluister-small", size="small", is_fluister=True)
+                          model_name="digiphyte/fluister-small", size="small", family="fluister")
     engine._apply_pending_change(0.0)
     assert engine.model is new_model and engine.model is not model_before, "model change must swap the model"
     assert engine.size == "small" and engine.model_name == "digiphyte/fluister-small", (engine.size, engine.model_name)

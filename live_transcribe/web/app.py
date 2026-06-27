@@ -119,7 +119,7 @@ class _State:
         self.started_at: Optional[datetime] = None
         self.tier: Optional[str] = None
         self.model: Optional[str] = None
-        self.family: Optional[str] = None    # "fluister" | "whisper", for the lean engine label
+        self.family: Optional[str] = None    # "fluister" | "whisper" | "swivuriso", for the lean engine label
         self.output_path: Optional[Path] = None
         self.language: Optional[str] = None
         # Current capture device specs + chunk size, so a live device switch can rebuild
@@ -547,23 +547,31 @@ def reconfigure(req: ReconfigureRequest):
         cur_size = engine.size
         cur_language = engine.language            # None (auto) | "af" | "en"
         cur_engine_pref = engine.engine
+        cur_family = engine.family                # "fluister" | "whisper" | "swivuriso"
 
     new_lang = (data["language"] or None) if change_lang else cur_language   # "" -> None (auto-detect)
     new_engine_pref = (data.get("engine") or cur_engine_pref)
 
-    # Resolve + build a new model only when the model is actually changing; a language-only change
-    # keeps the current model (the whole point for a bilingual meeting on a both-capable model).
-    model = model_name = is_fluister = None
+    # The family the new language/engine wants. If it differs from the running model's family (e.g.
+    # switching to a Bantu language needs the Swivuriso model, or switching back off it), the model
+    # MUST swap even on a language-only request, not just re-point the decoder.
+    want_family = (new_engine_pref.lower() if new_engine_pref and new_engine_pref.lower() in ("fluister", "whisper", "swivuriso")
+                   else transcribe.family_for_language(new_lang))
+    family_change = want_family != cur_family
+
+    # Resolve + build a new model when the model OR the family is changing; a same-family language-only
+    # change keeps the current model (the whole point for a bilingual meeting on a both-capable model).
+    model = model_name = family = None
     new_tier = None
     new_size = cur_size
-    if change_model:
+    if change_model or family_change:
         if data.get("tier"):
             # A quality change: map the key to a size on THIS device (never flip CPU<->GPU live).
             new_tier = resolve_tier(data["tier"], "cpu" if cur_is_cpu else "auto")
             new_size = transcribe.TIER_CONFIG[new_tier]["model"]
         else:
-            new_size = cur_size                   # engine-only change: keep the running size
-        model_name, is_fluister = transcribe.resolve_model(new_size, new_lang, new_engine_pref)
+            new_size = cur_size                   # engine/family-only change: keep the running size
+        model_name, family = transcribe.resolve_model(new_size, new_lang, new_engine_pref)
         device_str = "cpu" if cur_is_cpu else "cuda"
         try:
             model = transcribe.load_model(model_name, device_str, compute, cpu_threads=threads)
@@ -575,14 +583,18 @@ def reconfigure(req: ReconfigureRequest):
         if not (STATE.running and STATE.transcribing and not STATE.stopping
                 and STATE.source_kind == "live" and STATE.engine is engine):
             raise HTTPException(status_code=409, detail="The session changed before the new settings could apply.")
-        engine.request_change(language=new_lang, engine=new_engine_pref,
-                              model=model, model_name=model_name, size=new_size, is_fluister=is_fluister)
+        # Swivuriso has no faster-whisper codes for the SA Bantu languages, so it always decodes on
+        # auto-detect; every other family uses the chosen language.
+        eff_family = family if family is not None else cur_family
+        decode_lang = None if eff_family == "swivuriso" else new_lang
+        engine.request_change(language=decode_lang, engine=new_engine_pref,
+                              model=model, model_name=model_name, size=new_size, family=family)
         STATE.language = (new_lang or "auto")
-        if change_model:
+        if model is not None:
             if new_tier is not None:
                 STATE.tier = new_tier
             STATE.model = model_name
-            STATE.family = "fluister" if is_fluister else "whisper"
+            STATE.family = family
         return {"language": STATE.language, "tier": STATE.tier, "model": STATE.model,
                 "family": STATE.family, "engine": new_engine_pref}
 
@@ -1409,6 +1421,9 @@ def voice_models():
     # Install state + version of each Fluister model on this machine (local only, no network), so the
     # voice-model card can show "installed v1.0.0" and, after a manual check, "update available".
     cat["fluister"] = voicedl.fluister_catalogue()
+    # Swivuriso (DSFSI / African Next Voices): one credited third-party model for seven SA Bantu
+    # languages. Install state only (no network), so the card can show installed / not installed.
+    cat["swivuriso"] = voicedl.swivuriso_catalogue()
     return cat
 
 

@@ -145,22 +145,31 @@ def test_family_resolution():
     assert T.family_for_language("en") == "whisper"
     assert T.family_for_language("") == "fluister"      # auto-detect -> Fluister
     assert T.family_for_language(None) == "fluister"    # None == auto -> Fluister
-    # Explicit English resolves to the plain stock size; a size with no Fluister build stays stock
-    # even for Afrikaans (base/tiny have no app-side Fluister entry).
-    assert T.resolve_model("small", "en") == ("small", False)
-    assert T.resolve_model("base", "af") == ("base", False)
-    # Auto-detect ("") now resolves to a Fluister build when one exists for that size.
-    assert T.resolve_model("large-v3", "")[1] is True
+    # resolve_model now returns (model_id, family) where family is "fluister" | "whisper" |
+    # "swivuriso". Explicit English -> stock size; a size with no Fluister build stays stock even for
+    # Afrikaans (base/tiny have no app-side Fluister entry).
+    assert T.resolve_model("small", "en") == ("small", "whisper")
+    assert T.resolve_model("base", "af") == ("base", "whisper")
+    # Auto-detect ("") resolves to a Fluister build when one exists for that size.
+    assert T.resolve_model("large-v3", "")[1] == "fluister"
     # Engine override forces the family regardless of language.
-    assert T.resolve_model("small", "en", "fluister")[1] is True
-    assert T.resolve_model("small", "af", "whisper") == ("small", False)
+    assert T.resolve_model("small", "en", "fluister")[1] == "fluister"
+    assert T.resolve_model("small", "af", "whisper") == ("small", "whisper")
+    # Swivuriso: the seven SA Bantu languages route to it; it falls back to stock Whisper only when
+    # no Swivuriso model is installed/hosted on this machine.
+    assert T.family_for_language("zu") == "swivuriso"
+    assert T.family_for_language("xh-ZA") == "swivuriso"
+    _, sv_fam = T.resolve_model("large-v3-turbo", "zu")
+    assert sv_fam == ("swivuriso" if T.swivuriso_available() else "whisper"), sv_fam
     # Every tier now stores a stock size name, never a hardcoded Fluister path.
     sizes = {"tiny", "base", "small", "medium", "large-v3-turbo", "large-v3"}
     for t, cfg in T.TIER_CONFIG.items():
         assert cfg["model"] in sizes, (t, cfg["model"])
-    # /api/voice-models exposes whether Fluister is installed, so the UI can be honest.
-    assert isinstance(client.get("/api/voice-models").json().get("fluister_available"), bool)
-    print("  OK  family resolution: af -> Fluister, others -> Whisper; tiers hold stock sizes")
+    # /api/voice-models exposes Fluister-installed + the Swivuriso catalogue, so the UI can be honest.
+    vm = client.get("/api/voice-models").json()
+    assert isinstance(vm.get("fluister_available"), bool)
+    assert isinstance(vm.get("swivuriso"), dict) and "present" in vm["swivuriso"], vm
+    print("  OK  family resolution: af->Fluister, Bantu->Swivuriso, others->Whisper; voice-models exposes both")
 
 
 def test_model_delete_api():

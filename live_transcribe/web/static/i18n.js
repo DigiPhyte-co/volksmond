@@ -459,6 +459,26 @@ window.VM_I18N = {
       "Engels en ander tale gebruik standaard Whisper, die model wat jy hieronder aflaai.",
     "The size you pick (speed against accuracy) applies to whichever family your language needs.":
       "Die grootte wat jy kies (spoed teenoor akkuraatheid) geld vir watter familie jou taal ook al nodig het.",
+    // Swivuriso (DSFSI / African Next Voices) family + the three-family note
+    "Three model families, chosen by language": "Drie modelfamilies, gekies volgens taal",
+    "South African languages model": "Suid-Afrikaanse tale-model",
+    "South African languages (Swivuriso)": "Suid-Afrikaanse tale (Swivuriso)",
+    "Beta": "Beta",
+    "Fluister, our Afrikaans-tuned model: best for Afrikaans and mixed Afrikaans and English meetings. It downloads automatically the first time you transcribe Afrikaans.":
+      "Fluister, ons Afrikaans-gestemde model: die beste vir Afrikaans en vergaderings wat Afrikaans en Engels meng. Dit laai outomaties af die eerste keer wat jy Afrikaans transkribeer.",
+    "Swivuriso, by African Next Voices (DSFSI): one model for seven South African languages (isiZulu, isiXhosa, Sesotho, Setswana, Xitsonga, isiNdebele, Tshivenda). Beta.":
+      "Swivuriso, deur African Next Voices (DSFSI): een model vir sewe Suid-Afrikaanse tale (isiZulu, isiXhosa, Sesotho, Setswana, Xitsonga, isiNdebele, Tshivenda). Beta.",
+    "One model covers all seven. It runs on auto-detect.": "Een model dek al sewe. Dit loop op outomatiese opsporing.",
+    "Not installed yet. Pick one of these languages to use it.": "Nog nie geïnstalleer nie. Kies een van hierdie tale om dit te gebruik.",
+    "Model by DSFSI, African Next Voices. MIT licence.": "Model deur DSFSI, African Next Voices. MIT-lisensie.",
+    "The Swivuriso model for South African languages is not installed on this computer yet, so this runs on standard Whisper for now.":
+      "Die Swivuriso-model vir Suid-Afrikaanse tale is nog nie op hierdie rekenaar geïnstalleer nie, so dit loop voorlopig op standaard Whisper.",
+    "South African languages use Swivuriso, a model by African Next Voices (DSFSI). The size is chosen automatically for your computer.":
+      "Suid-Afrikaanse tale gebruik Swivuriso, 'n model deur African Next Voices (DSFSI). Die grootte word outomaties vir jou rekenaar gekies.",
+    "Best for Afrikaans and mixed Afrikaans and English meetings. The size is chosen automatically for your computer.":
+      "Die beste vir Afrikaans en vergaderings wat Afrikaans en Engels meng. Die grootte word outomaties vir jou rekenaar gekies.",
+    "Afrikaans uses Fluister, our Afrikaans-tuned model; the South African languages use Swivuriso (beta); English and other languages use standard Whisper.":
+      "Afrikaans gebruik Fluister, ons Afrikaans-gestemde model; die Suid-Afrikaanse tale gebruik Swivuriso (beta); Engels en ander tale gebruik standaard Whisper.",
     // Afrikaans (Fluister) model update panel
     "Afrikaans model (Fluister)": "Afrikaanse model (Fluister)",
     "Checking": "Soek tans",

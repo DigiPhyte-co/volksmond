@@ -1415,7 +1415,7 @@ function liveView() {
   else statusChip = el("span", { class: "chip ok" }, [el("span", { class: "dot" }), "Saved"]);
 
   elapsedEl = el("span", { class: "mono", text: fmtElapsed(S.live.startedAt) });
-  var langLabel = S.live.language === "auto" || !S.live.language ? "Auto-detect" : (S.live.language === "af" ? "Afrikaans" : (S.live.language === "en" ? "English" : S.live.language));
+  var langLabel = (S.live.language === "auto" || !S.live.language) ? "Auto-detect" : langName(S.live.language);
 
   var header = el("div", { class: "live-header" }, [
     el("div", { style: { minWidth: "0" } }, [
@@ -1929,7 +1929,7 @@ function transcriptionCard(st) {
         var on = sel.indexOf(l.code) >= 0;
         return el("button", { class: "btn sm" + (on ? " primary" : " ghost"), onclick: function () { toggleLang(l.code); } }, [on ? icon("check", 12) : null, el("span", { text: l.name })]);
       })),
-      el("div", { class: "s", style: { marginTop: "10px" }, text: "Afrikaans uses Fluister, our Afrikaans-tuned model; English and other languages use standard Whisper." }),
+      el("div", { class: "s", style: { marginTop: "10px" }, text: "Afrikaans uses Fluister, our Afrikaans-tuned model; the South African languages use Swivuriso (beta); English and other languages use standard Whisper." }),
       (afOn && !fluisterReady()) ? el("div", { class: "s", style: { marginTop: "4px" }, text: "The Afrikaans-tuned Fluister model is not installed on this computer yet, so Afrikaans runs on standard Whisper for now." }) : null,
     ]),
     el("div", { class: "set-row" }, [
@@ -2142,10 +2142,11 @@ function modelFamiliesNote() {
   return el("div", { class: "card", style: { padding: "12px 14px", marginBottom: "12px", background: "var(--surface-2)" } }, [
     el("div", { class: "row gap-8", style: { alignItems: "center", marginBottom: "6px" } }, [
       el("span", { class: "tone-tile accent", style: { width: "26px", height: "26px", flex: "0 0 auto" } }, icon("sparkle", 13)),
-      el("div", { style: { fontWeight: "600", fontSize: "13px" }, text: "Two model families, chosen by language" }),
+      el("div", { style: { fontWeight: "600", fontSize: "13px" }, text: "Three model families, chosen by language" }),
     ]),
     el("ul", { style: { margin: "0", paddingLeft: "18px", fontSize: "12px", lineHeight: "1.55", color: "var(--ink-2)" } }, [
-      li("Afrikaans uses Fluister, our Afrikaans-tuned model: much better on Afrikaans and the Afrikaans-English mix. It downloads automatically the first time you transcribe Afrikaans."),
+      li("Fluister, our Afrikaans-tuned model: best for Afrikaans and mixed Afrikaans and English meetings. It downloads automatically the first time you transcribe Afrikaans."),
+      li("Swivuriso, by African Next Voices (DSFSI): one model for seven South African languages (isiZulu, isiXhosa, Sesotho, Setswana, Xitsonga, isiNdebele, Tshivenda). Beta."),
       li("English and other languages use standard Whisper, the model you download below."),
       li("The size you pick (speed against accuracy) applies to whichever family your language needs."),
     ]),
@@ -2218,6 +2219,28 @@ function startFluisterUpdate(size) {
     .then(function () { pollVoiceDownload(); render(); })
     .catch(function (e) { toast(e.message || "Could not start the update.", true); });
 }
+// Swivuriso (DSFSI / African Next Voices): one credited third-party model for seven SA Bantu
+// languages. Beta, shown so someone who selected one of those languages can see the model state.
+// We did not train it, so it carries its own name + credit (MIT).
+function swivurisoPanel() {
+  var d = S.voiceModels;
+  if (!d || !d.swivuriso) return null;
+  var sv = d.swivuriso;
+  return el("div", { class: "card", style: { padding: "12px 14px", marginBottom: "12px", background: "var(--surface-2)" } }, [
+    el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "center", marginBottom: "6px" } }, [
+      el("div", { class: "row gap-8", style: { alignItems: "center" } }, [
+        el("span", { style: { fontWeight: "600", fontSize: "13px" }, text: "South African languages (Swivuriso)" }),
+        el("span", { class: "chip", text: "Beta" }),
+      ]),
+      sv.present ? el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]) : null,
+    ]),
+    el("div", { style: { fontSize: "11.5px", color: "var(--ink-3)", marginBottom: "6px" } }, raw("isiZulu, isiXhosa, Sesotho, Setswana, Xitsonga, isiNdebele, Tshivenda")),
+    el("div", { class: "ink-3", style: { fontSize: "11.5px" }, text: sv.present
+      ? "One model covers all seven. It runs on auto-detect."
+      : "Not installed yet. Pick one of these languages to use it." }),
+    el("div", { style: { fontSize: "11px", color: "var(--ink-3)", marginTop: "6px", borderTop: "0.5px solid var(--line)", paddingTop: "6px" }, text: "Model by DSFSI, African Next Voices. MIT licence." }),
+  ]);
+}
 function voiceModelCard() {
   return el("div", { class: "card settings-card" }, [
     el("div", { class: "card-title section-label", text: "Transcription model, on this machine" }),
@@ -2226,6 +2249,7 @@ function voiceModelCard() {
       el("div", { class: "s", style: { marginBottom: "10px" }, text: "Volksmond transcribes on this computer. Download the model that suits your machine; the recommended one is marked. Bigger is more accurate, but slower and larger to download. Remove any you no longer need to free space." }),
       modelFamiliesNote(),
       fluisterUpdatePanel(),
+      swivurisoPanel(),
       voiceDownloadPanel(true),
     ]),
     el("div", { class: "set-row" }, [
@@ -2505,14 +2529,24 @@ function stopRow(what, recommended, title, sub, kb, finish) {
 var SUPPORTED_LANGS = [
   { code: "af", name: "Afrikaans", family: "fluister" },
   { code: "en", name: "English", family: "whisper" },
+  { code: "zu", name: "isiZulu", family: "swivuriso" },
+  { code: "xh", name: "isiXhosa", family: "swivuriso" },
+  { code: "st", name: "Sesotho", family: "swivuriso" },
+  { code: "tn", name: "Setswana", family: "swivuriso" },
+  { code: "ts", name: "Xitsonga", family: "swivuriso" },
+  { code: "nr", name: "isiNdebele", family: "swivuriso" },
+  { code: "ve", name: "Tshivenda", family: "swivuriso" },
 ];
-var LANG_NAMES = { "af": "Afrikaans", "en": "English", "": "Auto-detect" };
+var SWIVURISO_LANGS = ["zu", "xh", "st", "tn", "ts", "nr", "ve"];
+var LANG_NAMES = { "af": "Afrikaans", "en": "English", "": "Auto-detect",
+  "zu": "isiZulu", "xh": "isiXhosa", "st": "Sesotho", "tn": "Setswana", "ts": "Xitsonga", "nr": "isiNdebele", "ve": "Tshivenda" };
 function langName(code) { return LANG_NAMES[code] != null ? LANG_NAMES[code] : code; }
-function familyForLang(lang) { var l = (lang || "").toLowerCase(); return (l === "" || l === "auto" || /^af/.test(l)) ? "fluister" : "whisper"; }
-// True once a Fluister model is actually installed; until then an Afrikaans session honestly
-// runs (and is labelled) as stock Whisper.
+function familyForLang(lang) { var l = (lang || "").toLowerCase().split("-")[0]; if (SWIVURISO_LANGS.indexOf(l) >= 0) return "swivuriso"; return (l === "" || l === "auto" || /^af/.test(l)) ? "fluister" : "whisper"; }
+// True once the matching model is actually installed; until then a session honestly runs (and is
+// labelled) as stock Whisper.
 function fluisterReady() { return !!(S.voiceModels && S.voiceModels.fluister_available); }
-function familyLabelFor(lang) { return (familyForLang(lang) === "fluister" && fluisterReady()) ? "Fluister" : "Whisper"; }
+function swivurisoReady() { return !!(S.voiceModels && S.voiceModels.swivuriso && S.voiceModels.swivuriso.present); }
+function familyLabelFor(lang) { var f = familyForLang(lang); if (f === "swivuriso") return swivurisoReady() ? "Swivuriso" : "Whisper"; return (f === "fluister" && fluisterReady()) ? "Fluister" : "Whisper"; }
 // Friendly size label from the loaded model id/path (a stock name like "large-v3", a hosted
 // Fluister repo like "digiphyte/fluister-medium", or a local ct2 dir). Mirrors the Quality
 // vocabulary so the live chip can read "Fluister, Best".
@@ -2531,6 +2565,7 @@ function sizeLabelFromModel(model) {
 // so the user can see it is e.g. Fluister at Balanced without opening anything.
 function familyChip(family, model) {
   var size = sizeLabelFromModel(model);
+  if (family === "swivuriso") return el("span", { class: "chip accent", title: tr("South African languages model") }, [icon("language", 12), el("span", {}, raw("Swivuriso"))]);
   var name = (family === "fluister") ? "Fluister" : "Whisper";
   var label = size ? (name + ", " + tr(size)) : name;
   if (family === "fluister") return el("span", { class: "chip accent", title: tr("Afrikaans-optimised model") }, [icon("sparkle", 12), el("span", {}, raw(label))]);
@@ -2556,21 +2591,26 @@ function engineLine() {
   var lang = S.form.language;
   var ov = S.form.engine || "auto";
   var famWanted = (ov === "fluister") ? "fluister" : (ov === "whisper") ? "whisper" : familyForLang(lang);
-  var label = (famWanted === "fluister" && fluisterReady()) ? "Fluister" : "Whisper";
+  var label = (famWanted === "swivuriso") ? (swivurisoReady() ? "Swivuriso" : "Whisper")
+            : (famWanted === "fluister" && fluisterReady()) ? "Fluister" : "Whisper";
   var msg;
   if (famWanted === "fluister" && !fluisterReady())
     msg = "Fluister (our Afrikaans-tuned model) is not installed on this computer yet, so this runs on standard Whisper for now.";
+  else if (famWanted === "swivuriso" && !swivurisoReady())
+    msg = "The Swivuriso model for South African languages is not installed on this computer yet, so this runs on standard Whisper for now.";
   else if (ov === "fluister")
     msg = "Forced to Fluister for every language. Handy when an English meeting has Afrikaans words mixed in.";
   else if (ov === "whisper")
     msg = "Forced to standard Whisper for every language.";
+  else if (famWanted === "swivuriso")
+    msg = "South African languages use Swivuriso, a model by African Next Voices (DSFSI). The size is chosen automatically for your computer.";
   else if (famWanted === "fluister")
     msg = (lang === "")
       ? "Auto-detect uses Fluister, our Afrikaans-tuned model. The size is chosen automatically for your computer."
-      : "Afrikaans uses Fluister, our Afrikaans-tuned model. The size is chosen automatically for your computer.";
+      : "Best for Afrikaans and mixed Afrikaans and English meetings. The size is chosen automatically for your computer.";
   else msg = "English uses standard Whisper. The size is chosen automatically for your computer.";
   return el("div", { class: "card", style: { padding: "11px 13px", display: "flex", gap: "10px", alignItems: "center", marginBottom: "16px" } }, [
-    el("div", { class: "tone-tile" + (label === "Fluister" ? " accent" : ""), style: { width: "30px", height: "30px", flex: "0 0 auto" } }, icon(label === "Fluister" ? "sparkle" : "globe", 15)),
+    el("div", { class: "tone-tile" + ((label === "Fluister" || label === "Swivuriso") ? " accent" : ""), style: { width: "30px", height: "30px", flex: "0 0 auto" } }, icon(label === "Fluister" ? "sparkle" : (label === "Swivuriso" ? "language" : "globe"), 15)),
     el("div", {}, [
       el("div", { style: { fontWeight: "600", fontSize: "12.5px" } }, [el("span", { text: "Engine: " }), el("span", { text: label })]),
       el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "1px" }, text: msg }),

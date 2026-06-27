@@ -1,5 +1,12 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-28, v1.6.1: Swivuriso, South African languages (beta)
+
+`licensing.APP_VERSION` 1.6.0 -> 1.6.1.
+
+- **Seven more South African languages, via Swivuriso (beta).** Selecting isiZulu, isiXhosa, Sesotho, Setswana, Xitsonga, isiNdebele or Tshivenda routes to Swivuriso, one model that covers all seven. It is a third-party model by DSFSI / African Next Voices (MIT), used under its own name and credited in the app rather than branded as ours; we convert it to ctranslate2 for faster-whisper. faster-whisper has no codes for these languages and DSFSI forces none, so Swivuriso runs on auto-detect (a deliberate departure from the force-the-language rule, for this family only). A live language switch into or out of these languages swaps the model automatically. New family routing (`transcribe.family_for_language` / `resolve_model` now return a family of fluister | whisper | swivuriso), a Swivuriso card in Settings -> Transcription model, and the seven languages added to "Languages you transcribe". Marked beta: transcription quality on real SA-language audio is still being verified. (`transcribe.py`, `voicedl.py`, `web/app.py`, `web/static/app.js`, `i18n.js`, `site/models.json`.)
+- **Copy:** Fluister is now described as "best for Afrikaans and mixed Afrikaans and English meetings".
+
 ## 2026-06-26, v1.6.0: voice model management (manifest + opt-in updates)
 
 `licensing.APP_VERSION` 1.5.0 -> 1.6.0.

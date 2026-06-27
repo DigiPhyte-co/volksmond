@@ -26,7 +26,8 @@ from pathlib import Path
 
 from . import config
 from .__main__ import pick_tier
-from .transcribe import TIER_CONFIG, FLUISTER_REPOS
+from .transcribe import (TIER_CONFIG, FLUISTER_REPOS,
+                         SWIVURISO_REPO, SWIVURISO_LOCAL, SWIVURISO_LANGS, swivuriso_available)
 
 # Approx on-disk sizes (bytes) of the faster-whisper (CTranslate2) repos, dominated
 # by model.bin. Used only for the progress estimate; HuggingFace verifies the real
@@ -65,6 +66,10 @@ _FLUISTER_SIZES = {
 # but has no install record yet (downloaded before version tracking existed), so a later manifest
 # that raises the version is still seen as an update. The live manifest is the real source of truth.
 _FLUISTER_BASELINE = "1.0.0"
+
+# Swivuriso (DSFSI / African Next Voices): one model (turbo) covering seven SA Bantu languages.
+_SWIVURISO_SIZE = 820_000_000
+_SWIVURISO_BASELINE = "1.0.0"
 
 # Cache the (subprocess-backed) hardware probe: it cannot change during a run, and
 # catalogue_public() is polled once a second while a download runs.
@@ -335,6 +340,27 @@ def fluister_catalogue():
     return out
 
 
+def swivuriso_catalogue():
+    """Local-only install state of the Swivuriso (DSFSI / African Next Voices) model: one model for
+    seven SA Bantu languages. present = a local ct2 build OR the hosted repo cached. No network."""
+    rec = _installed_versions()
+    present = swivuriso_available() or _present(SWIVURISO_REPO)
+    if os.path.isdir(SWIVURISO_LOCAL):
+        on_disk = _dir_size(Path(SWIVURISO_LOCAL))
+    elif _present(SWIVURISO_REPO):
+        on_disk = _dir_size(_repo_dir(SWIVURISO_REPO))
+    else:
+        on_disk = 0
+    return {
+        "repo": SWIVURISO_REPO,
+        "present": present,
+        "installed_version": _effective_version(SWIVURISO_REPO, present, rec),
+        "approx_bytes": _SWIVURISO_SIZE,
+        "size_on_disk": on_disk,
+        "languages": list(SWIVURISO_LANGS),
+    }
+
+
 def fetch_manifest(timeout=8):
     """Fetch our published models.json (ONE outbound GET, generic User-Agent, no user data). Returns
     the parsed dict; raises on any network/parse error for the caller to turn into a friendly 502.
@@ -372,6 +398,21 @@ def model_update_status(manifest):
             "latest": latest,
             "revision": man.get("revision") or "",
             "approx_bytes": man.get("approx_bytes") or _FLUISTER_SIZES.get(size, 0),
+            "update_available": _vtuple(latest) > _vtuple(installed or ""),
+        })
+    # Swivuriso (one credited third-party model) rides the same channel once hosted + versioned.
+    sv_present = swivuriso_available() or _present(SWIVURISO_REPO)
+    sv_man = by_repo.get(SWIVURISO_REPO)
+    if sv_present and sv_man and sv_man.get("version"):
+        installed = _effective_version(SWIVURISO_REPO, True, rec)
+        latest = str(sv_man.get("version"))
+        updates.append({
+            "size": "turbo",
+            "repo": SWIVURISO_REPO,
+            "installed": installed,
+            "latest": latest,
+            "revision": sv_man.get("revision") or "",
+            "approx_bytes": sv_man.get("approx_bytes") or _SWIVURISO_SIZE,
             "update_available": _vtuple(latest) > _vtuple(installed or ""),
         })
     return updates
