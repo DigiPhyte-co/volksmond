@@ -463,6 +463,11 @@ window.VM_I18N = {
     "Three model families, chosen by language": "Drie modelfamilies, gekies volgens taal",
     "South African languages model": "Suid-Afrikaanse tale-model",
     "South African languages": "Suid-Afrikaanse tale",
+    "General Whisper models": "Algemene Whisper-modelle",
+    "For English and other languages.": "Vir Engels en ander tale.",
+    "Our Afrikaans-tuned model. Best for Afrikaans and mixed Afrikaans and English.": "Ons Afrikaans-gestemde model. Beste vir Afrikaans en gemengde Afrikaans en Engels.",
+    "Other South African languages (Swivuriso)": "Ander Suid-Afrikaanse tale (Swivuriso)",
+    "One model covers all seven South African languages, on auto-detect. Only High quality is available.": "Een model dek al sewe Suid-Afrikaanse tale, met outomatiese opsporing. Slegs Hoë gehalte is beskikbaar.",
     "South African languages (Swivuriso)": "Suid-Afrikaanse tale (Swivuriso)",
     "Beta": "Beta",
     "Fluister, our Afrikaans-tuned model: best for Afrikaans and mixed Afrikaans and English meetings. It downloads automatically the first time you transcribe Afrikaans.":

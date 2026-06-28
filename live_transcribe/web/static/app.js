@@ -617,13 +617,17 @@ function confirmModal(opts) {
 }
 function confirmRemoveVoice(m) {
   var meta = VOICE_LABELS[m.model] || { title: m.model };
+  confirmRemoveVoiceItem(meta.title, m.model, m.size_on_disk || m.approx_bytes);
+}
+// Remove any voice model by its delete id (a Whisper size, or a Fluister/Swivuriso repo id).
+function confirmRemoveVoiceItem(label, id, bytes) {
   confirmModal({
     title: "Remove this model?",
     message: "Remove this transcription model from your computer? You can download it again later.",
-    detail: meta.title + "   " + fmtGB(m.size_on_disk || m.approx_bytes),
+    detail: label + "   " + fmtGB(bytes),
     confirmLabel: "Remove", danger: true,
     onConfirm: function () {
-      api.post("/api/voice-model/delete", { model: m.model })
+      api.post("/api/voice-model/delete", { model: id })
         .then(function () { toast("Model removed."); loadVoiceModels(); })
         .catch(function (e) { toast(e.message || "Could not remove.", true); });
     },
@@ -2108,7 +2112,7 @@ function voiceDownloadPanel(manage) {
   models.sort(function (a, b) { return (b.recommended ? 1 : 0) - (a.recommended ? 1 : 0); }); // recommended first
   return el("div", { class: "stack", style: { gap: "10px" } }, models.map(function (m) {
     var meta = VOICE_LABELS[m.model] || { title: m.model, note: "" };
-    var isThis = downloading && p.model === m.model;
+    var isThis = downloading && (p.kind === "whisper" || !p.kind) && p.model === m.model;
     var pct = (isThis && p.total) ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0;
     var usable = !(m.model === "large-v3" && d.is_gpu === false);
     return el("div", { class: "card", style: { padding: "14px", opacity: usable ? "1" : "0.6" } }, [
@@ -2152,57 +2156,92 @@ function modelFamiliesNote() {
     ]),
   ]);
 }
-// The Afrikaans (Fluister) model is OURS, so unlike stock Whisper it improves over time and can have
-// a newer version. This panel shows what is installed and, after a MANUAL check, offers an opt-in
-// update. The check and the update are the only times the app reaches our server about models, and
-// only when the user clicks: same no-phone-home stance as the app-version check. The model loads
-// from the local cache (local_files_only), so a newer Fluister can ONLY arrive through this opt-in.
-function fluisterUpdatePanel() {
-  var d = S.voiceModels;
-  if (!d) return null;
-  var installed = (d.fluister || []).filter(function (m) { return m.present; });
-  var ups = {};
-  ((S.modelUpdates && S.modelUpdates.updates) || []).forEach(function (u) { ups[u.repo] = u; });
-  var checking = S._checkingModelUpdates;
-  var p = d.progress || {};
-  var downloading = p.state === "downloading";
-  var header = el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "center", marginBottom: installed.length ? "8px" : "0" } }, [
-    el("div", { style: { fontWeight: "600", fontSize: "13px" }, text: "Afrikaans model (Fluister)" }),
-    installed.length ? el("button", { class: "btn ghost sm", disabled: checking, onclick: function () { checkModelUpdates(); } }, checking ? "Checking" : "Check for updates") : null,
+// ── Settings: one consistent model card per family ──────────────────────────
+// All three families (Afrikaans/Fluister, the other South African languages/Swivuriso, general
+// Whisper) render with the SAME card via voiceModelRow: title, download size, description, and
+// Installed/Download + Remove. Built from the backend catalogues (d.fluister, d.swivuriso, d.models).
+function vmChip(cls, text) { return el("span", { class: "chip " + cls, style: { marginLeft: "8px" }, text: text }); }
+function vmPct(p) { return (p && p.total) ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0; }
+function voiceModelSectionHeader(title, rightEl, sub) {
+  return el("div", { style: { marginTop: "4px", marginBottom: "8px" } }, [
+    el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "center" } }, [
+      el("div", { style: { fontWeight: "600", fontSize: "13px" }, text: title }),
+      rightEl || null,
+    ]),
+    sub ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "3px" }, text: sub }) : null,
   ]);
-  var body;
-  if (!installed.length) {
-    body = el("div", { class: "ink-3", style: { fontSize: "12px" }, text: "Not installed yet. The Afrikaans model downloads automatically the first time you transcribe Afrikaans." });
+}
+// o: title, badges[], sizeBytes, present, description, note, downloading, isThis, pct, p,
+//    onDownload, onRemove, status (element shown when present, before Remove), disabled, disabledNote.
+function voiceModelRow(o) {
+  var right;
+  if (o.present) {
+    right = el("div", { class: "row gap-8", style: { alignItems: "center", flex: "0 0 auto" } }, [
+      o.status || el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]),
+      o.onRemove ? el("button", { class: "btn ghost sm", onclick: o.onRemove }, "Remove") : null,
+    ]);
+  } else if (o.disabled) {
+    right = null;
   } else {
-    body = el("div", { class: "stack", style: { gap: "8px" } }, installed.map(function (m) {
-      var meta = VOICE_LABELS[m.size] || { title: m.size };
-      var u = ups[m.repo];
-      var isThis = downloading && p.model === m.size;
-      var pct = (isThis && p.total) ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0;
-      var right;
-      if (u && u.update_available) {
-        right = el("div", { class: "row gap-8", style: { alignItems: "center" } }, [
-          el("span", { class: "chip accent" }, [el("span", { text: "Update available" }), raw(" → v" + u.latest)]),
-          el("button", { class: "btn sm", disabled: downloading, onclick: function () { if (downloading) return; startFluisterUpdate(m.size); } }, isThis ? "Updating" : "Update"),
-        ]);
-      } else if (S.modelUpdates) {
-        right = el("span", { class: "chip ok" }, [icon("check", 12), "Up to date"]);
-      } else {
-        right = el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]);
-      }
-      return el("div", { class: "card", style: { padding: "12px 14px" } }, [
-        el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "center", gap: "10px" } }, [
-          el("div", {}, [
-            el("span", { style: { fontWeight: "600" }, text: meta.title }),
-            el("span", { class: "ink-3", style: { fontSize: "11.5px", marginLeft: "8px" } }, raw("v" + (m.installed_version || "?"))),
-          ]),
-          right,
-        ]),
-        isThis ? voiceProgressBar(pct) : null,
-      ]);
-    }));
+    right = el("button", { class: "btn", onclick: function () { if (o.downloading) return; o.onDownload(); } }, o.isThis ? "Downloading" : "Download");
   }
-  return el("div", { class: "card", style: { padding: "12px 14px", marginBottom: "12px", background: "var(--surface-2)" } }, [header, body]);
+  var title = [el("span", { text: o.title })].concat(o.badges || []).concat([
+    el("span", { class: "chip", style: { marginLeft: "8px" } }, raw(fmtGB(o.sizeBytes))),
+  ]);
+  return el("div", { class: "card", style: { padding: "14px", opacity: o.disabled ? "0.6" : "1" } }, [
+    el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "flex-start", gap: "12px" } }, [
+      el("div", { class: "grow" }, [
+        el("div", { style: { fontWeight: "600" } }, title),
+        o.description ? el("div", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "2px" }, text: o.description }) : null,
+        o.note ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "4px" }, text: o.note }) : null,
+        o.disabledNote ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "4px" }, text: o.disabledNote }) : null,
+      ]),
+      right,
+    ]),
+    o.isThis ? voiceProgressBar(o.pct) : null,
+    o.isThis ? el("div", { id: "vm-vdl-text", class: "ink-3", style: { fontSize: "11.5px", marginTop: "4px" } }, raw(fmtGB(o.p.downloaded) + " of " + fmtGB(o.p.total) + "  (" + o.pct + "%)")) : null,
+  ]);
+}
+// Afrikaans (Fluister) is OURS, so unlike stock Whisper it improves over time: a manual "Check for
+// updates" offers an opt-in newer version (the only time the app reaches our server about models, and
+// only on click). Loads from the local cache (local_files_only), so a newer Fluister can ONLY arrive
+// through this opt-in. Each of the four sizes is a consistent card with Download / Installed + Remove.
+function afrikaansModelSection() {
+  var d = S.voiceModels; if (!d) return null;
+  var p = d.progress || {}; var downloading = p.state === "downloading";
+  var fl = (d.fluister || []).slice();
+  var anyInstalled = fl.some(function (m) { return m.present; });
+  var ups = {}; ((S.modelUpdates && S.modelUpdates.updates) || []).forEach(function (u) { ups[u.repo] = u; });
+  var checking = S._checkingModelUpdates;
+  var checkBtn = anyInstalled ? el("button", { class: "btn ghost sm", disabled: checking, onclick: function () { checkModelUpdates(); } }, checking ? "Checking" : "Check for updates") : null;
+  fl.sort(function (a, b) { return (b.size === d.recommended_model ? 1 : 0) - (a.size === d.recommended_model ? 1 : 0); });
+  return el("div", { style: { marginBottom: "14px" } }, [
+    voiceModelSectionHeader("Afrikaans model (Fluister)", checkBtn, "Our Afrikaans-tuned model. Best for Afrikaans and mixed Afrikaans and English."),
+    el("div", { class: "stack", style: { gap: "10px" } }, fl.map(function (m) {
+      var meta = VOICE_LABELS[m.size] || { title: m.size, note: "" };
+      var u = ups[m.repo];
+      var isThis = downloading && p.kind === "fluister" && p.model === m.size;
+      var badges = [];
+      if (m.size === d.recommended_model) badges.push(vmChip("accent", "Recommended"));
+      var status = null;
+      if (u && u.update_available) status = el("button", { class: "btn sm", disabled: downloading, onclick: function () { if (downloading) return; startFluisterUpdate(m.size); } }, isThis ? "Updating" : ("Update → v" + u.latest));
+      else if (S.modelUpdates) status = el("span", { class: "chip ok" }, [icon("check", 12), "Up to date"]);
+      return voiceModelRow({
+        title: meta.title, badges: badges,
+        sizeBytes: (m.present && m.size_on_disk) ? m.size_on_disk : m.approx_bytes,
+        present: m.present, description: meta.note,
+        downloading: downloading, isThis: isThis, pct: vmPct(p), p: p,
+        onDownload: function () { startFluisterDownload(m.size); },
+        onRemove: function () { confirmRemoveVoiceItem(meta.title + " (Fluister)", m.repo, m.size_on_disk || m.approx_bytes); },
+        status: status,
+      });
+    })),
+  ]);
+}
+function startFluisterDownload(size) {
+  api.post("/api/voice-model/fluister-download", { size: size })
+    .then(function () { pollVoiceDownload(); render(); })
+    .catch(function (e) { toast(e.message || "Could not start the download.", true); });
 }
 function checkModelUpdates() {
   S._checkingModelUpdates = true; render();
@@ -2219,41 +2258,26 @@ function startFluisterUpdate(size) {
     .then(function () { pollVoiceDownload(); render(); })
     .catch(function (e) { toast(e.message || "Could not start the update.", true); });
 }
-// Swivuriso (DSFSI / African Next Voices): one credited third-party model for seven South African
-// languages. Beta, shown so someone who selected one of those languages can see the model state.
-// We did not train it, so it carries its own name + credit (MIT).
-function swivurisoPanel() {
-  var d = S.voiceModels;
-  if (!d || !d.swivuriso) return null;
-  var sv = d.swivuriso;
-  var p = d.progress || {};
-  var downloading = p.state === "downloading";
+// The other South African languages (Swivuriso, by DSFSI / African Next Voices). One model covers
+// all seven; only High quality is available. We did not train it, so it carries its own name +
+// credit (MIT), and is beta. Same consistent card as the rest, with Download / Installed + Remove.
+function saLanguagesSection() {
+  var d = S.voiceModels; if (!d || !d.swivuriso) return null;
+  var sv = d.swivuriso; var p = d.progress || {}; var downloading = p.state === "downloading";
   var isThis = downloading && p.kind === "swivuriso";
-  var pct = (isThis && p.total) ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0;
-  var right;
-  if (sv.present) {
-    right = el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]);
-  } else {
-    right = el("div", { class: "row gap-8", style: { alignItems: "center" } }, [
-      el("span", { class: "chip" }, raw(fmtGB(sv.approx_bytes))),
-      el("button", { class: "btn sm", disabled: downloading, onclick: function () { if (downloading) return; startSwivurisoDownload(); } }, isThis ? "Downloading" : "Download"),
-    ]);
-  }
-  return el("div", { class: "card", style: { padding: "12px 14px", marginBottom: "12px", background: "var(--surface-2)" } }, [
-    el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "center", marginBottom: "6px" } }, [
-      el("div", { class: "row gap-8", style: { alignItems: "center" } }, [
-        el("span", { style: { fontWeight: "600", fontSize: "13px" }, text: "South African languages (Swivuriso)" }),
-        el("span", { class: "chip", text: "Beta" }),
-      ]),
-      right,
-    ]),
-    el("div", { style: { fontSize: "11.5px", color: "var(--ink-3)", marginBottom: "6px" } }, raw("isiZulu, isiXhosa, Sesotho, Setswana, Xitsonga, isiNdebele, Tshivenda")),
-    el("div", { class: "ink-3", style: { fontSize: "11.5px" }, text: sv.present
-      ? "One model covers all seven. It runs on auto-detect."
-      : "Not installed yet. Download it now, or it downloads automatically the first time you pick one of these languages." }),
-    isThis ? voiceProgressBar(pct) : null,
-    isThis ? el("div", { id: "vm-vdl-text", class: "ink-3", style: { fontSize: "11.5px", marginTop: "4px" } }, raw(fmtGB(p.downloaded) + " of " + fmtGB(p.total) + "  (" + pct + "%)")) : null,
-    el("div", { style: { fontSize: "11px", color: "var(--ink-3)", marginTop: "6px", borderTop: "0.5px solid var(--line)", paddingTop: "6px" }, text: "Model by DSFSI, African Next Voices. MIT licence." }),
+  return el("div", { style: { marginBottom: "14px" } }, [
+    voiceModelSectionHeader("Other South African languages (Swivuriso)", el("span", { class: "chip", text: "Beta" }), null),
+    el("div", { style: { fontSize: "11.5px", color: "var(--ink-3)", marginBottom: "8px" } }, raw("isiZulu, isiXhosa, Sesotho, Setswana, Xitsonga, isiNdebele, Tshivenda")),
+    voiceModelRow({
+      title: "High quality",
+      sizeBytes: (sv.present && sv.size_on_disk) ? sv.size_on_disk : sv.approx_bytes,
+      present: sv.present,
+      description: "One model covers all seven South African languages, on auto-detect. Only High quality is available.",
+      note: "Model by DSFSI, African Next Voices. MIT licence.",
+      downloading: downloading, isThis: isThis, pct: vmPct(p), p: p,
+      onDownload: function () { startSwivurisoDownload(); },
+      onRemove: function () { confirmRemoveVoiceItem("South African languages (Swivuriso)", sv.repo, sv.size_on_disk || sv.approx_bytes); },
+    }),
   ]);
 }
 function startSwivurisoDownload() {
@@ -2268,8 +2292,9 @@ function voiceModelCard() {
       el("div", { class: "t", style: { marginBottom: "4px" }, text: "Download or switch model" }),
       el("div", { class: "s", style: { marginBottom: "10px" }, text: "Volksmond transcribes on this computer. Download the model that suits your machine; the recommended one is marked. Bigger is more accurate, but slower and larger to download. Remove any you no longer need to free space." }),
       modelFamiliesNote(),
-      fluisterUpdatePanel(),
-      swivurisoPanel(),
+      afrikaansModelSection(),
+      saLanguagesSection(),
+      voiceModelSectionHeader("General Whisper models", null, "For English and other languages."),
       voiceDownloadPanel(true),
     ]),
     el("div", { class: "set-row" }, [

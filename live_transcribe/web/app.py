@@ -1527,6 +1527,24 @@ def voice_model_swivuriso_download():
     return voicedl.progress()
 
 
+@app.post("/api/voice-model/fluister-download")
+def voice_model_fluister_download(req: VoiceUpdateRequest):
+    """Download one Afrikaans (Fluister) model to this machine up front (a plain first-install pull),
+    so the model card can install a size with a progress bar instead of faster-whisper fetching it
+    silently at first use. Background; the UI polls /api/voice-models. Refused while a session runs."""
+    from .. import voicedl
+    with STATE.lock:
+        if STATE.engine is not None:
+            raise HTTPException(status_code=409, detail="A transcription session is running. Stop it before downloading a model.")
+    try:
+        voicedl.start_fluister_download(req.size)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return voicedl.progress()
+
+
 @app.get("/api/cuda")
 def cuda_status():
     """NVIDIA CUDA (optional GPU acceleration) status. NVIDIA ONLY; AMD/Intel GPUs use

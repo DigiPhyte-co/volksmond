@@ -1,5 +1,14 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-28, v1.6.4: consistent model cards (sizes, descriptions, Remove for every family)
+
+`licensing.APP_VERSION` 1.6.3 -> 1.6.4.
+
+- **Settings, Transcription model: all three families now look and behave the same.** The Afrikaans (Fluister), other South African languages (Swivuriso) and general Whisper models were three different card styles, and the Afrikaans and South African ones had no size, no description and no Remove. They now share one card (`voiceModelRow`): title, download size, a one-line description, and Installed/Download + Remove, under three clear headers ("Afrikaans model (Fluister)", "Other South African languages (Swivuriso)", "General Whisper models"). The Afrikaans section shows all four sizes (Download for any not installed) and keeps the opt-in "Check for updates"; the Swivuriso card states that only High quality is available, since it is one model. (`web/static/app.js`, `i18n.js`.)
+- **You can now remove the Afrikaans and South African models.** `voicedl.delete` accepts a Fluister or Swivuriso repo id (not just a Whisper size) and clears the recorded version; Swivuriso removal also clears the local ct2 build. New `voicedl.start_fluister_download` + `POST /api/voice-model/fluister-download` give a first-install download for a Fluister size straight from the card. (`voicedl.py`, `web/app.py`.)
+
+Verified: py_compile, node --check, test_web_api + test_engine_drain all green. The card layout still wants an on-machine eyeball on the next build.
+
 ## 2026-06-28, v1.6.3: South African languages reachable in one tap; "Bantu" removed
 
 `licensing.APP_VERSION` 1.6.2 -> 1.6.3.

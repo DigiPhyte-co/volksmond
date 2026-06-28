@@ -231,22 +231,33 @@ def start_download(model):
 
 
 def delete(model):
-    """Remove a downloaded voice model from the cache to free space. The user can
-    download it again later. Refuses while that same model is downloading. Only ever
-    removes the cache folder for one of our catalogue models, never an arbitrary path."""
-    if model not in _SIZES:
+    """Remove a downloaded voice model from the cache to free space (re-downloadable later). `model`
+    is a Whisper size (small/medium/...), a Fluister repo id (digiphyte/fluister-*), or the Swivuriso
+    repo id. Refuses while any download is running. Only ever removes a cache folder for one of our
+    known models, never an arbitrary path; also clears the recorded install version for our models."""
+    fluister_repos = set(FLUISTER_REPOS.values())
+    if model in _SIZES:
+        dirs = [_repo_dir(_repo_id(model))]
+    elif model in fluister_repos:
+        dirs = [_repo_dir(model)]
+    elif model == SWIVURISO_REPO:
+        # Remove both the hosted-repo cache and, if present, the local ct2 build, so "Removed" is true.
+        dirs = [_repo_dir(model)] + ([Path(SWIVURISO_LOCAL)] if os.path.isdir(SWIVURISO_LOCAL) else [])
+    else:
         raise ValueError("Unknown model")
     with _LOCK:
-        if _STATE["state"] == "downloading" and _STATE.get("model") == model:
-            raise RuntimeError("That model is downloading.")
-    d = _repo_dir(_repo_id(model))
-    if d.exists():
-        try:
-            shutil.rmtree(d)
-        except OSError as e:
-            # Surface the failure (e.g. a Windows file lock) instead of reporting a
-            # silent success that did not actually free any space.
-            raise RuntimeError(f"Could not remove the model files: {e}")
+        if _STATE["state"] == "downloading":
+            raise RuntimeError("A model is downloading. Wait for it to finish.")
+    for d in dirs:
+        if d.exists():
+            try:
+                shutil.rmtree(d)
+            except OSError as e:
+                # Surface the failure (e.g. a Windows file lock) instead of reporting a
+                # silent success that did not actually free any space.
+                raise RuntimeError(f"Could not remove the model files: {e}")
+    if model in fluister_repos or model == SWIVURISO_REPO:
+        _forget_installed(model)
 
 
 def _run(model):
@@ -298,6 +309,15 @@ def record_installed(repo, version, revision=None):
     cur = dict(_installed_versions())
     cur[repo] = {"version": str(version or ""), "revision": str(revision or "")}
     config.update({"installed_models": cur})
+
+
+def _forget_installed(repo):
+    """Drop the recorded install version for a model we just removed, so the catalogue reports it as
+    not-installed (and a later download re-records it)."""
+    cur = dict(_installed_versions())
+    if repo in cur:
+        cur.pop(repo, None)
+        config.update({"installed_models": cur})
 
 
 def _ref_main_sha(repo):
@@ -483,3 +503,21 @@ def start_swivuriso_download():
                        "downloaded": 0, "total": _SWIVURISO_SIZE, "error": None})
     threading.Thread(target=_run_fluister, args=(repo, "", _SWIVURISO_BASELINE, _SWIVURISO_SIZE),
                      daemon=True).start()
+
+
+def start_fluister_download(size):
+    """Begin a background first-download of one Fluister model from its hosted repo (a plain pull that
+    records the build baseline version). For installing a size from the model card; the manifest-driven
+    newer-version path is start_fluister_update. Raises ValueError (unknown size) or RuntimeError (a
+    download is already running)."""
+    repo = FLUISTER_REPOS.get(size)
+    if not repo:
+        raise ValueError("Unknown model")
+    total = _FLUISTER_SIZES.get(size, 0)
+    with _LOCK:
+        if _STATE["state"] == "downloading":
+            raise RuntimeError("A model is already downloading.")
+        _STATE.update({"state": "downloading", "model": size, "repo": repo, "kind": "fluister",
+                       "version": _FLUISTER_BASELINE, "revision": "",
+                       "downloaded": 0, "total": total, "error": None})
+    threading.Thread(target=_run_fluister, args=(repo, "", _FLUISTER_BASELINE, total), daemon=True).start()
