@@ -58,7 +58,7 @@ _FLUISTER = {
 
 
 # Swivuriso: the South African Next Voices (DSFSI) multilingual model, used UNDER ITS OWN NAME (we
-# did not train it; MIT). One model covers seven SA Bantu languages. faster-whisper has no codes for
+# did not train it; MIT). One model covers seven South African languages. faster-whisper has no codes for
 # them and DSFSI forces none, so the engine runs it on auto-detect (language=None). ct2-converted
 # from dsfsi-anv/za-anv-multilingual-whisper-v3-turbo; a local ct2 build is reused if present, just
 # like Fluister. Credit DSFSI / African Next Voices (model card + NOTICE on the hosted repo).
@@ -82,11 +82,14 @@ def swivuriso_available():
 
 
 def family_for_language(language):
-    """The model family that transcribes this language. The seven SA Bantu languages -> Swivuriso
-    (the DSFSI model); Afrikaans AND auto-detect ("") -> our Fluister tune; explicit English/other ->
-    stock Whisper. A manual engine override (resolve_model) can still force any family."""
+    """The model family that transcribes this language. The seven South African languages -> Swivuriso
+    (the DSFSI model), whether named individually (zu/xh/...) or via the "sa" group code the UI sends
+    when the user picks "South African languages"; Afrikaans AND auto-detect ("") -> our Fluister tune;
+    explicit English/other -> stock Whisper. A manual engine override (resolve_model) can still force
+    any family."""
     lang = (language or "").lower()
-    if lang.split("-")[0] in SWIVURISO_LANGS:
+    base = lang.split("-")[0]
+    if base == "sa" or base in SWIVURISO_LANGS:
         return "swivuriso"
     return "fluister" if (lang == "" or lang == "auto" or lang.startswith("af")) else "whisper"
 
@@ -419,7 +422,7 @@ class Engine:
         self.size = cfg["model"]
         self.model_name, self.family = resolve_model(self.size, language, engine)
         self.is_fluister = self.family == "fluister"
-        # Swivuriso has no faster-whisper codes for the SA Bantu languages and DSFSI forces none, so
+        # Swivuriso has no faster-whisper codes for these South African languages and DSFSI forces none, so
         # run it on auto-detect; every other family keeps the chosen decode language.
         self.language = None if self.family == "swivuriso" else language
 

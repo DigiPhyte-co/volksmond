@@ -155,10 +155,11 @@ def test_family_resolution():
     # Engine override forces the family regardless of language.
     assert T.resolve_model("small", "en", "fluister")[1] == "fluister"
     assert T.resolve_model("small", "af", "whisper") == ("small", "whisper")
-    # Swivuriso: the seven SA Bantu languages route to it; it falls back to stock Whisper only when
-    # no Swivuriso model is installed/hosted on this machine.
+    # Swivuriso: the seven South African languages route to it; it falls back to stock Whisper only
+    # when no Swivuriso model is installed/hosted on this machine.
     assert T.family_for_language("zu") == "swivuriso"
     assert T.family_for_language("xh-ZA") == "swivuriso"
+    assert T.family_for_language("sa") == "swivuriso"   # the "South African languages" group code the picker sends
     _, sv_fam = T.resolve_model("large-v3-turbo", "zu")
     assert sv_fam == ("swivuriso" if T.swivuriso_available() else "whisper"), sv_fam
     # Every tier now stores a stock size name, never a hardcoded Fluister path.
@@ -169,7 +170,7 @@ def test_family_resolution():
     vm = client.get("/api/voice-models").json()
     assert isinstance(vm.get("fluister_available"), bool)
     assert isinstance(vm.get("swivuriso"), dict) and "present" in vm["swivuriso"], vm
-    print("  OK  family resolution: af->Fluister, Bantu->Swivuriso, others->Whisper; voice-models exposes both")
+    print("  OK  family resolution: af->Fluister, SA languages->Swivuriso, others->Whisper; voice-models exposes both")
 
 
 def test_model_delete_api():

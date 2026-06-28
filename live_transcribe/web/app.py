@@ -553,7 +553,7 @@ def reconfigure(req: ReconfigureRequest):
     new_engine_pref = (data.get("engine") or cur_engine_pref)
 
     # The family the new language/engine wants. If it differs from the running model's family (e.g.
-    # switching to a Bantu language needs the Swivuriso model, or switching back off it), the model
+    # switching to a South African language needs the Swivuriso model, or switching back off it), the model
     # MUST swap even on a language-only request, not just re-point the decoder.
     want_family = (new_engine_pref.lower() if new_engine_pref and new_engine_pref.lower() in ("fluister", "whisper", "swivuriso")
                    else transcribe.family_for_language(new_lang))
@@ -583,7 +583,7 @@ def reconfigure(req: ReconfigureRequest):
         if not (STATE.running and STATE.transcribing and not STATE.stopping
                 and STATE.source_kind == "live" and STATE.engine is engine):
             raise HTTPException(status_code=409, detail="The session changed before the new settings could apply.")
-        # Swivuriso has no faster-whisper codes for the SA Bantu languages, so it always decodes on
+        # Swivuriso has no faster-whisper codes for the South African languages, so it always decodes on
         # auto-detect; every other family uses the chosen language.
         eff_family = family if family is not None else cur_family
         decode_lang = None if eff_family == "swivuriso" else new_lang
@@ -1421,7 +1421,7 @@ def voice_models():
     # Install state + version of each Fluister model on this machine (local only, no network), so the
     # voice-model card can show "installed v1.0.0" and, after a manual check, "update available".
     cat["fluister"] = voicedl.fluister_catalogue()
-    # Swivuriso (DSFSI / African Next Voices): one credited third-party model for seven SA Bantu
+    # Swivuriso (DSFSI / African Next Voices): one credited third-party model for seven South African
     # languages. Install state only (no network), so the card can show installed / not installed.
     cat["swivuriso"] = voicedl.swivuriso_catalogue()
     return cat
@@ -1511,7 +1511,7 @@ def voice_model_update(req: VoiceUpdateRequest):
 
 @app.post("/api/voice-model/swivuriso-download")
 def voice_model_swivuriso_download():
-    """Download the Swivuriso model (one model for seven SA Bantu languages, by DSFSI / African Next
+    """Download the Swivuriso model (one model for seven South African languages, by DSFSI / African Next
     Voices) to this machine up front, with a progress bar, instead of faster-whisper fetching it
     silently at first use. Background; the UI polls /api/voice-models for progress (shared with the
     other downloads). Refused while a session runs, since it writes into the model cache a live

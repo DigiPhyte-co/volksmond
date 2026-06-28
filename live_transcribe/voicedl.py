@@ -67,7 +67,7 @@ _FLUISTER_SIZES = {
 # that raises the version is still seen as an update. The live manifest is the real source of truth.
 _FLUISTER_BASELINE = "1.0.0"
 
-# Swivuriso (DSFSI / African Next Voices): one model (turbo) covering seven SA Bantu languages.
+# Swivuriso (DSFSI / African Next Voices): one model (turbo) covering seven South African languages.
 _SWIVURISO_SIZE = 820_000_000
 _SWIVURISO_BASELINE = "1.0.0"
 
@@ -342,7 +342,7 @@ def fluister_catalogue():
 
 def swivuriso_catalogue():
     """Local-only install state of the Swivuriso (DSFSI / African Next Voices) model: one model for
-    seven SA Bantu languages. present = a local ct2 build OR the hosted repo cached. No network."""
+    seven South African languages. present = a local ct2 build OR the hosted repo cached. No network."""
     rec = _installed_versions()
     present = swivuriso_available() or _present(SWIVURISO_REPO)
     if os.path.isdir(SWIVURISO_LOCAL):
@@ -468,7 +468,7 @@ def _run_fluister(repo, revision, version, total):
 # ── Swivuriso: first-time download (DSFSI / African Next Voices) ────────────
 
 def start_swivuriso_download():
-    """Begin a background download of the Swivuriso model (one model, seven SA Bantu languages) from
+    """Begin a background download of the Swivuriso model (one model, seven South African languages) from
     the hosted repo, recording it as installed at the build baseline version. A PLAIN repo pull, not
     a manifest-driven update: faster-whisper would fetch this repo from HuggingFace at first use
     anyway; this just does it up front with a progress bar instead of a silent multi-hundred-MB stall.

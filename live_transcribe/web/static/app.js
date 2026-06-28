@@ -1065,7 +1065,7 @@ function setupView() {
       // English-only first run does not still start in Afrikaans/Fluister (mirrors transcriptionCard).
       var cur = S.settings && S.settings.transcription_language;
       if (cur && cur !== "" && sel.indexOf(cur) < 0) patch.transcription_language = sel[0];
-      if (S.form && S.form.language && S.form.language !== "" && sel.indexOf(S.form.language) < 0) S.form.language = sel[0];
+      if (S.form && S.form.language && S.form.language !== "" && S.form.language !== "sa" && sel.indexOf(S.form.language) < 0) S.form.language = sel[0];
       saveSettings(patch);
     };
     inner = el("div", { class: "col-narrow stack", style: { gap: "18px" } }, [
@@ -2219,7 +2219,7 @@ function startFluisterUpdate(size) {
     .then(function () { pollVoiceDownload(); render(); })
     .catch(function (e) { toast(e.message || "Could not start the update.", true); });
 }
-// Swivuriso (DSFSI / African Next Voices): one credited third-party model for seven SA Bantu
+// Swivuriso (DSFSI / African Next Voices): one credited third-party model for seven South African
 // languages. Beta, shown so someone who selected one of those languages can see the model state.
 // We did not train it, so it carries its own name + credit (MIT).
 function swivurisoPanel() {
@@ -2558,10 +2558,10 @@ var SUPPORTED_LANGS = [
   { code: "ve", name: "Tshivenda", family: "swivuriso" },
 ];
 var SWIVURISO_LANGS = ["zu", "xh", "st", "tn", "ts", "nr", "ve"];
-var LANG_NAMES = { "af": "Afrikaans", "en": "English", "": "Auto-detect",
+var LANG_NAMES = { "af": "Afrikaans", "en": "English", "": "Auto-detect", "sa": "South African languages",
   "zu": "isiZulu", "xh": "isiXhosa", "st": "Sesotho", "tn": "Setswana", "ts": "Xitsonga", "nr": "isiNdebele", "ve": "Tshivenda" };
 function langName(code) { return LANG_NAMES[code] != null ? LANG_NAMES[code] : code; }
-function familyForLang(lang) { var l = (lang || "").toLowerCase().split("-")[0]; if (SWIVURISO_LANGS.indexOf(l) >= 0) return "swivuriso"; return (l === "" || l === "auto" || /^af/.test(l)) ? "fluister" : "whisper"; }
+function familyForLang(lang) { var l = (lang || "").toLowerCase().split("-")[0]; if (l === "sa" || SWIVURISO_LANGS.indexOf(l) >= 0) return "swivuriso"; return (l === "" || l === "auto" || /^af/.test(l)) ? "fluister" : "whisper"; }
 // True once the matching model is actually installed; until then a session honestly runs (and is
 // labelled) as stock Whisper.
 function fluisterReady() { return !!(S.voiceModels && S.voiceModels.fluister_available); }
@@ -2591,12 +2591,13 @@ function familyChip(family, model) {
   if (family === "fluister") return el("span", { class: "chip accent", title: tr("Afrikaans-optimised model") }, [icon("sparkle", 12), el("span", {}, raw(label))]);
   return el("span", { class: "chip" }, [el("span", {}, raw(label))]);
 }
-// The languages the user transcribes (Settings), plus Auto-detect, as picker options.
+// The pre-meeting / import language picker: the three model families plus Auto-detect. The seven
+// South African languages (Swivuriso) are collapsed into one "sa" option so they are reachable in a
+// single tap without cluttering the picker. "sa" is a UI group code that routes to Swivuriso (see
+// familyForLang and transcribe.family_for_language); af -> Fluister, en -> Whisper. The Settings
+// "languages you transcribe" list still drives which models first-run offers to download.
 function transcribeLangOpts() {
-  var ls = (S.settings && S.settings.transcribe_languages) || ["af", "en"];
-  var opts = ls.map(function (c) { return [c, langName(c)]; });
-  opts.push(["", "Auto-detect"]);
-  return opts;
+  return [["af", "Afrikaans"], ["en", "English"], ["sa", "South African languages"], ["", "Auto-detect"]];
 }
 // Language is the hero control on the pre-meeting screens. Switching it re-warms the matching
 // family so Begin stays instant.

@@ -1,5 +1,12 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-28, v1.6.3: South African languages reachable in one tap; "Bantu" removed
+
+`licensing.APP_VERSION` 1.6.2 -> 1.6.3.
+
+- **The South African languages are now in the pre-meeting Language picker.** 1.6.2 routed the seven Swivuriso languages correctly, but the "Start the meeting" screen only offered Afrikaans, English and Auto-detect, so there was no way to choose them there. The picker now reads Afrikaans, English, South African languages, Auto-detect: the seven are collapsed into one "South African languages" option (a "sa" group code that routes to Swivuriso, which auto-detects among the seven). Same on the file-import screen. (`transcribe.py` family_for_language now also accepts the "sa" group code, `web/static/app.js`, `i18n.js`.)
+- **"Bantu" removed throughout.** The term carries apartheid-era baggage in South Africa, so every user-facing string, code comment, the manifest, the docs and the published Swivuriso model card now say "South African languages" instead. (`transcribe.py`, `voicedl.py`, `web/app.py`, `web/static/app.js`, `i18n.js`, `site/models.json`, `docs/`, and the HuggingFace card re-uploaded via `push_swivuriso.py`.)
+
 ## 2026-06-28, v1.6.2: Swivuriso is hosted, so every machine can get it
 
 `licensing.APP_VERSION` 1.6.1 -> 1.6.2.

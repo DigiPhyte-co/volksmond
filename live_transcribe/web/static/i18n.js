@@ -462,6 +462,7 @@ window.VM_I18N = {
     // Swivuriso (DSFSI / African Next Voices) family + the three-family note
     "Three model families, chosen by language": "Drie modelfamilies, gekies volgens taal",
     "South African languages model": "Suid-Afrikaanse tale-model",
+    "South African languages": "Suid-Afrikaanse tale",
     "South African languages (Swivuriso)": "Suid-Afrikaanse tale (Swivuriso)",
     "Beta": "Beta",
     "Fluister, our Afrikaans-tuned model: best for Afrikaans and mixed Afrikaans and English meetings. It downloads automatically the first time you transcribe Afrikaans.":
