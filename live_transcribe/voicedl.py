@@ -463,3 +463,23 @@ def _run_fluister(repo, revision, version, total):
         _set(state="done", downloaded=total)
     except Exception as e:
         _set(state="error", error=str(e))
+
+
+# ── Swivuriso: first-time download (DSFSI / African Next Voices) ────────────
+
+def start_swivuriso_download():
+    """Begin a background download of the Swivuriso model (one model, seven SA Bantu languages) from
+    the hosted repo, recording it as installed at the build baseline version. A PLAIN repo pull, not
+    a manifest-driven update: faster-whisper would fetch this repo from HuggingFace at first use
+    anyway; this just does it up front with a progress bar instead of a silent multi-hundred-MB stall.
+    Raises RuntimeError if a download is already running. Reuses _run_fluister (a generic repo sync +
+    record-installed); the blank revision skips the pin check and records the baseline version."""
+    repo = SWIVURISO_REPO
+    with _LOCK:
+        if _STATE["state"] == "downloading":
+            raise RuntimeError("A model is already downloading.")
+        _STATE.update({"state": "downloading", "model": "swivuriso", "repo": repo, "kind": "swivuriso",
+                       "version": _SWIVURISO_BASELINE, "revision": "",
+                       "downloaded": 0, "total": _SWIVURISO_SIZE, "error": None})
+    threading.Thread(target=_run_fluister, args=(repo, "", _SWIVURISO_BASELINE, _SWIVURISO_SIZE),
+                     daemon=True).start()

@@ -2226,20 +2226,40 @@ function swivurisoPanel() {
   var d = S.voiceModels;
   if (!d || !d.swivuriso) return null;
   var sv = d.swivuriso;
+  var p = d.progress || {};
+  var downloading = p.state === "downloading";
+  var isThis = downloading && p.kind === "swivuriso";
+  var pct = (isThis && p.total) ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0;
+  var right;
+  if (sv.present) {
+    right = el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]);
+  } else {
+    right = el("div", { class: "row gap-8", style: { alignItems: "center" } }, [
+      el("span", { class: "chip" }, raw(fmtGB(sv.approx_bytes))),
+      el("button", { class: "btn sm", disabled: downloading, onclick: function () { if (downloading) return; startSwivurisoDownload(); } }, isThis ? "Downloading" : "Download"),
+    ]);
+  }
   return el("div", { class: "card", style: { padding: "12px 14px", marginBottom: "12px", background: "var(--surface-2)" } }, [
     el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "center", marginBottom: "6px" } }, [
       el("div", { class: "row gap-8", style: { alignItems: "center" } }, [
         el("span", { style: { fontWeight: "600", fontSize: "13px" }, text: "South African languages (Swivuriso)" }),
         el("span", { class: "chip", text: "Beta" }),
       ]),
-      sv.present ? el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]) : null,
+      right,
     ]),
     el("div", { style: { fontSize: "11.5px", color: "var(--ink-3)", marginBottom: "6px" } }, raw("isiZulu, isiXhosa, Sesotho, Setswana, Xitsonga, isiNdebele, Tshivenda")),
     el("div", { class: "ink-3", style: { fontSize: "11.5px" }, text: sv.present
       ? "One model covers all seven. It runs on auto-detect."
-      : "Not installed yet. Pick one of these languages to use it." }),
+      : "Not installed yet. Download it now, or it downloads automatically the first time you pick one of these languages." }),
+    isThis ? voiceProgressBar(pct) : null,
+    isThis ? el("div", { id: "vm-vdl-text", class: "ink-3", style: { fontSize: "11.5px", marginTop: "4px" } }, raw(fmtGB(p.downloaded) + " of " + fmtGB(p.total) + "  (" + pct + "%)")) : null,
     el("div", { style: { fontSize: "11px", color: "var(--ink-3)", marginTop: "6px", borderTop: "0.5px solid var(--line)", paddingTop: "6px" }, text: "Model by DSFSI, African Next Voices. MIT licence." }),
   ]);
+}
+function startSwivurisoDownload() {
+  api.post("/api/voice-model/swivuriso-download")
+    .then(function () { pollVoiceDownload(); render(); })
+    .catch(function (e) { toast(e.message || "Could not start the download.", true); });
 }
 function voiceModelCard() {
   return el("div", { class: "card settings-card" }, [

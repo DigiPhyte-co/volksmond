@@ -63,9 +63,9 @@ _FLUISTER = {
 # from dsfsi-anv/za-anv-multilingual-whisper-v3-turbo; a local ct2 build is reused if present, just
 # like Fluister. Credit DSFSI / African Next Voices (model card + NOTICE on the hosted repo).
 SWIVURISO_LANGS = ("zu", "xh", "st", "tn", "ts", "nr", "ve")  # isiZulu isiXhosa Sesotho Setswana Xitsonga isiNdebele Tshivenda
-SWIVURISO_REPO = "digiphyte/swivuriso-turbo"          # our hosted ct2 (publish pending)
+SWIVURISO_REPO = "digiphyte/swivuriso-turbo"          # our hosted ct2 (published, public, MIT)
 SWIVURISO_LOCAL = r"C:\Users\seanf\.cache\swivuriso-turbo-ct2-int8"
-SWIVURISO_HOSTED = False                               # flip True once SWIVURISO_REPO is published
+SWIVURISO_HOSTED = True                                # SWIVURISO_REPO is published, so non-local machines resolve to it
 
 
 def swivuriso_model():

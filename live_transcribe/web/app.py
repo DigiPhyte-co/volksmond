@@ -1509,6 +1509,24 @@ def voice_model_update(req: VoiceUpdateRequest):
     return voicedl.progress()
 
 
+@app.post("/api/voice-model/swivuriso-download")
+def voice_model_swivuriso_download():
+    """Download the Swivuriso model (one model for seven SA Bantu languages, by DSFSI / African Next
+    Voices) to this machine up front, with a progress bar, instead of faster-whisper fetching it
+    silently at first use. Background; the UI polls /api/voice-models for progress (shared with the
+    other downloads). Refused while a session runs, since it writes into the model cache a live
+    engine may read."""
+    from .. import voicedl
+    with STATE.lock:
+        if STATE.engine is not None:
+            raise HTTPException(status_code=409, detail="A transcription session is running. Stop it before downloading a model.")
+    try:
+        voicedl.start_swivuriso_download()
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return voicedl.progress()
+
+
 @app.get("/api/cuda")
 def cuda_status():
     """NVIDIA CUDA (optional GPU acceleration) status. NVIDIA ONLY; AMD/Intel GPUs use

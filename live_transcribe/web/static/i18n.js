@@ -469,7 +469,7 @@ window.VM_I18N = {
     "Swivuriso, by African Next Voices (DSFSI): one model for seven South African languages (isiZulu, isiXhosa, Sesotho, Setswana, Xitsonga, isiNdebele, Tshivenda). Beta.":
       "Swivuriso, deur African Next Voices (DSFSI): een model vir sewe Suid-Afrikaanse tale (isiZulu, isiXhosa, Sesotho, Setswana, Xitsonga, isiNdebele, Tshivenda). Beta.",
     "One model covers all seven. It runs on auto-detect.": "Een model dek al sewe. Dit loop op outomatiese opsporing.",
-    "Not installed yet. Pick one of these languages to use it.": "Nog nie geïnstalleer nie. Kies een van hierdie tale om dit te gebruik.",
+    "Not installed yet. Download it now, or it downloads automatically the first time you pick one of these languages.": "Nog nie geïnstalleer nie. Laai dit nou af, of dit laai outomaties af die eerste keer wat jy een van hierdie tale kies.",
     "Model by DSFSI, African Next Voices. MIT licence.": "Model deur DSFSI, African Next Voices. MIT-lisensie.",
     "The Swivuriso model for South African languages is not installed on this computer yet, so this runs on standard Whisper for now.":
       "Die Swivuriso-model vir Suid-Afrikaanse tale is nog nie op hierdie rekenaar geïnstalleer nie, so dit loop voorlopig op standaard Whisper.",

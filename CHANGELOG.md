@@ -1,5 +1,12 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-28, v1.6.2: Swivuriso is hosted, so every machine can get it
+
+`licensing.APP_VERSION` 1.6.1 -> 1.6.2.
+
+- **Swivuriso now downloads on any machine, with a progress bar.** v1.6.1 shipped Swivuriso (the seven South African languages) but only Sean's dev box had it, as a local ct2 build; every other machine silently fell back to standard Whisper for those languages. The converted model is now published at huggingface.co/digiphyte/swivuriso-turbo (public, MIT, credited to DSFSI / African Next Voices, with the OpenAI Whisper Apache-2.0 base preserved in NOTICE), and `transcribe.SWIVURISO_HOSTED` is flipped on, so a machine without the local build resolves to the hosted repo. A **Download** button in Settings -> Transcription model (the Swivuriso card) pulls it down up front with a progress bar instead of faster-whisper fetching it silently at first use; it also still downloads automatically the first time one of the seven languages is picked. New plain-repo download path (`voicedl.start_swivuriso_download`, recording the build baseline version) + `POST /api/voice-model/swivuriso-download` (session-gated) + the Settings card affordance and Afrikaans copy. Still beta. (`transcribe.py`, `voicedl.py`, `web/app.py`, `web/static/app.js`, `i18n.js`.)
+- **Publishing script.** `SA-ASR-Model/finetune/push_swivuriso.py` (the Swivuriso twin of `push_fluister.py`) uploads the ct2 build with a credit-first model card, the model's MIT LICENSE, a NOTICE crediting DSFSI / African Next Voices and OpenAI Whisper, and the Apache-2.0 text.
+
 ## 2026-06-28, v1.6.1: Swivuriso, South African languages (beta)
 
 `licensing.APP_VERSION` 1.6.0 -> 1.6.1.
