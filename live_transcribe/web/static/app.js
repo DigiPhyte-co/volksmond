@@ -1405,7 +1405,7 @@ function startingView() {
 // Manager to find out where transcription is actually running.
 function deviceBadge(tier) {
   if (!tier) return null;
-  if (tier === "gpu" || tier === "gpu-4gb") {
+  if (tier && tier.indexOf("gpu") === 0) {   // gpu, gpu-4gb, gpu-turbo, gpu-medium, gpu-small
     return el("span", { class: "chip ok", title: (S.cuda && S.cuda.gpu_name) || "GPU" }, [icon("check", 12), "GPU"]);
   }
   return el("span", { class: "chip" }, "CPU");
@@ -1414,8 +1414,8 @@ function deviceBadge(tier) {
 function liveView() {
   var statusChip;
   if (S.live.stopping) statusChip = el("span", { class: "chip warn" }, [el("span", { class: "dot" }), el("span", { id: "live-status-text", text: "Finishing" })]);
-  else if (S.live.transcribing) statusChip = el("span", { class: "chip live" }, [el("span", { class: "dot" }), "Listening"]);
-  else statusChip = el("span", { class: "chip ok" }, [el("span", { class: "dot" }), "Saved"]);
+  else if (S.live.transcribing) statusChip = el("span", { class: "chip live" }, [el("span", { class: "dot" }), el("span", { text: "Listening" })]);
+  else statusChip = el("span", { class: "chip ok" }, [el("span", { class: "dot" }), el("span", { text: "Saved" })]);
 
   elapsedEl = el("span", { class: "mono", text: fmtElapsed(S.live.startedAt) });
   var langLabel = (S.live.language === "auto" || !S.live.language) ? "Auto-detect" : langName(S.live.language);
@@ -2712,7 +2712,7 @@ function aecLiveControl() {
 // shown here and in the download panel, so the two never disagree. Auto is default.
 var QUALITY_OPTS = [["auto", "Auto"], ["small", "Fast"], ["medium", "Balanced"], ["large-v3-turbo", "High quality"], ["large-v3", "Best"]];
 // Legacy saved tier keys -> the new model-keyed quality, so old settings still highlight.
-var LEGACY_QUALITY = { "gpu": "large-v3", "gpu-4gb": "large-v3", "cpu-large": "large-v3", "cpu-strong": "large-v3-turbo", "cpu-mid": "medium", "cpu": "small", "cpu-min": "small" };
+var LEGACY_QUALITY = { "gpu": "large-v3", "gpu-4gb": "large-v3", "gpu-turbo": "large-v3-turbo", "gpu-medium": "medium", "gpu-small": "small", "cpu-large": "large-v3", "cpu-strong": "large-v3-turbo", "cpu-mid": "medium", "cpu": "small", "cpu-min": "small" };
 function normalizeQuality(q) {
   if (!q) return "auto";
   for (var i = 0; i < QUALITY_OPTS.length; i++) { if (QUALITY_OPTS[i][0] === q) return q; }

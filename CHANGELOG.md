@@ -1,5 +1,14 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-30, v1.7.1: fix the GPU/CPU label + Quality readout on the new GPU tiers
+
+`licensing.APP_VERSION` 1.7.0 -> 1.7.1.
+
+- **The GPU/CPU badge and the Quality dropdown now read correctly on the new GPU size tiers.** v1.7.0 added `gpu-turbo`/`gpu-medium`/`gpu-small`, but the header badge only recognised `gpu`/`gpu-4gb`, so a session running on GPU turbo was mislabelled "CPU", and the live Quality dropdown showed "Auto" instead of the running size. Transcription was unaffected (it really was on the GPU); only the labels were wrong. Fixed the badge check (any `gpu*` tier) and the `LEGACY_QUALITY` map. (`web/static/app.js`.)
+- **Listening / Saved status pills wrap their text in a span**, so the dot is unambiguously the first flex item (dot to the left, pill sized to content), consistent with the Finishing pill. (`web/static/app.js`.)
+
+Verified: node --check; no Python logic changed, so test_web_api + test_engine_drain are unaffected.
+
 ## 2026-06-29, v1.7.0: one clean stereo recording + model selection that respects your pick
 
 `licensing.APP_VERSION` 1.6.4 -> 1.7.0.
