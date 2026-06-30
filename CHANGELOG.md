@@ -1,5 +1,15 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-06-29, v1.7.0: one clean stereo recording + model selection that respects your pick
+
+`licensing.APP_VERSION` 1.6.4 -> 1.7.0.
+
+- **Recordings are now a single, echo-cancelled stereo file.** A recorded session used to leave three raw files (`-MIC.wav`, `-SYS.wav`, `-MIXED.wav`) with the speaker echo still in the mic, so the recordings were messy and a re-transcribe of them came out garbled. A session now saves one `<stem>.wav`: LEFT = your mic, RIGHT = everyone else, with echo cancellation already applied to the mic (live AEC is now ON by default). The per-source channels are still written during the meeting (crash-safe) and folded into the single stereo file on close, then removed. Tradeoff: baked-in AEC can blur your words during heavy crosstalk, the same trade Zoom and Teams make. (`config.py` aec_live default, `sinks.py` AudioRecorder.`_finalise_recording`, `web/app.py` start endpoint + sessions list.)
+- **Re-transcribe splits the stereo recording; legacy recordings still work.** The file engine detects the single stereo recording and transcribes left as MIC and right as SYS, with no echo step (the mic is already clean). Old per-source `-MIC/-SYS` recordings keep the offline-AEC path unchanged. (`web/app.py` transcribe-file.)
+- **Model selection now respects exactly what you pick.** Choosing a Quality (Fast / Balanced / High quality / Best) is honoured on the GPU too, not silently overridden to large-v3 as before. "Auto" picks the best model for the chosen language: Afrikaans goes to Fluister turbo (our v2 tune beats large-v3), English goes to Whisper large-v3. The CPU "too slow, stepping down" loop is unchanged. New GPU size tiers and a rewritten `resolve_tier(quality, device, language, engine)`. (`transcribe.py` TIER_CONFIG, `__main__.py`, `web/app.py`, `web/static/app.js`.)
+
+Verified: py_compile, node --check, and test_web_api (with new stereo-fold + model-selection tests) + test_engine_drain all green. The recording format and the model picker still want an on-machine eyeball and a real-meeting validation (live transcript vs a re-transcribe of the recording).
+
 ## 2026-06-28, v1.6.4: consistent model cards (sizes, descriptions, Remove for every family)
 
 `licensing.APP_VERSION` 1.6.3 -> 1.6.4.

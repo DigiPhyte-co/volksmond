@@ -134,6 +134,11 @@ def fluister_available():
 TIER_CONFIG = {
     "gpu":        {"model": "large-v3",       "device": "cuda", "compute_type": "int8_float16"},
     "gpu-4gb":    {"model": "large-v3",       "device": "cuda", "compute_type": "int8_float16"},
+    # GPU size variants, so an explicit Quality pick is honoured on the GPU instead of always
+    # running large-v3. Same compute_type; only the model size loaded differs.
+    "gpu-turbo":  {"model": "large-v3-turbo", "device": "cuda", "compute_type": "int8_float16"},
+    "gpu-medium": {"model": "medium",         "device": "cuda", "compute_type": "int8_float16"},
+    "gpu-small":  {"model": "small",          "device": "cuda", "compute_type": "int8_float16"},
     # CPU tiers set the STARTING size. On CPU the engine measures its real-time
     # factor each chunk and auto-downgrades along CPU_LADDER if it can't keep up
     # (see _maybe_downgrade), so a fast CPU keeps the bigger model and a slow one

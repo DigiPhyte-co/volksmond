@@ -567,7 +567,7 @@ def reconfigure(req: ReconfigureRequest):
     if change_model or family_change:
         if data.get("tier"):
             # A quality change: map the key to a size on THIS device (never flip CPU<->GPU live).
-            new_tier = resolve_tier(data["tier"], "cpu" if cur_is_cpu else "auto")
+            new_tier = resolve_tier(data["tier"], "cpu" if cur_is_cpu else "auto", new_lang, new_engine_pref)
             new_size = transcribe.TIER_CONFIG[new_tier]["model"]
         else:
             new_size = cur_size                   # engine/family-only change: keep the running size
@@ -624,9 +624,9 @@ def warm_up(req: WarmUpRequest):
     settings = config.load()
     quality = req.tier if (req.tier and req.tier != "auto") else (settings.get("tier") or "auto")
     device = (getattr(req, "device", None) or settings.get("device") or "auto")
-    tier = resolve_tier(quality, device)
     language = req.language or None     # "" (auto-detect) -> None, matching Begin
     engine_pref = (req.engine or settings.get("engine") or "auto")
+    tier = resolve_tier(quality, device, language, engine_pref)
     return transcribe.warm_up_async(tier, language, engine_pref)
 
 
@@ -640,7 +640,9 @@ def _resolve_tier_lang_prompt(req):
     if quality is None and settings.get("tier") and settings["tier"] != "auto":
         quality = settings["tier"]
     device = getattr(req, "device", None) or settings.get("device") or "auto"
-    tier = resolve_tier(quality or "auto", device)
+    language = req.language if req.language else None  # "" -> None (auto-detect)
+    engine_pref = (getattr(req, "engine", None) or settings.get("engine") or "auto")
+    tier = resolve_tier(quality or "auto", device, language, engine_pref)
     # Record the device decision in the log so a "why is it on CPU?" is answerable at a
     # glance (calling cuda_ready here also registers the libs before the engine loads).
     try:
@@ -649,10 +651,8 @@ def _resolve_tier_lang_prompt(req):
               f"installed={cudadl.installed()} cuda_ready={cudadl.cuda_ready()} -> {tier}", flush=True)
     except Exception:
         pass
-    language = req.language if req.language else None  # "" -> None (auto-detect)
     parts = [p for p in (settings.get("default_context", "").strip(), req.prompt.strip()) if p]
     prompt = ", ".join(parts) or None
-    engine_pref = (getattr(req, "engine", None) or settings.get("engine") or "auto")
     return tier, language, prompt, engine_pref
 
 
@@ -718,7 +718,7 @@ def start(req: StartRequest):
             chunk_seconds=chunk_seconds,
             on_chunk=_feed,
             aec=aec_live,
-            record_raw_mic=(record_on and aec_live),
+            record_raw_mic=False,   # record the AEC-cleaned mic into the single stereo file, not a raw stem
         )
         try:
             cap.start()
@@ -815,10 +815,15 @@ def transcribe_file(req: TranscribeFileRequest):
         candidate = Path(req.stem).name + ".md"
         _validate_session_filename(candidate)
         base = candidate[:-3]
-        # Feed the per-source channels (-MIC/-SYS), never the convenience -MIXED.wav:
-        # the mix is the same audio summed, so including it would double-count.
-        files += sorted(str(p) for p in sdir.glob(base + "-*.wav")
-                        if not p.name.lower().endswith("-mixed.wav"))
+        stereo = sdir / (base + ".wav")
+        if stereo.is_file():
+            # New format: one stereo recording (left = MIC, right = SYS), already echo-cancelled.
+            files.append(str(stereo))
+        else:
+            # Legacy format: the per-source channels (-MIC/-SYS), never the summed -MIXED.wav
+            # (it is the same audio summed, so including it would double-count).
+            files += sorted(str(p) for p in sdir.glob(base + "-*.wav")
+                            if not p.name.lower().endswith("-mixed.wav"))
     elif files:
         files = _expand_recording_channels(files)
     files = [f for f in files if Path(f).is_file()]
@@ -882,39 +887,57 @@ def transcribe_file(req: TranscribeFileRequest):
         try:
             from faster_whisper.audio import decode_audio
             win = int(16000 * chunk_seconds)
-            # Echo cancellation: when re-transcribing a recording that has BOTH channels, subtract
-            # the SYS (speaker) echo from the MIC before transcribing, so the other side is not
-            # transcribed twice. The cleaned MIC + raw SYS still feed the engine with their source
-            # tags, so the you/other-side split is preserved. Best-effort: any failure falls back
-            # to the raw MIC. Decoded audio is cached so SYS is not decoded twice.
-            decoded = {}
-            # Run on ANY file set that has both a MIC and a SYS channel (a History re-transcribe via
-            # stem, OR an uploaded recording whose siblings were pulled in above), not just the stem
-            # path. The inner mic_fp/sys_fp check is the real guard that both channels are present.
-            if aec_on:
-                from .. import aec as _aec
-                if _aec.available():
-                    mic_fp = next((f for f in files if f.lower().endswith("-mic.wav")), None)
-                    sys_fp = next((f for f in files if f.lower().endswith("-sys.wav")), None)
-                    if mic_fp and sys_fp:
-                        try:
-                            mic_audio = decode_audio(mic_fp, sampling_rate=16000)
-                            sys_audio = decode_audio(sys_fp, sampling_rate=16000)
-                            decoded[sys_fp] = sys_audio
-                            decoded[mic_fp] = _aec.cancel_echo(mic_audio, sys_audio)
-                            print(f"[transcribe-file] echo cancellation applied to {Path(mic_fp).name}", flush=True)
-                        except Exception as e:
-                            decoded.clear()
-                            print(f"[transcribe-file] echo cancellation skipped: {e}", flush=True)
             items = []  # (t_start, source, window), merged across files by time
-            for fp in files:
-                low = fp.lower()
-                src = "MIC" if low.endswith("-mic.wav") else ("SYS" if low.endswith("-sys.wav") else "FILE")
-                audio = decoded.get(fp)
-                if audio is None:
-                    audio = decode_audio(fp, sampling_rate=16000)
-                for i in range(0, len(audio), win):
-                    items.append((i / 16000.0, src, audio[i:i + win]))
+            # New single stereo recording (<stem>.wav: left = MIC, right = SYS), already
+            # echo-cancelled at capture. Split the channels and skip offline AEC entirely.
+            if base and len(files) == 1:
+                import wave as _wave
+                import numpy as _np
+                ok, raw = False, b""
+                try:
+                    with _wave.open(files[0], "rb") as w:
+                        ok = (w.getnchannels() == 2 and w.getframerate() == 16000)
+                        if ok:
+                            raw = w.readframes(w.getnframes())
+                except Exception:
+                    ok = False
+                if ok:
+                    data = _np.frombuffer(raw, dtype="<i2").astype(_np.float32).reshape(-1, 2) / 32768.0
+                    for src, chan in (("MIC", data[:, 0]), ("SYS", data[:, 1])):
+                        for i in range(0, len(chan), win):
+                            items.append((i / 16000.0, src, _np.ascontiguousarray(chan[i:i + win])))
+
+            if not items:
+                # Legacy / import path. When the file set has both a MIC and a SYS channel (an old
+                # per-source recording, or an uploaded recording whose siblings were pulled in),
+                # subtract the SYS (speaker) echo from the MIC before transcribing, so the other
+                # side is not transcribed twice. The cleaned MIC + raw SYS keep their source tags,
+                # so the you/other-side split is preserved. Best-effort: any failure falls back to
+                # the raw MIC. Decoded audio is cached so SYS is not decoded twice.
+                decoded = {}
+                if aec_on:
+                    from .. import aec as _aec
+                    if _aec.available():
+                        mic_fp = next((f for f in files if f.lower().endswith("-mic.wav")), None)
+                        sys_fp = next((f for f in files if f.lower().endswith("-sys.wav")), None)
+                        if mic_fp and sys_fp:
+                            try:
+                                mic_audio = decode_audio(mic_fp, sampling_rate=16000)
+                                sys_audio = decode_audio(sys_fp, sampling_rate=16000)
+                                decoded[sys_fp] = sys_audio
+                                decoded[mic_fp] = _aec.cancel_echo(mic_audio, sys_audio)
+                                print(f"[transcribe-file] echo cancellation applied to {Path(mic_fp).name}", flush=True)
+                            except Exception as e:
+                                decoded.clear()
+                                print(f"[transcribe-file] echo cancellation skipped: {e}", flush=True)
+                for fp in files:
+                    low = fp.lower()
+                    src = "MIC" if low.endswith("-mic.wav") else ("SYS" if low.endswith("-sys.wav") else "FILE")
+                    audio = decoded.get(fp)
+                    if audio is None:
+                        audio = decode_audio(fp, sampling_rate=16000)
+                    for i in range(0, len(audio), win):
+                        items.append((i / 16000.0, src, audio[i:i + win]))
             items.sort(key=lambda x: x[0])
             aborted = False
             for t_start, src, window in items:
@@ -1180,9 +1203,10 @@ def sessions_list():
     for p in sdir.glob("*.wav"):
         low = p.name.lower()
         suff = next((s for s in ("-mic.wav", "-sys.wav", "-mixed.wav") if low.endswith(s)), None)
-        if suff is None:
-            continue
-        r = _row(p.name[:-len(suff)])
+        # New recordings are a single stereo `<stem>.wav`; legacy ones are per-source
+        # `<stem>-MIC/-SYS/-MIXED.wav`. Either way, map back to the session stem.
+        stem = p.name[:-len(suff)] if suff is not None else p.name[:-4]
+        r = _row(stem)
         r["recorded"] = True
         try:
             r["mtime"] = max(r["mtime"], p.stat().st_mtime)

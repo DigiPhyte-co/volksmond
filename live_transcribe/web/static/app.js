@@ -411,11 +411,10 @@ function liveAudioStrip() {
   ]);
 }
 // Compact strip on the live screen to change the LANGUAGE and MODEL mid-meeting. Language alone
-// keeps the loaded model; Engine/Quality reload it. Quality shows only on CPU, where the size is
-// the user's to pick (on the GPU the best model always runs).
+// keeps the loaded model; Engine/Quality reload it. Quality is the user's to pick on GPU or CPU
+// (Auto runs the best model for the chosen language).
 function liveTuneStrip() {
   if (!S.live.transcribing || S.live.stopping) return null;
-  var isGpu = (S.live.tier === "gpu" || S.live.tier === "gpu-4gb");
   var langVal = (S.live.language === "auto" || !S.live.language) ? "" : S.live.language;
   function tuneSelect(opts, value, fn) {
     var s = el("select", {
@@ -434,7 +433,7 @@ function liveTuneStrip() {
     field("Language", tuneSelect(transcribeLangOpts(), langVal, function (v) { reconfigureLive({ language: v }, "Language switched."); })),
     field("Engine", tuneSelect([["auto", "Auto"], ["fluister", "Fluister"], ["whisper", "Whisper"]], S.live.engine || "auto", function (v) { reconfigureLive({ engine: v }, "Model switched."); })),
   ];
-  if (!isGpu) items.push(field("Quality", tuneSelect(QUALITY_OPTS, normalizeQuality(S.live.tier), function (v) { reconfigureLive({ tier: v }, "Model switched."); })));
+  items.push(field("Quality", tuneSelect(QUALITY_OPTS, normalizeQuality(S.live.tier), function (v) { reconfigureLive({ tier: v }, "Model switched."); })));
   return el("div", { class: "row gap-16", style: { flexWrap: "wrap", padding: "8px 16px", borderBottom: "1px solid var(--line)", background: "var(--surface-2)", alignItems: "center" } }, items);
 }
 
@@ -2757,8 +2756,8 @@ function segmented(options, value, onChange) {
   }));
 }
 // "Run on" GPU/CPU choice for the pre-meeting + import screens. Returns null unless an
-// NVIDIA GPU is present. Remembered as a setting (default GPU). On the GPU the best model
-// runs, so the Quality picker only matters on CPU.
+// NVIDIA GPU is present. Remembered as a setting (default GPU). The Model size choice above is
+// honoured on either processor; Auto picks the best model for the chosen language.
 function runOnField() {
   if (!(S.cuda && S.cuda.gpu_present)) return null;
   var v = (S.form.device === "cpu") ? "cpu" : "auto";
@@ -2766,8 +2765,8 @@ function runOnField() {
     S.form.device = val; saveSettings({ device: val }); render();
   });
   var note = (v === "cpu")
-    ? el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Running on the CPU. The Quality choice above applies." })
-    : el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "On the GPU, Volksmond runs the Best model. The Quality choice applies on CPU." });
+    ? el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Running on the CPU. Auto starts high and steps down if your computer cannot keep up." })
+    : el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Running on the GPU. Your Model size choice above is used as-is; Auto picks the best model for your language." });
   return formField("Run on", null, el("div", {}, [seg, note]), true);
 }
 function selectEl(options, value, onChange) {

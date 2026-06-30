@@ -106,11 +106,14 @@ def pick_tier(explicit):
     return "cpu"            # small start for modest CPUs (downgrades live if it lags)
 
 
-# UI quality keys are model names (plus "auto"); map them to concrete tiers. large-v3
-# uses the GPU when one is present, else CPU (slow live, but fine for uploaded files).
+# UI quality keys are model SIZES (plus "auto"); map them to a concrete tier per device.
 _QUALITY_TO_CPU_TIER = {
     "small": "cpu", "medium": "cpu-mid", "large-v3-turbo": "cpu-strong",
     "large-v3": "cpu-large", "base": "cpu-min",
+}
+_QUALITY_TO_GPU_TIER = {
+    "small": "gpu-small", "base": "gpu-small", "medium": "gpu-medium",
+    "large-v3-turbo": "gpu-turbo", "large-v3": "gpu",
 }
 
 
@@ -120,28 +123,37 @@ def _cpu_auto_tier():
     return "cpu-mid" if cores >= 8 else "cpu"
 
 
-def resolve_tier(quality, device="auto"):
-    """Resolve a UI quality choice + device preference to a concrete TIER_CONFIG tier.
+def _best_size_for(language, engine="auto"):
+    """Highest-quality model SIZE for the family this language/engine will use: Fluister
+    (Afrikaans) is best at large-v3-turbo (our v2 tune beats large-v3); stock Whisper
+    (English/other) is best at large-v3; Swivuriso is one model, so the size is nominal."""
+    from . import transcribe
+    eng = (engine or "auto").lower()
+    fam = eng if eng in ("fluister", "whisper", "swivuriso") else transcribe.family_for_language(language)
+    return "large-v3-turbo" if fam == "fluister" else "large-v3"
 
-    device: "cpu" forces the CPU even when a GPU is present; "auto"/"gpu" use the GPU when
-    it is ready. The UI exposes this as a GPU/CPU toggle (default GPU on GPU machines). On
-    the GPU large-v3 is fast, so the Quality dropdown only applies on the CPU; on the GPU we
-    run the best model the card can hold."""
+
+def resolve_tier(quality, device="auto", language=None, engine="auto"):
+    """Resolve a UI quality choice + device + language to a concrete TIER_CONFIG tier.
+
+    device: "cpu" forces the CPU even when a GPU is present; "auto"/"gpu" use the GPU when ready.
+    An EXPLICIT quality (a size like "medium"/"large-v3") is honoured as-is, on GPU or CPU, so the
+    user always gets the model they asked for. "auto" picks the highest-quality model for the
+    chosen language's family (Afrikaans -> turbo, English -> large-v3). On the CPU the engine still
+    downgrades along CPU_LADDER if the chosen model cannot keep up live."""
+    explicit = bool(quality) and quality != "auto"
     if device != "cpu":
         try:
             from . import cudadl
             if cudadl.cuda_ready():
-                # Pick the GPU tier directly from VRAM. Do NOT route through pick_tier() here:
-                # it honours the SA_LIVE_TIER env override (a CLI-only feature), so a stray
-                # leftover like SA_LIVE_TIER=cpu-strong would silently force a CPU tier even
-                # though the user chose GPU and the GPU is ready (the cuda_ready=True ->
-                # cpu-strong bug seen on the test laptop). The GUI app never honours it.
-                vram = _gpu_vram_mb()
-                return "gpu-4gb" if (vram is not None and vram < 6000) else "gpu"
+                # Do NOT route through pick_tier() here: it honours the SA_LIVE_TIER env override
+                # (a CLI-only feature), which could force a CPU tier even though the GPU is ready.
+                size = quality if explicit else _best_size_for(language, engine)
+                return _QUALITY_TO_GPU_TIER.get(size, "gpu")
         except Exception:
             pass
     # CPU path (forced, or no usable GPU): honour the picked quality, never a GPU tier.
-    if not quality or quality == "auto":
+    if not explicit:
         return _cpu_auto_tier()
     if quality in TIER_CHOICES:
         t = pick_tier(quality)
@@ -152,7 +164,7 @@ def resolve_tier(quality, device="auto"):
 
 
 def default_chunk_seconds(tier):
-    return 8 if tier in ("gpu", "gpu-4gb") else 15
+    return 8 if tier.startswith("gpu") else 15
 
 
 def default_output_path():

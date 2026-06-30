@@ -119,12 +119,13 @@ def test_cuda_api():
 
 
 def test_quality_resolution():
-    # The UI sends model-keyed quality choices; resolve_tier maps each to a real tier
-    # whose model matches. Force the CPU path (device="cpu"): on a GPU box every quality
-    # is overridden to the GPU tier (the Quality dropdown only applies on the CPU), so the
-    # quality->model mapping is only meaningful, and only deterministic, on the CPU path.
+    # An EXPLICIT quality is honoured as the model the user asked for, on CPU or GPU.
+    # "auto" picks the best model for the language's family (Afrikaans -> turbo, English ->
+    # large-v3). The CPU path is deterministic; the GPU path is exercised with cuda_ready stubbed.
     from live_transcribe.__main__ import resolve_tier
     from live_transcribe.transcribe import TIER_CONFIG
+    from live_transcribe import cudadl as _cudadl
+    # CPU path: explicit size honoured, never a GPU tier.
     assert TIER_CONFIG[resolve_tier("small", "cpu")]["model"] == "small"
     assert TIER_CONFIG[resolve_tier("medium", "cpu")]["model"] == "medium"
     assert TIER_CONFIG[resolve_tier("large-v3-turbo", "cpu")]["model"] == "large-v3-turbo"
@@ -132,7 +133,21 @@ def test_quality_resolution():
     assert resolve_tier("auto") in TIER_CONFIG
     assert resolve_tier("cpu-mid") in TIER_CONFIG          # legacy tier key passthrough
     assert "cpu-large" in TIER_CONFIG and TIER_CONFIG["cpu-large"]["device"] == "cpu"
-    print("  OK  quality resolution: model keys + auto + legacy all map to valid tiers")
+    # GPU path (cuda_ready stubbed True): explicit picks are HONOURED, not overridden to large-v3.
+    orig = _cudadl.cuda_ready
+    _cudadl.cuda_ready = lambda: True
+    try:
+        assert TIER_CONFIG[resolve_tier("medium", "auto")]["model"] == "medium"
+        assert TIER_CONFIG[resolve_tier("small", "auto")]["model"] == "small"
+        assert TIER_CONFIG[resolve_tier("large-v3-turbo", "auto")]["model"] == "large-v3-turbo"
+        # "auto" = best model for the language: Afrikaans -> turbo, English -> large-v3.
+        assert TIER_CONFIG[resolve_tier("auto", "auto", "af")]["model"] == "large-v3-turbo"
+        assert TIER_CONFIG[resolve_tier("auto", "auto", "en")]["model"] == "large-v3"
+        # device="cpu" still forces the CPU even when a GPU is ready.
+        assert TIER_CONFIG[resolve_tier("medium", "cpu")]["device"] == "cpu"
+    finally:
+        _cudadl.cuda_ready = orig
+    print("  OK  quality resolution: explicit honoured (CPU+GPU), auto = best per language")
 
 
 def test_family_resolution():
@@ -357,6 +372,30 @@ def test_recording_channel_bundling():
     print("  OK  upload of one recording channel bundles MIC+SYS (drops MIXED); external file untouched")
 
 
+def test_recorder_stereo_fold():
+    # The recorder streams per-source mono during the session, then on close folds MIC+SYS into
+    # ONE stereo <stem>.wav (left = MIC / you, right = SYS / everyone else) and removes the
+    # per-source files, so the user is left with a single clean playable + re-transcribable file.
+    import tempfile, pathlib, wave
+    import numpy as np
+    from live_transcribe import sinks
+    d = pathlib.Path(tempfile.mkdtemp())
+    stem = d / "2026-01-01-0000-call"
+    rec = sinks.AudioRecorder(stem)
+    rec.on_chunk("MIC", np.full(16000, 0.5, dtype=np.float32), 0.0)    # 1s, left, positive
+    rec.on_chunk("SYS", np.full(16000, -0.25, dtype=np.float32), 0.0)  # 1s, right, negative
+    rec.close()
+    out = stem.with_name(stem.name + ".wav")
+    assert out.is_file(), "single stereo <stem>.wav not written"
+    with wave.open(str(out), "rb") as w:
+        assert w.getnchannels() == 2 and w.getframerate() == 16000, "recording is not 16k stereo"
+        data = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").reshape(-1, 2)
+    assert data[100, 0] > 10000 and data[100, 1] < -4000, ("channels swapped/wrong", data[100].tolist())
+    assert not stem.with_name(stem.name + "-MIC.wav").is_file(), "MIC stem not removed"
+    assert not stem.with_name(stem.name + "-SYS.wav").is_file(), "SYS stem not removed"
+    print("  OK  recorder folds MIC+SYS into one stereo <stem>.wav (left=MIC, right=SYS); stems removed")
+
+
 def test_feed_raw_mic_routing():
     # Live AEC + recording: the recorder must get the RAW mic (MIC_RAW, saved as the -MIC channel)
     # while the engine transcribes the cleaned MIC, so recordings stay raw. SYS goes to both. This
@@ -520,6 +559,7 @@ if __name__ == "__main__":
                test_fits_on_gpu_logic,
                test_levels_and_switch_device,
                test_recording_channel_bundling,
+               test_recorder_stereo_fold,
                test_feed_raw_mic_routing,
                test_reconfigure_session_gated,
                test_warm_up,
