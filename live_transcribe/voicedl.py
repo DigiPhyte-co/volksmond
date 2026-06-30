@@ -51,7 +51,10 @@ _OFFER = ["small", "medium", "large-v3-turbo", "large-v3"]
 # check closes that gap: the app fetches our own models.json, compares the published version to
 # what is recorded as installed here, and offers an opt-in update. Nothing is sent and nothing is
 # fetched until the user clicks (same privacy stance as the app-version check).
-MODELS_MANIFEST_URL = "https://volksmond.digiphyte.com/models.json"
+# Default is the production manifest. SA_LIVE_MODELS_MANIFEST_URL overrides it (e.g. to a staging
+# Pages URL) so the opt-in update flow can be tested end-to-end before the prod domain is cut over.
+MODELS_MANIFEST_URL = os.environ.get(
+    "SA_LIVE_MODELS_MANIFEST_URL", "https://volksmond.digiphyte.com/models.json")
 
 # Approx on-disk sizes (bytes) of the Fluister ct2-int8 repos, for the progress estimate only;
 # HuggingFace verifies the real file hashes. The live manifest's approx_bytes overrides these.
