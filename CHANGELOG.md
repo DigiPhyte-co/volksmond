@@ -1,5 +1,13 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-07-02, v1.8.1: silence-hallucination guards (loops, room tone, prompt leaks)
+
+`licensing.APP_VERSION` 1.8.0 -> 1.8.1.
+
+- **Fewer invented lines when no one is talking.** Three deterministic backstops for the junk Whisper produces on quiet audio, layered under the echo veto. (1) A pre-transcription **silence gate** skips a chunk whose loudest ~100 ms frame is below the speech floor (room tone / true silence, where the model only hallucinates); it uses the loudest frame, so any real utterance keeps the chunk. (2) A **phrase-loop killer** drops a segment that is mostly one repeated multi-word unit ("as jy gaan as jy gaan as jy gaan ..."), which the single-token collapse missed; it only fires when the loop dominates the segment, so ordinary speech is left alone. (3) The **anchor-prompt-leak** match now catches the "Algemene woorde" list regardless of trailing punctuation (previously only with a colon or comma). Layers under the echo veto (which handles far-end bleed) and complements it for the no-far-end case. Toggle `SA_LIVE_SILENCE_GATE=0`. (`transcribe.py` `_is_silence` + `_is_phrase_loop` + the engine `_run`, `_HALLUCINATION_RE`.)
+
+Verified: py_compile, all eight test scripts, and a new `tests/test_silence_loops.py` (11 cases). A/B on the vleis meeting mic: removed 2 phrase-loops + 1 anchor leak, zero real segments touched.
+
 ## 2026-07-02, v1.8.0: cross-channel echo suppression (the far end stops ghosting into your mic)
 
 `licensing.APP_VERSION` 1.7.1 -> 1.8.0.

@@ -441,6 +441,29 @@ def sys_echo_veto(mic_audio, sys_ring, abs_start, abs_end, word_count, sr=16000,
     return drop, f"cov={coverage:.2f} sysP70={sys_p70:.0f} micP90={mic_p90:.0f}"
 
 
+def _is_silence(audio, sr=16000, frame_ms=100, floor_db=-45.0):
+    """True if a chunk is room tone / near-silence: no ~100ms frame reaches the speech floor.
+
+    Whisper invents phrases and loops on such audio, so the caller skips it. Uses the LOUDEST
+    frame, so any real utterance - even a quiet one - keeps the chunk; only chunks with no frame
+    above the floor are dropped. Complements sys_echo_veto, which needs a loud far end as its
+    reference; this is the case where nothing is playing at all (the pure-silence hallucination)."""
+    import numpy as np
+    try:
+        a = np.asarray(audio, dtype=np.float32)
+        fr = max(1, int(sr * frame_ms / 1000.0))
+        if a.ndim != 1 or a.size < fr:
+            return False
+        floor_lin = 10.0 ** (floor_db / 20.0)
+        for i in range(0, len(a) - fr + 1, fr):
+            w = a[i:i + fr]
+            if float(np.sqrt(np.mean(w * w))) >= floor_lin:
+                return False   # a frame reached the floor -> real speech somewhere -> keep the chunk
+        return True            # nothing reached the floor -> silence
+    except Exception:
+        return False           # not real audio (e.g. a test stub) -> never gate on bad input
+
+
 def _collapse_repetition(text, max_run=3):
     """Collapse pathological consecutive-token loops on bad audio.
 
@@ -465,6 +488,32 @@ def _collapse_repetition(text, max_run=3):
     return " ".join(out)
 
 
+def _is_phrase_loop(text, max_unit=5, min_repeats=3, min_cov=0.6):
+    """True if the text is mostly ONE multi-word unit repeated back to back ("ek het nie ek het nie
+    ek het nie ..."), a quiet-mic loop artifact rather than speech, so the caller drops the segment.
+
+    _collapse_repetition handles single-token runs; this catches word-group loops that slip past it
+    and past the compression-ratio guard. Conservative: needs several words, at least min_repeats
+    consecutive repeats of the unit, and the loop to cover most of the segment, so an ordinary
+    sentence with an incidental repeat is left alone."""
+    words = [w for w in (t.lower().strip('.,!?;:"\'') for t in text.split()) if w]
+    n = len(words)
+    if n < 6:
+        return False
+    for u in range(1, max_unit + 1):
+        if u * min_repeats > n:
+            break
+        for start in range(0, n - u * min_repeats + 1):
+            unit = words[start:start + u]
+            reps, j = 1, start + u
+            while j + u <= n and words[j:j + u] == unit:
+                reps += 1
+                j += u
+            if reps >= min_repeats and (reps * u) / n >= min_cov:
+                return True
+    return False
+
+
 # Whisper's training data is saturated with YouTube subtitle credits and video
 # end-cards. On silence or noise it reproduces these verbatim and CONFIDENTLY, so
 # the decoder confidence thresholds (which only catch low-confidence guessing) miss
@@ -480,7 +529,7 @@ _HALLUCINATION_RE = re.compile(
     r"amara\.org"
     r"|\bondertitel\w*\b.*\b(gemeenskap|gemeenschap|amara)"
     r"|\buntertitel\w*\b.*amara"
-    r"|\balgemene woorde[:,]"           # AF_ANCHOR_PROMPT list header leaking
+    r"|\balgemene woorde\b"             # AF_ANCHOR_PROMPT list header leaking (any trailing punctuation)
     r"|\bbaie,\s*nogal,\s*lekker"       # AF_ANCHOR_PROMPT word-list leaking
     r"|ons praat suid-?afrikaans.{0,40}nie nederlands nie",  # AF_ANCHOR_PROMPT opening leaking
     re.IGNORECASE,
@@ -555,6 +604,7 @@ class Engine:
         self._pending_mic = []                # [(release_monotonic, Segment)] held by MIC_PUBLISH_DELAY
         self.sys_env = None                   # optional SysEnergyRing -> enables the MIC echo veto
         self._xchan_veto = os.environ.get("SA_LIVE_XCHAN_VETO", "1") != "0"
+        self._silence_gate = os.environ.get("SA_LIVE_SILENCE_GATE", "1") != "0"
         self._queue = queue.Queue(maxsize=32)
         self._stop = threading.Event()    # shutting down: stop accepting new audio
         self._abort = threading.Event()   # hard abort: discard the backlog instead of draining
@@ -792,6 +842,12 @@ class Engine:
 
             self._busy = True
             try:
+                # Silence gate: room tone / near-silence makes Whisper invent phrases and loops.
+                # If no frame in the chunk reaches the speech floor there is nothing to transcribe,
+                # so skip it. Complements the echo veto (which needs a loud far end as reference);
+                # this is the no-far-end pure-silence case. Toggle SA_LIVE_SILENCE_GATE=0.
+                if self._silence_gate and _is_silence(audio):
+                    continue
                 t0 = time.monotonic()
                 segs, _info = self.model.transcribe(
                     audio,
@@ -809,6 +865,11 @@ class Engine:
                     if not text:
                         continue
                     if _is_hallucination(text):
+                        continue
+                    # Phrase-loop artifact: a segment that is mostly one repeated multi-word unit
+                    # ("ek het nie ek het nie ...") is a quiet-mic hallucination, not speech.
+                    # (_collapse_repetition handles single-token runs; this catches word groups.)
+                    if _is_phrase_loop(text):
                         continue
                     # Residual silence hallucination the window-level no_speech guard
                     # let through: drop a segment the model is very sure is non-speech.
