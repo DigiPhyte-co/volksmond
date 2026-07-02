@@ -1,5 +1,14 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-07-02, v1.8.0: cross-channel echo suppression (the far end stops ghosting into your mic)
+
+`licensing.APP_VERSION` 1.7.1 -> 1.8.0.
+
+- **Echoes of the other person no longer show up on your side of the transcript.** Even on headphones a little of the far end leaks into your microphone (about 100 ms behind), and Whisper transcribed that leak as garbled "ghost" lines under your name that shadowed what the other person just said. The end-of-session text de-dup could not catch them, because the leak transcribes to different words. Two energy-based defences now remove it: a per-frame gate on the aligned stereo re-transcribe (silences mic frames sitting far below the concurrent far end, before transcription), and a segment veto in the live engine (drops a mic segment whose audio was well below the far end across the segment, using a real-time far-end energy reference fed from capture). The veto is conservative by design: it only drops segments that are overwhelmingly far end, always keeps short replies, and never fires without a far-end reference, so your own speech is left untouched. Live and re-transcribe both benefit. (`transcribe.py` `SysEnergyRing` + `sys_echo_veto` + `xchan_gate_mic` + the engine veto, `capture.py` per-block SYS energy feed, `web/app.py` live + file + device-switch wiring.)
+- **Toggles:** `SA_LIVE_XCHAN_GATE=0` disables the re-transcribe frame gate, `SA_LIVE_XCHAN_VETO=0` disables the segment veto. Both on by default. The existing text de-dup (`strip_mic_echoes`) still runs as the speakers-in-a-room backstop.
+
+Verified: py_compile (transcribe/capture/app), all six existing test scripts, and a new `tests/test_echo_veto.py` (7 cases). A/B on a real 39-minute call: 87 ghost segments dropped, genuine speech byte-identical, the one mixed line correctly kept. Still wants a real-meeting eyeball of the LIVE path on this build.
+
 ## 2026-06-30, v1.7.1: fix the GPU/CPU label + Quality readout on the new GPU tiers
 
 `licensing.APP_VERSION` 1.7.0 -> 1.7.1.

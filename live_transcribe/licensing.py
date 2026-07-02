@@ -40,7 +40,7 @@ _PUBLIC_KEY_HEX = ""
 
 # The package major version a licence is checked against. Bump on a paid major
 # release so older perpetual licences resolve to "upgrade available", not "valid".
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.8.0"
 APP_MAJOR = 1
 
 _LICENSE_PATH = (

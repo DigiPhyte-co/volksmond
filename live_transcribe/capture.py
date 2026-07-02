@@ -107,6 +107,7 @@ class AudioCapture:
         self._streams = []
         self._workers = []
         self._levels = {}         # source -> (peak, rms), latest input level for a live meter
+        self._sys_ring = None     # optional transcribe.SysEnergyRing, fed SYS block RMS for the echo veto
 
         # Per-source state, keyed by "MIC" / "SYS"
         self._buffers = {}        # source -> list[np.ndarray]
@@ -283,6 +284,12 @@ class AudioCapture:
                 out[src] = {"peak": v[0], "rms": v[1]}
         return out
 
+    def attach_sys_ring(self, ring):
+        """Attach a transcribe.SysEnergyRing. The audio callback then feeds it one SYS RMS sample
+        per ~0.5 s block in real time, so the engine's echo veto has a current far-end reference
+        even during a monologue (when SYS chunks emit late)."""
+        self._sys_ring = ring
+
     def _open_stream(self, source, info):
         rate = int(info["defaultSampleRate"])
         max_ch = max(1, int(info["maxInputChannels"]))
@@ -325,7 +332,13 @@ class AudioCapture:
                     # Cheap per-block level for the live meter (peak + RMS, 0..1). A single
                     # dict assignment, so the reader (levels()) never sees a torn value.
                     if arr.size:
-                        _levels[_src] = (float(np.max(np.abs(arr))), float(np.sqrt(np.mean(arr * arr))))
+                        _rms = float(np.sqrt(np.mean(arr * arr)))
+                        _levels[_src] = (float(np.max(np.abs(arr))), _rms)
+                        # Feed the SYS energy ring (engine echo veto): one RMS sample per block,
+                        # timestamped on the session clock (same _t0 as chunk t_start). SYS only.
+                        _ring = _self._sys_ring
+                        if _ring is not None and _src == "SYS" and _self._t0 is not None:
+                            _ring.add(time.monotonic() - _self._t0, 20.0 * np.log10(_rms + 1e-9))
                     # Live echo cancellation (when engaged): hand the mono block to the APM worker
                     # instead of the native chunk buffer; the worker resamples + cancels and feeds
                     # the (now 16k) chunk buffer itself.

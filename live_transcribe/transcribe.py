@@ -328,6 +328,119 @@ DOWNGRADE_WINDOW = 4     # consecutive chunks of evidence required before a step
 MIC_PUBLISH_DELAY = 1.0
 
 
+def xchan_gate_mic(mic, sysc, sr=16000, frame_ms=300, gate_db=10.0, sys_floor_db=-50.0):
+    """Silence far-end bleed in the MIC channel using the time-aligned SYS as the reference.
+
+    Even on headphones the far side leaks into the microphone at low level (measured ~100ms
+    behind SYS), and Whisper transcribes that leak as garbled ghost lines that shadow the real
+    SYS line. dedup.strip_mic_echoes cannot catch them because the leak transcribes to DIFFERENT
+    words, so we remove it in the audio, before transcription. A MIC frame is treated as bleed
+    (zeroed) when the SYS is active there AND the MIC sits more than gate_db below it - i.e. the
+    only thing in the mic is a quiet copy of the far end. Near-end speech (MIC at or above the
+    SYS) is left untouched, so on a clean recording this is a no-op. Only meaningful for the single
+    stereo recording, where MIC (left) and SYS (right) are sample-aligned.
+
+    Returns (cleaned_mic, silenced_frames, total_frames).
+    """
+    import numpy as np
+    mic = np.asarray(mic, dtype=np.float32)
+    sysc = np.asarray(sysc, dtype=np.float32)
+    n = min(len(mic), len(sysc))
+    out = mic.copy()
+    fr = max(1, int(sr * frame_ms / 1000.0))
+    silenced = total = 0
+    for i in range(0, n, fr):
+        m = mic[i:i + fr]
+        s = sysc[i:i + fr]
+        total += 1
+        m_db = 20.0 * np.log10(float(np.sqrt(np.mean(m * m))) + 1e-9)
+        s_db = 20.0 * np.log10(float(np.sqrt(np.mean(s * s))) + 1e-9)
+        if s_db > sys_floor_db and m_db < s_db - gate_db:
+            out[i:i + fr] = 0.0
+            silenced += 1
+    return out, silenced, total
+
+
+class SysEnergyRing:
+    """Rolling per-frame RMS (dBFS) of the SYS (far-end) channel, keyed by session-relative time.
+
+    Written in real time by the capture callback (live) or filled in one pass from the aligned SYS
+    channel (re-transcribe); read by the transcription worker to veto MIC echo segments. The live
+    write MUST come from the capture callback (every ~0.5 s block), NOT from SYS chunk arrival:
+    chunks only emit at a silence or a force-cut, so during a far-end monologue - precisely the echo
+    case - the SYS chunk lands many seconds late and the reference would be missing when the MIC
+    ghost is judged. Retained for minutes because a MIC chunk can be transcribed well after capture
+    under CPU backlog. Thread-safe: the audio thread writes, the transcribe worker reads.
+    """
+    def __init__(self, retain_s=600.0):
+        self._t = deque()
+        self._db = deque()
+        self._retain = retain_s
+        self._lock = threading.Lock()
+
+    def add(self, t, db):
+        with self._lock:
+            self._t.append(t)
+            self._db.append(db)
+            cut = t - self._retain
+            while self._t and self._t[0] < cut:
+                self._t.popleft()
+                self._db.popleft()
+
+    def add_block(self, t, samples):
+        import numpy as np
+        s = np.asarray(samples, dtype=np.float32)
+        rms = float(np.sqrt(np.mean(s * s))) if s.size else 0.0
+        self.add(t, 20.0 * np.log10(rms + 1e-9))
+
+    def frames_in(self, t_lo, t_hi):
+        """The SYS frame dB values whose timestamps fall in [t_lo, t_hi]. Copies under the lock;
+        the caller does the heavier percentile maths outside it."""
+        with self._lock:
+            return [d for t, d in zip(self._t, self._db) if t_lo <= t <= t_hi]
+
+
+def sys_echo_veto(mic_audio, sys_ring, abs_start, abs_end, word_count, sr=16000,
+                  frame_ms=100, tol=0.3, active_floor=-50.0, min_coverage=0.60,
+                  margin_db=10.0, mic_ceiling=-28.0):
+    """Decide whether a MIC segment is far-end bleed (echo) that should be dropped.
+
+    Conservative by construction so it (almost) never eats real speech: it fires only when the far
+    end was active across most of the segment AND the mic's LOUDEST frames still sit well below the
+    far end AND below an absolute ceiling. Short replies / backchannels are always kept, and a
+    missing SYS reference fails safe (keep). Post-ASR, so it cannot un-blend a mixed segment - hence
+    the coverage floor: it only drops segments that are overwhelmingly far-end. Returns
+    (drop: bool, reason: str). Thresholds are the tuned starting points from the design review.
+    """
+    import numpy as np
+    dur = abs_end - abs_start
+    if word_count <= 2 or dur < 0.5:
+        return False, "short"
+    mic = np.asarray(mic_audio, dtype=np.float32)
+    if mic.size < sr * frame_ms / 1000.0:
+        return False, "tiny"
+    fr = max(1, int(sr * frame_ms / 1000.0))
+    mdb = []
+    for i in range(0, len(mic), fr):
+        w = mic[i:i + fr]
+        if len(w) < fr // 2:
+            break
+        mdb.append(20.0 * np.log10(float(np.sqrt(np.mean(w * w))) + 1e-9))
+    if not mdb:
+        return False, "nomic"
+    mic_p90 = float(np.percentile(mdb, 90))       # the mic's loud frames; low => never really spoke
+    sys = sys_ring.frames_in(abs_start - tol, abs_end + tol)
+    if not sys:
+        return False, "nosys"                     # no reference -> keep (fail safe)
+    active = [d for d in sys if d > active_floor]
+    coverage = len(active) / len(sys)
+    if coverage < min_coverage:
+        return False, f"cov={coverage:.2f}"
+    sys_p70 = float(np.percentile(active, 70))
+    drop = (sys_p70 - mic_p90) >= margin_db and mic_p90 < mic_ceiling
+    return drop, f"cov={coverage:.2f} sysP70={sys_p70:.0f} micP90={mic_p90:.0f}"
+
+
 def _collapse_repetition(text, max_run=3):
     """Collapse pathological consecutive-token loops on bad audio.
 
@@ -440,6 +553,8 @@ class Engine:
         self._rtf = deque(maxlen=DOWNGRADE_WINDOW)  # recent real-time factors (CPU downgrade)
         self.subscribers = []
         self._pending_mic = []                # [(release_monotonic, Segment)] held by MIC_PUBLISH_DELAY
+        self.sys_env = None                   # optional SysEnergyRing -> enables the MIC echo veto
+        self._xchan_veto = os.environ.get("SA_LIVE_XCHAN_VETO", "1") != "0"
         self._queue = queue.Queue(maxsize=32)
         self._stop = threading.Event()    # shutting down: stop accepting new audio
         self._abort = threading.Event()   # hard abort: discard the backlog instead of draining
@@ -705,6 +820,16 @@ class Engine:
                         t_end=t_start + float(seg.end),
                         text=text,
                     )
+                    # Cross-channel echo veto: drop a MIC segment that is far-end bleed (quiet copy
+                    # of a concurrently-active SYS). Post-ASR + conservative, so it never touches the
+                    # audio (no word-nudging / fragmentation) and keeps real speech. Live and file
+                    # both feed self.sys_env; when it is absent the veto is inert.
+                    if source == "MIC" and self._xchan_veto and self.sys_env is not None:
+                        _mic = audio[int(float(seg.start) * 16000):int(float(seg.end) * 16000)]
+                        _drop, _why = sys_echo_veto(_mic, self.sys_env, out.t_start, out.t_end, len(text.split()))
+                        if _drop:
+                            print(f"[engine] echo-veto dropped MIC @ {out.t_start:.1f}s [{_why}] {text[:40]!r}", flush=True)
+                            continue
                     self._route(out)
 
                 # Adaptive model downgrade (CPU only): track real-time factor and

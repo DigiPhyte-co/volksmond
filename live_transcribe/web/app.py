@@ -472,9 +472,13 @@ def switch_device(req: SwitchDeviceRequest):
             # Carry the session's live-AEC + raw-mic-recording settings across the switch, else
             # changing mic/loopback mid-meeting would silently turn echo cancellation (or the raw
             # recording side channel) off.
-            return capture.AudioCapture(mic_device=m, loopback_device=l, chunk_seconds=chunk,
-                                        on_chunk=_feed, t0=old_cap._t0, aec=old_cap.aec,
-                                        record_raw_mic=old_cap.record_raw_mic)
+            c = capture.AudioCapture(mic_device=m, loopback_device=l, chunk_seconds=chunk,
+                                     on_chunk=_feed, t0=old_cap._t0, aec=old_cap.aec,
+                                     record_raw_mic=old_cap.record_raw_mic)
+            eng = STATE.engine
+            if eng is not None and getattr(eng, "sys_env", None) is not None:
+                c.attach_sys_ring(eng.sys_env)   # keep the echo-veto reference fed across the switch
+            return c
 
         try:
             old_cap.stop()
@@ -720,6 +724,12 @@ def start(req: StartRequest):
             aec=aec_live,
             record_raw_mic=False,   # record the AEC-cleaned mic into the single stereo file, not a raw stem
         )
+        # Feed a SYS energy ring from live capture so the engine vetoes MIC echo segments in real
+        # time. Fed per-block from the callback (not from late SYS chunks); see SysEnergyRing.
+        if engine is not None:
+            _sys_ring = transcribe.SysEnergyRing()
+            engine.sys_env = _sys_ring
+            cap.attach_sys_ring(_sys_ring)
         try:
             cap.start()
         except Exception as e:
@@ -903,9 +913,30 @@ def transcribe_file(req: TranscribeFileRequest):
                     ok = False
                 if ok:
                     data = _np.frombuffer(raw, dtype="<i2").astype(_np.float32).reshape(-1, 2) / 32768.0
-                    for src, chan in (("MIC", data[:, 0]), ("SYS", data[:, 1])):
+                    mic_ch, sys_ch = data[:, 0], data[:, 1]
+                    # Cross-channel bleed gate. Even on headphones the far side leaks into the MIC at
+                    # low level; Whisper transcribes that leak as garbled ghost lines the text de-dup
+                    # cannot catch (different words). Silence those MIC frames before transcribing.
+                    # No-op on a clean recording (the MIC is never far below the SYS there). Toggle
+                    # off with SA_LIVE_XCHAN_GATE=0.
+                    gate_on = os.environ.get("SA_LIVE_XCHAN_GATE", "1") != "0"
+                    if gate_on:
+                        mic_ch, _sil, _tot = transcribe.xchan_gate_mic(mic_ch, sys_ch)
+                        print(f"[transcribe-file] cross-channel gate silenced {_sil}/{_tot} mic frames", flush=True)
+                    # Build the SYS energy ring from the aligned far-end channel so the engine's echo
+                    # veto has a reference for every MIC segment (the same mechanism it uses live).
+                    _ring = transcribe.SysEnergyRing(retain_s=len(sys_ch) / 16000.0 + 60.0)
+                    for _i in range(0, len(sys_ch), 8000):
+                        _ring.add_block(_i / 16000.0, sys_ch[_i:_i + 8000])
+                    engine.sys_env = _ring
+                    for src, chan in (("MIC", mic_ch), ("SYS", sys_ch)):
                         for i in range(0, len(chan), win):
-                            items.append((i / 16000.0, src, _np.ascontiguousarray(chan[i:i + win])))
+                            chunk = _np.ascontiguousarray(chan[i:i + win])
+                            # A MIC chunk the gate left as near-silence is pure far-end bleed: skip it
+                            # so Whisper never runs on it (no words to echo, no silence hallucination).
+                            if src == "MIC" and gate_on and float(_np.sqrt(_np.mean(chunk * chunk))) < 1.8e-3:
+                                continue
+                            items.append((i / 16000.0, src, chunk))
 
             if not items:
                 # Legacy / import path. When the file set has both a MIC and a SYS channel (an old
