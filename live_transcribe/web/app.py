@@ -243,9 +243,12 @@ _RESERVED_NAMES = (
 def _validate_session_filename(name: str) -> None:
     """Reject anything that is not a plain `*.md` basename. resolve()+relative_to()
     at the call site already blocks traversal; this adds a strict allow-list for
-    Windows oddities (alternate data streams via ':', NUL, reserved device names)."""
+    Windows oddities (alternate data streams via ':', NUL, reserved device names) and
+    glob metacharacters (* ? [ ]) that would otherwise widen a later glob() over the
+    sessions dir into a match on other sessions' files."""
     if (not name
             or "/" in name or "\\" in name or ":" in name or "\x00" in name
+            or any(c in name for c in "*?[]")
             or name != Path(name).name
             or not name.lower().endswith(".md")
             or name.split(".", 1)[0].upper() in _RESERVED_NAMES):
@@ -664,6 +667,20 @@ def _resolve_tier_lang_prompt(req):
 def start(req: StartRequest):
     if _summary_running():
         raise HTTPException(status_code=409, detail="A summary is being generated. Wait for it to finish before starting a new session, so the two never compete for the machine.")
+    # Pre-warm the model OUTSIDE the state lock. A cold or first-time load takes seconds (longer on
+    # a network fallback), and doing it under STATE.lock (as the Engine build below does) freezes
+    # /api/status and /api/levels, which the UI polls ~1/s, so the app reads as hung. load_model
+    # caches by (model_name, device, compute_type), so the Engine build reuses this warm entry.
+    # Best-effort: if this resolution ever drifts from Engine's, the build just loads under the lock
+    # as before (slower, never wrong).
+    if bool(req.transcribe):
+        try:
+            _wt, _wlang, _wp, _weng = _resolve_tier_lang_prompt(req)
+            _wcfg = transcribe.TIER_CONFIG[_wt]
+            _wmodel, _wfam = transcribe.resolve_model(_wcfg["model"], _wlang, _weng)
+            transcribe.load_model(_wmodel, _wcfg["device"], _wcfg["compute_type"])
+        except Exception:
+            pass
     with STATE.lock:
         if STATE.running:
             raise HTTPException(status_code=409, detail="Session already running")
@@ -898,6 +915,7 @@ def transcribe_file(req: TranscribeFileRequest):
             from faster_whisper.audio import decode_audio
             win = int(16000 * chunk_seconds)
             items = []  # (t_start, source, window), merged across files by time
+            aborted = False  # set True on user cancel; controls drain-vs-abort in the finally
             # New single stereo recording (<stem>.wav: left = MIC, right = SYS), already
             # echo-cancelled at capture. Split the channels and skip offline AEC entirely.
             if base and len(files) == 1:
@@ -970,7 +988,6 @@ def transcribe_file(req: TranscribeFileRequest):
                     for i in range(0, len(audio), win):
                         items.append((i / 16000.0, src, audio[i:i + win]))
             items.sort(key=lambda x: x[0])
-            aborted = False
             for t_start, src, window in items:
                 with STATE.lock:
                     if STATE.stopping:
@@ -995,7 +1012,10 @@ def transcribe_file(req: TranscribeFileRequest):
             print(f"[transcribe-file] error: {e}", flush=True)
         finally:
             try:
-                engine.stop(drain=True)
+                # On user Cancel (aborted) do NOT drain: draining keeps transcribing the queued
+                # backlog (minutes on CPU) after the user asked to stop, and holds STATE.running so
+                # the next session 409s. Drain only on natural completion.
+                engine.stop(drain=not aborted)
             except Exception:
                 pass
             try:

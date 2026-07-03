@@ -407,14 +407,18 @@ def sys_echo_veto(mic_audio, sys_ring, abs_start, abs_end, word_count, sr=16000,
 
     Conservative by construction so it (almost) never eats real speech: it fires only when the far
     end was active across most of the segment AND the mic's LOUDEST frames still sit well below the
-    far end AND below an absolute ceiling. Short replies / backchannels are always kept, and a
+    far end AND below an absolute ceiling. Only a sub-0.5s blip is auto-exempt now (a genuine short reply survives via its above-ceiling mic energy), and a
     missing SYS reference fails safe (keep). Post-ASR, so it cannot un-blend a mixed segment - hence
     the coverage floor: it only drops segments that are overwhelmingly far-end. Returns
     (drop: bool, reason: str). Thresholds are the tuned starting points from the design review.
     """
     import numpy as np
     dur = abs_end - abs_start
-    if word_count <= 2 or dur < 0.5:
+    # Only a sub-0.5s blip is auto-exempt. The old `word_count <= 2` exemption also kept short
+    # segments, but that let quiet far-end bleed fragments ("Thank you", "ja") survive on a silent
+    # mic; short segments now face the energy test too, and a genuinely-spoken short reply still
+    # stays because its mic energy is above the ceiling (A/B-verified on real recordings, v1.8.2).
+    if dur < 0.5:
         return False, "short"
     mic = np.asarray(mic_audio, dtype=np.float32)
     if mic.size < sr * frame_ms / 1000.0:
@@ -467,9 +471,9 @@ def _is_silence(audio, sr=16000, frame_ms=100, floor_db=-45.0):
 def _collapse_repetition(text, max_run=3):
     """Collapse pathological consecutive-token loops on bad audio.
 
-    "Hekkaan. Hekkaan. Hekkaan. ..." -> "Hekkaan." Legitimate emphasis like
-    "baie baie baie" (a run of 3) is left alone; only runs LONGER than max_run
-    identical consecutive tokens are collapsed to a single token.
+    A run of the same token longer than max_run is truncated to its first max_run
+    tokens (not to one): "Hekkaan." x20 -> "Hekkaan. Hekkaan. Hekkaan." Legitimate
+    emphasis like "baie baie baie" (a run of 3) is left alone.
     """
     words = text.split()
     if len(words) <= max_run:

@@ -410,6 +410,7 @@ class AudioCapture:
         while not self._stop_event.is_set():
             time.sleep(0.1)
             audio_to_emit = None
+            emit_t_start = None
 
             with lock:
                 count = self._buffer_counts[source]
@@ -424,6 +425,13 @@ class AudioCapture:
 
                     if cut_at is not None and cut_at >= min_emit:
                         audio_to_emit = full[:cut_at]
+                        # The emitted slice is the OLDEST audio in the buffer: it starts one FULL
+                        # buffer span before the newest sample (~now), not one emitted-length before.
+                        # count/rate is that span (rate matches the buffer contents in both the native
+                        # and live-AEC 16k paths). Deriving t_start from the emitted length alone left
+                        # every chunk late by the carried-over tail (up to ~2s on a silence cut), which
+                        # misaligned the SYS-ring echo veto.
+                        emit_t_start = max(0.0, time.monotonic() - self._t0 - count / rate)
                         tail = full[cut_at:]
                         self._buffers[source].clear()  # in-place, callback closes over this list
                         if tail.shape[0] > 0:
@@ -434,19 +442,22 @@ class AudioCapture:
                     # else: not enough audio yet, or no silence found before max, keep waiting
 
             if audio_to_emit is not None:
-                self._emit(source, audio_to_emit, rate)
+                self._emit(source, audio_to_emit, rate, emit_t_start)
 
         # Flush trailing audio on shutdown (only if at least 1s)
         audio = None
+        flush_t_start = None
         with lock:
             if self._buffers[source]:
                 audio = np.concatenate(self._buffers[source], axis=0)
+                # Whole remaining buffer is emitted, so its first sample is one full span back.
+                flush_t_start = max(0.0, time.monotonic() - self._t0 - audio.shape[0] / rate)
                 self._buffers[source].clear()
                 self._buffer_counts[source] = 0
         if audio is not None and audio.shape[0] >= rate:
-            self._emit(source, audio, rate)
+            self._emit(source, audio, rate, flush_t_start)
 
-    def _emit(self, source, audio, src_rate):
+    def _emit(self, source, audio, src_rate, t_start):
         # Channels -> mono
         if audio.ndim > 1:
             mono = audio.mean(axis=1) if audio.shape[1] > 1 else audio[:, 0]
@@ -457,7 +468,9 @@ class AudioCapture:
             g = gcd(src_rate, TARGET_RATE)
             mono = resample_poly(mono, TARGET_RATE // g, src_rate // g)
         mono = np.asarray(mono, dtype=np.float32)
-        duration = len(mono) / TARGET_RATE
-        t_start = max(0.0, time.monotonic() - self._t0 - duration)
+        # t_start is computed by the caller from the FULL buffer span (see _chunker); it is the
+        # session-clock time of the first emitted sample. Do NOT derive it from the emitted length
+        # here: that ignores the carried-over tail and left every chunk late by up to ~2s, which
+        # skewed the SYS-ring echo veto.
         if self.on_chunk:
             self.on_chunk(source, mono, t_start)

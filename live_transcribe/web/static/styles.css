@@ -236,6 +236,7 @@ html, body { margin: 0; padding: 0; height: 100%; }
   background: var(--surface-2); color: var(--ink-2);
   border: 1px solid var(--line);
   letter-spacing: 0.01em;
+  white-space: nowrap;
 }
 .vm .chip .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .vm .chip.live { color: var(--record); background: var(--record-soft); border-color: transparent; }

@@ -1215,7 +1215,7 @@ function homeView() {
     el("div", { class: "entry-grid" }, [
       entry({ primary: true, ic: "mic", title: "Start a live meeting", cta: "Begin",
         body: "Transcribe what you and others are saying right now, on this computer. Optionally record the audio too.",
-        onclick: function () { go("pre"); } }),
+        onclick: function () { S.form.title = ""; go("pre"); } }),
       entry({ ic: "upload", title: "Upload a recording to transcribe", cta: "Choose a file",
         body: "Pick an audio or video file you already have. Volksmond transcribes it locally, just like a live meeting.",
         formats: [".mp3", ".m4a", ".wav", ".mp4", ".mov", ".ogg"],
@@ -1835,8 +1835,8 @@ function settingsView() {
 }
 var updateState = { state: "idle", info: null };
 // Manual, user-initiated update check. Posts to the localhost server, which makes ONE outbound
-// GET to the public GitHub releases API. Never automatic; nothing leaves the machine until the
-// user clicks Check for updates.
+// GET to the Volksmond update manifest on volksmond.digiphyte.com. Never automatic; nothing
+// leaves the machine until the user clicks Check for updates.
 function checkUpdates() {
   updateState = { state: "checking", info: null }; render();
   api.post("/api/check-updates").then(function (d) {
@@ -1845,13 +1845,27 @@ function checkUpdates() {
     updateState = { state: "error", info: null }; render();
   });
 }
+// The update manifest is our own file, but treat its "url" as untrusted anyway: only follow an
+// https link to our own domains (or GitHub, where release assets live), so a tampered manifest
+// cannot turn the Download button into a redirect to an arbitrary site.
+function openUpdateLink(u) {
+  try {
+    var url = new URL(u);
+    var host = url.hostname.toLowerCase();
+    var ok = url.protocol === "https:" && (
+      host === "digiphyte.com" || host.endsWith(".digiphyte.com") ||
+      host === "github.com" || host.endsWith(".github.com") || host.endsWith(".githubusercontent.com"));
+    if (ok) { openExternal(u); return; }
+  } catch (e) {}
+  toast("That update link looked wrong, so it was not opened.", true);
+}
 function aboutCard() {
   var version = (S.appInfo && S.appInfo.version) || "?";
   var u = updateState;
   var updateLine =
     u.state === "checking" ? el("div", { class: "s", style: { marginTop: "4px", display: "flex", gap: "6px", alignItems: "center" } }, [el("span", { class: "spinner" }), el("span", { text: "Checking for updates" })]) :
     u.state === "error" ? el("div", { class: "s", style: { marginTop: "4px", color: "var(--warn)" }, text: "Could not check for updates." }) :
-    (u.state === "done" && u.info && u.info.update_available) ? el("div", { class: "s", style: { marginTop: "4px" } }, [el("span", { text: "Update available" }), raw(": v" + u.info.latest + "  "), el("span", { class: "link", onclick: function () { openExternal(u.info.url); } }, "Download")]) :
+    (u.state === "done" && u.info && u.info.update_available) ? el("div", { class: "s", style: { marginTop: "4px" } }, [el("span", { text: "Update available" }), raw(": v" + u.info.latest + "  "), el("span", { class: "link", onclick: function () { openUpdateLink(u.info.url); } }, "Download")]) :
     (u.state === "done") ? el("div", { class: "s ok-text", style: { marginTop: "4px" }, text: "You are up to date." }) : null;
   return el("div", { class: "card settings-card" }, [
     el("div", { class: "card-title section-label", text: "About" }),
@@ -2609,7 +2623,7 @@ function sizeLabelFromModel(model) {
 // so the user can see it is e.g. Fluister at Balanced without opening anything.
 function familyChip(family, model) {
   var size = sizeLabelFromModel(model);
-  if (family === "swivuriso") return el("span", { class: "chip accent", title: tr("South African languages model") }, [icon("language", 12), el("span", {}, raw("Swivuriso"))]);
+  if (family === "swivuriso") return el("span", { class: "chip accent", title: tr("South African languages model") }, [icon("globe", 12), el("span", {}, raw("Swivuriso"))]);
   var name = (family === "fluister") ? "Fluister" : "Whisper";
   var label = size ? (name + ", " + tr(size)) : name;
   if (family === "fluister") return el("span", { class: "chip accent", title: tr("Afrikaans-optimised model") }, [icon("sparkle", 12), el("span", {}, raw(label))]);

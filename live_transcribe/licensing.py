@@ -40,7 +40,7 @@ _PUBLIC_KEY_HEX = ""
 
 # The package major version a licence is checked against. Bump on a paid major
 # release so older perpetual licences resolve to "upgrade available", not "valid".
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.8.2"
 APP_MAJOR = 1
 
 _LICENSE_PATH = (
@@ -68,10 +68,14 @@ def _b64d(s: str) -> bytes:
 
 
 def _pubkey_hex() -> str:
-    # A baked-in key always wins; the env override only applies when no key is
-    # shipped (dev/test), so a released build can't be pointed at another key to
-    # self-sign Pro.
-    return _PUBLIC_KEY_HEX or os.environ.get("SA_LIVE_LICENSE_PUBKEY", "").strip()
+    # A baked-in key always wins. The env override is a dev/test convenience only: in a frozen
+    # (shipped) build we ignore it entirely, so nobody can point a released binary at their own
+    # key via SA_LIVE_LICENSE_PUBKEY and self-sign Pro against it.
+    if _PUBLIC_KEY_HEX:
+        return _PUBLIC_KEY_HEX
+    if getattr(sys, "frozen", False):
+        return ""
+    return os.environ.get("SA_LIVE_LICENSE_PUBKEY", "").strip()
 
 
 @dataclass(frozen=True)

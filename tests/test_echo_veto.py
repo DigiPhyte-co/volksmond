@@ -49,10 +49,23 @@ def test_quiet_but_below_ceiling_kept():
     assert not drop, f"segment above the mic ceiling must be kept: {why}"
 
 
-def test_short_reply_kept():
-    # a 2-word backchannel is never dropped even if it looks like bleed
+def test_short_real_backchannel_kept():
+    # a short but genuinely-spoken "ja/okay" (loud mic) survives the energy test
+    drop, why = T.sys_echo_veto(tone(-8, 3.0), ring_with(-19, 9.7, 13.3), 10.0, 13.0, word_count=2)
+    assert not drop, f"a loud short backchannel must be kept: {why}"
+
+
+def test_short_bleed_dropped():
+    # a short far-end bleed fragment (quiet mic under a loud far end) is now dropped: the
+    # word_count<=2 exemption used to keep these ("Thank you", "ja"); the energy test catches them.
     drop, why = T.sys_echo_veto(tone(-33, 3.0), ring_with(-19, 9.7, 13.3), 10.0, 13.0, word_count=2)
-    assert not drop and why == "short", f"short reply must be kept: {why}"
+    assert drop, f"a short quiet bleed fragment must be dropped: {why}"
+
+
+def test_sub_half_second_exempt():
+    # the dur<0.5 floor still exempts a very brief blip regardless of energy
+    drop, why = T.sys_echo_veto(tone(-33, 0.4), ring_with(-19, 9.5, 10.9), 10.0, 10.4, word_count=1)
+    assert not drop and why == "short", f"a sub-0.5s blip must be exempt: {why}"
 
 
 def test_no_reference_fails_safe():
@@ -77,7 +90,8 @@ def test_ring_retention_evicts():
 
 def main():
     tests = [test_ghost_dropped, test_real_speech_kept, test_quiet_but_below_ceiling_kept,
-             test_short_reply_kept, test_no_reference_fails_safe, test_far_end_silent_kept,
+             test_short_real_backchannel_kept, test_short_bleed_dropped, test_sub_half_second_exempt,
+             test_no_reference_fails_safe, test_far_end_silent_kept,
              test_ring_retention_evicts]
     for t in tests:
         t()

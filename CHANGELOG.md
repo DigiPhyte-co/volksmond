@@ -1,5 +1,18 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-07-03, v1.8.2: fewer short mic ghosts, accurate live timing, snappier start + review fixes
+
+`licensing.APP_VERSION` 1.8.1 -> 1.8.2.
+
+- **Short one- and two-word mic ghosts ("Thank you", "dankie", "ja") are now caught.** v1.8.0's echo veto exempted every <=2-word segment to protect real backchannels, so short far-end bleed fragments slipped through on a silent mic. Short segments now face the same energy test as long ones: a genuinely-spoken short reply survives (its mic energy sits above the ceiling), while a quiet bleed fragment is dropped. Only a sub-0.5s blip stays auto-exempt. A/B across two real recordings (39 + 24 min) dropped 36 bleed fragments and kept every genuine backchannel. (`transcribe.py` `sys_echo_veto`.)
+- **Live transcript timing is accurate again.** Each live chunk was timestamped from the emitted length only, ignoring the carried-over tail, so mic lines landed up to ~2s late and the echo veto's far-end lookup was misaligned against its real-time reference. The timestamp is now derived from the full buffer span, so mic and system lines interleave correctly and the veto reads the right window. (`capture.py` `_chunker` / `_emit`.)
+- **Begin no longer freezes the window on a cold start.** The transcription model is pre-warmed outside the state lock, so `/api/status` and `/api/levels` keep responding while a first-time or uncached model loads. (`web/app.py` start.)
+- **Cancelling a file transcription stops promptly** instead of grinding through the queued backlog first. (`web/app.py` transcribe-file.)
+- **UI:** the status pill no longer stacks its label into two lines on a narrow window (pill labels never wrap), and starting a new meeting no longer pre-fills the previous meeting's name. (`web/static/styles.css`, `web/static/app.js`.)
+- **Hardening (from a full-project review):** session filenames reject glob metacharacters (`* ? [ ]`); a frozen build ignores the `SA_LIVE_LICENSE_PUBKEY` env override, so a shipped binary cannot be pointed at another key to self-sign Pro; the update "Download" link is restricted to our own domains + GitHub; the Swivuriso chip icon renders (was an empty SVG). (`web/app.py`, `licensing.py`, `web/static/app.js`.)
+
+Verified: py_compile + node --check, all eight test scripts green (echo-veto tests updated for the new short-segment behaviour), plus targeted checks (filename reject, frozen pubkey, update-link allowlist, `_emit` arity). The live capture changes (timestamp + pre-warm) still want a real-meeting eyeball on this build.
+
 ## 2026-07-02, v1.8.1: silence-hallucination guards (loops, room tone, prompt leaks)
 
 `licensing.APP_VERSION` 1.8.0 -> 1.8.1.
