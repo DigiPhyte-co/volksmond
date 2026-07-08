@@ -29,11 +29,14 @@ class OutlookUnavailable(RuntimeError):
 
 
 def _to_naive(pt):
-    """A COM/pywintypes datetime to a naive local datetime, for comparison with now()."""
-    try:
-        return datetime.fromtimestamp(pt.timestamp())
-    except Exception:
-        return datetime(pt.year, pt.month, pt.day, pt.hour, pt.minute, pt.second)
+    """A COM/pywintypes datetime to a naive LOCAL datetime, matching the wall-clock time Outlook
+    shows (the value to compare against a local datetime.now()).
+
+    pywin32 returns AppointmentItem.Start with the LOCAL wall-clock components (e.g. 09:00) but tags
+    them with a bogus +00:00 tzinfo, so .timestamp() misreads 09:00 as UTC and shifts it by the UTC
+    offset (09:00 -> 11:00 in SAST). Read the calendar fields directly instead; never round-trip
+    through .timestamp()."""
+    return datetime(pt.year, pt.month, pt.day, pt.hour, pt.minute, getattr(pt, "second", 0))
 
 
 def _names(appt):
@@ -95,12 +98,13 @@ def current_or_next_meeting(look_back_min: int = 15, look_ahead_hours: int = 8):
         items.Sort("[Start]")
 
         # Recurring items expand from the beginning of time, so an unbounded scan is unsafe;
-        # Restrict to the window first. Outlook's Restrict expects a date string in the
-        # machine's locale short format, which is not knowable up front, so try a few common
-        # ones and use the first that Outlook accepts. A miss just means "no meeting found",
-        # which is a safe degradation (the user types names by hand), never a crash.
+        # Restrict to the window first. Outlook's Restrict wants a date string whose parsing
+        # depends on the machine locale, so lead with UNAMBIGUOUS year-first formats (which cannot
+        # be read as either d/m or m/d) and keep US m/d/Y only as a last resort. The en-ZA d/m/Y
+        # format is deliberately NOT used: on this machine it silently matched the wrong window.
+        # A miss just means "no meeting found" (a safe degradation), never a crash.
         restricted = None
-        for fmt in ("%m/%d/%Y %I:%M %p", "%d/%m/%Y %H:%M", "%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M"):
+        for fmt in ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M", "%m/%d/%Y %I:%M %p"):
             try:
                 query = "[Start] <= '{}' AND [End] >= '{}'".format(
                     window_end.strftime(fmt), window_start.strftime(fmt)
