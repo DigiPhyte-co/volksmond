@@ -230,7 +230,13 @@ html, body { margin: 0; padding: 0; height: 100%; }
 
 /* ── Chip / status ────────────────────────────────────────── */
 .vm .chip {
-  display: inline-flex; align-items: center; gap: 6px;
+  /* Chip status modifiers (.rec/.ok/.warn/.accent/.muted) deliberately do NOT reuse a
+     screen-container class name. An earlier red pill was "chip live", but "live" also matches
+     the .live screen container (flex-direction:column), which under some rule orderings stacked
+     the pulse dot ABOVE the label (the recurring "dot on top of the word" bug). The modifier is
+     now ".rec", so no chip can collide with a layout container again. Row stays explicit as belt
+     and braces. */
+  display: inline-flex; flex-direction: row; align-items: center; gap: 6px;
   height: 22px; padding: 0 8px; border-radius: 999px;
   font: 500 11px/1 var(--font-sans);
   background: var(--surface-2); color: var(--ink-2);
@@ -239,8 +245,8 @@ html, body { margin: 0; padding: 0; height: 100%; }
   white-space: nowrap;
 }
 .vm .chip .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-.vm .chip.live { color: var(--record); background: var(--record-soft); border-color: transparent; }
-.vm .chip.live .dot { background: var(--record); animation: vm-pulse 1.6s ease-in-out infinite; }
+.vm .chip.rec { color: var(--record); background: var(--record-soft); border-color: transparent; }
+.vm .chip.rec .dot { background: var(--record); animation: vm-pulse 1.6s ease-in-out infinite; }
 .vm .chip.ok { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
 .vm .chip.warn { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
 .vm .chip.accent { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
@@ -511,6 +517,12 @@ html, body { margin: 0; padding: 0; height: 100%; }
 .live-footer .rec-ind { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--record); font-weight: 500; }
 .live-footer .rec-ind i { width: 6px; height: 6px; border-radius: 50%; background: var(--record); animation: vm-pulse 1.6s ease-in-out infinite; }
 
+/* Meeting notes panel (typed live in the transcribe screen; saved beside the transcript) */
+.notes-panel { flex: 0 0 auto; border-top: 1px solid var(--line); background: var(--surface); }
+.notes-head { display: flex; align-items: center; gap: 8px; padding: 9px 24px; font-size: 12px; font-weight: 600; color: var(--ink-2); cursor: pointer; user-select: none; }
+.notes-head:hover { color: var(--ink); }
+.notes-ta.field { display: block; margin: 2px 24px 12px; min-height: 84px; max-height: 220px; resize: vertical; }
+
 /* Transcript: document variant */
 .doc { max-width: 760px; margin: 0 auto; font-family: var(--font-transcript); font-size: 17px; line-height: 1.65; }
 .doc .row { display: grid; grid-template-columns: 60px 1fr; gap: 12px; padding: 7px 0; align-items: baseline; }
@@ -596,8 +608,11 @@ html, body { margin: 0; padding: 0; height: 100%; }
 .bullet-list li { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; line-height: 1.5; margin: 6px 0; color: var(--ink-2); }
 .bullet-list li .ic { color: var(--ok); margin-top: 2px; flex: 0 0 auto; }
 
+.side-update { font-size: 11px; color: var(--ink-3); line-height: 1.4; padding: 2px 12px 8px 40px; }
+
 @media (max-width: 860px) {
   .entry-grid { grid-template-columns: 1fr; }
   .sidebar { width: 64px; flex-basis: 64px; }
   .sidebar .nav-item span, .sidebar .brand span, .sidebar .brand-sub, .sidebar .local-pill span { display: none; }
+  .sidebar .side-update { display: none; }
 }

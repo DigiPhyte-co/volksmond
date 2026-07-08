@@ -50,6 +50,10 @@ DEFAULTS = {
     "aec": False,                     # echo cancellation when re-transcribing (off by default: it cleans echo-only/you-listening audio well, but can garble YOUR words during sustained double-talk, so it is opt-in)
     "aec_live": True,                 # echo cancellation DURING a live meeting (mic + system loopback -> WebRTC APM). ON by default so the saved recording (a single AEC-cleaned stereo file) and the live transcript are echo-free. Tradeoff: can blur YOUR words during sustained double-talk.
     "installed_models": {},           # versioned models installed on this machine: {repo_id: {"version","revision"}}. Written when a Fluister model is downloaded/updated, so the manual update check can tell when a newer one (e.g. Fluister v2) is published. Machine state, not a user preference.
+    "licence_accepted": False,        # first-run licence agreement accepted. Honour-system gate; also mirrored to localStorage (vm_licence_accepted), same pattern as setup_complete.
+    "session_count": 0,               # completed sessions on this machine; drives the one-time business-use nudge. Local only, never sent anywhere. Incremented by the server at session finalisation, not by the UI.
+    "business_nudge_seen": False,     # the one-time business-use nudge has been shown and dismissed, so it never repeats.
+    "summary_footer": True,           # append a small "Made with Volksmond" line to the summary file. Never the raw transcript, never any export of it.
 }
 
 

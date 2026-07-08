@@ -1,5 +1,20 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-07-08, v1.9.0: first-run licence, business licensing, live meeting notes, and the recording pill fixed for good
+
+`licensing.APP_VERSION` 1.8.2 -> 1.9.0.
+
+- **First-run licence agreement.** A new user now sees a plain, un-skippable "free for personal use, paid licence for business use" screen before setup, with a prominent TLDR and three short bullets. The choice persists to `settings.json` (`licence_accepted`) and mirrors to localStorage; an existing user sees it once on the next launch. The rest of setup stays skippable, the licence gate does not. (`web/static/app.js`, `config.py`, `web/app.py`.)
+- **Business licensing, replacing the R599 one-time Pro.** The upgrade view and the Settings licence card now read as a per-person Business licence for commercial and team use; personal use stays free and is never crippled. No price is baked into the app: it links to volksmond.digiphyte.com/business for current pricing, so a price change never forces a rebuild. Activation by pasted key and the Ed25519 backend are unchanged. (`web/static/app.js`.)
+- **One-time business-use nudge.** After ten completed sessions on the free tier, a single dismissable card on the home screen mentions business licensing. Local only (a counter in `settings.json`), never blocks a meeting, never repeats, and is absent once a licence is active. (`config.py`, `web/app.py`, `web/static/app.js`.)
+- **Optional "Made with Volksmond" summary footer.** A one-line credit at the end of the summary file only, on by default, one click off in Settings. Never added to the raw transcript, and never to any export shared onward. (`web/app.py`, `web/static/app.js`.)
+- **Live meeting notes.** A collapsible notes panel on the live screen lets you type notes as the meeting runs; they autosave to `<stem>-notes.md` beside the transcript and never touch the transcript itself. At summary time you choose whether to fold them in, and when included they are handed to the local summariser as authoritative human input (preferred over the noisy transcript). Notes appear in the reader for a past session and are kept out of the session list. (`web/app.py`, `summarise.py`, `web/static/app.js`, `config.py`.)
+- **The recording status pill no longer stacks the dot above its label.** Root cause, finally: the pill reused the class name `live`, which also matches the full-screen `.live` container rule (`flex-direction: column`), so under some rule orderings the container stacked the pill. v1.7.1 and v1.8.2 both fought this with specificity and it kept coming back. The pill modifier is now `rec`, so no chip can share a class with a layout container again. (`web/static/styles.css`, `web/static/app.js`.)
+
+Verified: py_compile + node --check; isolated backend tests (the four licence/nudge/footer settings and the notes settings round-trip through /api/settings; notes write, read, session-list exclusion, path-traversal and CSRF rejection; the summariser folds notes in only when asked; the footer lands on the summary file only, transcript byte-identical); and a browser pass over the licence gate, Settings, the Business upgrade view, the nudge, the live notes panel and its autosave, the include-notes toggle, the reader notes card, and the pill rendering `flex-direction: row` with the dot measured beside the label. Still wants a real-machine eyeball on the frozen build (the pill symptom only showed there).
+
+Note: `_PUBLIC_KEY_HEX` in `licensing.py` is still empty, so this build cannot activate a Business licence until the keygen is done. Everything else, including all local features, works.
+
 ## 2026-07-03, v1.8.2: fewer short mic ghosts, accurate live timing, snappier start + review fixes
 
 `licensing.APP_VERSION` 1.8.1 -> 1.8.2.

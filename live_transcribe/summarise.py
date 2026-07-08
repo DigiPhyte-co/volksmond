@@ -112,8 +112,8 @@ class Summariser:
             chunks.append("".join(cur))
         return chunks
 
-    def summarise(self, transcript, instruction=None, language=None, chunk_tokens=3000,
-                  max_output_tokens=512):
+    def summarise(self, transcript, instruction=None, language=None, notes=None,
+                  chunk_tokens=3000, max_output_tokens=512):
         instruction = (instruction or DEFAULT_INSTRUCTION).strip()
         if language:
             lang_name = {"af": "Afrikaans", "en": "English"}.get(language)
@@ -123,9 +123,17 @@ class Summariser:
         transcript = transcript.strip()
         if not transcript:
             return ""
+        # The user's own notes, when supplied, are authoritative human input: a person wrote them,
+        # so prefer them over the noisy transcript and make sure their points land. Fed into the
+        # single-shot summary and, for a long transcript, into the final combine step (not each part).
+        notes = (notes or "").strip()
+        notes_block = ("" if not notes else
+                       "The user also kept their own written notes during this meeting. Treat these "
+                       "as authoritative: where they differ from the transcript, prefer the notes, and "
+                       "make sure the points they raise are reflected.\n\nUSER NOTES:\n" + notes + "\n\n")
         if self._ntokens(transcript) <= chunk_tokens:
-            return self._generate(f"{instruction}\n\n{TRANSCRIPT_NOTE}\n\nTRANSCRIPT:\n{transcript}", max_output_tokens)
-        # map: summarise each part on its own
+            return self._generate(f"{instruction}\n\n{TRANSCRIPT_NOTE}\n\n{notes_block}TRANSCRIPT:\n{transcript}", max_output_tokens)
+        # map: summarise each part on its own (the notes are applied at the combine step below)
         chunks = self._split_by_tokens(transcript, chunk_tokens)
         partials = []
         for i, ch in enumerate(chunks, 1):
@@ -138,7 +146,7 @@ class Summariser:
         # reduce: fold the part-summaries into one result under the user's instruction
         combined = "\n\n".join(partials)
         return self._generate(
-            f"{instruction}\n\nThe following are summaries of consecutive parts of one "
+            f"{instruction}\n\n{notes_block}The following are summaries of consecutive parts of one "
             f"meeting. Combine them into a single coherent result, removing repetition.\n\n{combined}",
             max_output_tokens + 128,
         )

@@ -1026,6 +1026,8 @@ def transcribe_file(req: TranscribeFileRequest):
             with STATE.lock:
                 STATE.reset()
                 STATE.sink_error = err
+            if not aborted:
+                _bump_session_count()  # one completed file transcription (not a user cancel)
 
     threading.Thread(target=_run, daemon=True, name="file-transcribe").start()
     return {
@@ -1036,6 +1038,17 @@ def transcribe_file(req: TranscribeFileRequest):
         "source_kind": "file",
         "files": files,
     }
+
+
+def _bump_session_count():
+    """Count one completed session. Local only: it drives the one-time business-use
+    nudge in the UI and never leaves this machine (the model is honour-system, not
+    enforcement). A record-only session that is later re-transcribed can count twice;
+    that is fine for a soft nudge and simpler than tracking session identity."""
+    try:
+        config.update({"session_count": int(config.load().get("session_count", 0)) + 1})
+    except Exception:
+        pass
 
 
 @app.post("/api/stop")
@@ -1172,6 +1185,7 @@ def stop(what: str = "all"):
             STATE.reset()
             STATE.sink_error = err
 
+    _bump_session_count()  # one completed live/record session; file transcription is counted on its own completion
     threading.Thread(target=_drain_and_close, daemon=True, name="stop-drain").start()
     return {"stopping": True, "pending": pending, "output_path": out}
 
@@ -1229,18 +1243,31 @@ def sessions_list():
             except OSError:
                 pass
 
+    # Same for <stem>-notes.md: the user's own notes sidecar, never its own session. Identified by
+    # the "# Notes:" header alone (a real ASR transcript never starts with that), so an orphan notes
+    # file with no transcript yet still never shows up as a phantom session.
+    notes_mds = set()
+    for name in md_names:
+        if name[:-3].endswith("-notes"):
+            try:
+                with open(sdir / name, "r", encoding="utf-8") as fh:
+                    if fh.readline(64).startswith("# Notes:"):
+                        notes_mds.add(name)
+            except OSError:
+                pass
+
     sessions = {}
 
     def _row(stem):
         r = sessions.get(stem)
         if r is None:
             r = {"name": stem + ".md", "stem": stem, "recorded": False, "transcribed": False,
-                 "has_summary": False, "size": 0, "mtime": 0.0, **_parse_session_filename(stem)}
+                 "has_summary": False, "has_notes": False, "size": 0, "mtime": 0.0, **_parse_session_filename(stem)}
             sessions[stem] = r
         return r
 
     for name in md_names:
-        if name in summary_mds:
+        if name in summary_mds or name in notes_mds:
             continue
         r = _row(name[:-3])
         r["transcribed"] = True
@@ -1267,6 +1294,8 @@ def sessions_list():
     for stem, r in sessions.items():
         if (stem + "-summary.md") in md_names:
             r["has_summary"] = True
+        if (stem + "-notes.md") in notes_mds:
+            r["has_notes"] = True
 
     files = sorted(sessions.values(), key=lambda f: f["mtime"], reverse=True)
 
@@ -1350,6 +1379,10 @@ class SettingsPatch(BaseModel):
     ai_instructions: Optional[list] = None
     active_instruction_id: Optional[str] = None
     setup_complete: Optional[bool] = None
+    licence_accepted: Optional[bool] = None
+    session_count: Optional[int] = None
+    business_nudge_seen: Optional[bool] = None
+    summary_footer: Optional[bool] = None
     # summary_model is intentionally NOT settable here: only the verified downloader
     # (modeldl.py) sets it, to a pinned catalogue filename, so an arbitrary or
     # unverified path cannot be made the active summary model via the settings API.
@@ -1801,13 +1834,68 @@ def pick_path(kind: str = "file"):
         _PICK_LOCK.release()
 
 
+# --- meeting notes (the user's own notes, typed live, kept beside the transcript) -----------
+# Stored as <stem>-notes.md next to the transcript, with a "# Notes:" header so the session list
+# can tell them apart from real transcripts (the same trick summaries use). They are the user's
+# own words, never the ASR transcript, and only ever reach a summary when the user opts in.
+
+def _notes_path(stem: str) -> Path:
+    return _sessions_dir() / (stem + "-notes.md")
+
+
+def _strip_notes_header(raw: str) -> str:
+    return re.sub(r"^#\s*Notes:[^\n]*\n+", "", raw or "", count=1)
+
+
+def _read_notes(stem: str) -> str:
+    """The user's notes for a session, header stripped, or '' if there are none."""
+    try:
+        return _strip_notes_header(_notes_path(stem).read_text(encoding="utf-8")).strip()
+    except OSError:
+        return ""
+
+
+class NotesRequest(BaseModel):
+    stem: str
+    text: str = ""
+
+
+@app.get("/api/notes")
+def get_notes(stem: str):
+    """The user's meeting notes for a session (empty string when there are none)."""
+    _validate_session_filename(stem + ".md")  # validate the stem via the transcript allow-list
+    return {"stem": stem, "text": _read_notes(stem)}
+
+
+@app.post("/api/notes")
+def set_notes(req: NotesRequest):
+    """Save, or when empty clear, the user's notes for a session. Written to <stem>-notes.md
+    next to the transcript; never mixed into the transcript file itself."""
+    _validate_session_filename(req.stem + ".md")
+    p = _notes_path(req.stem)
+    text = (req.text or "").strip()
+    if not text:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+        return {"stem": req.stem, "text": ""}
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"# Notes: {req.stem}\n\n{text}\n", encoding="utf-8")
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not save notes: {e}")
+    return {"stem": req.stem, "text": text}
+
+
 class SummariseRequest(BaseModel):
     file: str                      # session filename within the save location
     instruction: Optional[str] = None
     language: Optional[Literal["af", "en"]] = None  # output language for the summary
+    include_notes: Optional[bool] = None            # fold the user's <stem>-notes.md into the summary
 
 
-def _generate_summary(model_path, transcript, instruction, language):
+def _generate_summary(model_path, transcript, instruction, language, notes=None):
     """Run the local summariser, preferring the GPU when it is usable, falling back to CPU."""
     from .. import summarise as _summarise, cudadl
     # GPU only when: the user has not forced CPU, an NVIDIA GPU is present, this build's
@@ -1822,7 +1910,7 @@ def _generate_summary(model_path, transcript, instruction, language):
 
     def _run(layers):
         s = _summarise.Summariser(model_path, n_gpu_layers=layers)
-        return s.summarise(transcript, instruction=instruction, language=language)
+        return s.summarise(transcript, instruction=instruction, language=language, notes=notes)
     try:
         return _run(n_gpu_layers)
     except Exception as e:
@@ -1833,10 +1921,31 @@ def _generate_summary(model_path, transcript, instruction, language):
         raise
 
 
+# Appended to the summary FILE only, and only when the summary_footer setting is on. Never the
+# raw transcript, and never any export the user shares onward (these come from counselling and
+# legal sessions, so exports stay clean). A small, one-click-off growth surface. No em dash, by
+# house style.
+SUMMARY_FOOTER_TEXT = "Made with Volksmond - volksmond.digiphyte.com"
+
+
+def _summary_body(target, summary):
+    """The Markdown for a summary file: a header, the summary, and (when enabled) a small
+    Volksmond footer. The footer is gated on the summary_footer setting and touches nothing else."""
+    body = f"# Summary: {target.stem}\n\n{summary}\n"
+    try:
+        footer_on = bool(config.load().get("summary_footer", True))
+    except Exception:
+        footer_on = True
+    if footer_on:
+        body += "\n---\n_" + SUMMARY_FOOTER_TEXT + "_\n"
+    return body
+
+
 def _save_summary(target, summary):
     """Write <stem>-summary.md (the latest, which the reader loads), archiving any previous
     latest to <stem>-summary-N.md first so regenerating never destroys an earlier summary.
     Returns the path actually written."""
+    body = _summary_body(target, summary)
     out = target.with_name(target.stem + "-summary.md")
     if out.exists():
         n = 1
@@ -1848,9 +1957,9 @@ def _save_summary(target, summary):
         except OSError:
             # Could not archive the previous latest (e.g. a file lock). Do NOT overwrite and
             # lose it: save THIS run under the fresh archive name, leave the old latest in place.
-            archive.write_text(f"# Summary: {target.stem}\n\n{summary}\n", encoding="utf-8")
+            archive.write_text(body, encoding="utf-8")
             return archive
-    out.write_text(f"# Summary: {target.stem}\n\n{summary}\n", encoding="utf-8")
+    out.write_text(body, encoding="utf-8")
     return out
 
 
@@ -1893,6 +2002,9 @@ def summarise_endpoint(req: SummariseRequest):
         raise HTTPException(status_code=500, detail=f"Could not read the transcript: {e}")
     instruction = (req.instruction or config.active_instruction()) or None
     language = req.language
+    # The user's own meeting notes, only when they asked to include them. Read here (not in the
+    # worker) so a read error surfaces as a normal request, and so the worker closes over a value.
+    notes = _read_notes(target.stem) or None if req.include_notes else None
 
     stem = target.stem
     with _SUMMARY_LOCK:
@@ -1902,7 +2014,7 @@ def summarise_endpoint(req: SummariseRequest):
 
     def _worker():
         try:
-            summary = _generate_summary(model_path, transcript, instruction, language)
+            summary = _generate_summary(model_path, transcript, instruction, language, notes=notes)
             saved = _save_summary(target, summary)
             with _SUMMARY_LOCK:
                 _SUMMARY_JOBS[stem] = {"state": "done", "saved": str(saved), "summary": summary, "error": None}

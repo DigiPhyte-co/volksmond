@@ -12,9 +12,12 @@
 // Where "Report a bug or request a feature" sends. Privacy-first mailto: it
 // only carries the app version and OS, never logs or transcripts.
 var FEEDBACK_EMAIL = "volksmond@digiphyte.com";
-// Where "Buy Pro" sends the user. The purchase/pricing page on the site (not sold during
-// early access; this is the forward-looking link). Change when the page is live.
-var PRO_URL = "https://volksmond.digiphyte.com/pro";
+// The business / licensing page: current pricing and what a Business licence covers.
+// Personal use is free, so this is only ever a "learn or buy" link, opened in the browser.
+var BUSINESS_PAGE_URL = "https://volksmond.digiphyte.com/business";
+// Completed sessions before the one-time, dismissable business-use nudge. Local only; the
+// count lives in settings.json on this machine and is never sent anywhere.
+var SESSION_NUDGE_THRESHOLD = 10;
 
 var APP = document.getElementById("app");
 // CSRF token handed to the page by the server (app.py). Echoed on every
@@ -82,6 +85,7 @@ var IP = {
   sparkle: '<path d="M12 3l1.8 5.6L19.5 10.5l-5.7 1.9L12 18l-1.8-5.6L4.5 10.5l5.7-1.9z" fill="currentColor" stroke="none"/>',
   alert: '<path d="M12 3.5 2.5 20.5h19z"/><path d="M12 10v4.5M12 17.5h.01"/>',
   upload: '<path d="M12 15.5V4M7.5 8.5 12 4l4.5 4.5"/><path d="M5 15.5V19a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 19v-3.5"/>',
+  download: '<path d="M12 4v11.5M7.5 11 12 15.5l4.5-4.5"/><path d="M5 15.5V19a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 19v-3.5"/>',
   disk: '<path d="M5 4h11l3 3v13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M8 4v5h7V4"/><rect x="8" y="13" width="8" height="6.5"/>',
   note: '<path d="M7 3.5h6.5L18 8v12.5a.5.5 0 0 1-.5.5h-11a.5.5 0 0 1-.5-.5V4a.5.5 0 0 1 .5-.5z"/><path d="M13 3.5V8h5"/>',
   globe: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.6 2.6 14.4 0 17M12 3.5c-2.6 2.6-2.6 14.4 0 17"/>',
@@ -138,6 +142,7 @@ function freshLive() {
     startedAt: null, outputPath: null, audioStem: null, tier: null, model: null, family: null,
     language: null, engine: null, stopping: false, segments: [], es: null, title: "", importName: "",
     micDevice: null, loopbackDevice: null, switching: false, reconfiguring: false,
+    notes: "", notesOpen: false,
   };
 }
 var S = {
@@ -694,14 +699,20 @@ async function doStop(what) {
   } catch (e) { toast(e.message || "Could not stop.", true); }
 }
 function gotoFinish(outputPath, sinkError) {
+  saveNotesNow();                                  // flush any pending notes for this session
+  var notesText = (S.live.notes || "").trim();
   teardownLive();
   S.finish.outputPath = outputPath || S.live.outputPath;
   S.finish.title = S.live.title || topicFromName(baseName(S.finish.outputPath));
   S.finish.recordingStem = S.live.recording ? S.live.audioStem : null;
   S.finish.summary = null; S.finish.savedAs = null; S.finish.summarising = false;
   S.finish.sinkError = sinkError || null;
+  S.finish.notes = notesText; S.finish.hasNotes = !!notesText; S.finish.includeNotes = true;
   S.live.running = false;
   refreshSessions();
+  // The server bumped session_count as this session finalised; refresh settings so the one-time
+  // business nudge can appear on the home screen once the threshold is reached.
+  api.get("/api/settings").then(function (s) { if (s) S.settings = s; }).catch(function () {});
   if (S.finish.sinkError) toast(S.finish.sinkError, true);
   go("finish");
 }
@@ -757,6 +768,7 @@ async function doSummarise(fileName, scope) {
     var body = { file: fileName, language: target.sumLang || "en" };
     var instruction = summaryInstructionFor(target);
     if (instruction) body.instruction = instruction;
+    if (target.hasNotes && target.includeNotes !== false) body.include_notes = true;
     // The summary now runs as a server-side job (so it survives navigating away and shows up
     // in History). POST starts it; poll /api/summary-status for the result.
     await api.post("/api/summarise", body);
@@ -1008,6 +1020,9 @@ function sidebar(active) {
     ]),
     el("div", { class: "spacer" }),
     el("div", { class: "local-pill" }, [icon("lock", 14), el("span", { text: "Local only, no internet" })]),
+    el("button", { class: "nav-item", style: { fontSize: "12px" }, disabled: updateState.state === "checking", onclick: function () { checkUpdates(); } },
+      [icon("download", 16), el("span", { text: updateState.state === "checking" ? "Checking for updates" : "Check for updates" })]),
+    sideUpdateResult(),
     el("button", { class: "nav-item", style: { fontSize: "12px" }, onclick: reportBug },
       [icon("bug", 16), el("span", { text: "Report a bug or idea" })]),
   ]);
@@ -1027,10 +1042,53 @@ async function finishSetup() {
   try { localStorage.setItem("vm_setup_done", "1"); } catch (e) {}
   go("home");
 }
+// The first-run licence agreement. Un-skippable: accepting is the only way past it. Persist to
+// disk AND localStorage (the same belt-and-braces as setup_complete, because the WebView can wipe
+// localStorage between launches). A returning user who already finished setup goes straight home;
+// a genuine first run continues into the welcome stage.
+async function acceptLicence() {
+  try {
+    S.settings = await api.post("/api/settings", { licence_accepted: true });
+  } catch (e) {
+    if (S.settings) S.settings.licence_accepted = true;
+    toast(e.message || "Could not save.", true);
+  }
+  try { localStorage.setItem("vm_licence_accepted", "1"); } catch (e) {}
+  var done = false;
+  try { done = !!localStorage.getItem("vm_setup_done"); } catch (e) {}
+  if (S.settings && S.settings.setup_complete) done = true;
+  if (done) { go("home"); }
+  else { S.setup.stage = "welcome"; render(); }
+}
 function setupView() {
   var stage = S.setup.stage;
   var inner;
-  if (stage === "welcome") {
+  if (stage === "licence") {
+    inner = el("div", { class: "col-narrow stack", style: { gap: "20px" } }, [
+      el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "center" } }, [
+        el("div", { class: "wordmark" }, [markSvg(22), el("span", { text: "Volksmond" }), el("span", { class: "provisional", text: "Research Preview" })]),
+        langToggleSeg(),
+      ]),
+      // The TLDR, prominent and at the very top, so the deal is clear before anything else.
+      el("div", { class: "card disclosure accent", style: { padding: "18px", display: "flex", gap: "14px" } }, [
+        el("div", { class: "tone-tile accent", style: { width: "40px", height: "40px", flex: "0 0 auto" } }, icon("crown", 20)),
+        el("div", {}, [
+          el("div", { style: { fontWeight: "700", fontSize: "16px", marginBottom: "6px" }, text: "Free for personal use. Business use needs a licence." }),
+          el("p", { class: "ink-2", style: { fontSize: "13.5px", margin: "0" }, text: "Use Volksmond for your own meetings, study, or personal projects and it is free, forever. If a business or practice uses it for work, that needs a paid licence. One or two people trying it at work is fine; rolling it out to a team or using it in paid client work is what a licence is for." }),
+        ]),
+      ]),
+      bulletList([
+        "Personal use: free, everything on this computer, no account.",
+        "Business use: a paid licence per person, renewed yearly.",
+        "Your audio never leaves this computer either way.",
+      ]),
+      el("div", { class: "row gap-10" }, [
+        el("button", { class: "btn primary tall grow", onclick: acceptLicence }, "I agree and continue"),
+      ]),
+      el("div", { class: "row", style: { justifyContent: "center" } },
+        el("button", { class: "btn ghost sm", onclick: function () { openExternal(BUSINESS_PAGE_URL); } }, "Read the full licence")),
+    ]);
+  } else if (stage === "welcome") {
     inner = el("div", { class: "col-narrow stack", style: { gap: "20px" } }, [
       el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "center" } }, [
         el("div", { class: "wordmark" }, [markSvg(22), el("span", { text: "Volksmond" }), el("span", { class: "provisional", text: "Research Preview" })]),
@@ -1192,6 +1250,37 @@ function choiceCard(id, ic, title, body, note) {
   ]);
 }
 
+/* ── business-use nudge (one-time, local, dismissable) ────── */
+// After SESSION_NUDGE_THRESHOLD completed sessions on a free licence, show one gentle,
+// dismissable card on the home screen. It never blocks a meeting, never repeats (either button
+// retires it for good), and never shows once a licence is active. Entirely local: the trigger is
+// a count in settings.json and nothing is ever sent anywhere.
+function shouldShowBusinessNudge() {
+  var st = S.settings || {};
+  return !isPro()
+    && (st.session_count || 0) >= SESSION_NUDGE_THRESHOLD
+    && !st.business_nudge_seen;
+}
+function retireBusinessNudge(openLink) {
+  if (openLink) openExternal(BUSINESS_PAGE_URL);
+  if (S.settings) S.settings.business_nudge_seen = true;  // hide at once, then persist
+  render();
+  api.post("/api/settings", { business_nudge_seen: true }).then(function (s) { S.settings = s; }).catch(function () {});
+}
+function businessNudgeCard() {
+  return el("div", { class: "card", style: { padding: "16px", display: "flex", gap: "14px", alignItems: "flex-start", marginBottom: "16px" } }, [
+    el("div", { class: "tone-tile accent", style: { width: "36px", height: "36px", flex: "0 0 auto" } }, icon("crown", 18)),
+    el("div", { class: "grow" }, [
+      el("div", { style: { fontWeight: "600", marginBottom: "4px" }, text: "Using Volksmond for work?" }),
+      el("p", { class: "ink-2", style: { fontSize: "13px", margin: "0 0 12px" }, text: "Business use needs a licence. It keeps the personal version free for everyone and funds the open Afrikaans models." }),
+      el("div", { class: "row gap-8" }, [
+        el("button", { class: "btn sm primary", onclick: function () { retireBusinessNudge(true); } }, "Business licensing"),
+        el("button", { class: "btn sm ghost", onclick: function () { retireBusinessNudge(false); } }, "Not now"),
+      ]),
+    ]),
+  ]);
+}
+
 /* ── home (new session hub) ───────────────────────────────── */
 function homeView() {
   function entry(opts) {
@@ -1207,6 +1296,7 @@ function homeView() {
     ]);
   }
   return el("div", { class: "screen center" }, el("div", { class: "screen-inner" }, [
+    shouldShowBusinessNudge() ? businessNudgeCard() : null,
     el("div", { class: "screen-head" }, el("div", {}, [
       el("div", { class: "eyebrow", text: "Ready when you are" }),
       el("h1", { text: "Start a session" }),
@@ -1411,10 +1501,43 @@ function deviceBadge(tier) {
   return el("span", { class: "chip" }, "CPU");
 }
 
+/* ── meeting notes (typed live, saved beside the transcript) ── */
+// Notes are the user's own words, saved to <stem>-notes.md as they type. They never touch the
+// transcript, and only reach a summary if the user opts in (see summariseCard). The save is
+// debounced; typing does not re-render, so the textarea keeps focus while transcription streams.
+var notesSaveTimer = null;
+function liveStem() { return baseName(S.live.outputPath || "").replace(/\.md$/, ""); }
+function scheduleNotesSave() {
+  if (notesSaveTimer) clearTimeout(notesSaveTimer);
+  notesSaveTimer = setTimeout(saveNotesNow, 700);
+}
+function saveNotesNow() {
+  if (notesSaveTimer) { clearTimeout(notesSaveTimer); notesSaveTimer = null; }
+  var stem = liveStem();
+  if (!stem) return;
+  api.post("/api/notes", { stem: stem, text: S.live.notes || "" }).catch(function () {});
+}
+function liveNotesPanel() {
+  var open = !!S.live.notesOpen;
+  var toggle = function () { S.live.notesOpen = !S.live.notesOpen; render(); };
+  var head = el("div", { class: "notes-head", role: "button", tabindex: "0", onclick: toggle, onkeydown: keyActivate(toggle) }, [
+    icon("note", 14),
+    el("span", { text: "Your notes" }),
+    (S.live.notes && S.live.notes.trim()) ? el("span", { class: "chip muted", text: "saved on this computer" }) : null,
+    el("span", { class: "grow" }),
+    icon(open ? "chevDown" : "chevRight", 14),
+  ]);
+  if (!open) return el("div", { class: "notes-panel" }, head);
+  var ta = el("textarea", { class: "field notes-ta", value: S.live.notes || "",
+    placeholder: "Jot notes as the meeting goes: decisions, names, to-dos. Saved with this meeting on your computer. When you summarise, you choose whether to fold them in.",
+    oninput: function (e) { S.live.notes = e.target.value; scheduleNotesSave(); } });
+  return el("div", { class: "notes-panel open" }, [head, ta]);
+}
+
 function liveView() {
   var statusChip;
   if (S.live.stopping) statusChip = el("span", { class: "chip warn" }, [el("span", { class: "dot" }), el("span", { id: "live-status-text", text: "Finishing" })]);
-  else if (S.live.transcribing) statusChip = el("span", { class: "chip live" }, [el("span", { class: "dot" }), el("span", { text: "Listening" })]);
+  else if (S.live.transcribing) statusChip = el("span", { class: "chip rec" }, [el("span", { class: "dot" }), el("span", { text: "Listening" })]);
   else statusChip = el("span", { class: "chip ok" }, [el("span", { class: "dot" }), el("span", { text: "Saved" })]);
 
   elapsedEl = el("span", { class: "mono", text: fmtElapsed(S.live.startedAt) });
@@ -1454,7 +1577,7 @@ function liveView() {
     S.live.outputPath ? el("span", { class: "saving" }, ["Saving to ", el("span", { class: "mono", text: baseName(S.live.outputPath) })]) : null,
   ]);
 
-  return el("div", { class: "live" }, [header, liveAudioStrip(), liveTuneStrip(), liveBodyEl, footer]);
+  return el("div", { class: "live" }, [header, liveAudioStrip(), liveTuneStrip(), liveBodyEl, liveNotesPanel(), footer]);
 }
 
 /* ── record only ──────────────────────────────────────────── */
@@ -1466,7 +1589,7 @@ function recordOnlyView() {
         el("div", { class: "ttl" }, [S.live.title ? raw(S.live.title) : "Recording"]),
         el("div", { class: "meta" }, [el("span", { text: "Recording only, not transcribing yet" }), el("span", { text: "·" }), el("span", { text: "Local only" })]),
       ]),
-      el("div", { class: "right" }, el("span", { class: "chip live" }, [el("span", { class: "dot" }), "Recording"])),
+      el("div", { class: "right" }, el("span", { class: "chip rec" }, [el("span", { class: "dot" }), "Recording"])),
     ]);
     var body = el("div", { class: "live-body" }, el("div", { class: "rec-stage" }, [
       el("div", { class: "rec-pulse" }, el("div", { class: "core" }, el("i"))),
@@ -1566,6 +1689,32 @@ function finishView() {
     ]),
   ]));
 }
+// The "include my notes" choice, shown on the summary card only when this session has notes.
+// The notes are saved either way; this only decides whether the summary is told to use them.
+function notesIncludeRow(target) {
+  if (!target.hasNotes) return null;
+  var on = target.includeNotes !== false;
+  var flip = function () { target.includeNotes = !on; render(); };
+  return el("div", { class: "row gap-10", style: { alignItems: "flex-start", marginTop: "12px", paddingTop: "12px", borderTop: "1px solid var(--line)" } }, [
+    toggleEl(on, flip),
+    el("div", { class: "grow", role: "button", tabindex: "0", onclick: flip, onkeydown: keyActivate(flip), style: { cursor: "pointer" } }, [
+      el("div", { style: { fontWeight: "500", fontSize: "12.5px" }, text: "Include my notes in this summary" }),
+      el("div", { class: "ink-3", style: { fontSize: "11px", marginTop: "2px" }, text: "Your notes stay saved with the meeting either way. This tells the summary to treat them as your own record." }),
+    ]),
+  ]);
+}
+// The user's own notes, shown as a card in the reader for a past session.
+function notesCard(text) {
+  return el("div", { class: "card", style: { padding: "16px 18px" } }, [
+    el("div", { class: "row gap-8", style: { alignItems: "center", marginBottom: "8px" } }, [
+      el("span", { style: { color: "var(--accent)", display: "inline-flex" } }, icon("note", 15)),
+      el("div", { style: { fontWeight: "600" }, text: "Your notes" }),
+      el("span", { class: "grow" }),
+      el("button", { class: "btn ghost sm", onclick: function () { copyText(text); } }, [icon("copy", 12), "Copy"]),
+    ]),
+    el("div", { class: "ink-2", style: { fontSize: "13.5px", whiteSpace: "pre-wrap", fontFamily: "var(--font-transcript)" } }, raw(text)),
+  ]);
+}
 function summariseCard(fileName, scope) {
   var target = scope === "reader" ? S.reader : S.finish;
   if (target.summary) {
@@ -1596,6 +1745,7 @@ function summariseCard(fileName, scope) {
       ]),
     ]),
     el("div", { style: { marginTop: "12px" } }, summaryStyleControl(target)),
+    notesIncludeRow(target),
     el("div", { class: "row gap-8", style: { alignItems: "center", justifyContent: "flex-end", marginTop: "12px" } }, [
       el("span", { class: "ink-3", style: { fontSize: "11.5px" }, text: "Summary in" }),
       selectEl([["en", "English"], ["af", "Afrikaans"]], (target.sumLang || "en"), function (v) { target.sumLang = v; render(); }),
@@ -1621,6 +1771,7 @@ function summaryResult(summary, savedAs, fileName, scope) {
     el("div", { style: { marginTop: "14px", paddingTop: "14px", borderTop: "1px solid var(--line)" } }, [
       el("div", { class: "section-label", style: { marginBottom: "8px" }, text: "Make another summary" }),
       summaryStyleControl(target),
+      notesIncludeRow(target),
       el("div", { class: "row gap-8", style: { alignItems: "center", justifyContent: "flex-end", marginTop: "10px" } }, [
         el("span", { class: "ink-3", style: { fontSize: "11.5px" }, text: "Summary in" }),
         selectEl([["en", "English"], ["af", "Afrikaans"]], (target.sumLang || "en"), function (v) { target.sumLang = v; render(); }),
@@ -1644,7 +1795,7 @@ function busyChip(label, cls) {
 function sessionStatus(f, active, summarising) {
   var chips = [];
   if (active) {
-    if (active.recording) chips.push(el("span", { class: "chip live" }, [el("span", { class: "dot" }), el("span", { text: tr("Recording") })]));
+    if (active.recording) chips.push(el("span", { class: "chip rec" }, [el("span", { class: "dot" }), el("span", { text: tr("Recording") })]));
     if (active.transcribing) chips.push(busyChip(tr("Transcribing")));
   } else {
     if (f.recorded) chips.push(statChip(tr("Recorded"), "mic", "muted"));
@@ -1767,6 +1918,13 @@ async function openReader(name) {
       S.reader.savedAs = sumName;
     }
   } catch (e) { /* no summary yet, or unreadable: the transcript still shows */ }
+  // Load the user's own notes for this session (if any), so the reader can show them and the
+  // summary card can offer to fold them in.
+  S.reader.hasNotes = false; S.reader.notes = ""; S.reader.includeNotes = true;
+  try {
+    var nres = await api.get("/api/notes?stem=" + encodeURIComponent(S.reader.stem));
+    if (nres && nres.text && nres.text.trim()) { S.reader.notes = nres.text; S.reader.hasNotes = true; }
+  } catch (e) { /* no notes: fine */ }
   // If a summary is being generated right now (started before opening this reader), show the
   // in-progress state and poll for it, rather than showing nothing.
   if (!S.reader.summary && (S.sessionsSummarising || []).indexOf(S.reader.stem) >= 0) {
@@ -1799,6 +1957,7 @@ function readerView() {
   } else {
     body = el("div", { class: "stack", style: { gap: "16px" } }, [
       hasSummary ? null : summariseCard(S.reader.name, "reader"),
+      S.reader.hasNotes ? notesCard(S.reader.notes) : null,
       el("div", { class: "card", style: { padding: "20px 22px" } },
         el("div", { class: "doc", style: { maxWidth: "none", fontSize: "15px", whiteSpace: "pre-wrap", fontFamily: "var(--font-transcript)" } }, raw(S.reader.text))),
     ]);
@@ -1859,6 +2018,16 @@ function openUpdateLink(u) {
   } catch (e) {}
   toast("That update link looked wrong, so it was not opened.", true);
 }
+// Compact result under the sidebar "Check for updates" item, so a check from the sidebar shows its
+// outcome in place. Shares the same updateState as the Settings About card (they stay in sync).
+function sideUpdateResult() {
+  var u = updateState;
+  if (u.state === "done" && u.info && u.info.update_available)
+    return el("div", { class: "side-update" }, [el("span", { text: "v" + u.info.latest + " ready. " }), el("span", { class: "link", onclick: function () { openUpdateLink(u.info.url); } }, "Download")]);
+  if (u.state === "done") return el("div", { class: "side-update", style: { color: "var(--ok)" } }, "You are up to date.");
+  if (u.state === "error") return el("div", { class: "side-update", style: { color: "var(--warn)" } }, "Could not check.");
+  return null;
+}
 function aboutCard() {
   var version = (S.appInfo && S.appInfo.version) || "?";
   var u = updateState;
@@ -1888,18 +2057,25 @@ function aboutCard() {
 }
 function licenceCard() {
   var pro = isPro();
+  var lic = S.license || {};
+  var seats = lic.seats || 1;
+  var until = lic.valid_until;  // ISO date, or null for an undated key
+  var seatText = seats > 1 ? (seats + " seats") : "1 seat";
   return el("div", { class: "card settings-card" }, [
     el("div", { class: "set-row" }, [
       el("div", { class: "tone-tile accent", style: { width: "36px", height: "36px", flex: "0 0 auto" } }, icon("crown", 18)),
       el("div", { class: "body" }, [
-        el("div", { class: "t" }, [el("span", { text: pro ? "Pro, activated" : "Free" }), pro ? el("span", { class: "chip accent", text: "Perpetual" }) : null]),
+        el("div", { class: "t" }, [
+          el("span", { text: pro ? "Business licence, active" : "Personal use" }),
+          pro ? el("span", { class: "chip accent", text: seatText }) : null,
+        ]),
         el("div", { class: "s", text: pro
-          ? "Calendar attendee seeding and the optional online fallbacks are unlocked. Verified on this computer, never on a server."
-          : "Unlimited local transcription and summaries, forever. Pro adds calendar attendees and optional online fallbacks for weak machines." }),
+          ? ("This computer is activated on a business licence" + (until ? ", valid until " + until : "") + ". Calendar attendees and the optional online fallbacks are unlocked, verified on this computer, never on a server.")
+          : "Licensed for personal, non-commercial use. Everything runs on this computer, free, with no account. A business or team using Volksmond for work needs a licence." }),
       ]),
       pro
         ? el("button", { class: "btn ghost", onclick: deactivateLicence }, "Deactivate")
-        : el("span", { class: "chip", text: "Coming soon" }),
+        : el("button", { class: "btn ghost", onclick: function () { go("upgrade"); } }, "Business licensing"),
     ]),
   ]);
 }
@@ -2443,6 +2619,7 @@ function summaryDeviceRow() {
 function summariesCard() {
   var d = S.summaryModels || {};
   var anyActive = (d.installed != null) ? d.installed : !!(S.models && S.models.summary_installed);
+  var footerOn = !(S.settings && S.settings.summary_footer === false);  // default on
   return el("div", { class: "card settings-card" }, [
     el("div", { class: "card-title section-label", text: "Summaries, run on this machine" }),
     el("div", { class: "set-row", style: { display: "block" } }, [
@@ -2453,6 +2630,14 @@ function summariesCard() {
       summaryDownloadPanel(true),
     ]),
     summaryDeviceRow(),
+    el("div", { class: "set-row" }, [
+      el("div", { class: "ic" }, icon("note", 18)),
+      el("div", { class: "body" }, [
+        el("div", { class: "t", text: "Add a small 'Made with Volksmond' line to summaries" }),
+        el("div", { class: "s", text: "A single credit line at the end of the summary file only. Never added to the transcript, and never to anything you export to share." }),
+      ]),
+      el("div", { class: "ctl" }, toggleEl(footerOn, function () { saveSettings({ summary_footer: !footerOn }); })),
+    ]),
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("folder", 18)),
       el("div", { class: "body" }, [el("div", { class: "t", text: "Where summary models are stored" }),
@@ -2494,7 +2679,7 @@ function dangerCard(st) {
       [icon("alert", 16), el("span", { class: "section-label", style: { color: "var(--record)" }, text: "Danger zone, these settings can send data off your computer" })]),
     el("div", { style: { padding: "4px 18px 16px" } }, [
       el("div", { class: "set-row", style: { display: "block", borderTop: "0" } }, [
-        el("div", { class: "t", style: { marginBottom: "4px" } }, [el("span", { text: "Online API key for a future fallback" }), el("span", { class: "pro-badge", text: "Pro" })]),
+        el("div", { class: "t", style: { marginBottom: "4px" } }, [el("span", { text: "Online API key for a future fallback" }), el("span", { class: "pro-badge", text: "Business" })]),
         el("p", { class: "s", style: { marginBottom: "10px" }, text: "For weak machines that cannot keep up. When an online fallback is enabled in a later version, audio or transcript text would be sent to the provider you choose. Your data would leave this computer. Not recommended for counselling, legal, or any confidential context. The key is stored encrypted on this machine." }),
         keyInput,
         el("div", { class: "row gap-8", style: { marginTop: "10px", justifyContent: "flex-end" } }, [
@@ -2515,31 +2700,32 @@ function upgradeView() {
   else if (ks === "error-version") help = el("p", { style: { color: "var(--warn)", fontSize: "12px", marginTop: "8px" }, text: "That key is for a different major version of Volksmond." });
   else if (ks === "error-bad") help = el("p", { style: { color: "var(--danger)", fontSize: "12px", marginTop: "8px" }, text: S.upgrade.msg || "That key did not match. Check for a typo, or paste it from your purchase email." });
 
-  function freeCard() {
+  function personalCard() {
     return el("div", { class: "card", style: { padding: "20px" } }, [
-      el("div", { class: "row", style: { justifyContent: "space-between", marginBottom: "8px" } }, [el("div", { style: { fontWeight: "600" }, text: "Free" }), el("span", { class: "mono", text: "R 0" })]),
+      el("div", { class: "row", style: { justifyContent: "space-between", marginBottom: "8px" } }, [el("div", { style: { fontWeight: "600" }, text: "Personal" }), el("span", { class: "chip", text: "Free" })]),
       bulletList(["Unlimited local live transcription", "Local summaries, on this machine", "Afrikaans, English, and the mix", "Save and export, fully offline"]),
+      el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "10px" }, text: "For your own meetings, study, or personal projects. No account, no licence, forever." }),
     ]);
   }
-  function proCard() {
+  function businessCard() {
     return el("div", { class: "card disclosure accent", style: { padding: "20px" } }, [
       el("div", { class: "row", style: { justifyContent: "space-between", marginBottom: "8px" } }, [
-        el("div", { class: "row gap-8" }, [el("span", { style: { fontWeight: "600" }, text: "Pro" }), el("span", { class: "chip accent" }, [icon("crown", 11), "Pro"])]),
-        el("span", { class: "mono", text: "R 599, one-time" }),
+        el("div", { class: "row gap-8" }, [el("span", { style: { fontWeight: "600" }, text: "Business" }), el("span", { class: "chip accent" }, [icon("crown", 11), "Licence"])]),
+        el("span", { class: "mono ink-3", text: "Per person" }),
       ]),
-      bulletList(["Pull attendee names from your calendar", "Optional online transcription for weak machines", "Optional online summary for harder transcripts"]),
-      el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "10px" }, text: "Pro covers only what needs an online connection. Everything that runs on this computer stays free. Perpetual: you own this version forever." }),
+      bulletList(["Everything in Personal", "Licensed for business and professional use", "Pull attendee names from your calendar", "Optional online transcription for weak machines", "Optional online summary for harder transcripts"]),
+      el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "10px" }, text: "For teams and paid client work. A licence per person, renewed yearly. Everything that runs on this computer stays free." }),
     ]);
   }
   return el("div", { class: "screen center" }, el("div", { class: "screen-inner col-mid stack", style: { gap: "16px" } }, [
     el("button", { class: "btn ghost sm", style: { alignSelf: "flex-start" }, onclick: function () { go("settings"); } }, [icon("back", 14), "Back to settings"]),
-    el("div", {}, [el("div", { class: "eyebrow", text: "Upgrade" }), el("h1", { style: { marginTop: "6px" }, text: "Pro adds the polish, not the privacy." })]),
-    el("p", { class: "ink-2", text: "Free is the real thing: unlimited live transcription and local summaries, on this machine, forever. Pro adds the few features that actually need to reach the internet." }),
-    el("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" } }, [freeCard(), proCard()]),
+    el("div", {}, [el("div", { class: "eyebrow", text: "Business licensing" }), el("h1", { style: { marginTop: "6px" }, text: "Free for personal use. A licence for business." })]),
+    el("p", { class: "ink-2", text: "Personal use is the real thing: unlimited live transcription and local summaries, on this machine, forever. A business licence covers commercial and team use, and adds the few features that reach the internet." }),
+    el("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" } }, [personalCard(), businessCard()]),
     el("div", { class: "card", style: { padding: "20px" } }, [
-      el("button", { class: "btn primary tall", onclick: function () { openExternal(PRO_URL); } }, "Buy Pro for R 599"),
-      el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "8px" }, text: "Opens the Volksmond website in your browser. You get a licence key by email after purchase, and activation is fully offline." }),
-      el("div", { class: "divider-label", text: "Already bought" }),
+      el("button", { class: "btn primary tall", onclick: function () { openExternal(BUSINESS_PAGE_URL); } }, "View business licensing"),
+      el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "8px" }, text: "Opens volksmond.digiphyte.com/business for current pricing. You get a licence key by email, and activation is fully offline." }),
+      el("div", { class: "divider-label", text: "Already have a key" }),
       el("div", { class: "row gap-8" }, [
         el("input", { class: "field mono", style: { outline: "2px solid " + ring, outlineOffset: "-1px" }, placeholder: "Paste your licence key, e.g. VM1-XXXX-XXXX-XXXX-XXXX", value: S.upgrade.value, oninput: function (e) { S.upgrade.value = e.target.value; } }),
         el("button", { class: "btn", onclick: activateLicence }, "Activate"),
@@ -2858,10 +3044,21 @@ async function boot() {
   } catch (e) {}
 
   if (!resumed) {
-    var done = false;
-    try { done = !!localStorage.getItem("vm_setup_done"); } catch (e) {}
-    if (S.settings && S.settings.setup_complete) done = true;   // disk flag survives WebView storage resets
-    S.route = done ? "home" : "setup";
+    // The licence agreement gates everything and cannot be skipped. It is separate from the
+    // setup wizard: a returning user who already finished setup still sees it once (the flag
+    // defaults false until they accept), which is the intended one-time consent.
+    var licenceOk = false;
+    try { licenceOk = !!localStorage.getItem("vm_licence_accepted"); } catch (e) {}
+    if (S.settings && S.settings.licence_accepted) licenceOk = true;
+    if (!licenceOk) {
+      S.setup.stage = "licence";
+      S.route = "setup";
+    } else {
+      var done = false;
+      try { done = !!localStorage.getItem("vm_setup_done"); } catch (e) {}
+      if (S.settings && S.settings.setup_complete) done = true;   // disk flag survives WebView storage resets
+      S.route = done ? "home" : "setup";
+    }
   }
   S.booted = true;
   render();
