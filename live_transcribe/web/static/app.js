@@ -106,6 +106,8 @@ var IP = {
   copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/>',
   ext: '<path d="M14 5h5v5M19 5l-7 7M12 5H6a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-6"/>',
   heart: '<path d="M12 20s-7-4.6-7-9.6A3.9 3.9 0 0 1 12 7a3.9 3.9 0 0 1 7 2.8C19 15.4 12 20 12 20z"/>',
+  pencil: '<path d="M4 20l1.2-4.2L16 5a2 2 0 0 1 3 3L8.2 18.8z"/><path d="M14 7l3 3"/>',
+  calendar: '<rect x="4" y="5" width="16" height="16" rx="2"/><path d="M4 9.5h16M8 3v4M16 3v4"/>',
 };
 function icon(name, size) {
   size = size || 16;
@@ -155,6 +157,7 @@ var S = {
   setup: { stage: "welcome", choice: "transcribe" },
   finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null },
   reader: { name: "", title: "", text: "", summarising: false, summary: null },
+  reminder: null,   // active calendar reminder: {subject, attendees, start, key}, or null
   upgrade: { keyState: "empty", value: "", msg: "" },
   settingsDraft: null,
   theme: (function () { try { return localStorage.getItem("vm_theme") || "system"; } catch (e) { return "system"; } })(),
@@ -165,7 +168,7 @@ var S = {
 
 // transient refs + timers (not part of render state)
 var liveDocEl = null, liveBodyEl = null, elapsedEl = null, recTimerEl = null;
-var pollTimer = null, elapsedTimer = null, toastTimer = null, levelTimer = null, warmTimer = null, histTimer = null;
+var pollTimer = null, elapsedTimer = null, toastTimer = null, levelTimer = null, warmTimer = null, histTimer = null, reminderTimer = null;
 var startingTimer = null, startingElapsedEl = null;
 
 /* ── api ──────────────────────────────────────────────────── */
@@ -911,6 +914,7 @@ function summaryInstalled() { return S.models && S.models.summary_installed; }
 // Use it to open external links and native pickers; the browser build falls back.
 function inDesktop() { return !!(window.pywebview && window.pywebview.api); }
 function connected() { return !!(S.appInfo && S.appInfo.connected); }  // online (paid) edition; the offline build hides online-feature UI
+function offlineBuild() { return !!(S.appInfo && S.appInfo.offline); }  // the airtight offline-only edition: even the model-update check and calendar are compiled out
 function openExternal(url) {
   // Native shell: hand it to the OS (system browser / mail client).
   if (inDesktop() && window.pywebview.api.open_external) { window.pywebview.api.open_external(url); return; }
@@ -989,6 +993,11 @@ function render() {
   }
   APP.appendChild(view);
   if (S.stopMenuOpen) APP.appendChild(stopMenuLayer());
+  // A calendar reminder floats above every screen except the ones where starting a meeting makes no
+  // sense (already live/recording/importing, or the first-run gate).
+  if (S.reminder && ["setup", "starting", "live", "recordonly", "importing"].indexOf(S.route) < 0) {
+    APP.appendChild(reminderBanner());
+  }
   if (S.toast) {
     APP.appendChild(el("div", { class: "toast-wrap" }, el("div", { class: "toast" + (S.toast.err ? " err" : ""), text: S.toast.msg })));
   }
@@ -1020,9 +1029,12 @@ function sidebar(active) {
     ]),
     el("div", { class: "spacer" }),
     el("div", { class: "local-pill" }, [icon("lock", 14), el("span", { text: "Local only, no internet" })]),
-    el("button", { class: "nav-item", style: { fontSize: "12px" }, disabled: updateState.state === "checking", onclick: function () { checkUpdates(); } },
-      [icon("download", 16), el("span", { text: updateState.state === "checking" ? "Checking for updates" : "Check for updates" })]),
-    sideUpdateResult(),
+    // The app update check is an online-feature convenience, so only the connected edition shows it.
+    // The default and offline builds hide it (and the server route refuses / is compiled out), so
+    // the app never phones home behind the "Local only" promise.
+    connected() ? el("button", { class: "nav-item", style: { fontSize: "12px" }, disabled: updateState.state === "checking", onclick: function () { checkUpdates(); } },
+      [icon("download", 16), el("span", { text: updateState.state === "checking" ? "Checking for updates" : "Check for updates" })]) : null,
+    connected() ? sideUpdateResult() : null,
     el("button", { class: "nav-item", style: { fontSize: "12px" }, onclick: reportBug },
       [icon("bug", 16), el("span", { text: "Report a bug or idea" })]),
   ]);
@@ -1081,6 +1093,17 @@ function setupView() {
         "Personal use: free, everything on this computer, no account.",
         "Business use: a paid licence per person, renewed yearly.",
         "Your audio never leaves this computer either way.",
+      ]),
+      // The honour system, stated plainly. This IS the whole enforcement model (no telemetry, no
+      // phone-home, no activation check), so we say so out loud: it reads as a trust signal, not a
+      // disclaimer, and it is exactly the posture the buyers we want (counselling, legal, medical)
+      // respond to. Locked in the monetisation plan section 3.
+      el("div", { class: "card", style: { padding: "16px 18px", display: "flex", gap: "14px" } }, [
+        el("div", { class: "tone-tile accent", style: { width: "36px", height: "36px", flex: "0 0 auto" } }, icon("heart", 18)),
+        el("div", {}, [
+          el("div", { style: { fontWeight: "600", fontSize: "14px", marginBottom: "4px" }, text: "It runs on the honour system." }),
+          el("p", { class: "ink-2", style: { fontSize: "12.5px", margin: "0" }, text: "Volksmond never phones home. There is no account, no activation server, and no way for us to see that you installed it or how you use it. We are trusting you: if a business or practice uses Volksmond for work, buy a licence. That trust is what keeps the personal version free and the Afrikaans models open for everyone." }),
+        ]),
       ]),
       el("div", { class: "row gap-10" }, [
         el("button", { class: "btn primary tall grow", onclick: acceptLicence }, "I agree and continue"),
@@ -1281,6 +1304,68 @@ function businessNudgeCard() {
   ]);
 }
 
+/* ── calendar reminder (local Outlook, Business) ──────────────── */
+// While the app is open, poll the LOCAL Outlook calendar and nudge "start transcribing?" when a
+// meeting begins. Fully offline (the server reads Outlook over COM, no network call). Business-gated
+// and inert without a licence + Outlook + pywin32, so it costs nothing for personal users. The
+// nudge NEVER auto-starts (consent posture): it drops you on the pre-meeting screen, pre-seeded.
+var REMINDER_POLL_MS = 60000;
+var reminderHandled = {};   // meeting key -> true, so a meeting is nudged at most once per session
+function reminderKey(m) { return (m.subject || "") + "|" + (m.start || ""); }
+function startReminderPoll() {
+  if (reminderTimer) return;
+  reminderTimer = setInterval(reminderTick, REMINDER_POLL_MS);
+  reminderTick();
+}
+async function reminderTick() {
+  // Guard cheaply BEFORE any request: only Business licences with the setting on, and never while a
+  // session is already running or being set up.
+  if (!isPro() || !(S.settings && S.settings.calendar_reminders !== false)) return;
+  if (S.reminder || (S.live && S.live.running)) return;
+  if (["live", "recordonly", "importing", "starting", "setup"].indexOf(S.route) >= 0) return;
+  var r;
+  try { r = await api.get("/api/calendar-upcoming"); }
+  catch (e) { return; }   // 402 or a transient error: skip this tick, try again next minute
+  if (!r || !r.available || !r.found || typeof r.starts_in_min !== "number") return;
+  // Nudge when the meeting is starting: from 2 minutes before to 15 minutes after its start time.
+  if (r.starts_in_min > 2 || r.starts_in_min < -15) return;
+  var key = reminderKey(r);
+  if (reminderHandled[key]) return;
+  S.reminder = { subject: r.subject, attendees: r.attendees || [], start: r.start, key: key };
+  render();
+}
+function acceptReminder() {
+  var r = S.reminder; if (!r) return;
+  reminderHandled[r.key] = true;
+  S.reminder = null;
+  S.form.title = r.subject || "";
+  S.form.participants = (r.attendees || []).slice();
+  go("pre");   // drop on the pre-meeting screen, pre-seeded; the user presses Begin (never auto-start)
+}
+function dismissReminder() {
+  if (S.reminder) reminderHandled[S.reminder.key] = true;
+  S.reminder = null;
+  render();
+}
+// A floating banner injected in render() so it shows on any screen, not only the home hub.
+function reminderBanner() {
+  var r = S.reminder;
+  return el("div", { style: { position: "fixed", top: "16px", left: "50%", transform: "translateX(-50%)", zIndex: "60", maxWidth: "440px", width: "calc(100% - 32px)" } },
+    el("div", { class: "card", style: { padding: "14px 16px", display: "flex", gap: "12px", alignItems: "flex-start", borderColor: "var(--accent)", boxShadow: "0 10px 34px rgba(0,0,0,0.20)" } }, [
+      el("div", { class: "tone-tile accent", style: { width: "34px", height: "34px", flex: "0 0 auto" } }, icon("calendar", 17)),
+      el("div", { class: "grow" }, [
+        el("div", { style: { fontWeight: "600", fontSize: "13.5px" }, text: "A meeting is starting" }),
+        r.subject ? el("div", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "1px" } }, raw(r.subject)) : null,
+        el("p", { class: "ink-3", style: { fontSize: "11.5px", margin: "4px 0 0" }, text: "Start transcribing it? Names from the meeting are added automatically." }),
+        el("div", { class: "row gap-8", style: { marginTop: "10px" } }, [
+          el("button", { class: "btn sm primary", onclick: acceptReminder }, [icon("dot", 12), "Start transcribing"]),
+          el("button", { class: "btn sm ghost", onclick: dismissReminder }, "Not now"),
+        ]),
+      ]),
+      el("button", { class: "btn ghost sm", style: { flex: "0 0 auto", padding: "6px" }, onclick: dismissReminder, title: "Dismiss" }, icon("x", 14)),
+    ]));
+}
+
 /* ── home (new session hub) ───────────────────────────────── */
 function homeView() {
   function entry(opts) {
@@ -1343,6 +1428,7 @@ function preView() {
     engineLine(),
     advancedTranscribeControls(true),
     formField("Participants", el("span", { class: "label-muted", text: " (optional, helps accuracy)" }), termsBox(S.form.participants, "Add a name")),
+    (isPro() && !offlineBuild()) ? calendarSeedRow() : null,
     formField("Jargon and terms", el("span", { class: "label-muted", text: " (optional)" }), termsBox(S.form.terms, "Add a term")),
     defaultContextNote(),
     recordCard,
@@ -1406,6 +1492,34 @@ function defaultContextNote() {
     el("div", { class: "section-label", style: { marginBottom: "4px" }, text: "Always applied (from Settings)" }),
     el("div", { class: "ink-2", style: { fontSize: "12px" } }, raw(dc)),
   ]);
+}
+
+// Seed the Participants from the local Outlook calendar (Business feature, fully offline: the
+// server reads classic Outlook over COM, no network call). Shown only to Business licences; the
+// upgrade view advertises it to everyone else. Adds attendee names to the chips and fills an empty
+// title from the meeting subject.
+function calendarSeedRow() {
+  return el("div", { class: "row gap-8", style: { marginTop: "-4px", marginBottom: "2px" } }, [
+    el("button", { class: "btn ghost sm", onclick: pullFromCalendar },
+      [icon("calendar", 13), el("span", { text: "Pull from Outlook calendar" })]),
+    el("span", { class: "ink-3", style: { fontSize: "11px" }, text: "Reads your current meeting on this computer. Nothing is sent anywhere." }),
+  ]);
+}
+async function pullFromCalendar() {
+  try {
+    var r = await api.post("/api/calendar-seed");
+    if (!r.found) { toast(tr("No current or upcoming meeting found in Outlook.")); return; }
+    var added = 0;
+    (r.attendees || []).forEach(function (n) {
+      if (n && S.form.participants.indexOf(n) < 0) { S.form.participants.push(n); added++; }
+    });
+    if (r.subject && !(S.form.title || "").trim()) S.form.title = r.subject;
+    toast(added ? (tr("Added names from your calendar.")) : tr("Calendar meeting found; those names are already added."));
+    render();
+  } catch (e) {
+    if (e && /business licence/i.test(e.message || "")) { toast(tr("Pulling from your calendar is a business feature.")); go("upgrade"); return; }
+    toast(e.message || "Could not read the calendar.", true);
+  }
 }
 
 /* ── import setup (context before transcribing a file) ──────── */
@@ -1679,6 +1793,7 @@ function finishView() {
       el("div", { class: "row gap-8", style: { marginTop: "14px" } }, [
         el("button", { class: "btn", onclick: function () { api.post("/api/open-folder").catch(function (e) { toast(e.message, true); }); } }, [icon("folder", 15), "Open folder"]),
         el("button", { class: "btn", onclick: function () { openReader(name); } }, [icon("note", 15), "Open transcript"]),
+        S.finish.hasNotes ? el("button", { class: "btn", onclick: function () { openReader(name, "notes"); } }, [icon("pencil", 15), "Open my notes"]) : null,
         el("button", { class: "btn ghost", onclick: async function () { try { var t = await api.text("/sessions/" + encodeURIComponent(name)); copyText(t); } catch (e) { toast(e.message, true); } } }, [icon("copy", 15), "Copy"]),
       ]),
     ]),
@@ -1703,16 +1818,55 @@ function notesIncludeRow(target) {
     ]),
   ]);
 }
-// The user's own notes, shown as a card in the reader for a past session.
-function notesCard(text) {
-  return el("div", { class: "card", style: { padding: "16px 18px" } }, [
-    el("div", { class: "row gap-8", style: { alignItems: "center", marginBottom: "8px" } }, [
-      el("span", { style: { color: "var(--accent)", display: "inline-flex" } }, icon("note", 15)),
-      el("div", { style: { fontWeight: "600" }, text: "Your notes" }),
-      el("span", { class: "grow" }),
-      el("button", { class: "btn ghost sm", onclick: function () { copyText(text); } }, [icon("copy", 12), "Copy"]),
+/* ── reader notes (add or edit your own notes for a past session) ── */
+// The reader's notes tab is fully editable, so notes can be added or fixed AFTER the meeting (during
+// a live call there is often too much going on to write them). It autosaves to <stem>-notes.md, the
+// same sidecar the live panel writes, so nothing new is needed on the backend.
+var readerNotesSaveTimer = null;
+function scheduleReaderNotesSave() {
+  if (readerNotesSaveTimer) clearTimeout(readerNotesSaveTimer);
+  readerNotesSaveTimer = setTimeout(saveReaderNotesNow, 700);
+}
+function saveReaderNotesNow() {
+  if (readerNotesSaveTimer) { clearTimeout(readerNotesSaveTimer); readerNotesSaveTimer = null; }
+  if (!S.reader.stem) return;
+  api.post("/api/notes", { stem: S.reader.stem, text: S.reader.notes || "" }).catch(function () {});
+}
+// Edit-then-summarise, the workflow Sean asked for: flush the notes, mark them for inclusion, move
+// to the Summary tab, and (re)run the summary. Regenerating is safe: the server archives the prior
+// summary rather than overwriting it.
+function readerSummariseWithNotes() {
+  saveReaderNotesNow();
+  S.reader.hasNotes = !!(S.reader.notes && S.reader.notes.trim());
+  S.reader.includeNotes = true;
+  S.reader.tab = "summary";
+  if (summaryInstalled() && !S.reader.summarising) {
+    S.reader.summary = null;
+    doSummarise(S.reader.name, "reader");
+  } else {
+    render();   // Summary tab shows the "set up summaries" hint, or the run already in progress
+  }
+}
+function readerNotesTab() {
+  var has = !!(S.reader.notes && S.reader.notes.trim());
+  var ta = el("textarea", { class: "field notes-ta", value: S.reader.notes || "",
+    placeholder: "Add your own notes for this meeting: decisions, names, to-dos, anything you did not catch during the call. Saved with this meeting on your computer.",
+    oninput: function (e) { S.reader.notes = e.target.value; S.reader.hasNotes = !!e.target.value.trim(); scheduleReaderNotesSave(); } });
+  return el("div", { class: "stack", style: { gap: "16px" } }, [
+    el("div", { class: "card", style: { padding: "16px 18px" } }, [
+      el("div", { class: "row gap-8", style: { alignItems: "center", marginBottom: "8px" } }, [
+        el("span", { style: { color: "var(--accent)", display: "inline-flex" } }, icon("pencil", 15)),
+        el("div", { style: { fontWeight: "600" }, text: "My notes" }),
+        has ? el("span", { class: "chip muted", text: "saved on this computer" }) : null,
+        el("span", { class: "grow" }),
+        has ? el("button", { class: "btn ghost sm", onclick: function () { copyText(S.reader.notes); } }, [icon("copy", 12), "Copy"]) : null,
+      ]),
+      ta,
+      el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "8px" }, text: "Your notes are never mixed into the transcript. They stay on this computer, and you decide whether a summary uses them." }),
     ]),
-    el("div", { class: "ink-2", style: { fontSize: "13.5px", whiteSpace: "pre-wrap", fontFamily: "var(--font-transcript)" } }, raw(text)),
+    (has && summaryInstalled()) ? el("div", { class: "row gap-8", style: { justifyContent: "flex-end" } }, [
+      el("button", { class: "btn", onclick: readerSummariseWithNotes }, [icon("sparkle", 14), S.reader.summary ? "Update summary with these notes" : "Summarise with these notes"]),
+    ]) : null,
   ]);
 }
 function summariseCard(fileName, scope) {
@@ -1802,6 +1956,7 @@ function sessionStatus(f, active, summarising) {
     if (f.transcribed) chips.push(statChip(tr("Transcript"), "note", "ok"));
     if (summarising) chips.push(busyChip(tr("Summarising")));
     else if (f.has_summary) chips.push(statChip(tr("Summary"), "sparkle", "accent"));
+    if (f.has_notes) chips.push(statChip(tr("Notes"), "pencil", "muted"));
   }
   return chips.length ? el("div", { class: "stats" }, chips) : null;
 }
@@ -1897,10 +2052,10 @@ function historyView() {
     S.sessionsFolder ? el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "12px" } }, ["Saved in ", el("span", { class: "mono", text: S.sessionsFolder })]) : null,
   ]));
 }
-async function openReader(name) {
+async function openReader(name, initialTab) {
   var row = (S.sessions || []).filter(function (s) { return s.name === name; })[0] || {};
   S.reader = { name: name, stem: row.stem || name.replace(/\.md$/, ""), recorded: !!row.recorded,
-    title: topicFromName(name), text: "Loading...", tab: "transcript", summarising: false, summary: null, savedAs: null };
+    title: topicFromName(name), text: "Loading...", tab: initialTab || "transcript", summarising: false, summary: null, savedAs: null };
   go("reader");
   try { S.reader.text = await api.text("/sessions/" + encodeURIComponent(name)); }
   catch (e) { S.reader.text = "Could not load this transcript: " + e.message; }
@@ -1940,27 +2095,27 @@ function stripSummaryHeader(s) {
 
 /* ── reader (past transcript) ─────────────────────────────── */
 function readerView() {
-  var hasSummary = !!S.reader.summary;
-  var tab = hasSummary ? (S.reader.tab || "transcript") : "transcript";
-  // A connected segmented control, not two loose ghost buttons. Viewing the
-  // transcript, a lone "Summary" ghost button is indistinguishable from the Copy
-  // and Folder actions next to it, so the way back to the summary reads as just
-  // another toolbar action. The segmented switch makes Transcript/Summary an
-  // obvious two-way toggle, distinct from the actions.
-  var toggle = hasSummary ? el("div", { class: "segmented", style: { width: "auto", flex: "0 0 auto" } }, [
-    el("button", { class: tab === "transcript" ? "on" : "", onclick: function () { S.reader.tab = "transcript"; render(); } }, [icon("note", 13), el("span", { text: "Transcript" })]),
-    el("button", { class: tab === "summary" ? "on" : "", onclick: function () { S.reader.tab = "summary"; render(); } }, [icon("sparkle", 13), el("span", { text: "Summary" })]),
-  ]) : null;
+  var tab = S.reader.tab || "transcript";
+  // A connected segmented control: Transcript, Summary and My notes are always present, so the
+  // reader is one consistent three-way switch. The Summary tab hosts the summary if there is one,
+  // else the summarise controls; the My notes tab is an editor, so notes can be added or fixed after
+  // the meeting and folded into a fresh summary from right there.
+  var mkTab = function (id, ico, label) {
+    return el("button", { class: tab === id ? "on" : "", onclick: function () { S.reader.tab = id; render(); } }, [icon(ico, 13), el("span", { text: label })]);
+  };
+  var toggle = el("div", { class: "segmented", style: { width: "auto", flex: "0 0 auto" } }, [
+    mkTab("transcript", "note", "Transcript"),
+    mkTab("summary", "sparkle", "Summary"),
+    mkTab("notes", "pencil", "My notes"),
+  ]);
   var body;
-  if (hasSummary && tab === "summary") {
-    body = summaryResult(S.reader.summary, S.reader.savedAs, S.reader.name, "reader");
+  if (tab === "summary") {
+    body = summariseCard(S.reader.name, "reader");
+  } else if (tab === "notes") {
+    body = readerNotesTab();
   } else {
-    body = el("div", { class: "stack", style: { gap: "16px" } }, [
-      hasSummary ? null : summariseCard(S.reader.name, "reader"),
-      S.reader.hasNotes ? notesCard(S.reader.notes) : null,
-      el("div", { class: "card", style: { padding: "20px 22px" } },
-        el("div", { class: "doc", style: { maxWidth: "none", fontSize: "15px", whiteSpace: "pre-wrap", fontFamily: "var(--font-transcript)" } }, raw(S.reader.text))),
-    ]);
+    body = el("div", { class: "card", style: { padding: "20px 22px" } },
+      el("div", { class: "doc", style: { maxWidth: "none", fontSize: "15px", whiteSpace: "pre-wrap", fontFamily: "var(--font-transcript)" } }, raw(S.reader.text)));
   }
   return el("div", { class: "screen" }, el("div", { class: "screen-inner col-mid stack", style: { gap: "16px" } }, [
     el("button", { class: "btn ghost sm", style: { alignSelf: "flex-start" }, onclick: function () { go("history"); } }, [icon("back", 14), "Back to history"]),
@@ -1968,7 +2123,7 @@ function readerView() {
       el("h2", {}, raw(S.reader.title)),
       el("span", { class: "grow" }),
       toggle,
-      el("button", { class: "btn ghost sm", onclick: function () { copyText((hasSummary && tab === "summary") ? S.reader.summary : S.reader.text); } }, [icon("copy", 13), "Copy"]),
+      el("button", { class: "btn ghost sm", onclick: function () { copyText(tab === "summary" ? (S.reader.summary || "") : tab === "notes" ? (S.reader.notes || "") : S.reader.text); } }, [icon("copy", 13), "Copy"]),
       el("button", { class: "btn ghost sm", onclick: function () { api.post("/api/open-folder").catch(function () {}); } }, [icon("folder", 13), "Folder"]),
       S.reader.recorded ? el("button", { class: "btn ghost sm", onclick: function () { reTranscribe(S.reader.stem, S.reader.title, true); } }, [icon("mic", 13), tr("Re-transcribe")]) : null,
     ]),
@@ -2031,7 +2186,9 @@ function sideUpdateResult() {
 function aboutCard() {
   var version = (S.appInfo && S.appInfo.version) || "?";
   var u = updateState;
-  var updateLine =
+  // Update status is only meaningful in the connected edition; the default and offline builds
+  // never check, so there is nothing to report here.
+  var updateLine = !connected() ? null :
     u.state === "checking" ? el("div", { class: "s", style: { marginTop: "4px", display: "flex", gap: "6px", alignItems: "center" } }, [el("span", { class: "spinner" }), el("span", { text: "Checking for updates" })]) :
     u.state === "error" ? el("div", { class: "s", style: { marginTop: "4px", color: "var(--warn)" }, text: "Could not check for updates." }) :
     (u.state === "done" && u.info && u.info.update_available) ? el("div", { class: "s", style: { marginTop: "4px" } }, [el("span", { text: "Update available" }), raw(": v" + u.info.latest + "  "), el("span", { class: "link", onclick: function () { openUpdateLink(u.info.url); } }, "Download")]) :
@@ -2049,7 +2206,7 @@ function aboutCard() {
         updateLine,
       ]),
       el("div", { class: "ctl", style: { display: "flex", flexDirection: "column", gap: "6px", alignItems: "stretch" } }, [
-        el("button", { class: "btn ghost", disabled: u.state === "checking", onclick: function () { checkUpdates(); } }, "Check for updates"),
+        connected() ? el("button", { class: "btn ghost", disabled: u.state === "checking", onclick: function () { checkUpdates(); } }, "Check for updates") : null,
         el("button", { class: "btn ghost", onclick: function () { openExternal("https://digiphyte.com"); } }, "digiphyte.com"),
       ]),
     ]),
@@ -2061,6 +2218,7 @@ function licenceCard() {
   var seats = lic.seats || 1;
   var until = lic.valid_until;  // ISO date, or null for an undated key
   var seatText = seats > 1 ? (seats + " seats") : "1 seat";
+  var remindersOn = !(S.settings && S.settings.calendar_reminders === false);  // default on
   return el("div", { class: "card settings-card" }, [
     el("div", { class: "set-row" }, [
       el("div", { class: "tone-tile accent", style: { width: "36px", height: "36px", flex: "0 0 auto" } }, icon("crown", 18)),
@@ -2070,13 +2228,23 @@ function licenceCard() {
           pro ? el("span", { class: "chip accent", text: seatText }) : null,
         ]),
         el("div", { class: "s", text: pro
-          ? ("This computer is activated on a business licence" + (until ? ", valid until " + until : "") + ". Calendar attendees and the optional online fallbacks are unlocked, verified on this computer, never on a server.")
+          ? ("This computer is activated on a business licence" + (until ? ", valid until " + until : "") + ". Calendar attendees are unlocked, verified on this computer, never on a server.")
           : "Licensed for personal, non-commercial use. Everything runs on this computer, free, with no account. A business or team using Volksmond for work needs a licence." }),
       ]),
       pro
         ? el("button", { class: "btn ghost", onclick: deactivateLicence }, "Deactivate")
         : el("button", { class: "btn ghost", onclick: function () { go("upgrade"); } }, "Business licensing"),
     ]),
+    // Business only: the calendar reminder toggle. Reads the local Outlook calendar while the app is
+    // open and offers to start transcribing when a meeting begins. Local only, never auto-starts.
+    pro ? el("div", { class: "set-row" }, [
+      el("div", { class: "ic" }, icon("calendar", 18)),
+      el("div", { class: "body" }, [
+        el("div", { class: "t", text: "Remind me when a meeting starts" }),
+        el("div", { class: "s", text: "While Volksmond is open, it checks your Outlook calendar on this computer and offers to start transcribing when a meeting begins. Nothing is sent anywhere, and it never starts on its own." }),
+      ]),
+      el("div", { class: "ctl" }, toggleEl(remindersOn, function () { saveSettings({ calendar_reminders: !remindersOn }); })),
+    ]) : null,
   ]);
 }
 function appearanceCard() {
@@ -2402,7 +2570,8 @@ function afrikaansModelSection() {
   var anyInstalled = fl.some(function (m) { return m.present; });
   var ups = {}; ((S.modelUpdates && S.modelUpdates.updates) || []).forEach(function (u) { ups[u.repo] = u; });
   var checking = S._checkingModelUpdates;
-  var checkBtn = anyInstalled ? el("button", { class: "btn ghost sm", disabled: checking, onclick: function () { checkModelUpdates(); } }, checking ? "Checking" : "Check for updates") : null;
+  // The offline-only edition compiles out the model-update route, so hide its button there.
+  var checkBtn = (anyInstalled && !offlineBuild()) ? el("button", { class: "btn ghost sm", disabled: checking, onclick: function () { checkModelUpdates(); } }, checking ? "Checking" : "Check for updates") : null;
   fl.sort(function (a, b) { return (b.size === d.recommended_model ? 1 : 0) - (a.size === d.recommended_model ? 1 : 0); });
   return el("div", { style: { marginBottom: "14px" } }, [
     voiceModelSectionHeader("Afrikaans model (Fluister)", checkBtn, "Our Afrikaans-tuned model. Best for Afrikaans and mixed Afrikaans and English."),
@@ -2713,15 +2882,31 @@ function upgradeView() {
         el("div", { class: "row gap-8" }, [el("span", { style: { fontWeight: "600" }, text: "Business" }), el("span", { class: "chip accent" }, [icon("crown", 11), "Licence"])]),
         el("span", { class: "mono ink-3", text: "Per person" }),
       ]),
-      bulletList(["Everything in Personal", "Licensed for business and professional use", "Pull attendee names from your calendar", "Optional online transcription for weak machines", "Optional online summary for harder transcripts"]),
+      bulletList(["Everything in Personal", "Licensed for business and professional use", "Pull attendee names from your Outlook calendar", "Priority email support"]),
       el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "10px" }, text: "For teams and paid client work. A licence per person, renewed yearly. Everything that runs on this computer stays free." }),
+    ]);
+  }
+  // Coming soon: an OPTIONAL online tier that runs our most accurate SA models on DigiPhyte's own
+  // hardware in South Africa. It is explicit that audio leaves the machine, and why it is still
+  // POPIA-friendly (our hardware, in-country); the free local tier is never replaced.
+  function comingSoonCard() {
+    return el("div", { class: "card", style: { padding: "14px 18px", display: "flex", gap: "12px" } }, [
+      el("div", { class: "tone-tile muted", style: { width: "32px", height: "32px", flex: "0 0 auto" } }, icon("clock", 16)),
+      el("div", {}, [
+        el("div", { class: "row gap-8", style: { alignItems: "center" } }, [
+          el("span", { style: { fontWeight: "600", fontSize: "13.5px" }, text: "Premium South African transcription models" }),
+          el("span", { class: "chip", text: "Coming soon" }),
+        ]),
+        el("p", { class: "ink-3", style: { fontSize: "11.5px", margin: "4px 0 0" }, text: "An optional online tier that runs our most accurate South African models on DigiPhyte's own hardware in South Africa. Your audio would leave this computer, but it stays in the country on hardware we control, so it remains POPIA-friendly. The local, offline transcription always stays free and is never replaced." }),
+      ]),
     ]);
   }
   return el("div", { class: "screen center" }, el("div", { class: "screen-inner col-mid stack", style: { gap: "16px" } }, [
     el("button", { class: "btn ghost sm", style: { alignSelf: "flex-start" }, onclick: function () { go("settings"); } }, [icon("back", 14), "Back to settings"]),
     el("div", {}, [el("div", { class: "eyebrow", text: "Business licensing" }), el("h1", { style: { marginTop: "6px" }, text: "Free for personal use. A licence for business." })]),
-    el("p", { class: "ink-2", text: "Personal use is the real thing: unlimited live transcription and local summaries, on this machine, forever. A business licence covers commercial and team use, and adds the few features that reach the internet." }),
+    el("p", { class: "ink-2", text: "Personal use is the real thing: unlimited live transcription and local summaries, on this machine, forever. A business licence covers commercial and team use, and unlocks the extras for professional work." }),
     el("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" } }, [personalCard(), businessCard()]),
+    comingSoonCard(),
     el("div", { class: "card", style: { padding: "20px" } }, [
       el("button", { class: "btn primary tall", onclick: function () { openExternal(BUSINESS_PAGE_URL); } }, "View business licensing"),
       el("p", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "8px" }, text: "Opens volksmond.digiphyte.com/business for current pricing. You get a licence key by email, and activation is fully offline." }),
@@ -3036,6 +3221,9 @@ async function boot() {
     if (S.devices.default_loopback_index != null) S.form.loopback = String(S.devices.default_loopback_index);
   }
   refreshSessions();
+  startReminderPoll();   // Business + calendar-reminders-on + Outlook are all checked inside the tick
+
+
 
   var resumed = false;
   try {

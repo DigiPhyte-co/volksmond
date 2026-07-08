@@ -28,7 +28,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .. import capture, config, licensing, sinks, transcribe
+from .. import buildflags, capture, config, licensing, sinks, transcribe
 from ..__main__ import default_chunk_seconds, pick_tier, resolve_tier
 
 app = FastAPI(title="SA-Live-Transcribe")
@@ -1383,6 +1383,7 @@ class SettingsPatch(BaseModel):
     session_count: Optional[int] = None
     business_nudge_seen: Optional[bool] = None
     summary_footer: Optional[bool] = None
+    calendar_reminders: Optional[bool] = None
     # summary_model is intentionally NOT settable here: only the verified downloader
     # (modeldl.py) sets it, to a pinned catalogue filename, so an arbitrary or
     # unverified path cannot be made the active summary model via the settings API.
@@ -1573,23 +1574,28 @@ def voice_model_delete(req: VoiceDownloadRequest):
     return {"ok": True}
 
 
-@app.post("/api/model-updates")
-def model_updates():
-    """Manual, user-initiated check for a newer transcription model (e.g. an improved Fluister).
-    Makes ONE outbound HTTPS GET to our OWN models.json manifest and compares it to the model
-    versions installed on this machine. Sends no user data, runs only when the user clicks, and is
-    CSRF-protected. The model-version twin of /api/check-updates (which checks the app version).
-    Because load_model() reads the local cache with local_files_only, an improved model can only
-    reach an existing install through this opt-in path; the app never revalidates against HF on its
-    own."""
-    from .. import voicedl
-    try:
-        manifest = voicedl.fetch_manifest()
-    except Exception:
-        raise HTTPException(status_code=502, detail="Could not reach the update server. Check your internet connection and try again.")
-    updates = voicedl.model_update_status(manifest)
-    return {"checked": True, "updates": updates,
-            "any_update": any(u["update_available"] for u in updates)}
+# The model-update check is the model-version twin of /api/check-updates: another outbound GET to
+# our own manifest. The default build keeps it (an offline user still wants a chance at an improved
+# Fluister), but the airtight offline-only build compiles it out too, so it makes no outbound call
+# at all beyond the models the user explicitly downloads.
+if not buildflags.OFFLINE_ONLY:
+    @app.post("/api/model-updates")
+    def model_updates():
+        """Manual, user-initiated check for a newer transcription model (e.g. an improved Fluister).
+        Makes ONE outbound HTTPS GET to our OWN models.json manifest and compares it to the model
+        versions installed on this machine. Sends no user data, runs only when the user clicks, and is
+        CSRF-protected. The model-version twin of /api/check-updates (which checks the app version).
+        Because load_model() reads the local cache with local_files_only, an improved model can only
+        reach an existing install through this opt-in path; the app never revalidates against HF on its
+        own."""
+        from .. import voicedl
+        try:
+            manifest = voicedl.fetch_manifest()
+        except Exception:
+            raise HTTPException(status_code=502, detail="Could not reach the update server. Check your internet connection and try again.")
+        updates = voicedl.model_update_status(manifest)
+        return {"checked": True, "updates": updates,
+                "any_update": any(u["update_available"] for u in updates)}
 
 
 class VoiceUpdateRequest(BaseModel):
@@ -1709,56 +1715,33 @@ def cuda_self_test():
     return {"ok": bool(ok), "error": err, "ready": cudadl.cuda_ready()}
 
 
-def _version_tuple(v):
-    """Numeric version tuple for comparison. Takes the leading digits of each dotted part, so
-    "1.1.1" -> (1,1,1) and "1.2.0-beta" -> (1,2,0); stops at a part with no leading digit."""
-    parts = []
-    for p in str(v or "").strip().lstrip("vV").split("."):
-        digits = ""
-        for ch in p:
-            if ch.isdigit():
-                digits += ch
-            else:
-                break
-        if not digits:
-            break
-        parts.append(int(digits))
-    return tuple(parts)
+def _connected():
+    """True only in the connected (online-features) build. The offline-only build sets
+    buildflags.OFFLINE_ONLY, and the default build simply never sets SA_LIVE_CONNECTED, so both
+    leave this False and the online-only routes (the app update check, calendar) refuse. A frozen
+    connected build sets SA_LIVE_CONNECTED=1 to turn them on."""
+    return (not buildflags.OFFLINE_ONLY) and os.environ.get("SA_LIVE_CONNECTED") == "1"
 
 
-@app.post("/api/check-updates")
-def check_updates():
-    """Manual, user-initiated update check. Makes ONE outbound HTTPS GET to our OWN published
-    version manifest (latest.json on the Volksmond site, served by Cloudflare) and compares it to
-    this build. It sends no user data (only a generic User-Agent), runs only when the user clicks
-    Check for updates, and is the single outbound call the app ever makes. CSRF-protected like
-    every other POST. We host the manifest ourselves rather than a third-party release feed, so the
-    only server that ever sees an update check is ours, and a release is a one-line manifest edit."""
-    import urllib.request
-    import json as _json
-    manifest = "https://volksmond.digiphyte.com/latest.json"
-    site = "https://volksmond.digiphyte.com/"
-    current = licensing.APP_VERSION
-    try:
-        rq = urllib.request.Request(manifest, headers={
-            "Accept": "application/json",
-            "User-Agent": "Volksmond-update-check",
-        })
-        with urllib.request.urlopen(rq, timeout=8) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=502, detail="Could not reach the update server. Check your internet connection and try again.")
-    latest = (data.get("version") or "").strip().lstrip("vV")
-    available = bool(latest) and _version_tuple(latest) > _version_tuple(current)
-    return {
-        "current": current,
-        "latest": latest or None,
-        "update_available": available,
-        # Where the in-app "Download" link sends the user. The manifest points it at the gated
-        # download page (every download stays a captured lead); switch it to a direct link in
-        # latest.json if existing-user update friction ever outweighs the capture.
-        "url": data.get("url") or site,
-    }
+# The app update check is an online-only convenience and the single outbound call the app makes on
+# its own behalf. The offline-only build compiles it out entirely: buildflags.OFFLINE_ONLY skips the
+# route registration below, and the updatecheck module that performs the fetch is excluded from that
+# bundle (sa-live-transcribe.spec), so the manifest URL is not even present. The default and
+# connected builds register the route, but it still refuses unless this is the connected edition, so
+# a default build never phones home for updates either.
+if not buildflags.OFFLINE_ONLY:
+    @app.post("/api/check-updates")
+    def check_updates():
+        """Manual, user-initiated app update check. Connected build only. Delegates the one outbound
+        HTTPS GET to updatecheck.check (kept in its own module so the offline build can drop it). No
+        user data is sent, it runs only on click, and it is CSRF-protected like every other POST."""
+        if not _connected():
+            raise HTTPException(status_code=404, detail="This build has no update check.")
+        from .. import updatecheck
+        try:
+            return updatecheck.check(licensing.APP_VERSION)
+        except updatecheck.UpdateCheckError as e:
+            raise HTTPException(status_code=502, detail=str(e))
 
 
 @app.get("/api/app-info")
@@ -1777,11 +1760,14 @@ def app_info():
         "voice_models_dir": voicedl.cache_dir(),
         "summary_models_dir": str(config.models_dir()),
         "cuda_dir": str(cudadl.cuda_dir()),
-        # Edition flag. The offline-only build (default) hides the online-feature UI:
-        # the cloud-key danger zone and the in-app Pro pricing page. A future connected
-        # build sets SA_LIVE_CONNECTED=1 to surface them. The actual cloud paths are not
-        # built either way, so this only governs which UI the user can reach.
-        "connected": os.environ.get("SA_LIVE_CONNECTED") == "1",
+        # Edition flags for the UI. "connected" gates the online-feature UI (the update check,
+        # the cloud-key danger zone, the in-app Pro pricing page); only the connected build sets
+        # SA_LIVE_CONNECTED=1. "offline" is the flagship offline-only build, which additionally
+        # compiles the online modules OUT of the bundle, so the UI hides the model-update check and
+        # calendar too. The default build is neither: it hides the online UI but is not the airtight
+        # offline edition.
+        "connected": _connected(),
+        "offline": buildflags.OFFLINE_ONLY,
     }
 
 
@@ -1886,6 +1872,60 @@ def set_notes(req: NotesRequest):
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"Could not save notes: {e}")
     return {"stem": req.stem, "text": text}
+
+
+# Calendar seeding is a connected/Business feature, so the offline-only build compiles it out with
+# the rest of the online modules (both outlook_local.py and its Graph sibling outlook.py are excluded
+# from that bundle). The local COM read makes no network call itself, but outlook.py does, and the
+# locked plan (section 3) drops the whole calendar feature from the airtight edition. Guarding the
+# registration also keeps the offline build from importing a module that is not in its bundle.
+if not buildflags.OFFLINE_ONLY:
+    @app.post("/api/calendar-seed")
+    def calendar_seed():
+        """Seed the prompt from the LOCAL Outlook desktop calendar. Fully offline: reads the current
+        or next meeting's subject + attendee names over COM from the classic Outlook app on this
+        machine, with no network call. A Business feature (calendar entitlement), since it is a
+        professional convenience; personal use stays fully manual and free.
+
+        Runs as a sync def, so FastAPI puts it on a worker thread; outlook_local does its own
+        per-thread COM init. 402 when unlicensed, 503 when Outlook/pywin32 is not reachable, and a
+        plain {"found": false} when Outlook is reachable but there is no meeting in the window."""
+        if not licensing.current().has("calendar"):
+            raise HTTPException(status_code=402, detail="Pulling attendees from your calendar needs a business licence.")
+        from .. import outlook_local
+        try:
+            meeting = outlook_local.current_or_next_meeting()
+        except outlook_local.OutlookUnavailable as e:
+            raise HTTPException(status_code=503, detail=str(e))
+        if not meeting:
+            return {"found": False, "subject": "", "attendees": []}
+        return {"found": True, "subject": meeting["subject"], "attendees": meeting["attendees"]}
+
+    @app.get("/api/calendar-upcoming")
+    def calendar_upcoming():
+        """Poll target for the calendar reminder: the current or next local Outlook meeting plus how
+        many minutes until it starts, so the UI can nudge "start transcribing?" when a meeting
+        begins. Fully offline (local COM read). Business-gated. Returns `available: false` (NOT an
+        error) when Outlook/pywin32 is not present, so the UI's repeating poll skips a tick quietly
+        rather than surfacing failures."""
+        if not licensing.current().has("calendar"):
+            raise HTTPException(status_code=402, detail="Calendar reminders need a business licence.")
+        from .. import outlook_local
+        try:
+            meeting = outlook_local.current_or_next_meeting()
+        except outlook_local.OutlookUnavailable:
+            return {"available": False, "found": False}
+        if not meeting:
+            return {"available": True, "found": False}
+        starts_in_min = None
+        start = meeting.get("start")
+        if start:
+            try:
+                starts_in_min = round((datetime.fromisoformat(start) - datetime.now()).total_seconds() / 60.0)
+            except ValueError:
+                starts_in_min = None
+        return {"available": True, "found": True, "subject": meeting["subject"],
+                "attendees": meeting["attendees"], "start": start, "starts_in_min": starts_in_min}
 
 
 class SummariseRequest(BaseModel):

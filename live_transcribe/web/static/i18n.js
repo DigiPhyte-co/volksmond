@@ -23,6 +23,23 @@ window.VM_I18N = {
     "Local only, no internet": "Net plaaslik, geen internet",
     "Report a bug or idea": "Meld 'n gogga of idee",
 
+    // First-run: licence agreement (the un-skippable gate)
+    "Free for personal use. Business use needs a licence.":
+      "Gratis vir persoonlike gebruik. Sakegebruik benodig 'n lisensie.",
+    "Use Volksmond for your own meetings, study, or personal projects and it is free, forever. If a business or practice uses it for work, that needs a paid licence. One or two people trying it at work is fine; rolling it out to a team or using it in paid client work is what a licence is for.":
+      "Gebruik Volksmond vir jou eie vergaderings, studie of persoonlike projekte en dit is gratis, vir altyd. As 'n besigheid of praktyk dit vir werk gebruik, is 'n betaalde lisensie nodig. Een of twee mense wat dit by die werk probeer is reg; om dit na 'n span uit te rol of in betaalde kliëntewerk te gebruik is waarvoor 'n lisensie bedoel is.",
+    "Personal use: free, everything on this computer, no account.":
+      "Persoonlike gebruik: gratis, alles op hierdie rekenaar, geen rekening nie.",
+    "Business use: a paid licence per person, renewed yearly.":
+      "Sakegebruik: 'n betaalde lisensie per persoon, jaarliks hernu.",
+    "Your audio never leaves this computer either way.":
+      "Jou klank verlaat in elk geval nooit hierdie rekenaar nie.",
+    "It runs on the honour system.": "Dit werk op die eresisteem.",
+    "Volksmond never phones home. There is no account, no activation server, and no way for us to see that you installed it or how you use it. We are trusting you: if a business or practice uses Volksmond for work, buy a licence. That trust is what keeps the personal version free and the Afrikaans models open for everyone.":
+      "Volksmond bel nooit huis toe nie. Daar is geen rekening, geen aktiveringsbediener, en geen manier vir ons om te sien dat jy dit geïnstalleer het of hoe jy dit gebruik nie. Ons vertrou jou: as 'n besigheid of praktyk Volksmond vir werk gebruik, koop 'n lisensie. Daardie vertroue is wat die persoonlike weergawe gratis hou en die Afrikaanse modelle oop hou vir almal.",
+    "I agree and continue": "Ek stem saam en gaan voort",
+    "Read the full licence": "Lees die volledige lisensie",
+
     // First-run: welcome
     "Research Preview": "Navorsingsvoorskou",
     "A calm, private transcript of any meeting on your computer.":
@@ -581,6 +598,49 @@ window.VM_I18N = {
     "Transcribing": "Transkribeer tans",
     "Summarising": "Som tans op",
     "Re-transcribe": "Hertranskribeer",
+
+    // Meeting notes (live panel, history pill, and the reader's editable My notes tab)
+    "Notes": "Notas",
+    "My notes": "My notas",
+    "Your notes": "Jou notas",
+    "Open my notes": "Maak my notas oop",
+    "saved on this computer": "op hierdie rekenaar gestoor",
+    "Summarise with these notes": "Som op met hierdie notas",
+    "Update summary with these notes": "Werk die opsomming by met hierdie notas",
+    "Add your own notes for this meeting: decisions, names, to-dos, anything you did not catch during the call. Saved with this meeting on your computer.":
+      "Voeg jou eie notas vir hierdie vergadering by: besluite, name, dinge om te doen, enigiets wat jy tydens die oproep gemis het. Word saam met hierdie vergadering op jou rekenaar gestoor.",
+    "Your notes are never mixed into the transcript. They stay on this computer, and you decide whether a summary uses them.":
+      "Jou notas word nooit met die transkripsie vermeng nie. Hulle bly op hierdie rekenaar, en jy besluit of 'n opsomming hulle gebruik.",
+    "Jot notes as the meeting goes: decisions, names, to-dos. Saved with this meeting on your computer. When you summarise, you choose whether to fold them in.":
+      "Skryf notas terwyl die vergadering aangaan: besluite, name, dinge om te doen. Word saam met hierdie vergadering op jou rekenaar gestoor. Wanneer jy opsom, kies jy of jy hulle wil insluit.",
+    "Include my notes in this summary": "Sluit my notas by hierdie opsomming in",
+    "Your notes stay saved with the meeting either way. This tells the summary to treat them as your own record.":
+      "Jou notas bly in elk geval saam met die vergadering gestoor. Dit sê vir die opsomming om hulle as jou eie rekord te behandel.",
+
+    // Calendar seeding (local Outlook, Business) and the upgrade view
+    "Pull from Outlook calendar": "Trek uit Outlook-kalender",
+    "Reads your current meeting on this computer. Nothing is sent anywhere.":
+      "Lees jou huidige vergadering op hierdie rekenaar. Niks word enige plek heen gestuur nie.",
+    "No current or upcoming meeting found in Outlook.": "Geen huidige of komende vergadering in Outlook gevind nie.",
+    "Added names from your calendar.": "Name uit jou kalender bygevoeg.",
+    "Calendar meeting found; those names are already added.": "Kalendervergadering gevind; daardie name is reeds bygevoeg.",
+    "Pulling from your calendar is a business feature.": "Om name uit jou kalender te trek is 'n sakekenmerk.",
+    "A meeting is starting": "'n Vergadering begin nou",
+    "Start transcribing it? Names from the meeting are added automatically.": "Transkribeer dit? Name uit die vergadering word outomaties bygevoeg.",
+    "Start transcribing": "Begin transkribeer",
+    "Not now": "Nie nou nie",
+    "Dismiss": "Maak toe",
+    "Remind me when a meeting starts": "Herinner my wanneer 'n vergadering begin",
+    "While Volksmond is open, it checks your Outlook calendar on this computer and offers to start transcribing when a meeting begins. Nothing is sent anywhere, and it never starts on its own.":
+      "Terwyl Volksmond oop is, kyk dit na jou Outlook-kalender op hierdie rekenaar en bied aan om te begin transkribeer wanneer 'n vergadering begin. Niks word enige plek heen gestuur nie, en dit begin nooit vanself nie.",
+    "Pull attendee names from your Outlook calendar": "Trek bywoners se name uit jou Outlook-kalender",
+    "Priority email support": "Voorkeur-e-posondersteuning",
+    "Coming soon": "Binnekort",
+    "Premium South African transcription models": "Premium Suid-Afrikaanse transkripsiemodelle",
+    "An optional online tier that runs our most accurate South African models on DigiPhyte's own hardware in South Africa. Your audio would leave this computer, but it stays in the country on hardware we control, so it remains POPIA-friendly. The local, offline transcription always stays free and is never replaced.":
+      "'n Opsionele aanlyn vlak wat ons akkuraatste Suid-Afrikaanse modelle op DigiPhyte se eie hardeware in Suid-Afrika laat loop. Jou klank sal hierdie rekenaar verlaat, maar dit bly in die land op hardeware wat ons beheer, so dit bly POPIA-vriendelik. Die plaaslike, vanlyn transkripsie bly altyd gratis en word nooit vervang nie.",
+    "Personal use is the real thing: unlimited live transcription and local summaries, on this machine, forever. A business licence covers commercial and team use, and unlocks the extras for professional work.":
+      "Persoonlike gebruik is die egte ding: onbeperkte lewendige transkripsie en plaaslike opsommings, op hierdie masjien, vir altyd. 'n Sakelisensie dek kommersiële en spangebruik, en ontsluit die ekstras vir professionele werk.",
     "Transcribe this recording?": "Transkribeer hierdie opname?",
     "Re-transcribe from the recording?": "Hertranskribeer vanaf die opname?",
     "Transcribes both sides (you and the other person) as separate speakers. Pick the language and model for this pass below.": "Transkribeer albei kante (jy en die ander persoon) as aparte sprekers. Kies hieronder die taal en model vir hierdie deurloop.",

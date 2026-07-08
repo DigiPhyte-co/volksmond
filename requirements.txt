@@ -42,6 +42,12 @@ uvicorn[standard]==0.47.0
 msal==1.36.0
 requests==2.34.2
 
+# Optional: LOCAL Outlook calendar attendee-seeding (live_transcribe/outlook_local.py, the
+# offline alternative to the Graph path above). Reads the classic Outlook desktop app over COM,
+# no network call. Windows only, imported lazily so the app runs without it (the in-app
+# "Pull from Outlook calendar" button just reports it is unavailable).
+pywin32==311; sys_platform == "win32"
+
 # Offline licence signing/verification (live_transcribe/licensing.py): Ed25519 via
 # cryptography. Already present transitively via msal, pinned here for repro.
 cryptography==48.0.0

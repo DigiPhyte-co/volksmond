@@ -54,6 +54,7 @@ DEFAULTS = {
     "session_count": 0,               # completed sessions on this machine; drives the one-time business-use nudge. Local only, never sent anywhere. Incremented by the server at session finalisation, not by the UI.
     "business_nudge_seen": False,     # the one-time business-use nudge has been shown and dismissed, so it never repeats.
     "summary_footer": True,           # append a small "Made with Volksmond" line to the summary file. Never the raw transcript, never any export of it.
+    "calendar_reminders": True,       # while the app is open, poll the LOCAL Outlook calendar and nudge "start transcribing?" when a meeting begins. Business feature; inert without a licence + Outlook + pywin32. Local only, no network call.
 }
 
 
