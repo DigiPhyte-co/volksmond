@@ -1723,20 +1723,18 @@ def _connected():
     return (not buildflags.OFFLINE_ONLY) and os.environ.get("SA_LIVE_CONNECTED") == "1"
 
 
-# The app update check is an online-only convenience and the single outbound call the app makes on
-# its own behalf. The offline-only build compiles it out entirely: buildflags.OFFLINE_ONLY skips the
-# route registration below, and the updatecheck module that performs the fetch is excluded from that
-# bundle (sa-live-transcribe.spec), so the manifest URL is not even present. The default and
-# connected builds register the route, but it still refuses unless this is the connected edition, so
-# a default build never phones home for updates either.
+# The app update check is the single outbound call the app makes on its own behalf, and only when
+# the user clicks it. Every build has it EXCEPT the airtight offline-only edition, which compiles it
+# out entirely: buildflags.OFFLINE_ONLY skips the route registration below, and the updatecheck
+# module that performs the fetch is excluded from that bundle (sa-live-transcribe.spec), so the
+# manifest URL is not even present. This gates exactly like the model-update check above.
 if not buildflags.OFFLINE_ONLY:
     @app.post("/api/check-updates")
     def check_updates():
-        """Manual, user-initiated app update check. Connected build only. Delegates the one outbound
-        HTTPS GET to updatecheck.check (kept in its own module so the offline build can drop it). No
-        user data is sent, it runs only on click, and it is CSRF-protected like every other POST."""
-        if not _connected():
-            raise HTTPException(status_code=404, detail="This build has no update check.")
+        """Manual, user-initiated app update check. Present in every build except the airtight
+        offline edition (the OFFLINE_ONLY guard skips this route, and updatecheck is excluded from
+        that bundle). Delegates the one outbound HTTPS GET to updatecheck.check. No user data is
+        sent, it runs only on click, and it is CSRF-protected like every other POST."""
         from .. import updatecheck
         try:
             return updatecheck.check(licensing.APP_VERSION)
@@ -1760,12 +1758,11 @@ def app_info():
         "voice_models_dir": voicedl.cache_dir(),
         "summary_models_dir": str(config.models_dir()),
         "cuda_dir": str(cudadl.cuda_dir()),
-        # Edition flags for the UI. "connected" gates the online-feature UI (the update check,
-        # the cloud-key danger zone, the in-app Pro pricing page); only the connected build sets
-        # SA_LIVE_CONNECTED=1. "offline" is the flagship offline-only build, which additionally
-        # compiles the online modules OUT of the bundle, so the UI hides the model-update check and
-        # calendar too. The default build is neither: it hides the online UI but is not the airtight
-        # offline edition.
+        # Edition flags for the UI. "offline" is the flagship offline-only build, which compiles the
+        # online modules (the app + model update checks, the calendar) OUT of the bundle, so the UI
+        # hides them; those features are present in every other build. "connected" is a stricter flag
+        # for genuinely online-only extras (the cloud-key danger zone) that only a build with
+        # SA_LIVE_CONNECTED=1 turns on; it does NOT gate the user-initiated update check.
         "connected": _connected(),
         "offline": buildflags.OFFLINE_ONLY,
     }

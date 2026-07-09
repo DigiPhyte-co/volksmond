@@ -1029,12 +1029,13 @@ function sidebar(active) {
     ]),
     el("div", { class: "spacer" }),
     el("div", { class: "local-pill" }, [icon("lock", 14), el("span", { text: "Local only, no internet" })]),
-    // The app update check is an online-feature convenience, so only the connected edition shows it.
-    // The default and offline builds hide it (and the server route refuses / is compiled out), so
-    // the app never phones home behind the "Local only" promise.
-    connected() ? el("button", { class: "nav-item", style: { fontSize: "12px" }, disabled: updateState.state === "checking", onclick: function () { checkUpdates(); } },
+    // The manual "Check for updates" is a user-initiated convenience (one outbound call, only on
+    // click), so every build shows it EXCEPT the airtight offline-only edition, where the route is
+    // compiled out. Same gating as the model-update check. It never runs on its own, so it does not
+    // touch the "Local only" promise (which is about audio, telemetry, and background calls).
+    !offlineBuild() ? el("button", { class: "nav-item", style: { fontSize: "12px" }, disabled: updateState.state === "checking", onclick: function () { checkUpdates(); } },
       [icon("download", 16), el("span", { text: updateState.state === "checking" ? "Checking for updates" : "Check for updates" })]) : null,
-    connected() ? sideUpdateResult() : null,
+    !offlineBuild() ? sideUpdateResult() : null,
     el("button", { class: "nav-item", style: { fontSize: "12px" }, onclick: reportBug },
       [icon("bug", 16), el("span", { text: "Report a bug or idea" })]),
   ]);
@@ -2186,9 +2187,9 @@ function sideUpdateResult() {
 function aboutCard() {
   var version = (S.appInfo && S.appInfo.version) || "?";
   var u = updateState;
-  // Update status is only meaningful in the connected edition; the default and offline builds
-  // never check, so there is nothing to report here.
-  var updateLine = !connected() ? null :
+  // The update check is present in every build except the airtight offline edition, so hide this
+  // status line only there.
+  var updateLine = offlineBuild() ? null :
     u.state === "checking" ? el("div", { class: "s", style: { marginTop: "4px", display: "flex", gap: "6px", alignItems: "center" } }, [el("span", { class: "spinner" }), el("span", { text: "Checking for updates" })]) :
     u.state === "error" ? el("div", { class: "s", style: { marginTop: "4px", color: "var(--warn)" }, text: "Could not check for updates." }) :
     (u.state === "done" && u.info && u.info.update_available) ? el("div", { class: "s", style: { marginTop: "4px" } }, [el("span", { text: "Update available" }), raw(": v" + u.info.latest + "  "), el("span", { class: "link", onclick: function () { openUpdateLink(u.info.url); } }, "Download")]) :
@@ -2206,7 +2207,7 @@ function aboutCard() {
         updateLine,
       ]),
       el("div", { class: "ctl", style: { display: "flex", flexDirection: "column", gap: "6px", alignItems: "stretch" } }, [
-        connected() ? el("button", { class: "btn ghost", disabled: u.state === "checking", onclick: function () { checkUpdates(); } }, "Check for updates") : null,
+        !offlineBuild() ? el("button", { class: "btn ghost", disabled: u.state === "checking", onclick: function () { checkUpdates(); } }, "Check for updates") : null,
         el("button", { class: "btn ghost", onclick: function () { openExternal("https://digiphyte.com"); } }, "digiphyte.com"),
       ]),
     ]),
