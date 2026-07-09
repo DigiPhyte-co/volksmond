@@ -36,7 +36,7 @@ from typing import Optional
 # the public hex here. While this is empty (dev/test) the SA_LIVE_LICENSE_PUBKEY
 # env var supplies the key; once a real key is baked in here it takes precedence
 # and the env var is ignored, so a shipped build can't be pointed at another key.
-_PUBLIC_KEY_HEX = ""
+_PUBLIC_KEY_HEX = "2f2cd9f8bba37db0222e396ff887b94f27604f8d1e0e607d58f4c6013109c5a2"
 
 # The package major version a licence is checked against. Bump on a paid major
 # release so older perpetual licences resolve to "upgrade available", not "valid".
