@@ -2568,12 +2568,17 @@ function afrikaansModelSection() {
   var d = S.voiceModels; if (!d) return null;
   var p = d.progress || {}; var downloading = p.state === "downloading";
   var fl = (d.fluister || []).slice();
+  // For Afrikaans we recommend High quality (the large-v3-turbo Fluister tune), NOT Best (large-v3):
+  // our turbo tune is the Afrikaans sweet spot (it beats large-v3 on real Afrikaans, is GPU-optional
+  // and faster). This override is display-only and scoped to the Fluister section; the hardware
+  // recommended_model still drives the general Whisper section and the first-run auto-download.
+  var fluisterRec = "large-v3-turbo";
   var anyInstalled = fl.some(function (m) { return m.present; });
   var ups = {}; ((S.modelUpdates && S.modelUpdates.updates) || []).forEach(function (u) { ups[u.repo] = u; });
   var checking = S._checkingModelUpdates;
   // The offline-only edition compiles out the model-update route, so hide its button there.
   var checkBtn = (anyInstalled && !offlineBuild()) ? el("button", { class: "btn ghost sm", disabled: checking, onclick: function () { checkModelUpdates(); } }, checking ? "Checking" : "Check for updates") : null;
-  fl.sort(function (a, b) { return (b.size === d.recommended_model ? 1 : 0) - (a.size === d.recommended_model ? 1 : 0); });
+  fl.sort(function (a, b) { return (b.size === fluisterRec ? 1 : 0) - (a.size === fluisterRec ? 1 : 0); });
   return el("div", { style: { marginBottom: "14px" } }, [
     voiceModelSectionHeader("Afrikaans model (Fluister)", checkBtn, "Our Afrikaans-tuned model. Best for Afrikaans and mixed Afrikaans and English."),
     el("div", { class: "stack", style: { gap: "10px" } }, fl.map(function (m) {
@@ -2581,7 +2586,7 @@ function afrikaansModelSection() {
       var u = ups[m.repo];
       var isThis = downloading && p.kind === "fluister" && p.model === m.size;
       var badges = [];
-      if (m.size === d.recommended_model) badges.push(vmChip("accent", "Recommended"));
+      if (m.size === fluisterRec) badges.push(vmChip("accent", "Recommended"));
       var status = null;
       if (u && u.update_available) status = el("button", { class: "btn sm", disabled: downloading, onclick: function () { if (downloading) return; startFluisterUpdate(m.size); } }, isThis ? "Updating" : ("Update → v" + u.latest));
       else if (S.modelUpdates) status = el("span", { class: "chip ok" }, [icon("check", 12), "Up to date"]);
