@@ -30,11 +30,12 @@
 param(
     [string]$Bucket = "volksmond-dl",
     [string]$Domain = "dl.volksmond.com",
-    # R2 jurisdiction. The release bucket is EU-resident. If it was created as an EU-jurisdiction
-    # bucket (wrangler r2 bucket create ... --jurisdiction eu), wrangler needs this flag on every
-    # object op or it cannot find the bucket. If it was instead created as a standard bucket with
-    # --location weur, pass -Jurisdiction "" to drop the flag.
-    [string]$Jurisdiction = "eu",
+    # R2 jurisdiction. The real volksmond-dl bucket is a STANDARD-jurisdiction bucket created with
+    # --location weur (EU location hint, not the eu jurisdiction), so the default is "" (no
+    # --jurisdiction flag). Only set this (e.g. -Jurisdiction eu) if the bucket is ever recreated
+    # as a true EU-jurisdiction bucket: wrangler cannot find a jurisdictioned bucket without the
+    # flag, and cannot find a standard bucket with it.
+    [string]$Jurisdiction = "",
     # Where the in-app "Download" link (latest.json "url") sends the user. MUST be an https URL on
     # digiphyte.com or a *.digiphyte.com subdomain (or github.com): the shipped app (app.js
     # openUpdateLink allowlist, live_transcribe/web/static/app.js:2166-2176) REJECTS any other
