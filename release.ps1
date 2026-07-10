@@ -1,17 +1,18 @@
 # release.ps1 - Publish a new Volksmond version online (surgical, repeatable, automated).
 #
-# Say "ship the new version" to Claude (the ship-volksmond skill) and it runs this end to
+# Say "release volksmond" to Claude (the release-volksmond skill) and it runs this end to
 # end. Or run it yourself. What it does, in order:
 #   1. Reads APP_VERSION from licensing.py (single source of truth; build-app.ps1 reads the
 #      same line, so the installer name always matches).
 #   2. Finds Volksmond-Setup-<ver>.exe in the repo root. -Build (re)builds it first.
 #   3. SHA-256 of the exact bytes to be published.
-#   4. VirusTotal: uploads the installer, waits for the scan, records the permalink +
-#      detection count. The key comes from $env:VT_API_KEY or Doppler infra-ops/prd; a real
-#      run FAILS without it unless you pass -SkipScan (which reuses the deterministic report
-#      link for the exact bytes, no fresh scan).
-#   5. Writes site/latest.json (update manifest) and site/trust.json (version + hash + VT,
-#      for trust.html to read) - both BOM-free.
+#   4. Malware scan: Microsoft Defender, fully local and MANDATORY (MpCmdRun.exe custom file
+#      scan; a threat fails the release loudly; engine + definitions versions recorded in
+#      trust.json). VirusTotal is OPT-IN only: -VirusTotal runs an API scan (needs VT_API_KEY
+#      and a VT licence appropriate to commercial use), or -VtUrl records a manually obtained
+#      report link. No VT network call happens by default. See RELEASE.md "Malware scanning".
+#   5. Writes site/latest.json (update manifest) and site/trust.json (version + hash + scan
+#      record, for trust.html to read) - both BOM-free.
 #   6. Uploads to the R2 bucket served at dl.volksmond.com (via doppler run -p infra-ops -c prd,
 #      which injects the Cloudflare R2 credentials):
 #        Volksmond-Setup-<ver>.exe      versioned installer (immutable, cached forever)
@@ -20,12 +21,13 @@
 #      A release touches ONLY the release host. The marketing site is never redeployed.
 #   7. Verifies the live manifest, prints the summary.
 #
-# One-time setup: see RELEASE.md ("One-time R2 setup" + "VirusTotal API key").
+# One-time setup: see RELEASE.md ("R2 setup" + "Malware scanning").
 #
-#   .\release.ps1              # publish the version currently in licensing.py
-#   .\release.ps1 -Build       # rebuild the installer first
-#   .\release.ps1 -SkipScan    # skip the fresh VirusTotal scan; reuse the report link for these bytes
-#   .\release.ps1 -DryRun      # everything except VirusTotal + the R2 uploads
+#   .\release.ps1                 # publish the version currently in licensing.py (Defender scan included)
+#   .\release.ps1 -Build          # rebuild the installer first
+#   .\release.ps1 -VirusTotal     # ALSO scan on VirusTotal (licensed API key required; see RELEASE.md)
+#   .\release.ps1 -VtUrl <link>   # record a manually obtained VirusTotal report link (no API call)
+#   .\release.ps1 -DryRun         # everything local (incl. the Defender scan); NO uploads, no VT
 [CmdletBinding()]
 param(
     # The canonical release bucket: the PRE-EXISTING `volksmond` bucket in the EU JURISDICTION,
@@ -47,12 +49,14 @@ param(
     [string]$SiteUrl = "https://volksmond.digiphyte.com/",
     [string]$Notes,
     [string]$AccountId,
-    # Optional: reuse a specific existing VirusTotal report URL instead of the deterministic one.
-    # (Named distinctly from the internal $vtUrl: PowerShell variable names are case-insensitive.)
-    [string]$ReuseVtUrl,
+    # OPT-IN: run a VirusTotal API scan. Requires VT_API_KEY (env or Doppler infra-ops/prd) AND
+    # a VT licence appropriate to commercial use; the free public API is ruled out for business
+    # workflows (Sean, 2026-07-11). See RELEASE.md "Malware scanning".
+    [switch]$VirusTotal,
+    # OPT-IN: record a manually obtained VirusTotal report link in trust.json (no API call).
+    # The internal variable is $vtLink because PS variable names are case-insensitive.
+    [string]$VtUrl,
     [switch]$Build,
-    # Skip the fresh VirusTotal scan and reuse the report link for these exact bytes.
-    [switch]$SkipScan,
     [switch]$DryRun
 )
 
@@ -87,7 +91,48 @@ function Resolve-VtKey {
     return $null
 }
 
+# --- Microsoft Defender: the MANDATORY local scan of the exact bytes to be published ------
+# MpCmdRun -Scan exit codes: 0 = no threat found, 2 = threat found. Anything else = the scan
+# itself failed; either way we do not publish. Returns the trust.json "defender" object.
+function Invoke-DefenderScan($file) {
+    $mp = Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe"
+    if (-not (Test-Path $mp)) {
+        # Newer Defender platform versions live under ProgramData\...\Platform\<version>\
+        $mp = $null
+        $plat = Join-Path $env:ProgramData "Microsoft\Windows Defender\Platform"
+        if (Test-Path $plat) {
+            $latest = Get-ChildItem $plat -Directory |
+                Where-Object { $_.Name -match '^\d' } |
+                Sort-Object { [version]($_.Name -replace '[^\d.].*$','') } -Descending |
+                Select-Object -First 1
+            if ($latest) {
+                $cand = Join-Path $latest.FullName "MpCmdRun.exe"
+                if (Test-Path $cand) { $mp = $cand }
+            }
+        }
+    }
+    if (-not $mp) { Fail "MpCmdRun.exe not found (checked `$env:ProgramFiles\Windows Defender and the Defender Platform dir). Defender is the mandatory release scan; not publishing unscanned." }
+    Write-Host "  Defender:  scanning the installer (MpCmdRun -Scan -ScanType 3)..." -ForegroundColor Gray
+    & $mp -Scan -ScanType 3 -File $file | Out-Null
+    $rc = $LASTEXITCODE
+    if ($rc -eq 2) { Fail "DEFENDER FOUND A THREAT in $file. DO NOT PUBLISH. Re-run for detail: & `"$mp`" -Scan -ScanType 3 -File `"$file`"" }
+    if ($rc -ne 0) { Fail "Defender scan did not complete cleanly (rc=$rc); not publishing an unscanned installer." }
+    $engine = ""; $defs = ""
+    try {
+        $s = Get-MpComputerStatus
+        $engine = "$($s.AMEngineVersion)"; $defs = "$($s.AntivirusSignatureVersion)"
+    } catch { }
+    Write-Host "  Defender:  clean (engine $engine, definitions $defs)" -ForegroundColor Green
+    return [ordered]@{
+        result      = "clean"
+        engine      = $engine
+        definitions = $defs
+        scanned     = (Get-Date -Format 'yyyy-MM-dd')
+    }
+}
+
 # --- VirusTotal: upload, wait for the scan, return @{ url; detections; status } ----------
+# OPT-IN only (-VirusTotal); see RELEASE.md "Malware scanning" for the licensing ruling.
 # $sha is lowercase hex (the GUI permalink form). $key is resolved by the caller and never printed.
 function Invoke-VirusTotal($file, $sha, $key) {
     $permalink = "https://www.virustotal.com/gui/file/$sha"
@@ -168,20 +213,22 @@ $shaUpper = (Get-FileHash -Path $exe -Algorithm SHA256).Hash   # Get-FileHash re
 $shaLower = $shaUpper.ToLower()                                # VirusTotal GUI permalink form
 Write-Host "  SHA-256:   $shaUpper" -ForegroundColor Green
 
-# --- 4. VirusTotal ------------------------------------------------------------------------
-# The permalink is deterministic from the hash, so trust.json always carries a valid link even
-# when no fresh scan runs. A scan only adds the detection count for the console summary.
-$vtUrl = "https://www.virustotal.com/gui/file/$shaLower"
-$vtDet = $null
-if (-not $DryRun) {
-    if ($SkipScan) {
-        if ($ReuseVtUrl) { $vtUrl = $ReuseVtUrl }
-        Write-Host "  VirusTotal: -SkipScan; reusing $vtUrl (no fresh scan)." -ForegroundColor Yellow
+# --- 4. Malware scan: Microsoft Defender (mandatory, fully local, runs even in -DryRun) ---
+$defender = Invoke-DefenderScan $exe
+
+# --- 4b. VirusTotal (OPT-IN only) ----------------------------------------------------------
+$vtLink = $null; $vtDet = $null
+if ($VtUrl) {
+    $vtLink = $VtUrl
+    Write-Host "  VirusTotal: recording the supplied report link (no API call)." -ForegroundColor Gray
+} elseif ($VirusTotal) {
+    if ($DryRun) {
+        Write-Host "  VirusTotal: -DryRun; skipping the opt-in VT scan (no network)." -ForegroundColor Yellow
     } else {
         $vtKey = Resolve-VtKey
-        if (-not $vtKey) { Fail "VirusTotal key not found. Set `$env:VT_API_KEY, or add it to Doppler (doppler secrets set VT_API_KEY -p infra-ops -c prd), or pass -SkipScan to reuse the existing report for these exact bytes." }
+        if (-not $vtKey) { Fail "-VirusTotal needs an API key: set `$env:VT_API_KEY or add it to Doppler (doppler secrets set VT_API_KEY -p infra-ops -c prd). It must be a licence appropriate to commercial use; the free API is ruled out. Or drop -VirusTotal (Defender is the mandatory scan) or pass -VtUrl <link>." }
         $vt = Invoke-VirusTotal $exe $shaLower $vtKey
-        if ($vt) { $vtUrl = $vt.url; $vtDet = $vt.detections }
+        if ($vt) { $vtLink = $vt.url; $vtDet = $vt.detections }
     }
 }
 
@@ -197,21 +244,24 @@ $downloadUrl = "https://$Domain/Volksmond-Setup-$ver.exe"   # versioned, matches
 $latestAlias = "https://$Domain/Volksmond-Setup-latest.exe" # stable, for the site DOWNLOAD_URL
 
 Write-JsonNoBom $manifestPath ([ordered]@{ version = $ver; url = $SiteUrl; notes = $Notes })
-# trust.json: exact contract shared with trust.html. Do not add, rename or reorder fields.
-# sha256 is UPPERCASE hex; virustotal is the lowercase-hash GUI permalink.
-Write-JsonNoBom $trustPath ([ordered]@{
-    version    = $ver
-    filename   = "Volksmond-Setup-$ver.exe"
-    sha256     = $shaUpper
-    virustotal = $vtUrl
-    published  = (Get-Date -Format 'yyyy-MM-dd')
-})
+# trust.json: contract shared with trust.html. REQUIRED: version, filename, sha256 (UPPERCASE
+# hex), published. OPTIONAL: virustotal (lowercase-hash GUI permalink, only when a link was
+# supplied or a VT scan ran) and defender (the local scan record). Do not rename fields.
+$trust = [ordered]@{
+    version  = $ver
+    filename = "Volksmond-Setup-$ver.exe"
+    sha256   = $shaUpper
+}
+if ($vtLink) { $trust["virustotal"] = $vtLink }
+$trust["published"] = (Get-Date -Format 'yyyy-MM-dd')
+if ($defender) { $trust["defender"] = $defender }
+Write-JsonNoBom $trustPath $trust
 Write-Host "  Wrote:     site\latest.json + site\trust.json (version=$ver)" -ForegroundColor Green
 
 # --- 6. Upload to R2 ---------------------------------------------------------------------
 if ($DryRun) {
     Write-Host ""
-    Write-Host "  -DryRun: skipping VirusTotal + the R2 uploads. Would upload:" -ForegroundColor Yellow
+    Write-Host "  -DryRun: skipping the R2 uploads (Defender already ran locally). Would upload:" -ForegroundColor Yellow
     "Volksmond-Setup-$ver.exe", "Volksmond-Setup-latest.exe", "latest.json", "models.json", "trust.json" |
         ForEach-Object { Write-Host "    $Bucket/$_" -ForegroundColor Yellow }
 } else {
@@ -264,8 +314,9 @@ Write-Host "  ===============  RELEASE $ver PUBLISHED  ===============" -Foregro
 Write-Host "  Download (versioned) : $downloadUrl"
 Write-Host "  Download (stable)    : $latestAlias"
 Write-Host "  SHA-256              : $shaUpper"
-if ($vtUrl) {
-    Write-Host "  VirusTotal           : $vtUrl"
+Write-Host "  Defender             : $($defender.result) (engine $($defender.engine), definitions $($defender.definitions))"
+if ($vtLink) {
+    Write-Host "  VirusTotal           : $vtLink"
     if ($vtDet) { Write-Host "  VT detections        : $vtDet" }
 }
 Write-Host "  Manifest / trust     : $manifestUrl  |  https://$Domain/trust.json"
