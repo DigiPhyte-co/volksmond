@@ -28,14 +28,16 @@
 #   .\release.ps1 -DryRun      # everything except VirusTotal + the R2 uploads
 [CmdletBinding()]
 param(
-    [string]$Bucket = "volksmond-dl",
+    # The canonical release bucket: the PRE-EXISTING `volksmond` bucket in the EU JURISDICTION,
+    # with dl.volksmond.com (canonical) and dl.volksmond.digiphyte.com (legacy alias) bound and
+    # Active. NOT the redundant standard-jurisdiction `volksmond-dl` bucket, which is pending
+    # deletion. See RELEASE.md.
+    [string]$Bucket = "volksmond",
     [string]$Domain = "dl.volksmond.com",
-    # R2 jurisdiction. The real volksmond-dl bucket is a STANDARD-jurisdiction bucket created with
-    # --location weur (EU location hint, not the eu jurisdiction), so the default is "" (no
-    # --jurisdiction flag). Only set this (e.g. -Jurisdiction eu) if the bucket is ever recreated
-    # as a true EU-jurisdiction bucket: wrangler cannot find a jurisdictioned bucket without the
-    # flag, and cannot find a standard bucket with it.
-    [string]$Jurisdiction = "",
+    # R2 jurisdiction. The volksmond bucket is an EU-JURISDICTION bucket, and wrangler cannot
+    # find a jurisdictioned bucket without this flag on every object op (nor a standard bucket
+    # with it). Keep "eu" unless targeting a standard-jurisdiction bucket, then pass "".
+    [string]$Jurisdiction = "eu",
     # Where the in-app "Download" link (latest.json "url") sends the user. MUST be an https URL on
     # digiphyte.com or a *.digiphyte.com subdomain (or github.com): the shipped app (app.js
     # openUpdateLink allowlist, live_transcribe/web/static/app.js:2166-2176) REJECTS any other
