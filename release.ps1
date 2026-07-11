@@ -27,6 +27,8 @@
 #   .\release.ps1 -Build          # rebuild the installer first
 #   .\release.ps1 -VirusTotal     # ALSO scan on VirusTotal (licensed API key required; see RELEASE.md)
 #   .\release.ps1 -VtUrl <link>   # record a manually obtained VirusTotal report link (no API call)
+#   .\release.ps1 -TrustOnly -VtUrl <link>   # regenerate + upload ONLY trust.json (attach a VT
+#                                            # link to an already-shipped release; no exe upload)
 #   .\release.ps1 -DryRun         # everything local (incl. the Defender scan); NO uploads, no VT
 [CmdletBinding()]
 param(
@@ -56,6 +58,10 @@ param(
     # OPT-IN: record a manually obtained VirusTotal report link in trust.json (no API call).
     # The internal variable is $vtLink because PS variable names are case-insensitive.
     [string]$VtUrl,
+    # Regenerate and upload ONLY trust.json (hash + Defender scan still run against the existing
+    # installer; the exe, latest.json and models.json are NOT uploaded). For attaching a
+    # VirusTotal link to an already-shipped release: .\release.ps1 -TrustOnly -VtUrl <link>.
+    [switch]$TrustOnly,
     [switch]$Build,
     [switch]$DryRun
 )
@@ -262,8 +268,9 @@ Write-Host "  Wrote:     site\latest.json + site\trust.json (version=$ver)" -For
 if ($DryRun) {
     Write-Host ""
     Write-Host "  -DryRun: skipping the R2 uploads (Defender already ran locally). Would upload:" -ForegroundColor Yellow
-    "Volksmond-Setup-$ver.exe", "Volksmond-Setup-latest.exe", "latest.json", "models.json", "trust.json" |
-        ForEach-Object { Write-Host "    $Bucket/$_" -ForegroundColor Yellow }
+    $would = @("Volksmond-Setup-$ver.exe", "Volksmond-Setup-latest.exe", "latest.json", "models.json", "trust.json")
+    if ($TrustOnly) { $would = @("trust.json") }
+    $would | ForEach-Object { Write-Host "    $Bucket/$_" -ForegroundColor Yellow }
 } else {
     $wBase = Get-WranglerBase
     if (-not $wBase) { Fail "wrangler not found (checked PATH and npx). Install it with: npm i -g wrangler" }
@@ -285,19 +292,24 @@ if ($DryRun) {
             if ($LASTEXITCODE -ne 0) { Fail "Upload of $key failed (rc=$LASTEXITCODE). Check bucket '$Bucket', jurisdiction '$Jurisdiction', and that Doppler infra-ops/prd holds the Cloudflare R2 credentials." }
         }
         # Versioned installer: safe to cache forever. Everything overwritten each release: short cache.
-        Put-R2 "Volksmond-Setup-$ver.exe"   $exe          "application/octet-stream" "public, max-age=31536000, immutable"
-        Put-R2 "Volksmond-Setup-latest.exe" $exe          "application/octet-stream" "public, max-age=300"
-        Put-R2 "latest.json"                $manifestPath "application/json"         "public, max-age=300"
-        Put-R2 "models.json"                $modelsPath   "application/json"         "public, max-age=300"
+        if (-not $TrustOnly) {
+            Put-R2 "Volksmond-Setup-$ver.exe"   $exe          "application/octet-stream" "public, max-age=31536000, immutable"
+            Put-R2 "Volksmond-Setup-latest.exe" $exe          "application/octet-stream" "public, max-age=300"
+            Put-R2 "latest.json"                $manifestPath "application/json"         "public, max-age=300"
+            Put-R2 "models.json"                $modelsPath   "application/json"         "public, max-age=300"
+        }
         Put-R2 "trust.json"                 $trustPath    "application/json"         "public, max-age=300"
-        Write-Host "  Uploaded 5 objects to $Bucket." -ForegroundColor Green
+        if ($TrustOnly) { Write-Host "  -TrustOnly: uploaded trust.json only." -ForegroundColor Green }
+        else { Write-Host "  Uploaded 5 objects to $Bucket." -ForegroundColor Green }
     } finally {
         if ($null -ne $savedToken) { $env:DOPPLER_TOKEN = $savedToken }
     }
 }
 
 # --- 7. Verify + summary -----------------------------------------------------------------
+# -TrustOnly only re-published trust.json, so verify that instead (same version field).
 $manifestUrl = "https://$Domain/latest.json"
+if ($TrustOnly) { $manifestUrl = "https://$Domain/trust.json" }
 if (-not $DryRun) {
     try {
         $live = (Invoke-WebRequest $manifestUrl -UseBasicParsing -TimeoutSec 20).Content | ConvertFrom-Json
@@ -310,7 +322,8 @@ if (-not $DryRun) {
 }
 
 Write-Host ""
-Write-Host "  ===============  RELEASE $ver PUBLISHED  ===============" -ForegroundColor Cyan
+if ($TrustOnly) { Write-Host "  ===============  TRUST.JSON RE-PUBLISHED FOR $ver  ===============" -ForegroundColor Cyan }
+else { Write-Host "  ===============  RELEASE $ver PUBLISHED  ===============" -ForegroundColor Cyan }
 Write-Host "  Download (versioned) : $downloadUrl"
 Write-Host "  Download (stable)    : $latestAlias"
 Write-Host "  SHA-256              : $shaUpper"
