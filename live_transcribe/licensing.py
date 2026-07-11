@@ -7,18 +7,19 @@ it grants. Only the holder of the matching private key (you) can issue a valid
 token, so it cannot be forged.
 
 Forward-compatible on purpose. A licence carries a tier, an explicit feature list
-(for add-ons), the highest major version it covers, and an optional expiry. That
-single format expresses every model we are still choosing between:
-  perpetual per major version  : valid_until = null, max_major = N
-  subscription (monthly/annual): valid_until = <date>, max_major = null
-so the commercial model can change later without touching this code or the UI.
+(for add-ons), an optional highest-major-version field, and an optional expiry.
+The chosen commercial model (monetisation plan section 9) is the ANNUAL Business
+licence:
+  annual: valid_until = <date one year from issue>, max_major = null
+The retired perpetual shape (valid_until = null, max_major = N) still verifies,
+so the model can change again without touching this code or the UI.
 
 Token format: base64url(payload_json) + "." + base64url(ed25519_signature).
 Verification needs only the public key, which is safe to ship in the binary.
 
 Issuing licences (you, offline; the private key never leaves your machine):
     python -m live_transcribe.licensing keygen
-    python -m live_transcribe.licensing sign <priv_hex> --tier pro --max-major 1
+    python -m live_transcribe.licensing sign <priv_hex> --tier pro --valid-until 2027-07-11 --issued-to "jan@example.co.za"
 Inspecting a token:
     python -m live_transcribe.licensing verify <token>
 """
@@ -48,12 +49,15 @@ _LICENSE_PATH = (
     / "sa-live-transcribe" / "license.key"
 )
 
-# Pro covers only what genuinely needs an online connection. Calendar attendee
-# seeding talks to Microsoft Graph, so it is Pro. cloud_api and multi_seat are
-# add-ons, granted only when explicitly listed in the licence, never by the tier
-# alone. Everything that runs on this machine (live transcription, local
-# summaries, the clean pass, history, exports, saved vocab) stays free, by
-# design: local features are never gated.
+# The paid (Business) tier gates convenience extras, not core transcription.
+# Calendar attendee seeding reads the LOCAL classic Outlook desktop app over COM
+# (outlook_local.py), fully offline: no Microsoft Graph, no network call.
+# multi_seat is an add-on, granted only when explicitly listed in the licence,
+# never by the tier alone. cloud_api is a DROPPED concept, kept in
+# ADDON_FEATURES only so previously issued tokens still parse; nothing in the
+# app consumes it. Everything that runs on this machine (live transcription,
+# local summaries, the clean pass, history, exports, saved vocab) stays free,
+# by design: local features are never gated.
 PRO_FEATURES = frozenset({"calendar"})
 ADDON_FEATURES = frozenset({"cloud_api", "multi_seat"})
 ALL_FEATURES = PRO_FEATURES | ADDON_FEATURES

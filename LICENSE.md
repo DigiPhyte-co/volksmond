@@ -15,7 +15,7 @@ education.
 
 **Commercial or business use of Volksmond requires a separate commercial licence
 from DigiPhyte (Pty) Ltd.** A Volksmond licence key grants that commercial
-licence. To obtain one, contact info@digiphyte.com.
+licence. To obtain one, contact volksmond@digiphyte.com.
 
 Required Notice: Copyright (c) 2026 DigiPhyte (Pty) Ltd (https://digiphyte.com)
 
