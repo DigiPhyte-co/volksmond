@@ -50,11 +50,19 @@ Volksmond-Setup-*.exe
 # Generated review artifact from landing/build/validate.py (regenerated on each run)
 landing/build/readable.html
 
-# Local agent / tooling state
-.claude/
+# Local agent / tooling state (but DO track shared project skills, e.g. release-volksmond)
+.claude/*
+!.claude/skills/
 .codex-review*.txt
 .codex-reviews/
 codex-review-*.md
+
+# Internal session docs (untracked from the public repo 2026-07-11; kept on disk,
+# and deliberately left in git history - no history rewrite)
+HANDOFF-*.md
+LAPTOP-FIX-*.md
+CLAUDE-LONG-SESSION-IMPROVEMENTS.md
+docs/code-review-*.md
 
 # Cloudflare wrangler local cache/state (Pages deploys)
 .wrangler/
