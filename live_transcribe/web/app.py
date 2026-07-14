@@ -28,7 +28,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .. import buildflags, capture, config, licensing, sinks, transcribe
+from .. import buildflags, capture, config, licensing, paths, sinks, transcribe
 from ..__main__ import default_chunk_seconds, pick_tier, resolve_tier
 
 app = FastAPI(title="SA-Live-Transcribe")
@@ -278,7 +278,7 @@ def _sessions_dir() -> Path:
     # non-synced user folder (same base as settings/models) instead - otherwise
     # transcripts bury inside the app and vanish on reinstall.
     if getattr(sys, "frozen", False):
-        p = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "sa-live-transcribe" / "sessions"
+        p = paths.data_dir() / "sessions"
     else:
         p = PROJECT_ROOT / "sessions"
     p.mkdir(parents=True, exist_ok=True)
@@ -1578,6 +1578,9 @@ def cuda_status():
     from .. import cudadl
     present = cudadl.gpu_present()
     return {
+        # False on platforms without CUDA support (e.g. macOS); the UI hides the
+        # whole GPU card when this is False. Always True on Windows.
+        "supported": cudadl.SUPPORTED,
         "gpu_present": present,
         "installed": cudadl.installed(),
         "ready": cudadl.cuda_ready(),

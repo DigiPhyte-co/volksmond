@@ -20,13 +20,21 @@ def _redirect_windowed_output():
     """In a windowed (no-console) build, point sys.stdout/stderr at a log file.
 
     Without a console both are None, so print() and tracebacks would raise. Write
-    them to %LOCALAPPDATA%\\sa-live-transcribe\\volksmond.log, truncated each launch
+    them to <data_dir>\\volksmond.log (live_transcribe.paths: the per-user app-data
+    folder, %LOCALAPPDATA%\\sa-live-transcribe on Windows), truncated each launch
     so it stays small and always reflects the latest run. Falls back to os.devnull
     if the file cannot be opened. No-op when a console is present (source/dev runs).
     """
     if sys.stdout is not None and sys.stderr is not None:
         return
-    base = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "sa-live-transcribe"
+    try:
+        # paths.py is stdlib-only and import-light by contract, so this is safe this
+        # early. The except is belt-and-braces: the redirect must NEVER itself crash
+        # a windowed build, or there would be no crash log at all.
+        from live_transcribe.paths import data_dir
+        base = data_dir()
+    except Exception:
+        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "sa-live-transcribe"
     try:
         base.mkdir(parents=True, exist_ok=True)
         sink = open(base / "volksmond.log", "w", encoding="utf-8", buffering=1)

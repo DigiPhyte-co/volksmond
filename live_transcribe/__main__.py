@@ -52,6 +52,9 @@ def _gpu_vram_mb():
     int8_float16 4GB tier (e.g. GTX 1650 Mobile). nvidia-smi ships with the
     driver, so this needs no extra dependency.
     """
+    from . import cudadl
+    if not cudadl.SUPPORTED:
+        return None   # non-Windows: no CUDA here, never shell nvidia-smi
     import subprocess
     try:
         out = subprocess.run(

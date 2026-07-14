@@ -109,8 +109,9 @@ def test_cuda_api():
     # are CSRF-protected; the test only hits them WITHOUT the token (403), so it never
     # triggers a real multi-GB download regardless of whether this machine has a GPU.
     j = client.get("/api/cuda").json()
-    for k in ("gpu_present", "installed", "ready", "approx_bytes", "progress"):
+    for k in ("supported", "gpu_present", "installed", "ready", "approx_bytes", "progress"):
         assert k in j, (k, j)
+    assert j["supported"] is True, j   # this suite runs on Windows, where CUDA is supported
     assert j["approx_bytes"] > 0, j
     bare = TestClient(app, base_url="http://localhost")
     assert bare.post("/api/cuda/download").status_code == 403, "cuda download not CSRF-protected"

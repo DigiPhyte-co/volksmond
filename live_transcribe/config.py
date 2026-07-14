@@ -21,7 +21,9 @@ import sys
 import threading
 from pathlib import Path
 
-_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "sa-live-transcribe"
+from . import paths
+
+_DIR = paths.data_dir()
 _SETTINGS_PATH = _DIR / "settings.json"
 
 # settings.json is written from more than one thread (the request thread and the

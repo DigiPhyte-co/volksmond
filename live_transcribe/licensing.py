@@ -30,8 +30,9 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime
-from pathlib import Path
 from typing import Optional
+
+from . import paths
 
 # Replace with YOUR public key: run `keygen`, keep the private key secret, paste
 # the public hex here. While this is empty (dev/test) the SA_LIVE_LICENSE_PUBKEY
@@ -44,10 +45,7 @@ _PUBLIC_KEY_HEX = "2f2cd9f8bba37db0222e396ff887b94f27604f8d1e0e607d58f4c6013109c
 APP_VERSION = "1.10.0"
 APP_MAJOR = 1
 
-_LICENSE_PATH = (
-    Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
-    / "sa-live-transcribe" / "license.key"
-)
+_LICENSE_PATH = paths.data_dir() / "license.key"
 
 # The paid (Business) tier gates convenience extras, not core transcription.
 # Calendar attendee seeding reads the LOCAL classic Outlook desktop app over COM

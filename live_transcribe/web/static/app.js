@@ -2141,7 +2141,7 @@ function settingsView() {
     appearanceCard(),
     transcriptionCard(st),
     voiceModelCard(),
-    (S.cuda && S.cuda.gpu_present) ? cudaCard() : null,
+    (S.cuda && S.cuda.supported !== false && S.cuda.gpu_present) ? cudaCard() : null,
     summariesCard(),
     dataCard(st),
     connected() ? dangerCard(st) : null,
@@ -2704,10 +2704,11 @@ function cudaProgressBar(pct) {
   return el("div", { style: { height: "8px", borderRadius: "999px", background: "var(--line)", overflow: "hidden", marginTop: "10px" } },
     el("div", { id: "vm-cuda-bar", style: { height: "100%", width: pct + "%", background: "var(--accent)", transition: "width .3s ease" } }));
 }
-// The CUDA download card. Returns null unless an NVIDIA GPU is present (NVIDIA only).
+// The CUDA download card. Returns null unless the platform supports CUDA at all
+// (supported === false on e.g. macOS hides it entirely) and an NVIDIA GPU is present.
 function cudaPanel(manage) {
   var c = S.cuda;
-  if (!c || !c.gpu_present) return null;
+  if (!c || c.supported === false || !c.gpu_present) return null;
   var p = c.progress || {};
   var downloading = p.state === "downloading";
   var pct = (downloading && p.total) ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0;

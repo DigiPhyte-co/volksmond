@@ -25,6 +25,16 @@ import threading
 import zipfile
 from pathlib import Path
 
+from . import paths
+
+# CUDA support here is Windows-only: the wheels fetched below are win_amd64, the DLL
+# registration is a Windows API (os.add_dll_directory / ctypes.WinDLL), and macOS has
+# no CUDA at all. On any other platform every probe reports False/None without touching
+# ctranslate2 or shelling nvidia-smi, register_dll_dir()/self_test() no-op cleanly, and
+# the download entry point refuses, so callers land on the CPU path with no special-casing.
+# /api/cuda exposes this as "supported" so the UI can hide the GPU card entirely.
+SUPPORTED = sys.platform == "win32"
+
 # ctranslate2 4.7.x => CUDA 12 + cuDNN 9. Fetch the matching NVIDIA wheels (Windows),
 # constrained to the right major version; the exact patch is resolved from PyPI.
 _WHEELS = [
@@ -47,7 +57,7 @@ _LOAD_OK = False        # cached self_test result: True once the CUDA DLLs have 
 
 
 def cuda_dir(create=False):
-    d = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "sa-live-transcribe" / "cuda"
+    d = paths.data_dir() / "cuda"
     if create:
         d.mkdir(parents=True, exist_ok=True)
     return d
@@ -55,6 +65,8 @@ def cuda_dir(create=False):
 
 def installed():
     """True once the required CUDA DLLs are on disk in <data>/cuda."""
+    if not SUPPORTED:
+        return False
     d = cuda_dir()
     return all((d / name).is_file() for name in _REQUIRED)
 
@@ -67,6 +79,8 @@ _PROBE = {}
 def gpu_present():
     """True if an NVIDIA CUDA device is visible. Uses ctranslate2's driver-level query,
     which works even on the CPU-only build (it does not need the runtime libs)."""
+    if not SUPPORTED:
+        return False
     if "gpu" not in _PROBE:
         try:
             import ctranslate2
@@ -80,6 +94,8 @@ def cuda_ready():
     """Whether the GPU should actually be used for transcription. In the shipped (frozen)
     build that means the CUDA libs are downloaded AND verified loadable; from source we
     trust the developer's system CUDA toolkit."""
+    if not SUPPORTED:
+        return False
     if not gpu_present():
         return False
     if getattr(sys, "frozen", False):
@@ -103,6 +119,8 @@ def cuda_ready():
 def vram_mb():
     """Total VRAM of GPU 0 in MB via nvidia-smi, or None. Used to pick the 4 GB tier.
     Cached (the value never changes during a run and the UI polls it)."""
+    if not SUPPORTED:
+        return None
     if "vram" not in _PROBE:
         _PROBE["vram"] = _probe_vram()
     return _PROBE["vram"]
@@ -126,6 +144,8 @@ def _probe_vram():
 def gpu_name():
     """Marketing name of GPU 0 (e.g. 'NVIDIA GeForce GTX 1650'), or None. Cached; used
     only for a friendly label in the UI."""
+    if not SUPPORTED:
+        return None
     if "name" not in _PROBE:
         _PROBE["name"] = _probe_name()
     return _PROBE["name"]
@@ -153,6 +173,8 @@ def register_dll_dir():
     faster_whisper / ctranslate2 are imported, so it must stay import-light. Idempotent:
     safe to call again after a download (it will not double-register or grow PATH)."""
     global _REGISTERED, _DLL_DIR_HANDLE
+    if not SUPPORTED:
+        return
     d = cuda_dir()
     if not d.is_dir():
         return
@@ -173,6 +195,8 @@ def self_test():
     """Try to load the required CUDA DLLs by bare name (after putting <data>/cuda on the
     search path). Returns (ok, error). A cheap, model-free proxy for "will the GPU
     libraries load this run": if ctypes can find and load them, so can ctranslate2."""
+    if not SUPPORTED:
+        return False, "GPU acceleration is only available on Windows."
     if not installed():
         return False, "The CUDA libraries are not downloaded yet."
     register_dll_dir()
@@ -213,7 +237,9 @@ def progress():
 
 def start_download():
     """Begin a background download + extract of the CUDA libraries. Raises RuntimeError
-    if one is already running."""
+    if one is already running, or on platforms without CUDA support."""
+    if not SUPPORTED:
+        raise RuntimeError("GPU acceleration is only available on Windows.")
     with _LOCK:
         if _STATE["state"] == "downloading":
             raise RuntimeError("CUDA libraries are already downloading.")
