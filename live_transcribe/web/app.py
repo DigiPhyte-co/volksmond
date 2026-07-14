@@ -339,103 +339,14 @@ def status():
 def devices_list():
     """List the mics and loopbacks the user can pick.
 
-    PyAudio enumerates every physical device once PER HOST API (MME +
-    DirectSound + WASAPI + WDM-KS), so on a typical laptop a single Realtek
-    mic appears 3-4 times under the same name. Plus the MME / DirectSound
-    meta-devices ("Microsoft Sound Mapper", "Primary Sound Capture Driver")
-    that point at "whatever Windows currently calls default" are not real
-    devices users should pick.
-
-    We filter to WASAPI-only for mics, matching what we already do for
-    loopbacks (loopback is WASAPI-exclusive on Windows). One entry per
-    physical device, all on the modern API. If WASAPI itself misbehaves
-    on a particular machine, the CLI `--list-devices` still shows every
-    host API for diagnostic purposes; this endpoint is for the UI.
+    Enumeration is platform-specific (WASAPI-only filtering, per-host-API
+    dedupe and the device-name mojibake fix on Windows), so the body lives
+    behind the devices seam (devices.list_ui_devices); this endpoint just
+    serves its dict: {loopbacks, mics, default_loopback_index,
+    default_mic_index}.
     """
-    import pyaudiowpatch as pa
-    def _fix_name(s):
-        # PyAudio returns device names as latin-1-encoded bytes wrapped in a
-        # Python str, so a real "Intel(R)" comes back as the mojibake we'd see
-        # if you decoded UTF-8 as latin-1. Reverse it: encode the str's code
-        # points as latin-1 bytes, decode those bytes as UTF-8. Falls open if
-        # the name was actually plain ASCII (no Unicode chars to misencode).
-        try:
-            return s.encode("latin-1").decode("utf-8")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            return s
-    p = pa.PyAudio()
-    try:
-        loopbacks = [
-            {"index": info["index"], "name": _fix_name(info["name"]), "rate": int(info["defaultSampleRate"])}
-            for info in p.get_loopback_device_info_generator()
-        ]
-        try:
-            default_lb = p.get_default_wasapi_loopback()
-            default_lb_idx = default_lb["index"]
-        except Exception:
-            default_lb_idx = None
-
-        try:
-            wasapi_idx = p.get_host_api_info_by_type(pa.paWASAPI)["index"]
-        except Exception:
-            wasapi_idx = None
-
-        try:
-            default_in = p.get_default_input_device_info()
-            default_in_idx = default_in["index"]
-        except Exception:
-            default_in_idx = None
-
-        def _collect_mics(wasapi_only):
-            # Dedupe by (cleaned name, rate): the same physical mic is enumerated once
-            # per host API (MME / DirectSound / WASAPI), so collapse those duplicates.
-            out, seen = [], set()
-            for i in range(p.get_device_count()):
-                info = p.get_device_info_by_index(i)
-                if info["maxInputChannels"] <= 0 or info.get("isLoopbackDevice"):
-                    continue
-                if wasapi_only and wasapi_idx is not None and info["hostApi"] != wasapi_idx:
-                    continue
-                name = _fix_name(info["name"])
-                rate = int(info["defaultSampleRate"])
-                if (name, rate) in seen:
-                    continue
-                seen.add((name, rate))
-                out.append({"index": info["index"], "name": name, "rate": rate})
-            return out
-
-        # WASAPI-only by default (clean list); if WASAPI exposes no input endpoints,
-        # fall back to every real mic so the dropdown is never empty.
-        mics = _collect_mics(wasapi_only=True)
-        if not mics:
-            mics = _collect_mics(wasapi_only=False)
-
-        # The system default mic may be on a non-WASAPI host API. Map it to the device
-        # with the same CLEANED name so the dropdown's default highlight is correct
-        # (compare _fix_name to _fix_name; a raw vs cleaned mismatch would miss). Never
-        # silently pick a different mic: with no match and more than one candidate, leave
-        # the default unset rather than risk opening the wrong device at /api/start.
-        if default_in_idx is not None and not any(m["index"] == default_in_idx for m in mics):
-            try:
-                default_name = _fix_name(p.get_device_info_by_index(default_in_idx)["name"])
-                match = next((m for m in mics if m["name"] == default_name), None)
-            except Exception:
-                match = None
-            if match:
-                default_in_idx = match["index"]
-            elif len(mics) == 1:
-                default_in_idx = mics[0]["index"]
-            else:
-                default_in_idx = None
-
-        return {
-            "loopbacks": loopbacks,
-            "mics": mics,
-            "default_loopback_index": default_lb_idx,
-            "default_mic_index": default_in_idx,
-        }
-    finally:
-        p.terminate()
+    from .. import devices
+    return devices.list_ui_devices()
 
 
 @app.get("/api/levels")
