@@ -42,6 +42,22 @@ class _FakeModel:
         return ([_FakeSeg(f"seg-{audio}")], {})
 
 
+_ORIG_MODEL = None
+
+
+def setup_module(module=None):
+    """Install the fake model for pytest runs (xunit hook, no pytest import needed).
+    The plain-script path patches in __main__ below; pytest never executes that block,
+    which used to leave the REAL WhisperModel in place and fail every engine test."""
+    global _ORIG_MODEL
+    _ORIG_MODEL = transcribe.WhisperModel
+    transcribe.WhisperModel = _FakeModel
+
+
+def teardown_module(module=None):
+    transcribe.WhisperModel = _ORIG_MODEL
+
+
 def _make_engine():
     engine = transcribe.Engine(tier="cpu-strong")  # model is the fake (patched below)
     collected = []
