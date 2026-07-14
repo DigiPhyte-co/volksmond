@@ -49,8 +49,15 @@ def test_data_dir_follows_sys_platform():
 
 
 def test_callers_share_the_data_dir():
-    # The five migrated call sites must all hang off the same folder.
+    # The five migrated call sites must all hang off the same folder. config._DIR and
+    # licensing._LICENSE_PATH are module-level singletons frozen at import time, and an
+    # earlier test in the same pytest process may have repointed them at a throwaway dir
+    # (test_modeldl._isolate does exactly that), so reload the modules first: the assertion
+    # is about the WIRING (everything resolves via paths.data_dir()), not about whatever
+    # state a previous test left behind. Reload is in-place, so held references stay valid.
     from live_transcribe import config, cudadl, licensing
+    importlib.reload(config)
+    importlib.reload(licensing)
     base = paths.data_dir()
     assert config._DIR == base, config._DIR
     assert licensing._LICENSE_PATH == base / "license.key", licensing._LICENSE_PATH

@@ -104,13 +104,55 @@ def test_up_to_date_no_update():
     print("  OK  darwin reports no update when already on the mac manifest version")
 
 
+def _assert_malformed(platform, manifest, label):
+    """The manifest must raise UpdateCheckError (the API's normal error shape), not blow up."""
+    try:
+        _check_with(platform, manifest)
+    except updatecheck.UpdateCheckError as e:
+        assert "malformed update manifest" in str(e), e
+        return
+    raise AssertionError(f"{label}: expected UpdateCheckError, got a result")
+
+
+def test_malformed_non_string_version_raises():
+    bad = dict(_MANIFEST_WIN_ONLY)
+    bad["version"] = 123
+    _assert_malformed("win32", bad, "non-string version")
+    print("  OK  a non-string version raises UpdateCheckError (no 500)")
+
+
+def test_malformed_manifest_not_a_dict_raises():
+    for platform in ("win32", "darwin"):
+        _assert_malformed(platform, ["not", "a", "dict"], f"non-dict manifest on {platform}")
+    print("  OK  a non-dict manifest raises UpdateCheckError on both platforms")
+
+
+def test_darwin_mac_key_not_a_dict_with_bad_top_level_raises():
+    # mac key not a dict -> fall back to the top level; the fallback entry is validated too,
+    # so a top level missing its url still raises rather than returning junk.
+    _assert_malformed("darwin", {"version": "1.10.0", "mac": "not-an-object"},
+                      "mac not a dict, top level missing url")
+    print("  OK  darwin: non-dict mac key with a malformed top level raises UpdateCheckError")
+
+
+def test_malformed_url_missing_raises():
+    bad = dict(_MANIFEST_WIN_ONLY)
+    del bad["url"]
+    _assert_malformed("win32", bad, "url missing")
+    print("  OK  a manifest without a url raises UpdateCheckError (no silent fallback)")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_darwin_reads_mac_key,
                test_darwin_falls_back_to_top_level,
                test_win32_ignores_mac_key,
                test_darwin_non_dict_mac_key_falls_back,
-               test_up_to_date_no_update):
+               test_up_to_date_no_update,
+               test_malformed_non_string_version_raises,
+               test_malformed_manifest_not_a_dict_raises,
+               test_darwin_mac_key_not_a_dict_with_bad_top_level_raises,
+               test_malformed_url_missing_raises):
         try:
             fn()
         except AssertionError as e:

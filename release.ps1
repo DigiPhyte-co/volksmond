@@ -11,8 +11,13 @@
 #      trust.json). VirusTotal is OPT-IN only: -VirusTotal runs an API scan (needs VT_API_KEY
 #      and a VT licence appropriate to commercial use), or -VtUrl records a manually obtained
 #      report link. No VT network call happens by default. See RELEASE.md "Malware scanning".
-#   5. Writes site/latest.json (update manifest) and site/trust.json (version + hash + scan
-#      record, for trust.html to read) - both BOM-free.
+#   5. Fetches the LIVE latest.json + trust.json from the release host as the merge base
+#      (site/ is untracked and machine-local, so the local copies may be stale), merges this
+#      platform's fields into that live content, then writes site/latest.json (update
+#      manifest) and site/trust.json (version + hash + scan record, for trust.html to read) -
+#      both BOM-free. A failed live fetch fails the publish; -DryRun warns and falls back to
+#      the local site/ files. A publish-time byte-preservation gate proves the merge did not
+#      touch the OTHER platform's fields.
 #   6. Uploads to the R2 bucket served at dl.volksmond.com (via doppler run -p infra-ops -c prd,
 #      which injects the Cloudflare R2 credentials):
 #        Volksmond-Setup-<ver>.exe      versioned installer (immutable, cached forever)
@@ -35,8 +40,9 @@
 # (WP-F); publishing stays on this machine. -MacDmg hashes the DMG, runs the SAME mandatory
 # local Defender scan over it (notarisation is the primary mac attestation; the Defender pass
 # is belt-and-braces since the DMG is published from this Windows machine anyway), merges the
-# "mac" keys into site/latest.json + site/trust.json WITHOUT touching any Windows field, and
-# uploads Volksmond-<ver>.dmg + Volksmond-latest.dmg + both manifests. Windows and Mac releases
+# "mac" keys into the LIVE latest.json + trust.json WITHOUT touching any Windows field, and
+# uploads Volksmond-<ver>.dmg first, then both manifests, then the Volksmond-latest.dmg alias
+# last (so nothing public ever points at bytes that are not up yet). Windows and Mac releases
 # ship independently: each lane only writes its own platform's keys.
 #
 #   .\release.ps1 -MacDmg <path> -NotarisationJson <path>   # publish the mac DMG
@@ -81,8 +87,10 @@ param(
     # Mutually exclusive with -Build / -TrustOnly / -VirusTotal / -VtUrl.
     [string]$MacDmg,
     # MAC LANE: the notarisation sidecar CI emits next to the DMG, JSON of the shape
-    # {submission_id, status, date}. Recorded in trust.json's mac entry as the notarisation
-    # attestation. REQUIRED for a real mac publish; may be omitted only with -DryRun.
+    # {submission_id, status, date, version, sha256}. version must equal APP_VERSION and
+    # sha256 must equal the SHA-256 of the DMG bytes (ties the sidecar to THIS release and
+    # THIS artifact). Recorded in trust.json's mac entry as the notarisation attestation.
+    # REQUIRED for a real mac publish; may be omitted only with -DryRun.
     [string]$NotarisationJson,
     [switch]$DryRun
 )
@@ -210,8 +218,67 @@ function Invoke-VirusTotal($file, $sha, $key) {
 function Write-JsonNoBom($path, $obj) {
     # UTF-8 WITHOUT BOM: updatecheck.py does json.loads(resp.read().decode("utf-8")), which a
     # BOM would break. Set-Content -Encoding UTF8 writes a BOM on PS 5.1, so write it by hand.
-    $json = ($obj | ConvertTo-Json -Depth 6)
+    $json = ($obj | ConvertTo-Json -Depth 10)
     [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# --- Live-manifest merge base --------------------------------------------------------------
+# site\ is untracked and machine-local, so the local latest.json / trust.json can be stale or
+# missing (another clone or the other platform's lane may have published since this machine
+# last wrote them). BOTH lanes therefore merge this platform's fields into the LIVE manifest
+# fetched from the release host, never into the local copy. Publish: a failed fetch hard-fails
+# the release. -DryRun: a failed fetch warns and falls back to the local site\ file so the
+# lane stays testable offline. Returns the raw JSON string of the merge base.
+function Get-MergeBaseRaw($name, $localPath) {
+    $url = "https://$Domain/$name"
+    try {
+        $raw = (Invoke-WebRequest $url -UseBasicParsing -TimeoutSec 15).Content
+        if (-not $raw) { throw "empty response" }
+        $null = $raw | ConvertFrom-Json   # must be JSON, or the merge below writes garbage
+        Write-Host "  Merge base: live $url" -ForegroundColor Green
+        return $raw
+    } catch {
+        if (-not $DryRun) {
+            Fail "Could not fetch the live $url ($($_.Exception.Message)). The merge base for a publish is the LIVE manifest, not the machine-local site\$name (which may be stale). Fix connectivity / the domain binding and retry; not publishing."
+        }
+        if (Test-Path $localPath) {
+            Write-Host "  Merge base: live fetch of $url failed ($($_.Exception.Message)); -DryRun falls back to the LOCAL site\$name." -ForegroundColor Yellow
+            return Get-Content $localPath -Raw
+        }
+        Fail "-DryRun: live fetch of $url failed AND there is no local site\$name to fall back to. Fetch it once: Invoke-WebRequest $url -OutFile site\$name"
+    }
+}
+
+# JSON of a manifest projected onto (keep only) or away from (drop) the "mac" key, for the
+# byte-preservation gate below. Both sides go through the same ConvertFrom/ConvertTo-Json
+# round trip, so formatting differences cancel out and only real value/shape changes remain.
+function Get-ProjectedJson($raw, $keepMacOnly) {
+    if (-not $raw) { return "" }
+    $o = $raw | ConvertFrom-Json
+    $proj = [ordered]@{}
+    foreach ($p in $o.PSObject.Properties) {
+        $isMac = ($p.Name -eq "mac")
+        if (($keepMacOnly -and $isMac) -or ((-not $keepMacOnly) -and (-not $isMac))) { $proj[$p.Name] = $p.Value }
+    }
+    return ($proj | ConvertTo-Json -Depth 10)
+}
+
+# PUBLISH-TIME byte-preservation gate: re-serialise the merge base and the merged result
+# WITHOUT this platform's key(s); any difference means the merge touched the OTHER platform's
+# fields. Publish: fail the release, naming the manifest. -DryRun: print the before/after for
+# inspection and continue (it is the dry run's job to surface this).
+function Assert-OtherPlatformPreserved($beforeRaw, $afterRaw, $what, $keepMacOnly) {
+    $before = Get-ProjectedJson $beforeRaw $keepMacOnly
+    $after  = Get-ProjectedJson $afterRaw  $keepMacOnly
+    $label = if ($keepMacOnly) { "mac" } else { "Windows" }
+    if ($before -eq $after) {
+        Write-Host "    $($what): $label fields byte-identical." -ForegroundColor Green
+        return
+    }
+    Write-Host "    $($what): $label FIELDS CHANGED by the merge:" -ForegroundColor Red
+    Write-Host "    --- before ---`n$before" -ForegroundColor Red
+    Write-Host "    --- after ----`n$after" -ForegroundColor Red
+    if (-not $DryRun) { Fail "Byte-preservation gate failed for ${what}: the merge changed the $label fields. Not publishing." }
 }
 
 # --- 1. Version (same read as build-app.ps1) --------------------------------------------
@@ -250,15 +317,33 @@ if ($MacDmg) {
     $macDefender = Invoke-DefenderScan $dmg "the DMG"
 
     # --- M4. Notarisation sidecar (CI emits it next to the DMG) ----------------------------
+    # The sidecar must describe THIS release and THIS artifact: CI writes the APP_VERSION it
+    # built and the SHA-256 of the DMG it notarised into the sidecar, and we verify both
+    # against what this run sees. A mismatch means the wrong artifact pair was downloaded
+    # (publishing would ship a DMG under a version/attestation Apple never saw together).
+    # Mismatches and a non-Accepted status hard-fail a publish; -DryRun warns and continues
+    # so the lane stays testable end to end.
     $notarisation = $null
     if ($NotarisationJson) {
         if (-not (Test-Path $NotarisationJson)) { Fail "Notarisation sidecar not found: $NotarisationJson" }
         try { $n = Get-Content $NotarisationJson -Raw | ConvertFrom-Json }
         catch { Fail "Notarisation sidecar is not valid JSON: $NotarisationJson" }
-        foreach ($k in @("submission_id", "status", "date")) {
-            if (-not $n.$k) { Fail "Notarisation sidecar is missing '$k' (expected {submission_id, status, date}): $NotarisationJson" }
+        foreach ($k in @("submission_id", "status", "date", "version", "sha256")) {
+            if (-not $n.$k) { Fail "Notarisation sidecar is missing '$k' (expected {submission_id, status, date, version, sha256}): $NotarisationJson" }
         }
-        if ("$($n.status)" -ne "Accepted") { Fail "Notarisation status is '$($n.status)', expected 'Accepted'. Do not publish a DMG Apple rejected." }
+        function Sidecar-Problem($msg) {
+            if ($DryRun) { Write-Host "  WARNING: $msg (-DryRun continues; a real publish fails here)" -ForegroundColor Yellow }
+            else { Fail $msg }
+        }
+        if ("$($n.version)" -ne $ver) {
+            Sidecar-Problem "Notarisation sidecar version '$($n.version)' does not match APP_VERSION '$ver' (licensing.py). Wrong sidecar, wrong DMG, or wrong checkout."
+        }
+        if ("$($n.sha256)".ToUpper() -ne $dmgSha) {
+            Sidecar-Problem "Notarisation sidecar sha256 '$("$($n.sha256)".ToUpper())' does not match the DMG bytes ($dmgSha). This sidecar was not produced for this DMG."
+        }
+        if ("$($n.status)" -ne "Accepted") {
+            Sidecar-Problem "Notarisation status is '$($n.status)', expected 'Accepted'. Do not publish a DMG Apple rejected."
+        }
         $notarisation = [ordered]@{
             submission_id = "$($n.submission_id)"
             status        = "$($n.status)"
@@ -268,43 +353,35 @@ if ($MacDmg) {
     } elseif ($DryRun) {
         Write-Host "  Notarisation: no sidecar; allowed only because this is -DryRun (the mac trust entry gets no notarisation object this run)." -ForegroundColor Yellow
     } else {
-        Fail "-MacDmg needs -NotarisationJson <path> (the CI sidecar, JSON {submission_id, status, date}). A mac release never publishes without the notarisation record; only -DryRun may omit it."
+        Fail "-MacDmg needs -NotarisationJson <path> (the CI sidecar, JSON {submission_id, status, date, version, sha256}). A mac release never publishes without the notarisation record; only -DryRun may omit it."
     }
 
-    # --- M5. Merge the "mac" keys into the manifests ----------------------------------------
-    # Read, add the one key, write: every existing (Windows) field passes through in its
-    # original order with its original value. The Windows lane never reads or writes the "mac"
-    # key, so the two lanes ship independently.
-    $manifestPath = Join-Path $here "site\latest.json"
-    $trustPath    = Join-Path $here "site\trust.json"
+    # --- M5. Merge the "mac" keys into the LIVE manifests ----------------------------------
+    # The merge base is what is actually published (Get-MergeBaseRaw): read the live manifest,
+    # add the one key, write. Every existing (Windows) field passes through in its original
+    # order with its original value; the local site\ files become the working copy of the
+    # merged result. The Windows lane never writes the "mac" key, so the two lanes ship
+    # independently.
+    $siteDir      = Join-Path $here "site"
+    if (-not (Test-Path $siteDir)) { New-Item -ItemType Directory -Path $siteDir | Out-Null }
+    $manifestPath = Join-Path $siteDir "latest.json"
+    $trustPath    = Join-Path $siteDir "trust.json"
 
-    function Merge-MacKey($path, $macObj, $what) {
-        if (-not (Test-Path $path)) {
-            Fail "site\$what not found. The mac lane merges into the CURRENT manifest so the Windows fields survive; fetch the live one first: Invoke-WebRequest https://$Domain/$what -OutFile site\$what (or run the Windows lane once)."
-        }
-        $cur = Get-Content $path -Raw | ConvertFrom-Json
+    $beforeLatest = Get-MergeBaseRaw "latest.json" $manifestPath
+    $beforeTrust  = Get-MergeBaseRaw "trust.json"  $trustPath
+
+    function Merge-MacKey($baseRaw, $macObj) {
+        $cur = $baseRaw | ConvertFrom-Json
         $merged = [ordered]@{}
         foreach ($p in $cur.PSObject.Properties) { if ($p.Name -ne "mac") { $merged[$p.Name] = $p.Value } }
         $merged["mac"] = $macObj
-        Write-JsonNoBom $path $merged
-    }
-
-    # JSON of everything EXCEPT the "mac" key, for the before/after proof in -DryRun.
-    function Get-NonMacJson($raw) {
-        $o = $raw | ConvertFrom-Json
-        $proj = [ordered]@{}
-        foreach ($p in $o.PSObject.Properties) { if ($p.Name -ne "mac") { $proj[$p.Name] = $p.Value } }
-        return ($proj | ConvertTo-Json -Depth 6)
+        return $merged
     }
 
     if (-not $PSBoundParameters.ContainsKey('Notes')) {
         $Notes = ""
-        if (Test-Path $manifestPath) {
-            try { $Notes = "$((Get-Content $manifestPath -Raw | ConvertFrom-Json).mac.notes)" } catch { $Notes = "" }
-        }
+        try { $Notes = "$(($beforeLatest | ConvertFrom-Json).mac.notes)" } catch { $Notes = "" }
     }
-    $beforeLatest = if (Test-Path $manifestPath) { Get-Content $manifestPath -Raw } else { $null }
-    $beforeTrust  = if (Test-Path $trustPath)    { Get-Content $trustPath -Raw }    else { $null }
 
     # latest.json mac entry: same shape as the top-level Windows fields. The url stays on the
     # allowlisted volksmond.digiphyte.com host (see the -SiteUrl comment above); the
@@ -322,33 +399,22 @@ if ($MacDmg) {
     if ($notarisation) { $macTrust["notarisation"] = $notarisation }
     $macTrust["defender"] = $macDefender
 
-    Merge-MacKey $manifestPath $macLatest "latest.json"
-    Merge-MacKey $trustPath    $macTrust  "trust.json"
-    Write-Host "  Wrote:     site\latest.json + site\trust.json (mac version=$ver; Windows keys untouched)" -ForegroundColor Green
+    Write-JsonNoBom $manifestPath (Merge-MacKey $beforeLatest $macLatest)
+    Write-JsonNoBom $trustPath    (Merge-MacKey $beforeTrust  $macTrust)
+    Write-Host "  Wrote:     site\latest.json + site\trust.json (mac version=$ver merged into the live manifests)" -ForegroundColor Green
+
+    # Byte-preservation gate (publish-time, not just a dry-run display): the merge must not
+    # have changed a single Windows field of either manifest. Fails the release on a publish.
+    Write-Host "  Byte-preservation gate (manifest minus its 'mac' key, merge base vs merged):" -ForegroundColor Cyan
+    Assert-OtherPlatformPreserved $beforeLatest (Get-Content $manifestPath -Raw) "latest.json" $false
+    Assert-OtherPlatformPreserved $beforeTrust  (Get-Content $trustPath -Raw)    "trust.json"  $false
 
     # --- M6. Upload to R2 (same bucket, same doppler/wrangler pattern as the Windows lane) --
     if ($DryRun) {
         Write-Host ""
-        Write-Host "  -DryRun: skipping the R2 uploads (Defender already ran locally). Would upload:" -ForegroundColor Yellow
-        @("Volksmond-$ver.dmg", "Volksmond-latest.dmg", "latest.json", "trust.json") |
+        Write-Host "  -DryRun: skipping the R2 uploads (Defender already ran locally). Would upload, in order:" -ForegroundColor Yellow
+        @("Volksmond-$ver.dmg", "latest.json", "trust.json", "Volksmond-latest.dmg") |
             ForEach-Object { Write-Host "    $Bucket/$_" -ForegroundColor Yellow }
-
-        # Proof that the merge left every Windows field byte-for-byte intact: serialise both
-        # manifests WITHOUT their "mac" key, before vs after, and compare.
-        Write-Host ""
-        Write-Host "  Windows-field preservation proof (manifest minus its 'mac' key, before vs after):" -ForegroundColor Cyan
-        foreach ($pair in @(@("latest.json", $beforeLatest, $manifestPath), @("trust.json", $beforeTrust, $trustPath))) {
-            $what = $pair[0]; $rawBefore = $pair[1]; $path = $pair[2]
-            $after = Get-NonMacJson (Get-Content $path -Raw)
-            $before = if ($rawBefore) { Get-NonMacJson $rawBefore } else { "" }
-            if ($before -eq $after) {
-                Write-Host "    $($what): Windows fields byte-identical." -ForegroundColor Green
-            } else {
-                Write-Host "    $($what): WINDOWS FIELDS CHANGED - inspect before publishing:" -ForegroundColor Red
-                Write-Host "    --- before ---`n$before" -ForegroundColor Red
-                Write-Host "    --- after ----`n$after" -ForegroundColor Red
-            }
-        }
     } else {
         $wBase = Get-WranglerBase
         if (-not $wBase) { Fail "wrangler not found (checked PATH and npx). Install it with: npm i -g wrangler" }
@@ -367,11 +433,14 @@ if ($MacDmg) {
                 & $doppler @dArgs
                 if ($LASTEXITCODE -ne 0) { Fail "Upload of $key failed (rc=$LASTEXITCODE). Check bucket '$Bucket', jurisdiction '$Jurisdiction', and that Doppler infra-ops/prd holds the Cloudflare R2 credentials." }
             }
-            # Versioned DMG: immutable, cached forever. The alias + manifests: short cache.
+            # Order matters: the versioned DMG goes up FIRST (nothing public references it
+            # yet), then the manifests that point at it, and the mutable Volksmond-latest.dmg
+            # alias LAST, so at no point does anything public reference bytes that are not up
+            # yet. Versioned DMG: immutable, cached forever. Alias + manifests: short cache.
             Put-R2Mac "Volksmond-$ver.dmg"    $dmg          "application/octet-stream" "public, max-age=31536000, immutable"
-            Put-R2Mac "Volksmond-latest.dmg"  $dmg          "application/octet-stream" "public, max-age=300"
             Put-R2Mac "latest.json"           $manifestPath "application/json"         "public, max-age=300"
             Put-R2Mac "trust.json"            $trustPath    "application/json"         "public, max-age=300"
+            Put-R2Mac "Volksmond-latest.dmg"  $dmg          "application/octet-stream" "public, max-age=300"
             Write-Host "  Uploaded 4 objects to $Bucket." -ForegroundColor Green
         } finally {
             if ($null -ne $savedToken) { $env:DOPPLER_TOKEN = $savedToken }
@@ -439,22 +508,32 @@ if ($VtUrl) {
 }
 
 # --- 5. Write site/latest.json + site/trust.json (no BOM) --------------------------------
-$manifestPath = Join-Path $here "site\latest.json"
-$trustPath    = Join-Path $here "site\trust.json"
-$modelsPath   = Join-Path $here "site\models.json"
+# The merge base is the LIVE manifests (Get-MergeBaseRaw): this lane rewrites the top-level
+# Windows fields and must carry the "mac" key through from what is actually published, or a
+# Windows release from a machine with stale local site\ files would silently drop the last
+# mac release. The local site\ files become the working copy of the merged result.
+$siteDir      = Join-Path $here "site"
+if (-not (Test-Path $siteDir)) { New-Item -ItemType Directory -Path $siteDir | Out-Null }
+$manifestPath = Join-Path $siteDir "latest.json"
+$trustPath    = Join-Path $siteDir "trust.json"
+$modelsPath   = Join-Path $siteDir "models.json"
 if (-not (Test-Path $modelsPath)) { Fail "site/models.json not found; expected next to latest.json." }
+
+$baseLatestRaw = Get-MergeBaseRaw "latest.json" $manifestPath
+$baseTrustRaw  = Get-MergeBaseRaw "trust.json"  $trustPath
+
 if (-not $PSBoundParameters.ContainsKey('Notes')) {
-    if (Test-Path $manifestPath) { try { $Notes = (Get-Content $manifestPath -Raw | ConvertFrom-Json).notes } catch { $Notes = "" } }
+    try { $Notes = ($baseLatestRaw | ConvertFrom-Json).notes } catch { $Notes = "" }
 }
 $downloadUrl = "https://$Domain/Volksmond-Setup-$ver.exe"   # versioned, matches the hash
 $latestAlias = "https://$Domain/Volksmond-Setup-latest.exe" # stable, for the site DOWNLOAD_URL
 
-# Carry over an existing "mac" entry unchanged: the mac lane (-MacDmg) owns that key, and a
+# Carry over the LIVE "mac" entry unchanged: the mac lane (-MacDmg) owns that key, and a
 # Windows release must not drop or alter it (the two lanes ship independently). When no mac
 # key exists the output is byte-identical to the pre-mac-lane format.
 $prevMacLatest = $null; $prevMacTrust = $null
-if (Test-Path $manifestPath) { try { $prevMacLatest = (Get-Content $manifestPath -Raw | ConvertFrom-Json).mac } catch { } }
-if (Test-Path $trustPath)    { try { $prevMacTrust  = (Get-Content $trustPath -Raw | ConvertFrom-Json).mac } catch { } }
+try { $prevMacLatest = ($baseLatestRaw | ConvertFrom-Json).mac } catch { }
+try { $prevMacTrust  = ($baseTrustRaw  | ConvertFrom-Json).mac } catch { }
 
 $latestObj = [ordered]@{ version = $ver; url = $SiteUrl; notes = $Notes }
 if ($prevMacLatest) { $latestObj["mac"] = $prevMacLatest }
@@ -474,7 +553,13 @@ $trust["published"] = (Get-Date -Format 'yyyy-MM-dd')
 if ($defender) { $trust["defender"] = $defender }
 if ($prevMacTrust) { $trust["mac"] = $prevMacTrust }
 Write-JsonNoBom $trustPath $trust
-Write-Host "  Wrote:     site\latest.json + site\trust.json (version=$ver)" -ForegroundColor Green
+Write-Host "  Wrote:     site\latest.json + site\trust.json (version=$ver; mac key carried through from the merge base)" -ForegroundColor Green
+
+# Byte-preservation gate (publish-time): this lane owns every top-level field, so the only
+# thing it must preserve byte-for-byte is the other platform's "mac" key. Fails a publish.
+Write-Host "  Byte-preservation gate (manifest's 'mac' key only, merge base vs merged):" -ForegroundColor Cyan
+Assert-OtherPlatformPreserved $baseLatestRaw (Get-Content $manifestPath -Raw) "latest.json" $true
+Assert-OtherPlatformPreserved $baseTrustRaw  (Get-Content $trustPath -Raw)    "trust.json"  $true
 
 # --- 6. Upload to R2 ---------------------------------------------------------------------
 if ($DryRun) {

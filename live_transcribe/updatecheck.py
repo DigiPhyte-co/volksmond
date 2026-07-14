@@ -55,6 +55,10 @@ def check(current_version):
         raise UpdateCheckError(
             "Could not reach the update server. Check your internet connection and try again."
         ) from e
+    # Type-validate before use: a malformed manifest must surface as UpdateCheckError (the
+    # route's normal error shape), never as an unhandled exception turning into a 500.
+    if not isinstance(data, dict):
+        raise UpdateCheckError("malformed update manifest")
     # One manifest, platform-keyed: the top level is the Windows entry (shipped Windows clients
     # parse only top-level version/url and ignore unknown keys), and the mac build reads the
     # "mac" object, falling back to the top level so a manifest without a mac key still answers.
@@ -64,7 +68,14 @@ def check(current_version):
             entry = data
     else:
         entry = data
-    latest = (entry.get("version") or "").strip().lstrip("vV")
+    if not isinstance(entry, dict):
+        raise UpdateCheckError("malformed update manifest")
+    version = entry.get("version")
+    url = entry.get("url")
+    if (not isinstance(version, str) or not version.strip()
+            or not isinstance(url, str) or not url.strip()):
+        raise UpdateCheckError("malformed update manifest")
+    latest = version.strip().lstrip("vV")
     available = bool(latest) and _version_tuple(latest) > _version_tuple(current_version)
     return {
         "current": current_version,
@@ -73,5 +84,5 @@ def check(current_version):
         # Where the in-app "Download" link sends the user. The manifest points it at the gated
         # download page (every download stays a captured lead); switch it to a direct link in
         # latest.json if existing-user update friction ever outweighs the capture.
-        "url": entry.get("url") or SITE_URL,
+        "url": url,
     }
