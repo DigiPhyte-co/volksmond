@@ -13,6 +13,7 @@ third-party release feed, so the only server that ever sees an update check is o
 release is a one-line manifest edit.
 """
 import json
+import sys
 import urllib.request
 
 MANIFEST_URL = "https://volksmond.digiphyte.com/latest.json"
@@ -54,7 +55,16 @@ def check(current_version):
         raise UpdateCheckError(
             "Could not reach the update server. Check your internet connection and try again."
         ) from e
-    latest = (data.get("version") or "").strip().lstrip("vV")
+    # One manifest, platform-keyed: the top level is the Windows entry (shipped Windows clients
+    # parse only top-level version/url and ignore unknown keys), and the mac build reads the
+    # "mac" object, falling back to the top level so a manifest without a mac key still answers.
+    if sys.platform == "darwin":
+        entry = data.get("mac") or data
+        if not isinstance(entry, dict):
+            entry = data
+    else:
+        entry = data
+    latest = (entry.get("version") or "").strip().lstrip("vV")
     available = bool(latest) and _version_tuple(latest) > _version_tuple(current_version)
     return {
         "current": current_version,
@@ -63,5 +73,5 @@ def check(current_version):
         # Where the in-app "Download" link sends the user. The manifest points it at the gated
         # download page (every download stays a captured lead); switch it to a direct link in
         # latest.json if existing-user update friction ever outweighs the capture.
-        "url": data.get("url") or SITE_URL,
+        "url": entry.get("url") or SITE_URL,
     }
