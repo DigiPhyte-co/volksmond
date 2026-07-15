@@ -1,0 +1,387 @@
+# Volksmond macOS release build (WP-F of the mac port; see docs/mac-port-plan.md section 2.7).
+#
+# What this does: on a manual dispatch it builds the signed, notarised, stapled macOS DMG on a
+# GitHub-hosted Apple Silicon runner and uploads it plus a notarisation.json sidecar as workflow
+# artifacts. It does NOT publish. Publishing stays on Sean's Windows box:
+#   .\release.ps1 -MacDmg <downloaded .dmg> -NotarisationJson <downloaded notarisation.json>
+# (release.ps1 hashes the DMG, Defender-scans it, merges the mac keys into the live manifests and
+# uploads to R2). CI produces artifacts; the human release lane publishes them.
+#
+# INERT UNTIL APPLE ENROLMENT. Apple Developer enrolment is deferred (mac-port-plan.md, "Decisions
+# taken 2026-07-14" #1), so the signing secrets below do not exist yet. With them absent this
+# workflow does NOT half-run: it fails fast at the preflight step with a clear message. There is one
+# opt-in escape hatch (allow_unsigned_build) that runs the BUILD only, to prove the port compiles in
+# CI before enrolment; its output is loudly labelled UNSIGNED and can never be fed to release.ps1
+# (no sidecar is produced), so it can never be mistaken for a shippable DMG.
+#
+# SECRETS (repository or environment secrets; set them when Apple enrolment completes). The plan
+# does not pin exact secret names (WP-F, section 5 #1 defers enrolment), so these are the WP-F
+# conventions, matching the task brief's secrets.APPLE_CERT_P12 example:
+#   APPLE_CERT_P12        base64 of the Developer ID Application cert+key exported as .p12
+#   APPLE_CERT_PASSWORD   password protecting that .p12
+#   APPLE_SIGNING_IDENTITY  the identity string, e.g. "Developer ID Application: DigiPhyte (Pty) Ltd (TEAMID)"
+#   APPLE_ASC_KEY_ID      App Store Connect API key id (for notarytool)
+#   APPLE_ASC_ISSUER_ID   App Store Connect issuer id
+#   APPLE_ASC_API_KEY_P8  base64 of the App Store Connect .p8 private key
+# Secrets are referenced by name only, never echoed. Anything derived from them (the .p12, the .p8,
+# the keychain) is written to a temp path and removed in an always() cleanup step.
+#
+# TRIGGER: workflow_dispatch only. There is deliberately NO push/tag trigger: a push must never burn
+# paid-tier macOS minutes or attempt a signing run (plan WP-F: "Manual workflow_dispatch, never on push").
+
+name: mac-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_unsigned_build:
+        description: "Run the BUILD only with no signing secrets, to prove the port compiles in CI before Apple enrolment. Output is labelled UNSIGNED and is NOT a shippable DMG (no notarisation sidecar)."
+        type: boolean
+        default: false
+
+# Least privilege: this workflow reads the repo and writes nothing back (no releases, no pushes).
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # macos-14 is GitHub's Apple Silicon (arm64) image, matching the arm64-only target. The app's
+    # LSMinimumSystemVersion 14.4 floor is set by the spec's Info.plist (WP-E), independent of the
+    # runner OS. If GitHub retires macos-14, bump to the next arm64 image (macos-15).
+    # TODO(ci-verify): confirm the default Xcode/Swift toolchain on this image exposes the Core Audio
+    # process-tap SDK symbols (AudioHardwareCreateProcessTap, 14.2+) the WP-B helper needs.
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    # Secrets are legal in job-level env expressions (they are not in workflow-level env). SIGNING_READY
+    # is the single gate: a real release needs ALL six secrets. Empty-string comparisons keep the values
+    # opaque (no secret is ever printed).
+    env:
+      SIGNING_READY: ${{ (secrets.APPLE_CERT_P12 != '' && secrets.APPLE_CERT_PASSWORD != '' && secrets.APPLE_SIGNING_IDENTITY != '' && secrets.APPLE_ASC_KEY_ID != '' && secrets.APPLE_ASC_ISSUER_ID != '' && secrets.APPLE_ASC_API_KEY_P8 != '') }}
+      LLAMA_CPP_VERSION: "0.3.22"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # R7 (public-repo runner assumption). GitHub-hosted macOS minutes are free only while the repo is
+      # public; a private repo bills them at the macOS multiplier. Do not silently assume public forever:
+      # warn loudly and point at the self-hosted fallback. Not a hard failure (a private repo can still
+      # run, it just costs), but it must be visible in the run.
+      - name: Runner-cost check (repo visibility, plan R7)
+        run: |
+          set -euo pipefail
+          # TODO(ci-verify): confirm github.event.repository.private is populated for workflow_dispatch on
+          # the hosted runner; if ever empty, switch to a gh/api visibility query.
+          PRIVATE='${{ github.event.repository.private }}'
+          if [ "$PRIVATE" = "true" ]; then
+            echo "::warning title=Private repo::This repo is PRIVATE. GitHub-hosted macOS minutes are billed at the macOS multiplier while private. Plan R7: if the repo stays private, move mac CI to a self-hosted runner on the physical Mac."
+          else
+            echo "Repo is public: GitHub-hosted macOS minutes are free (plan R7 assumption holds)."
+          fi
+
+      # Decide the mode and fail fast when nothing can be built. This is the "inert until enrolment" gate.
+      - name: Preflight (mode + secret gate)
+        id: preflight
+        run: |
+          set -euo pipefail
+          if [ "${SIGNING_READY}" = "true" ]; then
+            echo "mode=release" >> "$GITHUB_OUTPUT"
+            echo "Signing secrets present: full release build (sign + notarise + staple)."
+          elif [ "${{ inputs.allow_unsigned_build }}" = "true" ]; then
+            echo "mode=unsigned" >> "$GITHUB_OUTPUT"
+            echo "::warning title=UNSIGNED build::Apple signing secrets are absent and allow_unsigned_build was set. Building the app to prove it compiles ONLY. The output is UNSIGNED, is NOT notarised, has NO notarisation sidecar, and cannot be published with release.ps1."
+          else
+            echo "::error title=Signing secrets absent::Apple signing secrets are not configured, so this workflow cannot build a releasable macOS DMG. Apple Developer enrolment is deferred (docs/mac-port-plan.md, 'Decisions taken 2026-07-14' #1). Set the secrets APPLE_CERT_P12, APPLE_CERT_PASSWORD, APPLE_SIGNING_IDENTITY, APPLE_ASC_KEY_ID, APPLE_ASC_ISSUER_ID and APPLE_ASC_API_KEY_P8, then re-run. To only test that the port compiles before enrolment, re-run with the allow_unsigned_build input ticked."
+            exit 1
+          fi
+
+      # Version is the single source of truth: read APP_VERSION from licensing.py with the SAME regex
+      # release.ps1 uses (release.ps1:287-289). No workflow input override: an override would let the
+      # sidecar version drift from licensing.py, and release.ps1 hard-fails on that mismatch (release.ps1:338).
+      - name: Read APP_VERSION
+        id: version
+        run: |
+          set -euo pipefail
+          VER="$(grep -E 'APP_VERSION[[:space:]]*=' live_transcribe/licensing.py | head -1 | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/')"
+          if ! printf '%s' "$VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error title=Version::Could not read APP_VERSION from live_transcribe/licensing.py."
+            exit 1
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "APP_VERSION = $VER"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The Swift audiotap helper (WP-B). Built explicitly here so a swift failure shows up as its own
+      # step (matters for the R5 iteration loop). build-app-mac.sh may build it again when it bundles the
+      # binary; a release rebuild is idempotent, so the double build is harmless.
+      - name: Build the Swift audiotap helper (release)
+        run: |
+          set -euo pipefail
+          if [ ! -d mac/volksmond-audiotap ]; then
+            echo "::error title=Missing helper::mac/volksmond-audiotap is not present on this branch. It is authored in WP-B; this workflow cannot run until WP-B and WP-E have merged."
+            exit 1
+          fi
+          # TODO(ci-verify): confirm swift build -c release succeeds on the runner SDK and emits
+          # .build/release/volksmond-audiotap (the binary WP-E's spec bundles into Resources/bin/).
+          swift build -c release --package-path mac/volksmond-audiotap
+          ls -la mac/volksmond-audiotap/.build/release/ || true
+
+      # Cache the locally-built llama-cpp-python 0.3.22 Metal wheel (plan R4: no mac wheel exists, so pip
+      # source-builds it with GGML_METAL=on; that build is slow). pip caches wheels it builds under its
+      # cache dir, so restoring the cache skips the rebuild on later runs. Keyed on the pinned llama version
+      # plus runner OS and arch so a version bump or image change invalidates it cleanly.
+      - name: Cache pip wheels (llama-cpp-python Metal build, plan R4)
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: pip-llama-${{ env.LLAMA_CPP_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pip-llama-${{ env.LLAMA_CPP_VERSION }}-${{ runner.os }}-${{ runner.arch }}-
+
+      # Import the Developer ID cert into an ephemeral keychain so codesign (invoked inside-out by
+      # PyInstaller's BUNDLE step via the spec's codesign_identity) can find it. Release mode only.
+      # The keychain password is generated per run; no secret is needed for it and none is printed.
+      - name: Import signing certificate (release only)
+        if: steps.preflight.outputs.mode == 'release'
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/volksmond-signing.keychain-db"
+          KP="$(openssl rand -base64 24)"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          # Decode the cert from the base64 secret (openssl base64 -d is portable across the runner's
+          # BSD base64 quirks; -A accepts single-line input). Value is never echoed; file removed in cleanup.
+          printf '%s' "$APPLE_CERT_P12" | openssl base64 -d -A > "$CERT_PATH"
+          security create-keychain -p "$KP" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KP" "$KEYCHAIN"
+          security import "$CERT_PATH" -k "$KEYCHAIN" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          # Allow codesign to use the key without an interactive prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KP" "$KEYCHAIN" >/dev/null
+          # Put the temp keychain on the search list ahead of login so codesign resolves the identity.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$CERT_PATH"
+          echo "VOLKSMOND_SIGNING_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          # TODO(ci-verify): confirm the imported identity is visible to codesign:
+          #   security find-identity -v -p codesigning "$KEYCHAIN"  should list APPLE_SIGNING_IDENTITY.
+          echo "Signing certificate imported into an ephemeral keychain."
+
+      # The build driver (WP-E's mac/build-app-mac.sh): venv + pip install (requirements.txt, which WP-C
+      # makes mac-safe via platform markers) + PyInstaller against volksmond-mac.spec + dmgbuild. It is the
+      # local-Mac mirror of CI, so CI just calls it with the right environment.
+      #
+      # CONTRACT with build-app-mac.sh / volksmond-mac.spec (WP-E), all marked ci-verify because WP-E is a
+      # parallel work package not yet on this branch:
+      #   - VOLKSMOND_CODESIGN_IDENTITY: the spec reads this for its codesign_identity (mirrors how the
+      #     Windows spec reads VOLKSMOND_OFFLINE). Empty => ad-hoc / unsigned build.
+      #   - CMAKE_ARGS / FORCE_CMAKE: make pip build llama-cpp-python with Metal (plan 2.6, R4). build-app-mac.sh
+      #     must not override these.
+      #   - Output: the driver must produce exactly one .dmg. We discover it below rather than hard-code a path.
+      - name: Build the app and DMG (build-app-mac.sh)
+        env:
+          VOLKSMOND_CODESIGN_IDENTITY: ${{ steps.preflight.outputs.mode == 'release' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          CMAKE_ARGS: "-DGGML_METAL=on"
+          FORCE_CMAKE: "1"
+        run: |
+          set -euo pipefail
+          if [ ! -f mac/build-app-mac.sh ]; then
+            echo "::error title=Missing build driver::mac/build-app-mac.sh is not present on this branch. It is authored in WP-E; this workflow cannot run until WP-E has merged."
+            exit 1
+          fi
+          # TODO(ci-verify): confirm build-app-mac.sh honours VOLKSMOND_CODESIGN_IDENTITY, CMAKE_ARGS and
+          # FORCE_CMAKE, and that the spec enables the hardened runtime (codesign --options runtime) and a
+          # secure timestamp, both of which notarisation requires (plan R5).
+          bash mac/build-app-mac.sh
+          echo "Build driver finished."
+
+      # Locate the DMG the driver produced and give it the canonical, versioned name release.ps1 records in
+      # trust.json (filename = "Volksmond-<ver>.dmg", release.ps1:395). Renaming here means the artifact
+      # matches that field regardless of what WP-E's dmgbuild names it. Unsigned builds get a loud suffix.
+      - name: Locate and name the DMG
+        id: dmg
+        run: |
+          set -euo pipefail
+          VER="${{ steps.version.outputs.version }}"
+          MODE="${{ steps.preflight.outputs.mode }}"
+          # TODO(ci-verify): confirm build-app-mac.sh writes the DMG under dist/. This searches the whole
+          # workspace (which covers dist/) so a different output dir still works; it fails loudly if zero
+          # or many DMGs appear. No mapfile/arrays: the runner's default /bin/bash is 3.2.
+          DMGS="$(find . -maxdepth 4 -name '*.dmg' -type f 2>/dev/null)"
+          COUNT="$(printf '%s\n' "$DMGS" | grep -c . || true)"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error title=No DMG::build-app-mac.sh produced no .dmg. Check the build log above."
+            exit 1
+          fi
+          if [ "$COUNT" -gt 1 ]; then
+            printf '%s\n' "$DMGS"
+            echo "::error title=Ambiguous DMG::More than one .dmg found; expected exactly one. Listed above."
+            exit 1
+          fi
+          SRC="$(printf '%s\n' "$DMGS" | head -1)"
+          OUTDIR="$RUNNER_TEMP/artifacts"
+          mkdir -p "$OUTDIR"
+          if [ "$MODE" = "release" ]; then
+            DEST="$OUTDIR/Volksmond-$VER.dmg"
+          else
+            DEST="$OUTDIR/Volksmond-$VER-UNSIGNED.dmg"
+          fi
+          mv "$SRC" "$DEST"
+          echo "path=$DEST" >> "$GITHUB_OUTPUT"
+          echo "outdir=$OUTDIR" >> "$GITHUB_OUTPUT"
+          echo "DMG: $DEST"
+
+      # Notarise the DMG and staple the ticket (release only). notarytool --wait blocks until Apple returns
+      # a verdict; --timeout bounds it. On anything other than Accepted, pull the per-file notarytool log
+      # (R5: it names the exact reasons, e.g. a dylib missing the hardened runtime) and fail.
+      - name: Notarise and staple (release only)
+        if: steps.preflight.outputs.mode == 'release'
+        env:
+          APPLE_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+          APPLE_ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+          APPLE_ASC_API_KEY_P8: ${{ secrets.APPLE_ASC_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          DMG="${{ steps.dmg.outputs.path }}"
+          P8="$RUNNER_TEMP/asc_key.p8"
+          printf '%s' "$APPLE_ASC_API_KEY_P8" | openssl base64 -d -A > "$P8"
+          chmod 600 "$P8"
+          NOTARY_OUT="$RUNNER_TEMP/notary-submit.json"
+          # TODO(ci-verify): a first real submission is where entitlement/hardened-runtime problems surface
+          # (plan R5); budget several cycles and read the log this step prints on failure.
+          set +e
+          xcrun notarytool submit "$DMG" \
+            --key "$P8" --key-id "$APPLE_ASC_KEY_ID" --issuer "$APPLE_ASC_ISSUER_ID" \
+            --output-format json --wait --timeout 30m > "$NOTARY_OUT"
+          RC=$?
+          set -e
+          cat "$NOTARY_OUT" || true
+          SUBID="$(jq -r '.id // empty' "$NOTARY_OUT")"
+          STATUS="$(jq -r '.status // empty' "$NOTARY_OUT")"
+          if [ "$RC" -ne 0 ] || [ "$STATUS" != "Accepted" ]; then
+            echo "::error title=Notarisation failed::notarytool returned rc=$RC status='$STATUS'. Pulling the detailed log."
+            if [ -n "$SUBID" ]; then
+              xcrun notarytool log "$SUBID" \
+                --key "$P8" --key-id "$APPLE_ASC_KEY_ID" --issuer "$APPLE_ASC_ISSUER_ID" \
+                "$RUNNER_TEMP/notary-log.json" || true
+              cat "$RUNNER_TEMP/notary-log.json" || true
+            fi
+            rm -f "$P8"
+            exit 1
+          fi
+          rm -f "$P8"
+          # Staple the ticket so the DMG verifies offline (Gatekeeper-clean without a network round trip).
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          echo "notary_submission_id=$SUBID" >> "$GITHUB_OUTPUT"
+          echo "notary_status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "Notarised ($STATUS) and stapled: $SUBID"
+        id: notarise
+
+      # Gatekeeper self-check (release only): the same assessment a user's Mac makes on first open.
+      - name: Verify Gatekeeper acceptance (release only)
+        if: steps.preflight.outputs.mode == 'release'
+        run: |
+          set -euo pipefail
+          DMG="${{ steps.dmg.outputs.path }}"
+          # TODO(ci-verify): spctl on the DMG asserts the stapled app inside is notarised and accepted.
+          spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG" || {
+            echo "::error title=Gatekeeper::spctl did not accept the DMG. Do not ship it."
+            exit 1
+          }
+          echo "Gatekeeper accepted the DMG."
+
+      # SHA-256 of the exact bytes to be published, UPPERCASE hex to match release.ps1's Get-FileHash output
+      # (release.ps1:311); the mac lane compares the sidecar sha256 against this (release.ps1:341).
+      - name: Compute DMG SHA-256
+        id: sha
+        run: |
+          set -euo pipefail
+          DMG="${{ steps.dmg.outputs.path }}"
+          SHA="$(shasum -a 256 "$DMG" | awk '{print toupper($1)}')"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "SHA-256: $SHA"
+
+      # Emit the notarisation.json sidecar EXACTLY matching release.ps1's -NotarisationJson validator, which
+      # requires all of {submission_id, status, date, version, sha256} to be present and non-empty
+      # (release.ps1:331-332). release.ps1 then checks version == APP_VERSION (release.ps1:338), sha256 ==
+      # the DMG bytes (release.ps1:341) and status == "Accepted" (release.ps1:344). Release mode only: an
+      # unsigned build deliberately gets NO sidecar, so it can never be published.
+      - name: Write notarisation.json sidecar (release only)
+        if: steps.preflight.outputs.mode == 'release'
+        run: |
+          set -euo pipefail
+          OUTDIR="${{ steps.dmg.outputs.outdir }}"
+          SIDECAR="$OUTDIR/notarisation.json"
+          # date is free-form in release.ps1 (recorded verbatim into trust.json); use an ISO UTC date.
+          DATE="$(date -u +%Y-%m-%d)"
+          jq -n \
+            --arg submission_id "${{ steps.notarise.outputs.notary_submission_id }}" \
+            --arg status "${{ steps.notarise.outputs.notary_status }}" \
+            --arg date "$DATE" \
+            --arg version "${{ steps.version.outputs.version }}" \
+            --arg sha256 "${{ steps.sha.outputs.sha256 }}" \
+            '{submission_id:$submission_id, status:$status, date:$date, version:$version, sha256:$sha256}' \
+            > "$SIDECAR"
+          echo "Sidecar $SIDECAR:"
+          cat "$SIDECAR"
+
+      # Upload artifacts for the human release lane to download and feed to release.ps1 -MacDmg. Release
+      # mode uploads DMG + sidecar together. Unsigned mode uploads only the labelled DMG and NO sidecar, so
+      # release.ps1 has nothing to publish it with.
+      - name: Upload release artifacts (DMG + sidecar)
+        if: steps.preflight.outputs.mode == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: volksmond-mac-${{ steps.version.outputs.version }}
+          path: |
+            ${{ steps.dmg.outputs.outdir }}/Volksmond-${{ steps.version.outputs.version }}.dmg
+            ${{ steps.dmg.outputs.outdir }}/notarisation.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload UNSIGNED build artifact (no sidecar)
+        if: steps.preflight.outputs.mode == 'unsigned'
+        uses: actions/upload-artifact@v4
+        with:
+          name: volksmond-mac-UNSIGNED-${{ steps.version.outputs.version }}
+          path: ${{ steps.dmg.outputs.outdir }}/Volksmond-${{ steps.version.outputs.version }}-UNSIGNED.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Run summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Volksmond macOS build"
+            echo ""
+            echo "- Mode: \`${{ steps.preflight.outputs.mode }}\`"
+            echo "- Version: \`${{ steps.version.outputs.version }}\`"
+            if [ "${{ steps.preflight.outputs.mode }}" = "release" ]; then
+              echo "- Notarisation: \`${{ steps.notarise.outputs.notary_status }}\` (\`${{ steps.notarise.outputs.notary_submission_id }}\`)"
+              echo "- SHA-256: \`${{ steps.sha.outputs.sha256 }}\`"
+              echo ""
+              echo "Publish from the Windows box: \`.\\release.ps1 -MacDmg Volksmond-${{ steps.version.outputs.version }}.dmg -NotarisationJson notarisation.json\`"
+            elif [ "${{ steps.preflight.outputs.mode }}" = "unsigned" ]; then
+              echo ""
+              echo "**UNSIGNED build.** Not notarised, no sidecar, NOT shippable. Compile proof only."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Always remove the ephemeral keychain and any decoded secret material, whatever the outcome.
+      - name: Cleanup signing material
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/asc_key.p8" || true
+          if [ -n "${VOLKSMOND_SIGNING_KEYCHAIN:-}" ] && [ -f "${VOLKSMOND_SIGNING_KEYCHAIN}" ]; then
+            security delete-keychain "${VOLKSMOND_SIGNING_KEYCHAIN}" || true
+            echo "Deleted ephemeral signing keychain."
+          fi
