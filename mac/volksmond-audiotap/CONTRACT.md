@@ -1,0 +1,142 @@
+# volksmond-audiotap binary contract
+
+This is the frozen wire contract between the `volksmond-audiotap` Swift helper and
+its Python consumer (the macOS SYS capture backend). The consumer is coded against
+THIS document, not against the Swift source. Anything marked "frozen" is fixed by
+the macOS port design; anything marked "decision" is an implementation detail the
+helper author fixed here where the design was silent. Do not change a frozen line
+without updating both sides.
+
+Target platform: macOS 14.4+, Apple Silicon (arm64) only. arm64 is little-endian,
+so all multi-byte integers and floats on the wire are little-endian (see Endianness).
+
+## 1. Invocation (frozen)
+
+```
+volksmond-audiotap --sample-rate 16000 --mono
+```
+
+The helper captures the whole system audio output mix via a Core Audio process tap,
+resamples it to the requested rate, optionally downmixes to mono, and streams it on
+stdout. It runs until it receives SIGTERM or SIGINT (or its stdout reader closes).
+
+### CLI flags
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--sample-rate <hz>` | Output sample rate in Hz. Positive integer. The helper resamples the system rate (typically 48000) down to this. | `16000` |
+| `--mono` | Downmix to a single channel. When absent, output is stereo interleaved. | absent (stereo) |
+| `--help`, `-h` | Print usage to stderr, exit 0. Human convenience; never emitted with the protocol. | - |
+| `--version`, `-V` | Print version to stderr, exit 0. | - |
+
+Decision: `--sample-rate=16000` (joined form) is also accepted, equivalent to the
+space-separated form.
+
+Decision: the production caller passes exactly `--sample-rate 16000 --mono`. At
+16000 the Python `_emit` path stores 16000 as the SYS source rate and skips its own
+resampling (the helper has already delivered 16 kHz), matching the live-AEC path.
+
+## 2. stdout: two phases (frozen shape, phase boundary is a decision)
+
+stdout carries a control phase then a data phase. The transition is unambiguous:
+the control phase is newline-terminated JSON text; the data phase is raw binary and
+begins immediately after the `started` event line. Once `started` is seen, NO further
+JSON is ever written to stdout.
+
+### 2.1 Control phase (newline-delimited JSON, UTF-8)
+
+Line 1 is ALWAYS the format line, emitted before any audio work:
+
+```json
+{"format":"f32le","rate":16000,"channels":1}
+```
+
+- `format`: always `"f32le"` (32-bit float, little-endian).
+- `rate`: the `--sample-rate` value.
+- `channels`: `1` with `--mono`, else `2`.
+
+The consumer should read `rate`/`channels` from this line rather than assuming.
+
+After the format line, exactly one terminal control event follows:
+
+| Event line | Meaning | Then |
+|---|---|---|
+| `{"event":"started"}` | Tap is live; audio follows. | Switch to data phase (section 2.2). |
+| `{"event":"permission_denied"}` | Audio-capture TCC permission not granted. | Process exits 2. No audio. |
+| `{"event":"error","code":"tap_failed","message":"..."}` | Tap / aggregate / IO-proc creation failed (includes pre-14.4 API failure). | Process exits 3. No audio. |
+
+Notes:
+- Each control line is a complete JSON object terminated by a single `\n`. The
+  consumer should read the format line first, then read lines until it sees a
+  terminal event.
+- `message` in the error event is a human string for logs only; branch on `code`,
+  not on `message`. The only `code` currently emitted is `tap_failed`.
+- Decision: key order is fixed as shown, but the consumer must parse as JSON and
+  not rely on byte-exact key order.
+
+### 2.2 Data phase (length-prefixed binary frames)
+
+After `{"event":"started"}`, stdout is a continuous stream of frames:
+
+```
+[uint32 LE byte count N][N bytes: float32 LE samples]
+```
+
+- The 4-byte little-endian unsigned length `N` is the number of PCM BYTES that
+  follow (not sample count, not frame count). Samples = N / 4. Frames (sample sets)
+  = N / (4 * channels).
+- Samples are 32-bit IEEE-754 floats, little-endian, nominally in [-1.0, 1.0].
+- For stereo, samples are interleaved L, R, L, R, ... For mono, one channel.
+- Decision: frame sizes are VARIABLE (one frame per Core Audio callback block after
+  resampling, so typically a few hundred samples). The consumer MUST read exactly N
+  bytes per frame and never assume a fixed frame size.
+- Frames continue until the stream ends (clean stop, section 4) at which point
+  stdout reaches EOF.
+
+## 3. stderr (frozen intent)
+
+Human-readable diagnostics only, one line per message, each prefixed
+`[volksmond-audiotap] `. Never machine-parsed. Safe to log or discard. Nothing on
+stderr is part of the protocol.
+
+## 4. Shutdown and exit codes (frozen)
+
+The helper stops on:
+- SIGTERM or SIGINT: tears down the tap and aggregate device, stops writing, exits 0.
+- stdout reader closes (write returns EPIPE): treated as a clean stop, exits 0.
+
+| Code | Meaning |
+|---|---|
+| `0` | Clean stop (SIGTERM/SIGINT, or consumer closed stdout). |
+| `2` | Permission denied (TCC audio-capture not granted). Preceded by the `permission_denied` event. |
+| `3` | Tap creation failed: pre-14.4 API, aggregate/IO-proc failure, or unusable device format. Preceded by the `error`/`tap_failed` event. |
+| `64` | Decision (EX_USAGE): bad command-line arguments. Emitted before any stdout protocol output; the production caller never triggers it. |
+
+To stop the helper cleanly, the consumer sends SIGTERM and reads stdout to EOF. The
+consumer should NOT expect a trailing JSON line at shutdown (the data phase is pure
+binary; a trailing JSON line would corrupt the stream, so there is none).
+
+## 5. Permission behaviour (frozen intent, hardware-verified later)
+
+- The helper requests the audio-capture TCC permission
+  (`NSAudioCaptureUsageDescription`) the first time it runs. If already authorized,
+  no prompt appears. If denied, it emits `permission_denied` and exits 2.
+- When shipped inside `Volksmond.app` (`Contents/Resources/bin/`) and signed as part
+  of the bundle, the prompt is EXPECTED to name the parent app (Volksmond), and the
+  grant persists across relaunches. This roll-up is unverified until run on real Mac
+  hardware (port plan risk R1) and is marked `TODO(mac-hw)` in the source.
+- No Screen Recording permission is used or requested (that is the whole point of
+  using process taps rather than ScreenCaptureKit).
+
+## 6. Dev vs bundled invocation (frozen)
+
+- Bundled: `Volksmond.app/Contents/Resources/bin/volksmond-audiotap`.
+- Dev fallback: the Python side honours the `VOLKSMOND_AUDIOTAP` environment variable
+  pointing at a locally built binary (e.g. `.build/release/volksmond-audiotap`).
+
+## 7. Endianness (decision, follows from arm64-only)
+
+v1 targets Apple Silicon only, which is little-endian, so `f32le` and the `uint32 LE`
+length prefix are the host byte order and require no swapping on either side. If a
+big-endian target is ever added, this contract's `le` suffixes become load-bearing
+and both sides must honour them explicitly.
