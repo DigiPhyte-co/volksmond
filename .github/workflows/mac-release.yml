@@ -179,14 +179,15 @@ jobs:
       #
       # CONTRACT with build-app-mac.sh / volksmond-mac.spec (WP-E), all marked ci-verify because WP-E is a
       # parallel work package not yet on this branch:
-      #   - VOLKSMOND_CODESIGN_IDENTITY: the spec reads this for its codesign_identity (mirrors how the
-      #     Windows spec reads VOLKSMOND_OFFLINE). Empty => ad-hoc / unsigned build.
+      #   - CODESIGN_IDENTITY: build-app-mac.sh and volksmond-mac.spec both read this for the inside-out
+      #     codesign_identity (mirrors how the Windows spec reads VOLKSMOND_OFFLINE). Empty => ad-hoc /
+      #     unsigned build. The env key here MUST match the name those two consumers read.
       #   - CMAKE_ARGS / FORCE_CMAKE: make pip build llama-cpp-python with Metal (plan 2.6, R4). build-app-mac.sh
       #     must not override these.
       #   - Output: the driver must produce exactly one .dmg. We discover it below rather than hard-code a path.
       - name: Build the app and DMG (build-app-mac.sh)
         env:
-          VOLKSMOND_CODESIGN_IDENTITY: ${{ steps.preflight.outputs.mode == 'release' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          CODESIGN_IDENTITY: ${{ steps.preflight.outputs.mode == 'release' && secrets.APPLE_SIGNING_IDENTITY || '' }}
           CMAKE_ARGS: "-DGGML_METAL=on"
           FORCE_CMAKE: "1"
         run: |
@@ -195,7 +196,7 @@ jobs:
             echo "::error title=Missing build driver::mac/build-app-mac.sh is not present on this branch. It is authored in WP-E; this workflow cannot run until WP-E has merged."
             exit 1
           fi
-          # TODO(ci-verify): confirm build-app-mac.sh honours VOLKSMOND_CODESIGN_IDENTITY, CMAKE_ARGS and
+          # TODO(ci-verify): confirm build-app-mac.sh honours CODESIGN_IDENTITY, CMAKE_ARGS and
           # FORCE_CMAKE, and that the spec enables the hardened runtime (codesign --options runtime) and a
           # secure timestamp, both of which notarisation requires (plan R5).
           bash mac/build-app-mac.sh
@@ -272,6 +273,14 @@ jobs:
                 "$RUNNER_TEMP/notary-log.json" || true
               cat "$RUNNER_TEMP/notary-log.json" || true
             fi
+            rm -f "$P8"
+            exit 1
+          fi
+          # Accepted, but guard against an empty submission id: notarytool reported success yet gave no
+          # .id. A sidecar with an empty submission_id passes release.ps1's non-empty check but is a
+          # useless audit record, so fail loudly here BEFORE stapling or writing any output.
+          if [ -z "$SUBID" ]; then
+            echo "::error title=Empty submission id::notarytool returned status Accepted but no submission id (.id). Refusing to staple or emit a sidecar with an empty submission_id."
             rm -f "$P8"
             exit 1
           fi

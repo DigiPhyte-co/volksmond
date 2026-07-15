@@ -11,6 +11,41 @@ import Foundation
 // which StdoutWriter treats as a clean stop, not as a fatal signal.
 signal(SIGPIPE, SIG_IGN)
 
+// Orderly, idempotent shutdown. Installed BEFORE the blocking permission wait and the
+// tap setup, so an early SIGTERM (e.g. during the first-run TCC dialog, before any tap
+// exists) still exits 0 via orderly teardown rather than the default kill disposition.
+// `activeTap` is nil until the tap is built; teardown before then is a no-op.
+var didShutDown = false
+let shutdownLock = NSLock()
+var activeTap: ProcessTap?
+func shutdown(_ code: ExitCode) {
+    shutdownLock.lock()
+    if didShutDown {
+        shutdownLock.unlock()
+        return
+    }
+    didShutDown = true
+    let tapToStop = activeTap
+    shutdownLock.unlock()
+    logStderr("stopping")
+    tapToStop?.stop()
+    exit(code.rawValue)
+}
+
+// Route SIGTERM/SIGINT through Dispatch sources on a DEDICATED queue that stays
+// runnable even while the main thread is parked on the first-run TCC permission
+// semaphore. If these were on .main (blocked during the permission wait) an early
+// SIGTERM would not be handled until the human answered the dialog.
+signal(SIGTERM, SIG_IGN)
+signal(SIGINT, SIG_IGN)
+let signalQueue = DispatchQueue(label: "com.digiphyte.volksmond.audiotap.signals")
+let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: signalQueue)
+termSource.setEventHandler { shutdown(.cleanStop) }
+termSource.resume()
+let intSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: signalQueue)
+intSource.setEventHandler { shutdown(.cleanStop) }
+intSource.resume()
+
 let args = Array(CommandLine.arguments.dropFirst())
 
 let config: Config
@@ -45,8 +80,12 @@ case .authorized, .unknown:
 }
 
 // Step 3: build the tap and resampler. Kept alive for the process lifetime and
-// referenced by the signal handler for orderly teardown.
+// referenced by the signal handler for orderly teardown. Publish it to `activeTap`
+// under the lock so a SIGTERM arriving now tears the tap down instead of leaking it.
 let tap = ProcessTap()
+shutdownLock.lock()
+activeTap = tap
+shutdownLock.unlock()
 do {
     try tap.prepare()
 } catch let error as TapError {
@@ -71,33 +110,6 @@ tap.onInput = { buffer in
     resampler.process(buffer)
 }
 
-// Orderly shutdown, idempotent. Wired to SIGTERM/SIGINT below.
-var didShutDown = false
-let shutdownLock = NSLock()
-func shutdown(_ code: ExitCode) {
-    shutdownLock.lock()
-    if didShutDown {
-        shutdownLock.unlock()
-        return
-    }
-    didShutDown = true
-    shutdownLock.unlock()
-    logStderr("stopping")
-    tap.stop()
-    exit(code.rawValue)
-}
-
-// Default disposition would kill us before teardown; ignore it and route through
-// Dispatch sources so the tap and aggregate device are always destroyed.
-signal(SIGTERM, SIG_IGN)
-signal(SIGINT, SIG_IGN)
-let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-termSource.setEventHandler { shutdown(.cleanStop) }
-termSource.resume()
-let intSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-intSource.setEventHandler { shutdown(.cleanStop) }
-intSource.resume()
-
 // Step 4: begin audio, then announce. begin() first so a start failure exits 3
 // WITHOUT ever emitting "started"; the resampler's gate stays closed so no PCM
 // frame escapes during the window between begin() and the "started" line.
@@ -115,5 +127,8 @@ StdoutWriter.shared.writeControlLine(Control.started)
 resampler.open()
 logStderr("streaming: \(config.sampleRate) Hz, \(config.channels) ch, f32le")
 
-// Run until a signal handler calls shutdown().
-dispatchMain()
+// Block until shutdown is requested: a SIGTERM/SIGINT handler exits directly on the
+// signal queue, and an EPIPE on stdout (possibly from the realtime audio thread) wakes
+// us here so the tap is torn down on THIS thread, never from the audio callback.
+let requestedCode = ShutdownCoordinator.shared.wait()
+shutdown(ExitCode(rawValue: requestedCode) ?? .cleanStop)

@@ -68,6 +68,13 @@ enum AudioCapturePermission {
         let request = unsafeBitCast(requestSym, to: RequestFn.self)
 
         logStderr("permission: requesting audio-capture access")
+        // Announce, on stdout, that we are about to block on the interactive TCC
+        // dialog. This is the ONLY path that blocks on a human, so it is the only
+        // place waiting_permission is emitted. It follows the format line and precedes
+        // started, so it is a valid pre-started control event (CONTRACT.md 2.1). The
+        // consumer uses it to extend its handshake deadline; a consumer that does not
+        // recognise it ignores it (unknown control events are tolerated).
+        StdoutWriter.shared.writeControlLine(Control.waitingPermission)
         let semaphore = DispatchSemaphore(value: 0)
         var granted = false
         request(service, nil) { ok in

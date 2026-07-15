@@ -22,6 +22,7 @@ import os
 import struct
 import sys
 import threading
+import time
 
 import numpy as np
 
@@ -220,11 +221,32 @@ def test_parse_header_line_malformed():
 
 def test_classify_header():
     assert _classify_header({"format": "f32le", "rate": 16000, "channels": 1}) == (
-        "format", {"rate": 16000, "channels": 1})
+        "format", {"format": "f32le", "rate": 16000, "channels": 1})
     assert _classify_header({"event": "started"}) == ("started", None)
     assert _classify_header({"event": "permission_denied"}) == ("permission_denied", None)
+    assert _classify_header({"event": "waiting_permission"}) == ("waiting_permission", None)
+    assert _classify_header({"event": "error", "code": "tap_failed", "message": "boom"}) == (
+        "error", {"code": "tap_failed", "message": "boom"})
+    # An unknown control event is 'other' (tolerated + ignored for forward compat).
     assert _classify_header({"event": "level", "db": -30}) == ("other", None)
-    print("  OK  header classification covers format/started/permission_denied/other")
+    print("  OK  header classification covers format/started/denied/waiting/error/other")
+
+
+def test_validate_format():
+    from live_transcribe.capture_mac import _validate_format
+    assert _validate_format({"format": "f32le", "rate": 16000, "channels": 1}) == (16000, 1)
+    assert _validate_format({"format": "f32le", "rate": 48000, "channels": 2}) == (48000, 2)
+    for bad in ({"format": "s16le", "rate": 16000, "channels": 1},   # wrong format
+                {"rate": 0, "channels": 1},                          # non-positive rate
+                {"rate": 16000, "channels": 3},                      # bad channel count
+                {"rate": 16000},                                     # missing channels
+                {"channels": 1}):                                    # missing rate
+        try:
+            _validate_format(bad)
+        except HelperProtocolError:
+            continue
+        raise AssertionError(f"_validate_format accepted bad meta: {bad!r}")
+    print("  OK  _validate_format enforces f32le / positive rate / channels in {1,2}")
 
 
 # ---- _AudioTapHelper handshake + gated frames ------------------------------
@@ -278,6 +300,158 @@ def test_helper_early_exit_before_started():
     assert h.started_ok is False
     assert h.error
     print("  OK  helper: EOF before 'started' fails cleanly with an error")
+
+
+# ---- negative handshake state machine (fix 10) -----------------------------
+
+def test_helper_started_before_format_rejected():
+    # 'started' with no preceding format line violates the contract.
+    h = _run_helper(_FakeProc(b'{"event":"started"}\n'))
+    assert h._ready.wait(2.0)
+    assert h.started_ok is False
+    assert h.error and "format" in h.error.lower()
+    print("  OK  helper: 'started' before the format line is rejected")
+
+
+def test_helper_error_event_degrades_immediately():
+    header = (b'{"format":"f32le","rate":16000,"channels":1}\n'
+              b'{"event":"error","code":"tap_failed","message":"boom"}\n')
+    h = _run_helper(_FakeProc(header))
+    assert h._ready.wait(2.0)
+    assert h.started_ok is False
+    assert h.error and "tap_failed" in h.error
+    print("  OK  helper: event:error degrades immediately with the reported code")
+
+
+def test_helper_bad_channels_in_format_rejected():
+    header = (b'{"format":"f32le","rate":16000,"channels":3}\n'
+              b'{"event":"started"}\n')
+    h = _run_helper(_FakeProc(header))
+    assert h._ready.wait(2.0)
+    assert h.started_ok is False
+    assert h.error and "channel" in h.error.lower()
+    print("  OK  helper: an out-of-range channel count in the format line is rejected")
+
+
+def test_helper_unknown_event_tolerated_then_started():
+    # An unknown pre-started control event must be ignored (forward compat), and a
+    # valid format+started still resolves to a live stream.
+    header = (b'{"format":"f32le","rate":16000,"channels":1}\n'
+              b'{"event":"level","db":-30}\n'
+              b'{"event":"started"}\n')
+    body = _encode_frame([0.5])
+    got = []
+    h = capture_mac._AudioTapHelper("audiotap", on_frame=lambda a: got.append(a))
+    h._proc = _FakeProc(header + body)
+    h._stderr_thread = threading.Thread(target=h._drain_stderr, daemon=True)
+    h._stderr_thread.start()
+    h._reader_thread = threading.Thread(target=h._run, daemon=True)
+    h._reader_thread.start()
+    assert h._ready.wait(2.0)
+    assert h.started_ok is True
+    h.begin()
+    h._reader_thread.join(2.0)
+    assert got and np.allclose(got[0].reshape(-1), [0.5], atol=1e-6)
+    print("  OK  helper: an unknown control event is ignored, started still resolves")
+
+
+# ---- waiting_permission extended deadline (fix 3) --------------------------
+
+def test_helper_waiting_permission_extends_deadline():
+    # Drive the reader over a real OS pipe so 'started' can arrive LATER than
+    # 'waiting_permission', proving the started deadline is extended (not resolved
+    # by waiting_permission) and that wait_started only returns True after started.
+    r_fd, w_fd = os.pipe()
+    rf = os.fdopen(r_fd, "rb", buffering=0)
+    wf = os.fdopen(w_fd, "wb", buffering=0)
+    proc = _FakeProc()
+    proc.stdout = rf   # replace the empty BytesIO with the pipe read end
+    h = capture_mac._AudioTapHelper("audiotap", on_frame=lambda a: None)
+    h._proc = proc
+    h._stderr_thread = threading.Thread(target=h._drain_stderr, daemon=True)
+    h._stderr_thread.start()
+    h._reader_thread = threading.Thread(target=h._run, daemon=True)
+    h._reader_thread.start()
+
+    wf.write(b'{"format":"f32le","rate":16000,"channels":1}\n')
+    wf.write(b'{"event":"waiting_permission"}\n')
+    assert h._waiting.wait(2.0), "waiting_permission was not observed"
+    assert h._first.is_set(), "the initial handshake did not settle on waiting_permission"
+    assert not h._ready.is_set(), "the started deadline resolved before 'started' arrived"
+    assert not h.wait_started(0.2), "wait_started true before 'started'"
+
+    wf.write(b'{"event":"started"}\n')
+    assert h._ready.wait(2.0), "'started' after the wait was not observed"
+    assert h.started_ok is True
+    assert h.wait_started(2.0) is True
+    h.begin()
+    wf.close()   # EOF -> reader exits its stream loop and reaps
+    h._reader_thread.join(2.0)
+    print("  OK  helper: waiting_permission extends the deadline, then 'started' resolves")
+
+
+class _FakeHelper:
+    """Stand-in for _AudioTapHelper that lets a test drive the deferred permission
+    path: start() reports a fixed outcome; wait_started blocks until signalled."""
+
+    def __init__(self, status, rate=16000, channels=1):
+        self._status = status
+        self.rate = rate
+        self.channels = channels
+        self.error = None
+        self.began = False
+        self.stopped = False
+        self._started = threading.Event()
+
+    def start(self):
+        return self._status
+
+    def wait_started(self, timeout):
+        self._started.wait(timeout)
+        return self._started.is_set() and not self.stopped
+
+    def signal_started(self):
+        self._started.set()
+
+    def begin(self):
+        self.began = True
+
+    def stop(self):
+        self.stopped = True
+        self._started.set()
+
+
+def test_open_system_tap_waiting_defers_registration():
+    # WAITING must NOT block: _open_system_tap returns with SYS unregistered and a
+    # background thread pending; once the grant lands, that thread registers SYS,
+    # spawns its chunker, and opens the gate (SYS-registered-before-gate preserved).
+    cap = capture_mac.AudioCapture()
+    cap._t0 = 0.0
+    fake = _FakeHelper(capture_mac.START_WAITING)
+    orig_resolve = capture_mac._resolve_helper_path
+    orig_cls = capture_mac._AudioTapHelper
+    capture_mac._resolve_helper_path = lambda: capture_mac.Path("fake/volksmond-audiotap")
+    capture_mac._AudioTapHelper = lambda path, on_frame, **kw: fake
+    try:
+        cap._open_system_tap()   # must return promptly, not block
+        assert "SYS" not in cap._buffers, "SYS registered before the grant (should defer)"
+        assert cap._helper is fake
+        assert not fake.began, "gate opened before the grant"
+        fake.signal_started()
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if "SYS" in cap._buffers and fake.began:
+                break
+            time.sleep(0.02)
+        assert "SYS" in cap._buffers, "await thread never registered SYS after the grant"
+        assert fake.began, "await thread never opened the frame gate after the grant"
+        # A SYS chunker worker must have been spawned (start() only saw MIC).
+        assert any(w.name == "chunker-SYS" for w in cap._workers), "no SYS chunker spawned"
+    finally:
+        capture_mac._resolve_helper_path = orig_resolve
+        capture_mac._AudioTapHelper = orig_cls
+        cap._stop_event.set()   # let the spawned chunker flush (empty) and exit
+    print("  OK  _open_system_tap: WAITING defers SYS registration + chunker to the grant")
 
 
 # ---- devices_mac -----------------------------------------------------------
@@ -409,9 +583,16 @@ TESTS = [
     test_parse_header_line_ok,
     test_parse_header_line_malformed,
     test_classify_header,
+    test_validate_format,
     test_helper_started_then_frames,
     test_helper_permission_denied,
     test_helper_early_exit_before_started,
+    test_helper_started_before_format_rejected,
+    test_helper_error_event_degrades_immediately,
+    test_helper_bad_channels_in_format_rejected,
+    test_helper_unknown_event_tolerated_then_started,
+    test_helper_waiting_permission_extends_deadline,
+    test_open_system_tap_waiting_defers_registration,
     test_list_ui_devices_shape,
     test_merge_default_absent_multiple_mics,
     test_merge_default_absent_single_mic,

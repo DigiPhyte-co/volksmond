@@ -65,10 +65,22 @@ After the format line, exactly one terminal control event follows:
 | `{"event":"permission_denied"}` | Audio-capture TCC permission not granted. | Process exits 2. No audio. |
 | `{"event":"error","code":"tap_failed","message":"..."}` | Tap / aggregate / IO-proc creation failed (includes pre-14.4 API failure). | Process exits 3. No audio. |
 
+Between the format line and the terminal event, the helper MAY emit optional
+non-terminal control events. The consumer must tolerate and ignore any control event
+it does not recognise (forward compatibility). One such event is defined:
+
+| Event line | Meaning | Then |
+|---|---|---|
+| `{"event":"waiting_permission"}` | The helper is about to BLOCK on the first-run TCC permission dialog (it has not been granted or denied yet). Emitted after the format line, before `started`. | The dialog can take a human many seconds to answer. A consumer that recognises this should extend its handshake deadline (it will still receive `started` on grant, or `permission_denied` on denial); a consumer that does not recognise it ignores it. No audio has started. |
+
+`waiting_permission` is OPTIONAL and additive: it is emitted only on the interactive
+first-run request path, never when permission is already granted or denied, and never
+more than once. It is not a terminal event and does not change the exit codes.
+
 Notes:
 - Each control line is a complete JSON object terminated by a single `\n`. The
   consumer should read the format line first, then read lines until it sees a
-  terminal event.
+  terminal event, tolerating any unrecognised (e.g. future non-terminal) event.
 - `message` in the error event is a human string for logs only; branch on `code`,
   not on `message`. The only `code` currently emitted is `tap_failed`.
 - Decision: key order is fixed as shown, but the consumer must parse as JSON and

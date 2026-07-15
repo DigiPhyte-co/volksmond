@@ -92,9 +92,9 @@ datas += [(os.path.join("live_transcribe", "web", "static"),
 # it at this exact bundle path, so the dest MUST stay Contents/Resources/bin/volksmond-audiotap.
 # A DATA-type entry lands it under Contents/Resources/ (a `binaries` entry would be relocated to
 # Contents/Frameworks/ and break that runtime path); the tradeoff is that PyInstaller's binary
-# signing pass does NOT sign a data file. mac/build-app-mac.sh signs the bundled helper as its one
-# build-side signing step so the local app launches, and WP-F re-signs it with the Developer ID +
-# hardened runtime inside-out before notarisation.
+# signing pass does NOT sign a data file. mac/build-app-mac.sh signs the helper IN PLACE BEFORE this
+# bundling step (signing the nested copy afterwards would invalidate the sealed outer signature), so
+# this spec copies an already-signed binary; WP-F supplies the Developer ID + hardened runtime.
 # TODO(ci-verify): confirm the helper is present, executable AND signed with hardened runtime in
 # the notarised .app (spctl/codesign --verify over Contents/Resources/bin/volksmond-audiotap).
 _helper = os.environ.get("VOLKSMOND_AUDIOTAP_BIN")

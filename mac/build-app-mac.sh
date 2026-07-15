@@ -6,8 +6,9 @@
 # notarisation and stapling; this script produces an ad-hoc-signed .app that launches and
 # transcribes (the pre-notarisation acceptance bar), plus an unsigned DMG for hand-testing.
 #
-# Steps: venv -> compile the Swift SYS-capture helper (WP-B) -> PyInstaller (volksmond-mac.spec)
-#        -> ad-hoc sign the bundled helper -> DMG (dmgbuild). Apple Silicon, arm64, macOS 14.4+.
+# Steps: venv -> compile the Swift SYS-capture helper (WP-B) -> sign the helper IN PLACE (before it
+#        is bundled, so the outer signature stays valid) -> PyInstaller (volksmond-mac.spec) -> DMG
+#        (dmgbuild). Apple Silicon, arm64, macOS 14.4+.
 #
 # Env this script honours / sets:
 #   PYTHON             python3 interpreter to seed the venv (default: python3).
@@ -59,6 +60,19 @@ if [ -f "$HELPER_PKG/Package.swift" ]; then
     [ -x "$HELPER_BIN" ] || { echo "ERROR: swift build produced no volksmond-audiotap at $HELPER_BIN" >&2; exit 1; }
     export VOLKSMOND_AUDIOTAP_BIN="$HELPER_BIN"
     echo "    helper: $HELPER_BIN"
+
+    # Sign the helper IN PLACE, before PyInstaller bundles it. The helper is bundled as a DATA file
+    # (to land at Contents/Resources/bin/, the path WP-C's backend expects), so PyInstaller's own
+    # binary-signing pass never touches it, and an unsigned nested Mach-O will not launch under a
+    # signed parent. It MUST be signed before the bundle is sealed: signing it AFTER PyInstaller has
+    # built (and, with an identity, inside-out signed) the .app would invalidate that outer signature.
+    # By signing here, the spec copies an already-signed binary and the outer signature stays valid.
+    # Ad-hoc ("-") when no identity is set (local dev); WP-F sets the real Developer ID + hardened
+    # runtime for the notarised release.
+    IDENTITY="${CODESIGN_IDENTITY:--}"
+    echo "==> Signing the audiotap helper in place (identity: $IDENTITY)"
+    codesign --force --options runtime --timestamp --sign "$IDENTITY" "$HELPER_BIN" || \
+        codesign --force --sign "$IDENTITY" "$HELPER_BIN"   # timestamp needs network; ad-hoc has none
 else
     echo "==> WARNING: no mac/volksmond-audiotap/Package.swift (WP-B not present); building MIC-only."
 fi
@@ -70,19 +84,13 @@ rm -rf "$ROOT/dist/Volksmond.app"
 APP="$ROOT/dist/Volksmond.app"
 [ -d "$APP" ] || { echo "ERROR: PyInstaller did not produce $APP" >&2; exit 1; }
 
-# --- Sign the bundled helper -----------------------------------------------------------
-# The one signing step this build does: the helper is bundled as a DATA file (to land at
-# Contents/Resources/bin/, the path WP-C's backend expects), so PyInstaller's binary-signing pass
-# skips it, and an unsigned nested Mach-O will not launch under a signed parent. Ad-hoc ("-") when
-# no identity is set; the real Developer ID + hardened-runtime inside-out re-sign of the whole app
-# is WP-F's notarisation step. TODO(ci-verify): confirm WP-F re-signs this helper with the runtime.
-HELPER_IN_APP="$APP/Contents/Resources/bin/volksmond-audiotap"
-if [ -f "$HELPER_IN_APP" ]; then
-    IDENTITY="${CODESIGN_IDENTITY:--}"
-    echo "==> Signing bundled helper (identity: $IDENTITY)"
-    codesign --force --options runtime --timestamp --sign "$IDENTITY" "$HELPER_IN_APP" || \
-        codesign --force --sign "$IDENTITY" "$HELPER_IN_APP"   # timestamp needs network; ad-hoc has none
-fi
+# The helper was signed in place before bundling (see the Swift build step above), so there is NO
+# post-bundle codesign step here: re-signing the nested helper after PyInstaller sealed the .app
+# would invalidate the outer bundle signature.
+# TODO(ci-verify): after the Developer ID + hardened-runtime build, CI (WP-F) MUST run
+#   codesign --verify --deep --strict <APP>
+# to confirm the whole bundle, including the nested Contents/Resources/bin/volksmond-audiotap,
+# verifies as one consistently signed tree before notarisation.
 
 echo "==> Built: $APP"
 
