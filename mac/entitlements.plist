@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for the notarised Volksmond.app.
+  Referenced by volksmond-mac.spec (entitlements_file=). Contract: docs/mac-port-plan.md
+  section 2.6. Keep this minimal: exactly what the app needs, no extras, or notarisation
+  scrutiny and Gatekeeper surface grow for nothing.
+
+    device.audio-input                 : record the microphone (MIC channel, sounddevice) and
+                                         the system-audio process tap (SYS channel, the Swift
+                                         helper). Pairs with the two NS*UsageDescription strings
+                                         in Info.plist that drive the TCC prompts.
+    cs.allow-unsigned-executable-memory: ctranslate2 (faster-whisper) and llama.cpp allocate
+                                         JIT / W^X executable pages; the hardened runtime blocks
+                                         these without this entitlement.
+    cs.disable-library-validation      : the Python wheels bundle dylibs signed by many different
+                                         teams (or ad-hoc); library validation would reject loading
+                                         them into the Developer-ID-signed process. Marked "likely"
+                                         in the plan.
+                                         TODO(ci-verify): drop this if notarisation + launch pass
+                                         without it once every bundled dylib is re-signed.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>
