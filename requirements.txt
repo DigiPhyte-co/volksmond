@@ -10,10 +10,16 @@
 faster-whisper==1.2.1
 ctranslate2==4.7.2
 
-# Audio capture: PyAudio fork with WASAPI loopback support. `sounddevice`
-# doesn't expose loopback; `soundcard` advertises it but returns silence on
-# many Windows audio configurations (confirmed on Sean's Realtek setup).
-PyAudioWPatch==0.2.12.8
+# Audio capture (Windows): PyAudio fork with WASAPI loopback support.
+# `sounddevice` doesn't expose loopback; `soundcard` advertises it but returns
+# silence on many Windows audio configurations (confirmed on Sean's Realtek
+# setup). Windows-only: the macOS backend uses sounddevice + the audiotap helper.
+PyAudioWPatch==0.2.12.8; sys_platform == "win32"
+
+# Audio capture (macOS): mic via sounddevice (PortAudio over Core Audio,
+# universal2 wheel). System audio is captured by the signed volksmond-audiotap
+# helper (a Core Audio process tap), not by sounddevice. darwin-only.
+sounddevice==0.5.1; sys_platform == "darwin"
 
 # 48k/44.1k -> 16k resampling (polyphase filter, alias-safe)
 scipy==1.13.1
