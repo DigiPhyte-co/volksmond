@@ -36,9 +36,14 @@ class StdoutSink:
 
 
 class MarkdownSink:
-    """Appends segments to a Markdown file, line-buffered, SIGINT-safe."""
-    def __init__(self, path):
+    """Appends segments to a Markdown file, line-buffered, SIGINT-safe.
+
+    source_labels: optional {internal_tag: display_label} map applied at write time only
+    (e.g. MIC/SYS -> Speaker L/Speaker R for a stereo interview upload). The retained
+    segments keep their internal tags, so the close-time echo dedup still works."""
+    def __init__(self, path, source_labels=None):
         self.path = Path(path)
+        self._labels = source_labels or {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # The clean rewrite on close() replaces the whole file from our in-memory segments, so
         # it is only safe when we own the entire file. If the path already has content we are
@@ -57,11 +62,18 @@ class MarkdownSink:
         atexit.register(self.close)
 
     def _header_text(self):
+        if self._labels:
+            # Written before the audio is decoded, so it must stay honest when a stereo
+            # interview upload turns out to be mono (the body is then one `FILE` track).
+            fmt = ("- Format: `[mm:ss] [SPEAKER] text`, where `Speaker L` and `Speaker R` are the "
+                   "left and right channels of a stereo interview recording (a mono file is one `FILE` track)\n\n")
+        else:
+            fmt = "- Format: `[mm:ss] [SOURCE] text`, where `MIC` is your microphone and `SYS` is everyone else (your computer's audio)\n\n"
         return (
             "# Volksmond session\n\n"
             f"- Started: {self._started.isoformat(timespec='seconds')}\n"
             f"- File: `{self.path.name}`\n"
-            "- Format: `[mm:ss] [SOURCE] text`, where `MIC` is your microphone and `SYS` is everyone else (your computer's audio)\n\n"
+            + fmt +
             "---\n\n"
         )
 
@@ -72,7 +84,7 @@ class MarkdownSink:
     def __call__(self, segment):
         if self._closed:
             return
-        line = f"[{_fmt_ts(segment.t_start)}] [{segment.source}] {segment.text}\n"
+        line = f"[{_fmt_ts(segment.t_start)}] [{self._labels.get(segment.source, segment.source)}] {segment.text}\n"
         with self._lock:
             if self._closed:   # re-check under the lock: close() may have run since the check above
                 return
@@ -115,7 +127,7 @@ class MarkdownSink:
             from . import dedup
             ordered = sorted(segments, key=lambda s: s.t_start)
             kept = dedup.strip_mic_echoes(ordered)
-            body = "".join(f"[{_fmt_ts(s.t_start)}] [{s.source}] {s.text}\n" for s in kept)
+            body = "".join(f"[{_fmt_ts(s.t_start)}] [{self._labels.get(s.source, s.source)}] {s.text}\n" for s in kept)
             text = self._header_text() + body + "\n---\n\n_End of session._\n"
             tmp = self.path.with_name(self.path.name + ".tmp")
             tmp.write_text(text, encoding="utf-8")

@@ -594,6 +594,18 @@ window.VM_I18N = {
     "Remove the other side's voice that your speakers leak into your microphone, live as the meeting happens. Best on speakers when you are mostly listening; it can blur your words during heavy crosstalk, and does nothing on headphones.": "Verwyder die ander kant se stem wat jou luidsprekers in jou mikrofoon laat lek, regstreeks soos die vergadering plaasvind. Beste op luidsprekers wanneer jy meestal luister; dit kan jou woorde vertroebel tydens baie gelyktydige gepratery, en doen niks op oorfone nie.",
     "Cancel speaker echo": "Kanselleer luidspreker-eggo",
     "Off by default. When you re-transcribe a recording, remove the other side's voice that your microphone re-heard through the speakers. Best when you are mostly listening (a video or a one-sided talk). It can blur your own words when you and the other side talk over each other, so leave it off for normal back-and-forth meetings. No effect on headphones.": "Standaard af. Wanneer jy 'n opname hertranskribeer, verwyder die ander kant se stem wat jou mikrofoon deur die luidsprekers weer gehoor het. Beste wanneer jy meestal luister ('n video of 'n eensydige praatjie). Dit kan jou eie woorde vertroebel wanneer jy en die ander kant gelyktydig praat, so los dit af vir gewone heen-en-weer-vergaderings. Geen effek op oorfone nie.",
+    "Echo cancellation on.": "Eggo-kansellering aan.",
+    "Echo cancellation off.": "Eggo-kansellering af.",
+    "Could not change echo cancellation.": "Kon nie eggo-kansellering verander nie.",
+
+    // Stereo interview mode (upload option: one speaker per channel)
+    "Stereo interview mode": "Stereo-onderhoudmodus",
+    "For phone recordings where the two speakers sit in the left and right channels (e.g. Samsung Interview mode). Transcribes each side separately, labelled Speaker L and Speaker R. A mono file is transcribed as a single track.":
+      "Vir foonopnames waar die twee sprekers in die linker- en regterkanale sit (bv. Samsung se onderhoudmodus). Transkribeer elke kant apart, gemerk Spreker L en Spreker R. 'n Mono-lêer word as een enkele baan getranskribeer.",
+    "File is mono, transcribed as a single track": "Die lêer is mono en is as een enkele baan getranskribeer",
+    "[Speaker L]": "[Spreker L]",
+    "[Speaker R]": "[Spreker R]",
+
     "Recorded": "Opgeneem",
     "Transcribing": "Transkribeer tans",
     "Summarising": "Som tans op",

@@ -145,6 +145,9 @@ function freshLive() {
     language: null, engine: null, stopping: false, segments: [], es: null, title: "", importName: "",
     micDevice: null, loopbackDevice: null, switching: false, reconfiguring: false,
     notes: "", notesOpen: false,
+    // Live AEC toggle: rendered from the ENGINE'S confirmed state (/api/status, /api/aec-live),
+    // never from stored settings, so it can never show a value the engine does not have.
+    aecAvailable: false, aecActive: false, aecBusy: false, noticeShown: "",
   };
 }
 var S = {
@@ -153,7 +156,7 @@ var S = {
   sessions: [], sessionsFolder: "", sessionsActive: null, sessionsSummarising: [],
   live: freshLive(),
   starting: { active: false, kind: null, title: "", error: null, startedAt: null },
-  form: { title: "", language: "af", tier: "auto", device: "auto", engine: "auto", participants: [], terms: [], record: false, aec: false, mic: null, loopback: null, advancedOpen: false },
+  form: { title: "", language: "af", tier: "auto", device: "auto", engine: "auto", participants: [], terms: [], record: false, aec: false, stereoSplit: false, mic: null, loopback: null, advancedOpen: false },
   setup: { stage: "welcome", choice: "transcribe" },
   finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null },
   reader: { name: "", title: "", text: "", summarising: false, summary: null },
@@ -313,10 +316,13 @@ function onSegment(seg) {
 }
 function segRow(seg) {
   var src = (seg.source || "").toUpperCase();
-  var cls = src === "MIC" ? "mic" : (src === "SYS" ? "sys" : "file");
+  // Stereo interview mode streams "Speaker L"/"Speaker R"; keep their case (no shouting) and
+  // reuse the mic/sys colouring so the two sides stay visually distinct.
+  var cls = (src === "MIC" || src === "SPEAKER L") ? "mic" : ((src === "SYS" || src === "SPEAKER R") ? "sys" : "file");
+  var disp = (src === "SPEAKER L" || src === "SPEAKER R") ? (seg.source || "") : src;
   return el("div", { class: "row" }, [
     el("div", { class: "t", text: fmtTs(seg.t_start) }),
-    el("div", {}, [el("span", { class: "src " + cls, text: "[" + src + "]" }), raw(seg.text || "")]),
+    el("div", {}, [el("span", { class: "src " + cls, text: "[" + disp + "]" }), raw(seg.text || "")]),
   ]);
 }
 
@@ -395,6 +401,46 @@ async function reconfigureLive(patch, okMsg) {
     S.live.reconfiguring = false; render();
   }
 }
+// Pull the engine's ACTUAL live-AEC state into S.live (available + active). The in-meeting
+// toggle renders only from this server-confirmed state, never from S.form or stored settings,
+// so a long-running app instance can never show a value the engine does not have.
+function refreshLiveAec() {
+  api.get("/api/status").then(function (st) {
+    if (!st || !st.running) return;
+    S.live.aecAvailable = !!st.aec_live_available;
+    S.live.aecActive = !!st.aec_live_active;
+    if (S.route === "live") render();
+  }).catch(function () {});
+}
+// Toggle live echo cancellation mid-meeting. The UI reflects the CONFIRMED new state from the
+// server response, not an optimistic flip; the server also persists the choice as the new
+// default, so the pre-meeting toggle and disk stay in sync.
+async function toggleLiveAec() {
+  if (S.live.aecBusy) return;
+  S.live.aecBusy = true; render();
+  try {
+    var resp = await api.post("/api/aec-live", { enabled: !S.live.aecActive });
+    S.live.aecAvailable = !!resp.aec_live_available;
+    S.live.aecActive = !!resp.aec_live_active;
+    S.form.aecLive = S.live.aecActive;
+    if (S.settings) S.settings.aec_live = S.live.aecActive;
+    toast(S.live.aecActive ? "Echo cancellation on." : "Echo cancellation off.");
+  } catch (e) {
+    toast(e.message || "Could not change echo cancellation.", true);
+  } finally {
+    S.live.aecBusy = false; render();
+  }
+}
+// Compact in-meeting AEC control for the live audio strip. Hidden when the canceller never
+// engaged this session (mic-only capture, or the binding is missing): the toggle would lie.
+function liveAecToggle() {
+  if (S.live.sourceKind !== "live" || !S.live.aecAvailable) return null;
+  return el("div", { class: "row gap-6", style: { alignItems: "center", flex: "0 0 auto" },
+    title: tr("Remove the other side's voice that your speakers leak into your microphone, live as the meeting happens. Best on speakers when you are mostly listening; it can blur your words during heavy crosstalk, and does nothing on headphones.") }, [
+    el("span", { class: "ink-3", style: { fontSize: "11.5px" }, text: "Cancel echo live" }),
+    S.live.aecBusy ? el("span", { class: "spinner sm" }) : toggleEl(!!S.live.aecActive, toggleLiveAec),
+  ]);
+}
 // Compact strip for the live + record-only screens: per source, a dropdown to switch the
 // device on the fly and a level meter. An empty device list degrades to "not detected".
 function liveAudioStrip() {
@@ -422,6 +468,7 @@ function liveAudioStrip() {
   return el("div", { class: "row gap-16", style: { flexWrap: "wrap", padding: "10px 16px", borderBottom: "1px solid var(--line)", background: "var(--surface-2)" } }, [
     channel("mic", "mic", dev.mics, S.live.micDevice, dev.default_mic_index, "vm-meter-mic"),
     channel("loopback", "speaker", dev.loopbacks, S.live.loopbackDevice, dev.default_loopback_index, "vm-meter-sys"),
+    liveAecToggle(),
   ]);
 }
 // Compact strip on the live screen to change the LANGUAGE and MODEL mid-meeting. Language alone
@@ -503,7 +550,7 @@ async function startLive() {
     S.live.engine = S.form.engine;
     S.live.title = S.form.title || "Live meeting";
     S.live.micDevice = S.form.mic; S.live.loopbackDevice = S.form.loopback;
-    go("live"); openStream(); startElapsed(); startLevels();
+    go("live"); openStream(); startElapsed(); startLevels(); refreshLiveAec();
   } catch (e) {
     // Surface the failure on the Starting screen (with Back), not just a toast that
     // vanishes; the model-load error ("Could not load model ...") needs to be readable.
@@ -552,7 +599,7 @@ function recordPreView() {
 }
 async function startImport(arg) {
   var body = { topic: arg.topic || "", tier: S.form.tier, device: S.form.device, language: S.form.language, engine: S.form.engine, aec: !!S.form.aec, prompt: (S.form.participants || []).concat(S.form.terms || []).join(", ") };
-  if (arg.path) body.paths = [arg.path];
+  if (arg.path) { body.paths = [arg.path]; body.stereo_split = !!S.form.stereoSplit; }
   if (arg.stem) body.stem = arg.stem;
   beginStarting("file", arg.topic || S.importName || "Recording");
   try {
@@ -565,7 +612,14 @@ async function startImport(arg) {
     S.live.importName = baseName(arg.path) || (arg.topic || "recording");
     S.live.title = arg.topic || topicFromName(baseName(resp.output_path));
     go("importing"); openStream(); startElapsed();
-    pollStatus(function (st) { return !st.running; }, function () { gotoFinish(S.live.outputPath); });
+    // Surface a non-fatal server notice (e.g. "stereo requested but the file is mono") once,
+    // whether it lands mid-run or only on the final poll.
+    var showNotice = function (st) {
+      if (st && st.notice && S.live.noticeShown !== st.notice) { S.live.noticeShown = st.notice; toast(tr(st.notice)); }
+    };
+    pollStatus(function (st) { return !st.running; },
+      function (st) { showNotice(st); gotoFinish(S.live.outputPath); },
+      showNotice);
   } catch (e) {
     if (startingTimer) { clearInterval(startingTimer); startingTimer = null; }
     if (S.route === "starting") { S.starting.error = e.message || "Could not start transcription."; render(); }
@@ -671,6 +725,7 @@ async function importFromPicker() {
   // then transcribe - same as a live meeting gets its pre-meeting setup.
   S.importPath = p; S.importStem = null; S.importName = baseName(p);
   S.form.title = ""; S.form.participants = []; S.form.terms = [];
+  S.form.stereoSplit = false;   // per-file choice, never carried from a previous upload
   go("importpre");
 }
 
@@ -3161,8 +3216,23 @@ function advancedTranscribeControls(live) {
           el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Auto picks the best model your computer can run. Bigger is more accurate but slower." })]), true),
       runOnField(),
       live ? aecLiveControl() : aecRetranscribeControl(),
+      (!live && S.route === "importpre" && S.importPath) ? stereoSplitControl() : null,
     ]),
   ]);
+}
+// Stereo interview mode for an UPLOADED file: transcribe the left and right channels as two
+// separate speakers (Speaker L / Speaker R). Per-file choice, not persisted: it only makes
+// sense for recordings whose channels really carry one speaker each (e.g. Samsung Interview
+// mode). Not shown for saved Volksmond recordings, whose stereo channels mean you/everyone-else.
+function stereoSplitControl() {
+  return el("div", { style: { marginTop: "12px", paddingTop: "12px", borderTop: "1px solid var(--line)" } },
+    el("div", { class: "row gap-10", style: { alignItems: "flex-start" } }, [
+      el("div", { class: "grow" }, [
+        el("div", { style: { fontWeight: "600", fontSize: "13px" }, text: "Stereo interview mode" }),
+        el("p", { class: "ink-3", style: { fontSize: "11px", margin: "4px 0 0" }, text: "For phone recordings where the two speakers sit in the left and right channels (e.g. Samsung Interview mode). Transcribes each side separately, labelled Speaker L and Speaker R. A mono file is transcribed as a single track." }),
+      ]),
+      toggleEl(!!S.form.stereoSplit, function () { S.form.stereoSplit = !S.form.stereoSplit; render(); }),
+    ]));
 }
 // Echo cancellation for a re-transcribe / upload (the non-live Advanced panel). Mirrors
 // aecLiveControl but persists the `aec` setting; only does anything when the file set has both a
@@ -3362,6 +3432,8 @@ function adoptRunning(status) {
   S.live.title = topicFromName(baseName(status.output_path));
   S.live.micDevice = status.mic_device != null ? status.mic_device : null;
   S.live.loopbackDevice = status.loopback_device != null ? status.loopback_device : null;
+  S.live.aecAvailable = !!status.aec_live_available;
+  S.live.aecActive = !!status.aec_live_active;
   openStream(); startElapsed();
   seedFromTranscript();
   seedNotes();
@@ -3384,7 +3456,7 @@ function seedFromTranscript() {
   var name = baseName(S.live.outputPath || "");
   if (!/\.md$/.test(name)) return;
   api.text("/sessions/" + encodeURIComponent(name)).then(function (txt) {
-    var re = /^\[(\d+):(\d{2})\]\s+\[([A-Za-z]+)\]\s+(.*)$/;
+    var re = /^\[(\d+):(\d{2})\]\s+\[([A-Za-z]+(?: [A-Za-z]+)?)\]\s+(.*)$/;   // "MIC" or "Speaker L"
     var out = [];
     var lines = txt.split(/\r?\n/);
     for (var i = 0; i < lines.length; i++) {
