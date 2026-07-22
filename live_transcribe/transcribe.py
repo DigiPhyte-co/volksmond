@@ -94,6 +94,23 @@ def family_for_language(language):
     return "fluister" if (lang == "" or lang == "auto" or lang.startswith("af")) else "whisper"
 
 
+def decode_language(family, language):
+    """The language token actually passed to faster-whisper's transcribe(). Swivuriso always
+    decodes on auto-detect (faster-whisper has no codes for its languages and DSFSI forces
+    none). The same South African codes, and the "sa" group code, have no stock-Whisper token
+    either, so any OTHER family also decodes them on auto-detect instead of erroring (or, for
+    "sa", silently decoding as Sanskrit). Every other explicit code (af/en/de/fr/...) is forced
+    as-is, which stops the decoder flapping between languages per chunk; ""/None/"auto" stay
+    auto-detect."""
+    lang = (language or "").lower()
+    base = lang.split("-")[0]
+    if family == "swivuriso" or base == "sa" or base in SWIVURISO_LANGS:
+        return None
+    if lang in ("", "auto"):
+        return None
+    return language
+
+
 def resolve_model(size, language, engine="auto"):
     """Map a Whisper size + the spoken language to the concrete model id to load, and the FAMILY it
     belongs to. `engine` overrides the family: "auto" follows the language (family_for_language);
@@ -239,8 +256,11 @@ def _warm_run(tier, cfg, model_id, language, fam):
             # A tiny dummy inference triggers CUDA/cuDNN init (and any first-call autotune) now,
             # off the user's critical path. vad_filter=False so the encoder actually runs on the
             # silence rather than the VAD discarding it.
+            warm_lang = decode_language(fam, language)
+            if warm_lang is None and fam != "swivuriso":
+                warm_lang = "af"   # historic warm token for auto-detect; a fixed token skips detection on zeros
             try:
-                list(m.transcribe(np.zeros(16000, dtype=np.float32), language=(None if fam == "swivuriso" else (language or "af")),
+                list(m.transcribe(np.zeros(16000, dtype=np.float32), language=warm_lang,
                                   vad_filter=False, beam_size=1)[0])
             except Exception:
                 pass
@@ -593,9 +613,9 @@ class Engine:
         self.size = cfg["model"]
         self.model_name, self.family = resolve_model(self.size, language, engine)
         self.is_fluister = self.family == "fluister"
-        # Swivuriso has no faster-whisper codes for these South African languages and DSFSI forces none, so
-        # run it on auto-detect; every other family keeps the chosen decode language.
-        self.language = None if self.family == "swivuriso" else language
+        # The decode token: Swivuriso (and any South African code on any family) runs on
+        # auto-detect; every other explicit code is forced as-is (see decode_language).
+        self.language = decode_language(self.family, language)
 
         # Cached, local-only load (no network revalidation) and reused across sessions, so a
         # warmed model makes Begin instant. See load_model / warm_up_async above.
@@ -717,7 +737,7 @@ class Engine:
             self.is_fluister = ch["family"] == "fluister"
         self.initial_prompt = _compose_prompt(self.language, self._user_prompt)
         self._rtf.clear()   # judge the (possibly new) model fresh; never downgrade on the old RTF
-        lang_name = {"af": "Afrikaans", "en": "English"}.get(self.language, "auto-detect")
+        lang_name = {"af": "Afrikaans", "en": "English"}.get(self.language, self.language or "auto-detect")
         self._emit_notice(t_start, f"[engine: now {self.family} {self.size}, language {lang_name}]")
 
     def _fanout(self, seg):

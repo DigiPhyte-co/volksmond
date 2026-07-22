@@ -163,8 +163,8 @@ window.VM_I18N = {
       "Gedwing na standaard Whisper vir elke taal.",
     "Engine": "Enjin",
     " (auto follows the language)": " (outo volg die taal)",
-    "Auto picks Fluister for Afrikaans and auto-detect, Whisper for English. Force one to override.":
-      "Outo kies Fluister vir Afrikaans en outo-bespeur, en Whisper vir Engels. Kies Fluister of Whisper om dit te oorskryf.",
+    "Auto picks the model for your language: Fluister for Afrikaans and auto-detect, Swivuriso for South African languages, Whisper for the rest. Force one to override.":
+      "Outo kies die model vir jou taal: Fluister vir Afrikaans en outo-bespeur, Swivuriso vir Suid-Afrikaanse tale, en Whisper vir die res. Kies een om dit te oorskryf.",
     "Advanced": "Gevorderd",
     "Model size": "Modelgrootte",
     " (auto is recommended)": " (outo word aanbeveel)",
@@ -502,6 +502,30 @@ window.VM_I18N = {
       "Die beste vir Afrikaans en vergaderings wat Afrikaans en Engels meng. Die grootte word outomaties vir jou rekenaar gekies.",
     "Afrikaans uses Fluister, our Afrikaans-tuned model; the South African languages use Swivuriso (beta); English and other languages use standard Whisper.":
       "Afrikaans gebruik Fluister, ons Afrikaans-gestemde model; die Suid-Afrikaanse tale gebruik Swivuriso (beta); Engels en ander tale gebruik standaard Whisper.",
+    // "More languages" picker (pre-meeting) + the world-language list
+    "More languages": "Meer tale",
+    "Any South African language": "Enige Suid-Afrikaanse taal",
+    "World languages (Whisper)": "Wêreldtale (Whisper)",
+    "uses standard Whisper. The size is chosen automatically for your computer.":
+      "gebruik standaard Whisper. Die grootte word outomaties vir jou rekenaar gekies.",
+    "German": "Duits",
+    "French": "Frans",
+    "Spanish": "Spaans",
+    "Portuguese": "Portugees",
+    "Italian": "Italiaans",
+    "Dutch": "Nederlands",
+    "Mandarin": "Mandaryns",
+    "Arabic": "Arabies",
+    "Hindi": "Hindi",
+    "Russian": "Russies",
+    "Japanese": "Japannees",
+    "Korean": "Koreaans",
+    "Polish": "Pools",
+    "Turkish": "Turks",
+    "Swedish": "Sweeds",
+    "Norwegian": "Noors",
+    "Danish": "Deens",
+    "Greek": "Grieks",
     // Afrikaans (Fluister) model update panel
     "Afrikaans model (Fluister)": "Afrikaanse model (Fluister)",
     "Checking": "Soek tans",

@@ -156,7 +156,7 @@ var S = {
   sessions: [], sessionsFolder: "", sessionsActive: null, sessionsSummarising: [],
   live: freshLive(),
   starting: { active: false, kind: null, title: "", error: null, startedAt: null },
-  form: { title: "", language: "af", tier: "auto", device: "auto", engine: "auto", participants: [], terms: [], record: false, aec: false, stereoSplit: false, mic: null, loopback: null, advancedOpen: false },
+  form: { title: "", language: "af", moreLang: null, tier: "auto", device: "auto", engine: "auto", participants: [], terms: [], record: false, aec: false, stereoSplit: false, mic: null, loopback: null, advancedOpen: false },
   setup: { stage: "welcome", choice: "transcribe" },
   finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null },
   reader: { name: "", title: "", text: "", summarising: false, summary: null },
@@ -1227,8 +1227,8 @@ function setupView() {
       // If the removed language was the saved default, move the default to a kept one, so an
       // English-only first run does not still start in Afrikaans/Fluister (mirrors transcriptionCard).
       var cur = S.settings && S.settings.transcription_language;
-      if (cur && cur !== "" && sel.indexOf(cur) < 0) patch.transcription_language = sel[0];
-      if (S.form && S.form.language && S.form.language !== "" && S.form.language !== "sa" && sel.indexOf(S.form.language) < 0) S.form.language = sel[0];
+      if (cur && langIsToggleable(cur) && sel.indexOf(cur) < 0) patch.transcription_language = sel[0];
+      if (S.form && S.form.language && langIsToggleable(S.form.language) && sel.indexOf(S.form.language) < 0) S.form.language = sel[0];
       saveSettings(patch);
     };
     inner = el("div", { class: "col-narrow stack", style: { gap: "18px" } }, [
@@ -2420,12 +2420,17 @@ function transcriptionCard(st) {
     if (i >= 0) { if (sel.length <= 1) return; sel.splice(i, 1); }   // keep at least one language
     else sel.push(code);
     var patch = { transcribe_languages: sel };
-    // Keep the default language valid if we just removed it.
-    if (st.transcription_language !== "" && sel.indexOf(st.transcription_language) < 0) patch.transcription_language = sel[0];
+    // Keep the default language valid if we just removed it. Only the individually
+    // toggleable codes are clamped; "sa", world codes and auto-detect always stay valid.
+    if (langIsToggleable(st.transcription_language) && sel.indexOf(st.transcription_language) < 0) patch.transcription_language = sel[0];
     saveSettings(patch);
   }
   var afOn = sel.indexOf("af") >= 0;
+  // Every pre-meeting language mode is defaultable: the ticked languages above, the
+  // South African group, each world language, and auto-detect.
   var defOpts = sel.map(function (c) { return [c, langName(c)]; });
+  defOpts.push(["sa", "South African languages"]);
+  WORLD_LANGS.forEach(function (w) { defOpts.push(w.slice()); });
   defOpts.push(["", "Auto-detect"]);
   return el("div", { class: "card settings-card" }, [
     el("div", { class: "card-title section-label", text: "Transcription" }),
@@ -3119,9 +3124,23 @@ var SUPPORTED_LANGS = [
   { code: "ve", name: "Tshivenda", family: "swivuriso" },
 ];
 var SWIVURISO_LANGS = ["zu", "xh", "st", "tn", "ts", "nr", "ve"];
+// Major world languages standard Whisper handles well, offered under "More languages" so a
+// known single-language meeting can FORCE its token instead of relying on auto-detect (which
+// can flap between languages from chunk to chunk).
+var WORLD_LANGS = [
+  ["de", "German"], ["fr", "French"], ["es", "Spanish"], ["pt", "Portuguese"],
+  ["it", "Italian"], ["nl", "Dutch"], ["zh", "Mandarin"], ["ar", "Arabic"],
+  ["hi", "Hindi"], ["ru", "Russian"], ["ja", "Japanese"], ["ko", "Korean"],
+  ["pl", "Polish"], ["tr", "Turkish"], ["sv", "Swedish"], ["no", "Norwegian"],
+  ["da", "Danish"], ["el", "Greek"],
+];
 var LANG_NAMES = { "af": "Afrikaans", "en": "English", "": "Auto-detect", "sa": "South African languages",
   "zu": "isiZulu", "xh": "isiXhosa", "st": "Sesotho", "tn": "Setswana", "ts": "Xitsonga", "nr": "isiNdebele", "ve": "Tshivenda" };
+WORLD_LANGS.forEach(function (w) { LANG_NAMES[w[0]] = w[1]; });
 function langName(code) { return LANG_NAMES[code] != null ? LANG_NAMES[code] : code; }
+// True for codes the Settings "Languages you transcribe" checkboxes cover; only those get
+// clamped when a language is un-ticked. The "sa" group code and world codes are never clamped.
+function langIsToggleable(code) { return SUPPORTED_LANGS.some(function (l) { return l.code === code; }); }
 function familyForLang(lang) { var l = (lang || "").toLowerCase().split("-")[0]; if (l === "sa" || SWIVURISO_LANGS.indexOf(l) >= 0) return "swivuriso"; return (l === "" || l === "auto" || /^af/.test(l)) ? "fluister" : "whisper"; }
 // True once the matching model is actually installed; until then a session honestly runs (and is
 // labelled) as stock Whisper.
@@ -3152,20 +3171,57 @@ function familyChip(family, model) {
   if (family === "fluister") return el("span", { class: "chip accent", title: tr("Afrikaans-optimised model") }, [icon("sparkle", 12), el("span", {}, raw(label))]);
   return el("span", { class: "chip" }, [el("span", {}, raw(label))]);
 }
-// The pre-meeting / import language picker: the three model families plus Auto-detect. The seven
-// South African languages (Swivuriso) are collapsed into one "sa" option so they are reachable in a
-// single tap without cluttering the picker. "sa" is a UI group code that routes to Swivuriso (see
-// familyForLang and transcribe.family_for_language); af -> Fluister, en -> Whisper. The Settings
-// "languages you transcribe" list still drives which models first-run offers to download.
+// The pre-meeting / import language picker: Afrikaans and English one tap away, everything else
+// behind "More languages" (one dropdown: the seven Swivuriso South African languages first, then
+// major world languages on standard Whisper), plus Auto-detect. "sa" stays the group code that
+// routes to Swivuriso (see familyForLang and transcribe.family_for_language); a specific code
+// forces that language token so the decoder cannot flap between languages mid-meeting. The
+// Settings "languages you transcribe" list still drives which models first-run offers to download.
+function langModeOpts() {
+  return [["af", "Afrikaans"], ["en", "English"], ["more", "More languages"], ["", "Auto-detect"]];
+}
+// Which segment a language value belongs to: af / en / "" map to their own segments,
+// everything else ("sa", zu..., de...) lives under More languages.
+function langMode(lang) {
+  var l = lang || "";
+  return (l === "" || l === "af" || l === "en") ? l : "more";
+}
+// The grouped options for the More-languages dropdown: [groupLabel, [[code, name], ...]].
+function moreLangOpts() {
+  var sa = [["sa", "Any South African language"]];
+  SWIVURISO_LANGS.forEach(function (c) { sa.push([c, langName(c)]); });
+  return [["South African languages (Swivuriso)", sa],
+          ["World languages (Whisper)", WORLD_LANGS.map(function (w) { return w.slice(); })]];
+}
+// Flat list of EVERY language mode, for the native selects that need one (the live tune strip
+// and the re-transcribe dialog).
 function transcribeLangOpts() {
-  return [["af", "Afrikaans"], ["en", "English"], ["sa", "South African languages"], ["", "Auto-detect"]];
+  var flat = [["af", "Afrikaans"], ["en", "English"], ["sa", "South African languages"]];
+  SWIVURISO_LANGS.forEach(function (c) { flat.push([c, langName(c)]); });
+  WORLD_LANGS.forEach(function (w) { flat.push(w.slice()); });
+  flat.push(["", "Auto-detect"]);
+  return flat;
+}
+function moreLangSelect() {
+  var sel = el("select", {
+    class: "field", style: { width: "auto", minWidth: "220px", marginTop: "8px" },
+    onchange: function (e) { S.form.language = S.form.moreLang = e.target.value; warmUp(); render(); },
+  }, moreLangOpts().map(function (g) {
+    return el("optgroup", { label: tr(g[0]) }, g[1].map(function (o) { return el("option", { value: o[0], text: o[1] }); }));
+  }));
+  sel.value = S.form.language;
+  return sel;
 }
 // Language is the hero control on the pre-meeting screens. Switching it re-warms the matching
-// family so Begin stays instant.
+// family so Begin stays instant. Picking "More languages" reveals the grouped dropdown; the
+// last specific pick is remembered (S.form.moreLang) so the segment toggles back to it.
 function languageField() {
-  return formField("Language", null, segmented(transcribeLangOpts(), S.form.language, function (v) {
-    S.form.language = v; warmUp(); render();
-  }), true);
+  var mode = langMode(S.form.language);
+  var seg = segmented(langModeOpts(), mode, function (v) {
+    S.form.language = (v === "more") ? (S.form.moreLang || "sa") : v;
+    warmUp(); render();
+  });
+  return formField("Language", null, mode === "more" ? el("div", {}, [seg, moreLangSelect()]) : seg, true);
 }
 // One honest line: which engine this session will use (the language decides, unless the Advanced
 // Engine override forces a family), and that the size is automatic.
@@ -3190,7 +3246,9 @@ function engineLine() {
     msg = (lang === "")
       ? "Auto-detect uses Fluister, our Afrikaans-tuned model. The size is chosen automatically for your computer."
       : "Best for Afrikaans and mixed Afrikaans and English meetings. The size is chosen automatically for your computer.";
-  else msg = "English uses standard Whisper. The size is chosen automatically for your computer.";
+  else msg = (lang === "en")
+    ? "English uses standard Whisper. The size is chosen automatically for your computer."
+    : tr(langName(lang)) + " " + tr("uses standard Whisper. The size is chosen automatically for your computer.");
   return el("div", { class: "card", style: { padding: "11px 13px", display: "flex", gap: "10px", alignItems: "center", marginBottom: "16px" } }, [
     el("div", { class: "tone-tile" + ((label === "Fluister" || label === "Swivuriso") ? " accent" : ""), style: { width: "30px", height: "30px", flex: "0 0 auto" } }, icon(label === "Fluister" ? "sparkle" : (label === "Swivuriso" ? "language" : "globe"), 15)),
     el("div", {}, [
@@ -3210,7 +3268,7 @@ function advancedTranscribeControls(live) {
     el("div", { class: "card", style: { padding: "14px", marginTop: "8px" } }, [
       formField("Engine", el("span", { class: "label-muted", text: " (auto follows the language)" }),
         el("div", {}, [segmented([["auto", "Auto"], ["fluister", "Fluister"], ["whisper", "Whisper"]], S.form.engine || "auto", function (v) { S.form.engine = v; saveSettings({ engine: v }); warmUp(); render(); }),
-          el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Auto picks Fluister for Afrikaans and auto-detect, Whisper for English. Force one to override." })]), true),
+          el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Auto picks the model for your language: Fluister for Afrikaans and auto-detect, Swivuriso for South African languages, Whisper for the rest. Force one to override." })]), true),
       formField("Model size", el("span", { class: "label-muted", text: " (auto is recommended)" }),
         el("div", { style: { marginTop: "12px" } }, [qualitySelector(),
           el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Auto picks the best model your computer can run. Bigger is more accurate but slower." })]), true),
@@ -3375,8 +3433,11 @@ async function boot() {
   if (S.settings) {
     S.form.language = S.settings.transcription_language != null ? S.settings.transcription_language : "af";
     // Keep the default within the languages the user transcribes, so the picker highlights it.
+    // Only individually toggleable codes are clamped; "sa", world codes and "" pass through.
     var tl = S.settings.transcribe_languages || ["af", "en"];
-    if (S.form.language !== "" && tl.indexOf(S.form.language) < 0) S.form.language = tl[0] || "af";
+    if (langIsToggleable(S.form.language) && tl.indexOf(S.form.language) < 0) S.form.language = tl[0] || "af";
+    // A default under "More languages" pre-selects itself in the dropdown.
+    if (langMode(S.form.language) === "more") S.form.moreLang = S.form.language;
     S.form.tier = normalizeQuality(S.settings.tier);
     S.form.device = S.settings.device || "auto";
     S.form.engine = S.settings.engine || "auto";

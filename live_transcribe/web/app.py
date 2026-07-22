@@ -225,7 +225,7 @@ class StartRequest(BaseModel):
     topic: str = ""
     tier: str = "auto"            # "auto" | "gpu" | "cpu-strong" | "cpu-mid"
     device: str = "auto"          # "auto"/"gpu" use the GPU when ready; "cpu" forces CPU
-    language: str = "af"          # "af" | "en" | "" (empty == auto-detect)
+    language: str = "af"          # "af" | "en" | "sa" (SA group) | a code like "zu"/"de" | "" (empty == auto-detect)
     engine: str = "auto"          # model family: "auto" (by language) | "fluister" | "whisper"
     prompt: str = ""
     mic_device: Optional[str] = None
@@ -478,7 +478,7 @@ def set_aec_live(req: AecLiveRequest):
 
 class ReconfigureRequest(BaseModel):
     # All optional; omit a field to leave it unchanged. language "" == auto-detect.
-    language: Optional[str] = None    # "af" | "en" | ""
+    language: Optional[str] = None    # "af" | "en" | "sa" | a code like "zu"/"de" | ""
     tier: Optional[str] = None        # quality/model key (a model size like "medium", or "auto")
     engine: Optional[str] = None      # "auto" | "fluister" | "whisper"
 
@@ -547,10 +547,10 @@ def reconfigure(req: ReconfigureRequest):
         if not (STATE.running and STATE.transcribing and not STATE.stopping
                 and STATE.source_kind == "live" and STATE.engine is engine):
             raise HTTPException(status_code=409, detail="The session changed before the new settings could apply.")
-        # Swivuriso has no faster-whisper codes for the South African languages, so it always decodes on
-        # auto-detect; every other family uses the chosen language.
+        # Swivuriso (and any South African code on any family) decodes on auto-detect; every
+        # other explicit code is forced as-is (see transcribe.decode_language).
         eff_family = family if family is not None else cur_family
-        decode_lang = None if eff_family == "swivuriso" else new_lang
+        decode_lang = transcribe.decode_language(eff_family, new_lang)
         engine.request_change(language=decode_lang, engine=new_engine_pref,
                               model=model, model_name=model_name, size=new_size, family=family)
         STATE.language = (new_lang or "auto")
