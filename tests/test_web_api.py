@@ -516,6 +516,95 @@ def test_reconfigure_session_gated():
     print("  OK  /api/reconfigure: empty patch 400, idle 409, CSRF-protected")
 
 
+def test_reconfigure_keeps_user_language():
+    # Review wave 1, F1: the engine stores the DECODE token, which is None for every South
+    # African language (Swivuriso decodes on auto-detect), so it must never stand in for the
+    # user's language. A mid-meeting Quality-only change on an isiZulu session must keep the
+    # session language "zu" and the family Swivuriso, not read None as auto-detect, re-route
+    # the family to Fluister and rewrite the language to "auto". Simulated session with the
+    # loader stubbed: no audio and no model weights are touched.
+    from live_transcribe import transcribe as T
+
+    class _FakeEngine:
+        _is_cpu = True
+        _compute_type = "int8"
+        _cpu_threads = 4
+        size = "medium"
+        language = None          # the decode token a zu session really stores
+        engine = "auto"
+        family = "swivuriso"
+
+        def __init__(self):
+            self.changes = []
+
+        def request_change(self, **kw):
+            self.changes.append(kw)
+
+    st = webapp.STATE
+    fake = _FakeEngine()
+    saved = (st.running, st.transcribing, st.stopping, st.source_kind, st.engine,
+             st.language, st.tier, st.model, st.family)
+    orig_load, orig_hosted = T.load_model, T.SWIVURISO_HOSTED
+    try:
+        T.load_model = lambda *a, **k: object()   # never load real weights
+        T.SWIVURISO_HOSTED = True                 # Swivuriso resolvable on any machine
+        st.running, st.transcribing, st.stopping = True, True, False
+        st.source_kind, st.engine = "live", fake
+        st.language, st.tier, st.model, st.family = "zu", "cpu-mid", T.swivuriso_model(), "swivuriso"
+        r = client.post("/api/reconfigure", json={"tier": "small"})
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert j["language"] == "zu", j            # NOT rewritten to "auto"
+        assert j["family"] == "swivuriso", j       # NOT re-routed to fluister
+        assert st.language == "zu" and st.family == "swivuriso", (st.language, st.family)
+        assert client.get("/api/status").json()["language"] == "zu"
+        # The engine still receives the decode token (None: Swivuriso decodes on auto-detect).
+        assert fake.changes and fake.changes[-1]["language"] is None, fake.changes
+    finally:
+        T.load_model, T.SWIVURISO_HOSTED = orig_load, orig_hosted
+        (st.running, st.transcribing, st.stopping, st.source_kind, st.engine,
+         st.language, st.tier, st.model, st.family) = saved
+    print("  OK  reconfigure: tier-only change on a zu session keeps language zu + family swivuriso (decode token stays auto)")
+
+
+def test_aec_live_reports_persistence():
+    # Review wave 1, F7: /api/aec-live must keep working when the settings file cannot be
+    # written (the live toggle already took effect on the engine), but must report it via
+    # persisted: false so the UI can warn instead of the choice silently reverting next
+    # meeting. Simulated live session; config.update stubbed, the real settings never touched.
+    from live_transcribe import config as C
+
+    class _FakeCapture:
+        def set_aec(self, on):
+            return True
+
+        def aec_state(self):
+            return (True, True)
+
+    st = webapp.STATE
+    saved = (st.running, st.stopping, st.source_kind, st.capture)
+    orig_update = C.update
+    try:
+        st.running, st.stopping, st.source_kind, st.capture = True, False, "live", _FakeCapture()
+
+        def _boom(d):
+            raise OSError("disk full")
+        C.update = _boom
+        r = client.post("/api/aec-live", json={"enabled": True})
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert j["aec_live_active"] is True and j["persisted"] is False, j
+        # When persistence works the flag is True, and only aec_live is written.
+        wrote = {}
+        C.update = lambda d: wrote.update(d)
+        j2 = client.post("/api/aec-live", json={"enabled": False}).json()
+        assert j2["persisted"] is True and wrote == {"aec_live": False}, (j2, wrote)
+    finally:
+        C.update = orig_update
+        st.running, st.stopping, st.source_kind, st.capture = saved
+    print("  OK  /api/aec-live: toggle survives a failed settings write; persisted reported honestly")
+
+
 def test_warm_up():
     # Warm-up status is always readable, and shaped for the UI.
     st = client.get("/api/warm-up").json()
@@ -643,6 +732,8 @@ if __name__ == "__main__":
                test_recorder_stereo_fold,
                test_feed_raw_mic_routing,
                test_reconfigure_session_gated,
+               test_reconfigure_keeps_user_language,
+               test_aec_live_reports_persistence,
                test_warm_up,
                test_summarise_accepts_instruction,
                test_model_update_status_logic,

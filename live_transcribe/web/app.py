@@ -467,13 +467,16 @@ def set_aec_live(req: AecLiveRequest):
         if not cap.set_aec(bool(req.enabled)):
             raise HTTPException(status_code=409, detail="Echo cancellation is not available in this session. It needs both a microphone and system audio captured from the start.")
         avail, active = cap.aec_state()
-    # Persist outside the state lock (config.update does disk I/O). Best-effort: the live
-    # toggle already took effect either way.
+    # Persist outside the state lock (config.update does disk I/O). The live toggle already took
+    # effect either way, so a failed write must never fail the request; report it honestly in
+    # `persisted` instead, so the UI can warn that the choice will not survive as the default.
+    persisted = True
     try:
         config.update({"aec_live": bool(req.enabled)})
-    except Exception:
-        pass
-    return {"aec_live_available": avail, "aec_live_active": active}
+    except Exception as e:
+        persisted = False
+        print(f"[aec-live] toggle applied but the setting could not be saved: {e}", flush=True)
+    return {"aec_live_available": avail, "aec_live_active": active, "persisted": persisted}
 
 
 class ReconfigureRequest(BaseModel):
@@ -509,7 +512,12 @@ def reconfigure(req: ReconfigureRequest):
         compute = engine._compute_type
         threads = engine._cpu_threads
         cur_size = engine.size
-        cur_language = engine.language            # None (auto) | "af" | "en"
+        # The engine stores the DECODE token, which is None for auto-detect AND for every South
+        # African language (see transcribe.decode_language), so it cannot stand in for the user's
+        # language here: an isiZulu session would read as auto-detect and a tier-only change would
+        # re-route the family off Swivuriso. The canonical user-selected code lives in
+        # STATE.language ("zu" / "sa" / "af" / ... / "auto").
+        cur_language = None if STATE.language in (None, "auto") else STATE.language
         cur_engine_pref = engine.engine
         cur_family = engine.family                # "fluister" | "whisper" | "swivuriso"
 
@@ -553,7 +561,10 @@ def reconfigure(req: ReconfigureRequest):
         decode_lang = transcribe.decode_language(eff_family, new_lang)
         engine.request_change(language=decode_lang, engine=new_engine_pref,
                               model=model, model_name=model_name, size=new_size, family=family)
-        STATE.language = (new_lang or "auto")
+        # Only a request that actually carries a language change may rewrite the session's
+        # canonical language; a tier/engine-only change keeps it exactly as the user chose it.
+        if change_lang:
+            STATE.language = (new_lang or "auto")
         if model is not None:
             if new_tier is not None:
                 STATE.tier = new_tier

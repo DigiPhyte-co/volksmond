@@ -621,6 +621,7 @@ window.VM_I18N = {
     "Echo cancellation on.": "Eggo-kansellering aan.",
     "Echo cancellation off.": "Eggo-kansellering af.",
     "Could not change echo cancellation.": "Kon nie eggo-kansellering verander nie.",
+    "Echo cancellation changed for this meeting, but the choice could not be saved as your default.": "Eggo-kansellering is vir hierdie vergadering verander, maar die keuse kon nie as jou verstek gestoor word nie.",
 
     // Stereo interview mode (upload option: one speaker per channel)
     "Stereo interview mode": "Stereo-onderhoudmodus",

@@ -162,7 +162,8 @@ def test_aec_live_endpoint():
     try:
         st.running, st.stopping, st.source_kind, st.capture = True, False, "live", cap
         j = client.post("/api/aec-live", json={"enabled": True}).json()
-        assert j == {"aec_live_available": True, "aec_live_active": True}, j
+        # persisted: True reports the settings write succeeded (review wave 1, F7).
+        assert j == {"aec_live_available": True, "aec_live_active": True, "persisted": True}, j
         assert config.load().get("aec_live") is True, "choice not persisted as the new default"
         stj = client.get("/api/status").json()
         assert stj["aec_live_available"] is True and stj["aec_live_active"] is True, stj

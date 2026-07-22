@@ -144,7 +144,7 @@ function freshLive() {
     startedAt: null, outputPath: null, audioStem: null, tier: null, model: null, family: null,
     language: null, engine: null, stopping: false, segments: [], es: null, title: "", importName: "",
     micDevice: null, loopbackDevice: null, switching: false, reconfiguring: false,
-    notes: "", notesOpen: false,
+    notes: "", notesOpen: false, notesTouched: false,
     // Live AEC toggle: rendered from the ENGINE'S confirmed state (/api/status, /api/aec-live),
     // never from stored settings, so it can never show a value the engine does not have.
     aecAvailable: false, aecActive: false, aecBusy: false, noticeShown: "",
@@ -409,7 +409,7 @@ function refreshLiveAec() {
     if (!st || !st.running) return;
     S.live.aecAvailable = !!st.aec_live_available;
     S.live.aecActive = !!st.aec_live_active;
-    if (S.route === "live") render();
+    if (S.route === "live" || S.route === "recordonly") render();
   }).catch(function () {});
 }
 // Toggle live echo cancellation mid-meeting. The UI reflects the CONFIRMED new state from the
@@ -424,7 +424,10 @@ async function toggleLiveAec() {
     S.live.aecActive = !!resp.aec_live_active;
     S.form.aecLive = S.live.aecActive;
     if (S.settings) S.settings.aec_live = S.live.aecActive;
-    toast(S.live.aecActive ? "Echo cancellation on." : "Echo cancellation off.");
+    // The toggle itself worked either way; if the server could not save it as the new default
+    // (persisted false), warn softly so the user knows the next meeting starts from the old value.
+    if (resp.persisted === false) toast("Echo cancellation changed for this meeting, but the choice could not be saved as your default.");
+    else toast(S.live.aecActive ? "Echo cancellation on." : "Echo cancellation off.");
   } catch (e) {
     toast(e.message || "Could not change echo cancellation.", true);
   } finally {
@@ -569,7 +572,7 @@ async function startRecordOnly() {
     S.live.outputPath = resp.output_path; S.live.audioStem = resp.audio_stem;
     S.live.title = S.form.title || "Recording";
     S.live.micDevice = S.form.mic; S.live.loopbackDevice = S.form.loopback;
-    go("recordonly"); startElapsed(); startLevels();
+    go("recordonly"); startElapsed(); startLevels(); refreshLiveAec();
   } catch (e) { toast(e.message || "Could not start recording.", true); }
 }
 
@@ -1702,7 +1705,13 @@ var notesSaveTimer = null;
 function liveStem() { return baseName(S.live.outputPath || "").replace(/\.md$/, ""); }
 function scheduleNotesSave() {
   if (notesSaveTimer) clearTimeout(notesSaveTimer);
-  notesSaveTimer = setTimeout(saveNotesNow, 700);
+  // Capture the stem AND the text NOW: if the route or session changes before the debounce
+  // fires, the save still writes this text to the session it belongs to, never a later one's.
+  var stem = liveStem(), text = S.live.notes || "";
+  notesSaveTimer = setTimeout(function () {
+    notesSaveTimer = null;
+    if (stem) api.post("/api/notes", { stem: stem, text: text }).catch(function () {});
+  }, 700);
 }
 function saveNotesNow() {
   if (notesSaveTimer) { clearTimeout(notesSaveTimer); notesSaveTimer = null; }
@@ -1776,7 +1785,7 @@ function notesCol() {
   ]);
   var ta = el("textarea", { class: "field notes-ta", value: S.live.notes || "",
     placeholder: "Jot notes as the meeting goes: decisions, names, to-dos. Saved with this meeting on your computer. When you summarise, you choose whether to fold them in.",
-    oninput: function (e) { S.live.notes = e.target.value; scheduleNotesSave(); } });
+    oninput: function (e) { S.live.notes = e.target.value; S.live.notesTouched = true; scheduleNotesSave(); } });
   return el("div", { class: "notes-col" }, [head, ta]);
 }
 function notesRail() {
@@ -2411,6 +2420,17 @@ function appearanceCard() {
     ]),
   ]);
 }
+// A saved default language must reach the CURRENT app instance too (S.form seeds only at boot),
+// so the next pre-meeting screen already shows the new default without a restart.
+function saveDefaultLanguage(patch) {
+  return saveSettings(patch).then(function () {
+    var v = patch.transcription_language;
+    if (S.settings && S.settings.transcription_language === v) {
+      S.form.language = v;
+      if (langMode(v) === "more") S.form.moreLang = v;
+    }
+  });
+}
 function transcriptionCard(st) {
   var draft = S.settingsDraft || {};
   var ctxVal = draft.default_context != null ? draft.default_context : (st.default_context || "");
@@ -2422,7 +2442,11 @@ function transcriptionCard(st) {
     var patch = { transcribe_languages: sel };
     // Keep the default language valid if we just removed it. Only the individually
     // toggleable codes are clamped; "sa", world codes and auto-detect always stay valid.
-    if (langIsToggleable(st.transcription_language) && sel.indexOf(st.transcription_language) < 0) patch.transcription_language = sel[0];
+    if (langIsToggleable(st.transcription_language) && sel.indexOf(st.transcription_language) < 0) {
+      patch.transcription_language = sel[0];
+      saveDefaultLanguage(patch);
+      return;
+    }
     saveSettings(patch);
   }
   var afOn = sel.indexOf("af") >= 0;
@@ -2447,7 +2471,8 @@ function transcriptionCard(st) {
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("globe", 18)),
       el("div", { class: "body" }, [el("div", { class: "t", text: "Default language" }), el("div", { class: "s", text: "Used unless you change it for a meeting." })]),
-      el("div", { class: "ctl" }, selectEl(defOpts, st.transcription_language || "af", function (v) { saveSettings({ transcription_language: v }); })),
+      // "" is a real value (Auto-detect), so only null/undefined may fall back to "af".
+      el("div", { class: "ctl" }, selectEl(defOpts, st.transcription_language != null ? st.transcription_language : "af", function (v) { saveDefaultLanguage({ transcription_language: v }); })),
     ]),
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("cpu", 18)),
@@ -3495,17 +3520,58 @@ function adoptRunning(status) {
   S.live.loopbackDevice = status.loopback_device != null ? status.loopback_device : null;
   S.live.aecAvailable = !!status.aec_live_available;
   S.live.aecActive = !!status.aec_live_active;
+  // /api/status does not carry the recording stem; the server derives it from the transcript
+  // path (output_path minus ".md"), so reconstruct it for the record-only finish flow.
+  S.live.audioStem = (status.recording && status.output_path) ? status.output_path.replace(/\.md$/, "") : null;
   openStream(); startElapsed();
   seedFromTranscript();
   seedNotes();
   if (status.source_kind !== "file") startLevels();
   if (status.source_kind === "file") {
     S.route = "importing";
-    pollStatus(function (st) { return !st.running; }, function () { gotoFinish(S.live.outputPath); });
+    // Mirror startImport: surface the sticky server notice (e.g. "stereo requested but the file
+    // is mono") once, whether it is already on the adopted status, lands mid-run, or only
+    // arrives on the final poll.
+    var showNotice = function (st) {
+      if (st && st.notice && S.live.noticeShown !== st.notice) { S.live.noticeShown = st.notice; toast(tr(st.notice)); }
+    };
+    showNotice(status);
+    pollStatus(function (st) { return !st.running; },
+      function (st) { showNotice(st); gotoFinish(S.live.outputPath, st && st.sink_error); },
+      showNotice);
   } else if (status.transcribing) {
     S.route = "live";
   } else {
     S.route = "recordonly";
+  }
+  // A reload can land while a live or record-only session is already stopping. The in-page
+  // stop's completion polling died with the old page, so restart it here and route exactly as
+  // the normal stop does when the drain finishes (a file import already polls to completion
+  // above, so it never installs this second poll).
+  if (status.stopping && status.source_kind !== "file") {
+    pollStatus(
+      function (st) { return !st.running || (!st.stopping && !st.transcribing); },
+      function (st) {
+        S.live.stopping = false;
+        if (st.running) {
+          // Transcription-only stop finished; the recording carries on (doStop "transcription").
+          S.live.transcribing = false; S.live.recording = true; go("recordonly"); return;
+        }
+        if (S.live.transcribing) {
+          // A transcribing session ended: same handoff as doStop ("all").
+          gotoFinish(S.live.outputPath, st && st.sink_error); return;
+        }
+        // Record-only ended: mirror stopRecordOnly's completion.
+        var stem = S.live.audioStem;
+        teardownLive();
+        S.live.running = false;
+        S.finish.recordingStem = stem;
+        S.finish.outputPath = S.live.outputPath;
+        S.finish.sinkError = (st && st.sink_error) || null;
+        if (S.finish.sinkError) toast(S.finish.sinkError, true);
+        go("recordonly");
+      }
+    );
   }
 }
 
@@ -3541,7 +3607,10 @@ function seedNotes() {
   var stem = liveStem();
   if (!stem) return;
   api.get("/api/notes?stem=" + encodeURIComponent(stem)).then(function (n) {
-    if (n && n.text && !S.live.notes) {
+    // Apply the disk text only if the user has not typed (or deleted) anything since the
+    // adoption AND we are still on the same session: a late response must never resurrect
+    // old notes over an edit, or seed another session's panel.
+    if (n && n.text && !S.live.notes && !S.live.notesTouched && stem === liveStem()) {
       S.live.notes = n.text;
       if (S.route === "live") render();
     }
