@@ -15,6 +15,16 @@ sessions/*
 # Debug audio dumps
 debug_audio_*.wav
 
+# Root-level media (screen recordings, demo videos, photos land here from OneDrive;
+# POPIA risk if staged). Root-scoped so brand/ images stay tracked.
+/*.mp4
+/*.mov
+/*.mkv
+/*.jpg
+/*.jpeg
+/*.png
+/*.gif
+
 # Cached models (large; let users download on first run)
 models/
 ~/.cache/
