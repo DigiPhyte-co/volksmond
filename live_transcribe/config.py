@@ -36,7 +36,7 @@ _WRITE_LOCK = threading.RLock()
 # new key at its default rather than breaking.
 DEFAULTS = {
     "interface_language": "en-ZA",    # language of the app's own UI (i18n later)
-    "transcription_language": "af",   # default spoken language; "" == auto-detect
+    "transcription_language": "af",   # default spoken language mode: "af" | "en" | "sa" (SA group) | a code like "zu"/"de"; "" == auto-detect
     "transcribe_languages": ["af", "en"],  # languages the user transcribes; drives the per-session language picker and (later) which model families to provision. The chosen language picks the model FAMILY (Afrikaans -> Fluister), the hardware picks the size.
     "tier": "auto",                   # default hardware tier
     "save_location": "",              # "" == default folder (project sessions/ in dev, per-user app-data when frozen)
@@ -57,6 +57,7 @@ DEFAULTS = {
     "business_nudge_seen": False,     # the one-time business-use nudge has been shown and dismissed, so it never repeats.
     "summary_footer": True,           # append a small "Made with Volksmond" line to the summary file. Never the raw transcript, never any export of it.
     "calendar_reminders": True,       # while the app is open, poll the LOCAL Outlook calendar and nudge "start transcribing?" when a meeting begins. Business feature; inert without a licence + Outlook + pywin32. Local only, no network call.
+    "live_notes_width": 0,            # width (px) of the live-screen notes column; 0 = default. Disk mirror of localStorage vm_live_split, which the WebView can wipe between launches.
 }
 
 

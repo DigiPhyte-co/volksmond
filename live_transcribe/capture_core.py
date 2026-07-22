@@ -191,11 +191,14 @@ class CaptureBase:
         self._t0 = self._t0_init if self._t0_init is not None else time.monotonic()
         self._open_sources()
 
-        # Live echo cancellation: only when requested AND both a mic and a system loopback
-        # opened (we need the loopback as the far-end reference). The APM worker resamples both
-        # to 16k and emits the cleaned mic + passthrough system into the chunk buffers, so the
-        # chunkers then treat both sources as 16k (no second resample in _emit).
-        if self.aec and "MIC" in self._buffers and "SYS" in self._buffers:
+        # Live echo cancellation: engaged whenever both a mic and a system loopback opened (we
+        # need the loopback as the far-end reference). When the user has AEC off, the worker still
+        # runs but in BYPASS (raw mic emitted, APM kept fed), so echo cancellation can be toggled
+        # on or off mid-meeting by flipping the bypass; no capture rebuild, no rate change. The APM
+        # worker resamples both to 16k and emits the (cleaned or raw) mic + passthrough system into
+        # the chunk buffers, so the chunkers then treat both sources as 16k (no second resample in
+        # _emit).
+        if "MIC" in self._buffers and "SYS" in self._buffers:
             la = None
             try:
                 from . import aec as _aec
@@ -206,6 +209,7 @@ class CaptureBase:
                     self._rates["MIC"], self._rates["SYS"],
                     on_near=lambda x: self._append_16k("MIC", x),
                     on_far=lambda x: self._append_16k("SYS", x),
+                    bypass=not self.aec,
                 )
                 la.start()   # builds the APM + worker thread; raises here if the lib is broken
                 # Commit to the AEC path ONLY now the worker is live (so a failed start never
@@ -230,7 +234,7 @@ class CaptureBase:
                     with self._buffer_locks[s]:
                         self._buffers[s].clear()
                         self._buffer_counts[s] = 0
-                print("[aec] live echo cancellation engaged (mic + system -> WebRTC APM)", flush=True)
+                print(f"[aec] live echo canceller engaged ({'active' if self.aec else 'bypassed, ready to toggle on'}) (mic + system -> WebRTC APM)", flush=True)
             except Exception as e:
                 # A missing or broken echo canceller must never stop the session: degrade to
                 # normal capture (native rate, no AEC).
@@ -280,6 +284,30 @@ class CaptureBase:
         with lock:
             self._buffers[source].append(a)
             self._buffer_counts[source] += a.shape[0]
+
+    def set_aec(self, enabled):
+        """Toggle live echo cancellation mid-session. Instant and safe in both directions when
+        the APM worker is running (it flips the worker's bypass; the frame flow is identical
+        either way, so nothing replays or desyncs). Returns False only when the worker never
+        engaged (mic-only session, or the LiveKit binding is missing) and the caller asked for
+        ON, which cannot be honoured this session. `self.aec` tracks the ACTIVE state so a
+        mid-meeting device switch rebuilds the capture with the current choice, not the one
+        the session started with."""
+        la = self._live_aec
+        if la is None:
+            if enabled:
+                return False
+            self.aec = False
+            return True
+        la.bypass = not enabled
+        self.aec = bool(enabled)
+        return True
+
+    def aec_state(self):
+        """(available, active): available = the APM worker is running this session (so the
+        toggle can work), active = it is actually cancelling (not bypassed)."""
+        la = self._live_aec
+        return (la is not None, la is not None and not la.bypass)
 
     def has_raw_mic(self):
         """True once the raw-mic side channel is live (record_raw_mic AND live AEC engaged), so the

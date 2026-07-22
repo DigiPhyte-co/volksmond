@@ -325,6 +325,82 @@ def test_summary_device_and_capability():
     print("  OK  /api/models reports summary GPU capability + device; summary_device round-trips")
 
 
+def test_live_notes_width_roundtrip():
+    # The live-screen notes column width persists to disk (settings.json) as well as
+    # localStorage, because the WebView can wipe localStorage between launches.
+    from live_transcribe import config
+    orig = config.load().get("live_notes_width")
+    try:
+        assert client.post("/api/settings", json={"live_notes_width": 340}).json()["live_notes_width"] == 340
+        assert client.get("/api/settings").json()["live_notes_width"] == 340
+        assert client.post("/api/settings", json={"live_notes_width": 0}).json()["live_notes_width"] == 0
+    finally:
+        config.update({"live_notes_width": orig or 0})
+    print("  OK  live_notes_width round-trips through /api/settings")
+
+
+def test_default_language_roundtrip():
+    # Settings must accept EVERY pre-meeting language mode as the default: the classics
+    # ("af"/"en"), the Swivuriso group ("sa"), a specific South African language, a world
+    # language, and auto-detect (""). Save and restore the real value (repo convention).
+    orig = client.get("/api/settings").json()["transcription_language"]
+    try:
+        for v in ("af", "en", "sa", "zu", "de", ""):
+            assert client.post("/api/settings", json={"transcription_language": v}).json()["transcription_language"] == v, v
+            assert client.get("/api/settings").json()["transcription_language"] == v, v
+    finally:
+        client.post("/api/settings", json={"transcription_language": orig})
+    print("  OK  default language round-trips for every mode (af/en/sa/zu/de/auto)")
+
+
+def test_language_mode_tokens():
+    # Each pre-meeting mode maps to the right FAMILY, and to the decode token faster-whisper
+    # actually receives. A specific world language forces its token (no per-chunk language
+    # flapping); the South African codes never leak into a family that has no token for them.
+    from live_transcribe import transcribe as T
+    assert T.family_for_language("de") == "whisper"
+    assert T.family_for_language("fr-FR") == "whisper"
+    assert T.family_for_language("tn") == "swivuriso"
+    assert T.decode_language("whisper", "de") == "de"
+    assert T.decode_language("whisper", "en") == "en"
+    assert T.decode_language("fluister", "af") == "af"
+    assert T.decode_language("fluister", "") is None       # auto-detect stays auto
+    assert T.decode_language("fluister", "auto") is None
+    assert T.decode_language("swivuriso", "zu") is None    # Swivuriso always decodes on auto
+    assert T.decode_language("swivuriso", "sa") is None
+    assert T.decode_language("whisper", "zu") is None      # SA code on stock Whisper: no token exists
+    assert T.decode_language("whisper", "sa") is None      # "sa" must never decode as Sanskrit
+    print("  OK  language mode -> family + decode token (world forced, SA codes auto, no Sanskrit trap)")
+
+
+def test_settings_migration_old_default_language():
+    # A settings.json written by an older build (default language "af" or "en", no knowledge
+    # of the new modes) must load exactly as before: same value out, every other key at its
+    # default. Sandboxed: config is pointed at a temp folder, never the user's real file.
+    import json as _json
+    import tempfile
+    from pathlib import Path
+    from live_transcribe import config as C
+    orig_dir, orig_path = C._DIR, C._SETTINGS_PATH
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            C._DIR = Path(td)
+            C._SETTINGS_PATH = C._DIR / "settings.json"
+            for old in ("af", "en"):
+                C._SETTINGS_PATH.write_text(_json.dumps({"transcription_language": old,
+                                                         "transcribe_languages": ["af", "en"]}), encoding="utf-8")
+                s = C.load()
+                assert s["transcription_language"] == old, s
+                assert s["tier"] == "auto" and s["engine"] == "auto", s
+            # The new mode values persist and survive a reload unchanged.
+            for new in ("sa", "zu", "de", ""):
+                C.update({"transcription_language": new})
+                assert C.load()["transcription_language"] == new, new
+    finally:
+        C._DIR, C._SETTINGS_PATH = orig_dir, orig_path
+    print("  OK  old settings files ('af'/'en') load unchanged; new mode values persist (sandboxed)")
+
+
 def test_fits_on_gpu_logic():
     # The GPU fit check: full offload only when the model file plus a working-memory
     # headroom fits in VRAM. A tiny real file fits a big card; nothing fits an unknown
@@ -557,6 +633,10 @@ if __name__ == "__main__":
                test_filename_allow_list,
                test_license_pubkey_precedence,
                test_summary_device_and_capability,
+               test_live_notes_width_roundtrip,
+               test_default_language_roundtrip,
+               test_language_mode_tokens,
+               test_settings_migration_old_default_language,
                test_fits_on_gpu_logic,
                test_levels_and_switch_device,
                test_recording_channel_bundling,

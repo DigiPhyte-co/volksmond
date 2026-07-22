@@ -163,8 +163,8 @@ window.VM_I18N = {
       "Gedwing na standaard Whisper vir elke taal.",
     "Engine": "Enjin",
     " (auto follows the language)": " (outo volg die taal)",
-    "Auto picks Fluister for Afrikaans and auto-detect, Whisper for English. Force one to override.":
-      "Outo kies Fluister vir Afrikaans en outo-bespeur, en Whisper vir Engels. Kies Fluister of Whisper om dit te oorskryf.",
+    "Auto picks the model for your language: Fluister for Afrikaans and auto-detect, Swivuriso for South African languages, Whisper for the rest. Force one to override.":
+      "Outo kies die model vir jou taal: Fluister vir Afrikaans en outo-bespeur, Swivuriso vir Suid-Afrikaanse tale, en Whisper vir die res. Kies een om dit te oorskryf.",
     "Advanced": "Gevorderd",
     "Model size": "Modelgrootte",
     " (auto is recommended)": " (outo word aanbeveel)",
@@ -502,6 +502,30 @@ window.VM_I18N = {
       "Die beste vir Afrikaans en vergaderings wat Afrikaans en Engels meng. Die grootte word outomaties vir jou rekenaar gekies.",
     "Afrikaans uses Fluister, our Afrikaans-tuned model; the South African languages use Swivuriso (beta); English and other languages use standard Whisper.":
       "Afrikaans gebruik Fluister, ons Afrikaans-gestemde model; die Suid-Afrikaanse tale gebruik Swivuriso (beta); Engels en ander tale gebruik standaard Whisper.",
+    // "More languages" picker (pre-meeting) + the world-language list
+    "More languages": "Meer tale",
+    "Any South African language": "Enige Suid-Afrikaanse taal",
+    "World languages (Whisper)": "Wêreldtale (Whisper)",
+    "uses standard Whisper. The size is chosen automatically for your computer.":
+      "gebruik standaard Whisper. Die grootte word outomaties vir jou rekenaar gekies.",
+    "German": "Duits",
+    "French": "Frans",
+    "Spanish": "Spaans",
+    "Portuguese": "Portugees",
+    "Italian": "Italiaans",
+    "Dutch": "Nederlands",
+    "Mandarin": "Mandaryns",
+    "Arabic": "Arabies",
+    "Hindi": "Hindi",
+    "Russian": "Russies",
+    "Japanese": "Japannees",
+    "Korean": "Koreaans",
+    "Polish": "Pools",
+    "Turkish": "Turks",
+    "Swedish": "Sweeds",
+    "Norwegian": "Noors",
+    "Danish": "Deens",
+    "Greek": "Grieks",
     // Afrikaans (Fluister) model update panel
     "Afrikaans model (Fluister)": "Afrikaanse model (Fluister)",
     "Checking": "Soek tans",
@@ -594,10 +618,25 @@ window.VM_I18N = {
     "Remove the other side's voice that your speakers leak into your microphone, live as the meeting happens. Best on speakers when you are mostly listening; it can blur your words during heavy crosstalk, and does nothing on headphones.": "Verwyder die ander kant se stem wat jou luidsprekers in jou mikrofoon laat lek, regstreeks soos die vergadering plaasvind. Beste op luidsprekers wanneer jy meestal luister; dit kan jou woorde vertroebel tydens baie gelyktydige gepratery, en doen niks op oorfone nie.",
     "Cancel speaker echo": "Kanselleer luidspreker-eggo",
     "Off by default. When you re-transcribe a recording, remove the other side's voice that your microphone re-heard through the speakers. Best when you are mostly listening (a video or a one-sided talk). It can blur your own words when you and the other side talk over each other, so leave it off for normal back-and-forth meetings. No effect on headphones.": "Standaard af. Wanneer jy 'n opname hertranskribeer, verwyder die ander kant se stem wat jou mikrofoon deur die luidsprekers weer gehoor het. Beste wanneer jy meestal luister ('n video of 'n eensydige praatjie). Dit kan jou eie woorde vertroebel wanneer jy en die ander kant gelyktydig praat, so los dit af vir gewone heen-en-weer-vergaderings. Geen effek op oorfone nie.",
+    "Echo cancellation on.": "Eggo-kansellering aan.",
+    "Echo cancellation off.": "Eggo-kansellering af.",
+    "Could not change echo cancellation.": "Kon nie eggo-kansellering verander nie.",
+
+    // Stereo interview mode (upload option: one speaker per channel)
+    "Stereo interview mode": "Stereo-onderhoudmodus",
+    "For phone recordings where the two speakers sit in the left and right channels (e.g. Samsung Interview mode). Transcribes each side separately, labelled Speaker L and Speaker R. A mono file is transcribed as a single track.":
+      "Vir foonopnames waar die twee sprekers in die linker- en regterkanale sit (bv. Samsung se onderhoudmodus). Transkribeer elke kant apart, gemerk Spreker L en Spreker R. 'n Mono-lêer word as een enkele baan getranskribeer.",
+    "File is mono, transcribed as a single track": "Die lêer is mono en is as een enkele baan getranskribeer",
+    "[Speaker L]": "[Spreker L]",
+    "[Speaker R]": "[Spreker R]",
+
     "Recorded": "Opgeneem",
     "Transcribing": "Transkribeer tans",
     "Summarising": "Som tans op",
     "Re-transcribe": "Hertranskribeer",
+
+    // Sidebar return pill while a session runs on another screen
+    "Return to meeting": "Terug na vergadering",
 
     // Meeting notes (live panel, history pill, and the reader's editable My notes tab)
     "Notes": "Notas",

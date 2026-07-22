@@ -30,11 +30,18 @@ _MAXQ = 400          # ~ blocks queued before we drop (worker runs ~100x real-ti
 
 
 class LiveAEC:
-    def __init__(self, near_rate, far_rate, on_near, on_far):
+    def __init__(self, near_rate, far_rate, on_near, on_far, bypass=False):
         """on_near(cleaned_mono_16k_float32), on_far(system_mono_16k_float32): sinks that append
-        the processed audio into the capture pipeline (already at 16 k)."""
+        the processed audio into the capture pipeline (already at 16 k).
+
+        bypass: when True the RAW mic frames are emitted instead of the cleaned ones. The APM is
+        still fed every frame (both directions), so its echo estimate stays converged and flipping
+        bypass mid-meeting takes effect on the next 10 ms frame with no replay, drop, or clock
+        skew: the frame flow is identical either way, only which copy is emitted changes. Written
+        by the toggle endpoint's thread, read per-frame by the worker (a plain bool is atomic)."""
         self._on_near = on_near
         self._on_far = on_far
+        self.bypass = bypass
         self._near_rs = None if near_rate == TARGET_RATE else soxr.ResampleStream(near_rate, TARGET_RATE, 1, dtype="float32")
         self._far_rs = None if far_rate == TARGET_RATE else soxr.ResampleStream(far_rate, TARGET_RATE, 1, dtype="float32")
         self._near_q = queue.Queue(maxsize=_MAXQ)
@@ -125,14 +132,17 @@ class LiveAEC:
             self._near_buf = self._near_buf[FRAME:]
             af = self._pcm_frame(frame)
             self._apm.process_stream(af)
-            near_emit.append(np.frombuffer(af.data, dtype=np.int16).astype(np.float32) / 32768.0)
+            # Bypassed: emit the raw frame; the APM was still fed above so a re-enable is instant.
+            near_emit.append(frame if self.bypass
+                             else np.frombuffer(af.data, dtype=np.int16).astype(np.float32) / 32768.0)
         if flush and len(self._near_buf):
             rem = len(self._near_buf)
             padded = np.zeros(FRAME, dtype=np.float32)
             padded[:rem] = self._near_buf
             af = self._pcm_frame(padded)
             self._apm.process_stream(af)
-            near_emit.append((np.frombuffer(af.data, dtype=np.int16).astype(np.float32) / 32768.0)[:rem])
+            near_emit.append(padded[:rem] if self.bypass
+                             else (np.frombuffer(af.data, dtype=np.int16).astype(np.float32) / 32768.0)[:rem])
             self._near_buf = np.zeros(0, dtype=np.float32)
         if near_emit:
             self._on_near(np.concatenate(near_emit))
