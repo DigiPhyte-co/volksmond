@@ -167,7 +167,7 @@ var S = {
 };
 
 // transient refs + timers (not part of render state)
-var liveDocEl = null, liveBodyEl = null, elapsedEl = null, recTimerEl = null;
+var liveDocEl = null, liveBodyEl = null, elapsedEl = null, recTimerEl = null, returnPillTimeEl = null;
 var pollTimer = null, elapsedTimer = null, toastTimer = null, levelTimer = null, warmTimer = null, histTimer = null, reminderTimer = null;
 var startingTimer = null, startingElapsedEl = null;
 
@@ -248,6 +248,12 @@ if (window.matchMedia) {
 }
 
 /* ── navigation ───────────────────────────────────────────── */
+// The live-family route for the CURRENT running session, so the sidebar and the
+// return pill can navigate back to it instead of a fresh pre-meeting form.
+function liveRoute() {
+  if (S.live.sourceKind === "file") return "importing";
+  return S.live.transcribing ? "live" : "recordonly";
+}
 function go(route) {
   if ((S.route === "live" || S.route === "importing" || S.route === "recordonly") &&
       route !== S.route && !S.live.running) {
@@ -558,7 +564,7 @@ async function startImport(arg) {
     S.live.outputPath = resp.output_path; S.live.tier = resp.tier; S.live.model = resp.model; S.live.family = resp.family;
     S.live.importName = baseName(arg.path) || (arg.topic || "recording");
     S.live.title = arg.topic || topicFromName(baseName(resp.output_path));
-    go("importing"); openStream();
+    go("importing"); openStream(); startElapsed();
     pollStatus(function (st) { return !st.running; }, function () { gotoFinish(S.live.outputPath); });
   } catch (e) {
     if (startingTimer) { clearInterval(startingTimer); startingTimer = null; }
@@ -571,6 +577,7 @@ function startElapsed() {
   elapsedTimer = setInterval(function () {
     if (elapsedEl) elapsedEl.textContent = fmtElapsed(S.live.startedAt);
     if (recTimerEl) recTimerEl.textContent = fmtElapsed(S.live.startedAt);
+    if (returnPillTimeEl) returnPillTimeEl.textContent = fmtElapsed(S.live.startedAt);
   }, 1000);
 }
 async function pickFile(kind) {
@@ -971,7 +978,7 @@ function render() {
   var keepScroll = (S.route === _renderedRoute);
   var prevScroller = keepScroll ? APP.querySelector(".screen, .solo, .live-body") : null;
   var prevScrollTop = prevScroller ? prevScroller.scrollTop : 0;
-  liveDocEl = liveBodyEl = elapsedEl = recTimerEl = null;
+  liveDocEl = liveBodyEl = elapsedEl = recTimerEl = returnPillTimeEl = null;
   clear(APP);
   var view;
   switch (S.route) {
@@ -981,9 +988,11 @@ function render() {
     case "pre": view = shell("home", preView()); break;
     case "importpre": view = shell("home", importPreView()); break;
     case "recordpre": view = shell("home", recordPreView()); break;
-    case "live": view = liveView(); break;
-    case "recordonly": view = recordOnlyView(); break;
-    case "importing": view = importingView(); break;
+    // The live-family views render inside the shell so Meeting/History/Settings stay
+    // reachable during a session; capture is server-side, so navigating away loses nothing.
+    case "live": view = shell("home", liveView()); break;
+    case "recordonly": view = shell("home", recordOnlyView()); break;
+    case "importing": view = shell("home", importingView()); break;
     case "finish": view = shell("home", finishView()); break;
     case "history": view = shell("history", historyView()); break;
     case "reader": view = shell("history", readerView()); break;
@@ -1014,8 +1023,20 @@ function shell(active, mainNode) {
 }
 function sidebar(active) {
   function nav(id, label, ic, route) {
-    return el("button", { class: "nav-item" + (active === id ? " active" : ""), onclick: function () { go(route); } },
+    return el("button", { class: "nav-item" + (active === id ? " active" : ""), onclick: function () { go(typeof route === "function" ? route() : route); } },
       [icon(ic, 17), el("span", { text: label })]);
+  }
+  // While a session runs, a pulsing pill on every OTHER screen leads straight back to it.
+  // The elapsed time updates in place (startElapsed), never via render().
+  function returnPill() {
+    if (!S.live.running) return null;
+    if (S.route === "live" || S.route === "recordonly" || S.route === "importing") return null;
+    returnPillTimeEl = el("span", { class: "mono", text: fmtElapsed(S.live.startedAt) });
+    return el("button", { class: "return-pill", onclick: function () { go(liveRoute()); } }, [
+      el("span", { class: "dot" }),
+      el("span", { class: "rp-label", text: "Return to meeting" }),
+      returnPillTimeEl,
+    ]);
   }
   return el("aside", { class: "sidebar" }, [
     el("div", { class: "brand" }, [
@@ -1023,10 +1044,12 @@ function sidebar(active) {
       el("div", { class: "brand-sub", text: "by DigiPhyte" }),
     ]),
     el("nav", { class: "nav" }, [
-      nav("home", "Meeting", "mic", "home"),
+      // Meeting returns to the RUNNING session when there is one, never a fresh form.
+      nav("home", "Meeting", "mic", function () { return S.live.running ? liveRoute() : "home"; }),
       nav("history", "History", "clock", "history"),
       nav("settings", "Settings", "gear", "settings"),
     ]),
+    returnPill(),
     el("div", { class: "spacer" }),
     el("div", { class: "local-pill" }, [icon("lock", 14), el("span", { text: "Local only, no internet" })]),
     // The manual "Check for updates" is a user-initiated convenience (one outbound call, only on
@@ -1632,21 +1655,82 @@ function saveNotesNow() {
   if (!stem) return;
   api.post("/api/notes", { stem: stem, text: S.live.notes || "" }).catch(function () {});
 }
-function liveNotesPanel() {
-  var open = !!S.live.notesOpen;
-  var toggle = function () { S.live.notesOpen = !S.live.notesOpen; render(); };
-  var head = el("div", { class: "notes-head", role: "button", tabindex: "0", onclick: toggle, onkeydown: keyActivate(toggle) }, [
+// The notes now live in a resizable right-hand column on the live screen. notesOpen keeps its
+// old meaning: open = the full column, closed = a slim rail with a Notes button. The width is
+// dragged via the splitter, which mutates a CSS variable directly, NEVER render(): a render
+// mid-drag would rebuild the transcript DOM and steal the textarea's focus.
+var NOTES_W_DEFAULT = 300, NOTES_W_MIN = 220;
+var _notesW = 0;   // width picked up by the drag in progress, persisted on pointer-up
+function clampNotesWidth(w) {
+  var max = Math.max(NOTES_W_MIN, Math.floor(window.innerWidth * 0.6));
+  return Math.max(NOTES_W_MIN, Math.min(max, Math.round(w)));
+}
+function notesWidth() {
+  var w = 0;
+  try { w = parseInt(localStorage.getItem("vm_live_split") || "0", 10) || 0; } catch (e) {}
+  // localStorage first, settings.json as the durable mirror (the WebView can wipe localStorage).
+  if (!w && S.settings && S.settings.live_notes_width) w = parseInt(S.settings.live_notes_width, 10) || 0;
+  return w ? clampNotesWidth(w) : NOTES_W_DEFAULT;
+}
+function persistNotesWidth() {
+  if (!_notesW) return;
+  try { localStorage.setItem("vm_live_split", String(_notesW)); } catch (e) {}
+  api.post("/api/settings", { live_notes_width: _notesW })
+    .then(function (s) { if (s) S.settings = s; }).catch(function () {});
+}
+function resetNotesWidth(splitEl) {
+  _notesW = 0;
+  try { localStorage.removeItem("vm_live_split"); } catch (e) {}
+  api.post("/api/settings", { live_notes_width: 0 })
+    .then(function (s) { if (s) S.settings = s; }).catch(function () {});
+  splitEl.style.setProperty("--vm-notes-w", NOTES_W_DEFAULT + "px");
+}
+function splitHandle(splitEl) {
+  var h = el("div", { class: "split-handle", title: "Drag to resize. Double-click to reset." });
+  h.addEventListener("pointerdown", function (e) {
+    e.preventDefault();
+    try { h.setPointerCapture(e.pointerId); } catch (x) {}
+    h.classList.add("dragging");
+    function move(ev) {
+      var w = clampNotesWidth(splitEl.getBoundingClientRect().right - ev.clientX);
+      _notesW = w;
+      splitEl.style.setProperty("--vm-notes-w", w + "px");
+    }
+    function up() {
+      h.classList.remove("dragging");
+      h.removeEventListener("pointermove", move);
+      h.removeEventListener("pointerup", up);
+      h.removeEventListener("pointercancel", up);
+      persistNotesWidth();
+    }
+    h.addEventListener("pointermove", move);
+    h.addEventListener("pointerup", up);
+    h.addEventListener("pointercancel", up);
+  });
+  h.addEventListener("dblclick", function () { resetNotesWidth(splitEl); });
+  return h;
+}
+function notesCol() {
+  var collapse = function () { S.live.notesOpen = false; render(); };
+  var head = el("div", { class: "notes-head", role: "button", tabindex: "0", onclick: collapse, onkeydown: keyActivate(collapse), title: "Collapse notes" }, [
     icon("note", 14),
     el("span", { text: "Your notes" }),
     (S.live.notes && S.live.notes.trim()) ? el("span", { class: "chip muted", text: "saved on this computer" }) : null,
     el("span", { class: "grow" }),
-    icon(open ? "chevDown" : "chevRight", 14),
+    icon("chevRight", 14),
   ]);
-  if (!open) return el("div", { class: "notes-panel" }, head);
   var ta = el("textarea", { class: "field notes-ta", value: S.live.notes || "",
     placeholder: "Jot notes as the meeting goes: decisions, names, to-dos. Saved with this meeting on your computer. When you summarise, you choose whether to fold them in.",
     oninput: function (e) { S.live.notes = e.target.value; scheduleNotesSave(); } });
-  return el("div", { class: "notes-panel open" }, [head, ta]);
+  return el("div", { class: "notes-col" }, [head, ta]);
+}
+function notesRail() {
+  var expand = function () { S.live.notesOpen = true; render(); };
+  return el("div", { class: "notes-rail" },
+    el("button", { class: "rail-btn", onclick: expand, title: "Open notes" }, [
+      icon("note", 15),
+      el("span", { class: "vert", text: "Notes" }),
+    ]));
 }
 
 function liveView() {
@@ -1692,7 +1776,13 @@ function liveView() {
     S.live.outputPath ? el("span", { class: "saving" }, ["Saving to ", el("span", { class: "mono", text: baseName(S.live.outputPath) })]) : null,
   ]);
 
-  return el("div", { class: "live" }, [header, liveAudioStrip(), liveTuneStrip(), liveBodyEl, liveNotesPanel(), footer]);
+  // Transcript left, notes right (or a slim rail when collapsed), splitter between.
+  var split = el("div", { class: "live-split" }, [liveBodyEl]);
+  split.style.setProperty("--vm-notes-w", notesWidth() + "px");
+  if (S.live.notesOpen) { split.appendChild(splitHandle(split)); split.appendChild(notesCol()); }
+  else { split.appendChild(notesRail()); }
+
+  return el("div", { class: "live" }, [header, liveAudioStrip(), liveTuneStrip(), split, footer]);
 }
 
 /* ── record only ──────────────────────────────────────────── */
@@ -1719,9 +1809,9 @@ function recordOnlyView() {
     ]);
     return el("div", { class: "live" }, [header, liveAudioStrip(), body, footer]);
   }
-  // stopped: handoff
+  // stopped: handoff (the shell supplies .main now that this route renders with the sidebar)
   var stem = S.finish.recordingStem;
-  return el("div", { class: "main" }, el("div", { class: "screen center" }, el("div", { class: "screen-inner col-narrow stack", style: { gap: "18px" } }, [
+  return el("div", { class: "screen center" }, el("div", { class: "screen-inner col-narrow stack", style: { gap: "18px" } }, [
     el("div", { class: "row gap-12" }, [
       el("div", { class: "tone-tile ok", style: { width: "40px", height: "40px" } }, icon("check", 20)),
       el("div", {}, [el("h1", { style: { fontSize: "24px" }, text: "Recording saved." }),
@@ -1739,7 +1829,7 @@ function recordOnlyView() {
       ]),
     ]),
     el("p", { class: "ink-3", style: { fontSize: "12px" } }, ["You can transcribe a recording any time from ", el("span", { class: "link", onclick: function () { go("history"); } }, "History"), ". Recordings are kept until you delete them."]),
-  ])));
+  ]));
 }
 
 /* ── importing ────────────────────────────────────────────── */
@@ -3273,6 +3363,8 @@ function adoptRunning(status) {
   S.live.micDevice = status.mic_device != null ? status.mic_device : null;
   S.live.loopbackDevice = status.loopback_device != null ? status.loopback_device : null;
   openStream(); startElapsed();
+  seedFromTranscript();
+  seedNotes();
   if (status.source_kind !== "file") startLevels();
   if (status.source_kind === "file") {
     S.route = "importing";
@@ -3282,6 +3374,45 @@ function adoptRunning(status) {
   } else {
     S.route = "recordonly";
   }
+}
+
+// After a full reload mid-session, S.live.segments only holds lines that arrived AFTER the
+// reload (the SSE stream has no replay). The saved transcript has everything so far, in the
+// exact "[mm:ss] [SRC] text" format MarkdownSink writes: fetch it and seed the earlier lines.
+// Any failure just leaves the post-reload view; the stream carries on regardless.
+function seedFromTranscript() {
+  var name = baseName(S.live.outputPath || "");
+  if (!/\.md$/.test(name)) return;
+  api.text("/sessions/" + encodeURIComponent(name)).then(function (txt) {
+    var re = /^\[(\d+):(\d{2})\]\s+\[([A-Za-z]+)\]\s+(.*)$/;
+    var out = [];
+    var lines = txt.split(/\r?\n/);
+    for (var i = 0; i < lines.length; i++) {
+      var m = re.exec(lines[i]);
+      if (m) out.push({ t_start: parseInt(m[1], 10) * 60 + parseInt(m[2], 10), source: m[3], text: m[4] });
+    }
+    if (!out.length) return;
+    // Dedupe against segments that already arrived over SSE while the file was in flight.
+    var seen = {};
+    function key(s) { return fmtTs(s.t_start) + "|" + (s.source || "") + "|" + (s.text || ""); }
+    for (var j = 0; j < S.live.segments.length; j++) seen[key(S.live.segments[j])] = true;
+    var earlier = out.filter(function (s) { return !seen[key(s)]; });
+    if (!earlier.length) return;
+    S.live.segments = earlier.concat(S.live.segments);
+    if (S.route === "live" || S.route === "importing") render();
+  }).catch(function () {});
+}
+// Same idea for the user's own notes: repopulate the live panel from the saved sidecar so
+// typing after a reload extends the notes instead of starting from a blank textarea.
+function seedNotes() {
+  var stem = liveStem();
+  if (!stem) return;
+  api.get("/api/notes?stem=" + encodeURIComponent(stem)).then(function (n) {
+    if (n && n.text && !S.live.notes) {
+      S.live.notes = n.text;
+      if (S.route === "live") render();
+    }
+  }).catch(function () {});
 }
 
 // Global keyboard shortcuts: Escape closes the stop popover; Cmd/Ctrl+Enter

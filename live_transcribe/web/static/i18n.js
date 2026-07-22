@@ -599,6 +599,9 @@ window.VM_I18N = {
     "Summarising": "Som tans op",
     "Re-transcribe": "Hertranskribeer",
 
+    // Sidebar return pill while a session runs on another screen
+    "Return to meeting": "Terug na vergadering",
+
     // Meeting notes (live panel, history pill, and the reader's editable My notes tab)
     "Notes": "Notas",
     "My notes": "My notas",

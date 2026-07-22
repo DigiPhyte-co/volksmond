@@ -57,6 +57,7 @@ DEFAULTS = {
     "business_nudge_seen": False,     # the one-time business-use nudge has been shown and dismissed, so it never repeats.
     "summary_footer": True,           # append a small "Made with Volksmond" line to the summary file. Never the raw transcript, never any export of it.
     "calendar_reminders": True,       # while the app is open, poll the LOCAL Outlook calendar and nudge "start transcribing?" when a meeting begins. Business feature; inert without a licence + Outlook + pywin32. Local only, no network call.
+    "live_notes_width": 0,            # width (px) of the live-screen notes column; 0 = default. Disk mirror of localStorage vm_live_split, which the WebView can wipe between launches.
 }
 
 

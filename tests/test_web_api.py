@@ -325,6 +325,20 @@ def test_summary_device_and_capability():
     print("  OK  /api/models reports summary GPU capability + device; summary_device round-trips")
 
 
+def test_live_notes_width_roundtrip():
+    # The live-screen notes column width persists to disk (settings.json) as well as
+    # localStorage, because the WebView can wipe localStorage between launches.
+    from live_transcribe import config
+    orig = config.load().get("live_notes_width")
+    try:
+        assert client.post("/api/settings", json={"live_notes_width": 340}).json()["live_notes_width"] == 340
+        assert client.get("/api/settings").json()["live_notes_width"] == 340
+        assert client.post("/api/settings", json={"live_notes_width": 0}).json()["live_notes_width"] == 0
+    finally:
+        config.update({"live_notes_width": orig or 0})
+    print("  OK  live_notes_width round-trips through /api/settings")
+
+
 def test_fits_on_gpu_logic():
     # The GPU fit check: full offload only when the model file plus a working-memory
     # headroom fits in VRAM. A tiny real file fits a big card; nothing fits an unknown
@@ -557,6 +571,7 @@ if __name__ == "__main__":
                test_filename_allow_list,
                test_license_pubkey_precedence,
                test_summary_device_and_capability,
+               test_live_notes_width_roundtrip,
                test_fits_on_gpu_logic,
                test_levels_and_switch_device,
                test_recording_channel_bundling,
