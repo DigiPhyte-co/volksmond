@@ -72,11 +72,16 @@ async def _csrf_and_security_headers(request: Request, call_next):
 
 
 class BrowserSink:
-    """Fan-out sink: each connected SSE client gets its own queue."""
+    """Fan-out sink: each connected SSE client gets its own queue.
 
-    def __init__(self):
+    source_labels: optional {internal_tag: display_label} map applied to the streamed
+    payload only (e.g. MIC/SYS -> Speaker L/Speaker R for a stereo interview upload);
+    the pipeline's internal tags are never changed."""
+
+    def __init__(self, source_labels=None):
         self._subscribers: list[queue.Queue] = []
         self._lock = threading.Lock()
+        self._labels = source_labels or {}
 
     def add_subscriber(self) -> queue.Queue:
         q = queue.Queue(maxsize=500)
@@ -93,7 +98,7 @@ class BrowserSink:
 
     def __call__(self, segment):
         payload = {
-            "source": segment.source,
+            "source": self._labels.get(segment.source, segment.source),
             "t_start": segment.t_start,
             "t_end": segment.t_end,
             "text": segment.text,
@@ -138,6 +143,10 @@ class _State:
         # during finalisation and kept across reset() so the UI can show it after
         # the session ends; cleared when the next session starts.
         self.sink_error: Optional[str] = None
+        # Non-fatal notice about the running (or just-finished) session, surfaced via
+        # /api/status the same sticky way (e.g. "stereo interview requested but the file
+        # is mono"). Cleared when the next session starts.
+        self.notice: Optional[str] = None
 
     def reset(self):
         self.engine = None
@@ -216,7 +225,7 @@ class StartRequest(BaseModel):
     topic: str = ""
     tier: str = "auto"            # "auto" | "gpu" | "cpu-strong" | "cpu-mid"
     device: str = "auto"          # "auto"/"gpu" use the GPU when ready; "cpu" forces CPU
-    language: str = "af"          # "af" | "en" | "" (empty == auto-detect)
+    language: str = "af"          # "af" | "en" | "sa" (SA group) | a code like "zu"/"de" | "" (empty == auto-detect)
     engine: str = "auto"          # model family: "auto" (by language) | "fluister" | "whisper"
     prompt: str = ""
     mic_device: Optional[str] = None
@@ -311,7 +320,8 @@ def index():
 def status():
     with STATE.lock:
         if not STATE.running:
-            return {"running": False, "stopping": False, "sink_error": STATE.sink_error}
+            return {"running": False, "stopping": False, "sink_error": STATE.sink_error,
+                    "notice": STATE.notice}
         live_err = STATE.md_sink.last_error if STATE.md_sink else None
         resp = {
             "running": True,
@@ -327,9 +337,16 @@ def status():
             "output_path": str(STATE.output_path) if STATE.output_path else None,
             "started_at": STATE.started_at.isoformat() if STATE.started_at else None,
             "sink_error": live_err or STATE.sink_error,
+            "notice": STATE.notice,
             "mic_device": STATE.mic_device,
             "loopback_device": STATE.loopback_device,
         }
+        # Live AEC truth for the in-meeting toggle: the ENGINE'S actual state, never the stored
+        # setting (a long-running instance can drift from disk; the toggle must not lie).
+        if STATE.source_kind == "live" and STATE.capture is not None:
+            avail, active = STATE.capture.aec_state()
+            resp["aec_live_available"] = avail
+            resp["aec_live_active"] = active
         if STATE.stopping and STATE.engine is not None:
             resp["pending"] = STATE.engine.pending()
         return resp
@@ -430,9 +447,41 @@ def switch_device(req: SwitchDeviceRequest):
         return {"which": req.which, "device": req.device, "mic_device": mic, "loopback_device": loop}
 
 
+class AecLiveRequest(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/aec-live")
+def set_aec_live(req: AecLiveRequest):
+    """Turn live echo cancellation on or off DURING a live session, without ending it.
+
+    The capture keeps the WebRTC APM worker running (bypassed when off), so both directions are a
+    per-frame flip: no capture rebuild, no audio gap, effective within ~1s. The user's choice is
+    also persisted as the new default, so the pre-meeting toggle and disk stay in sync with what
+    the engine is actually doing. Returns the CONFIRMED engine state, which the UI renders."""
+    with STATE.lock:
+        if not (STATE.running and not STATE.stopping and STATE.source_kind == "live"
+                and STATE.capture is not None):
+            raise HTTPException(status_code=409, detail="Echo cancellation can only be changed during a live session.")
+        cap = STATE.capture
+        if not cap.set_aec(bool(req.enabled)):
+            raise HTTPException(status_code=409, detail="Echo cancellation is not available in this session. It needs both a microphone and system audio captured from the start.")
+        avail, active = cap.aec_state()
+    # Persist outside the state lock (config.update does disk I/O). The live toggle already took
+    # effect either way, so a failed write must never fail the request; report it honestly in
+    # `persisted` instead, so the UI can warn that the choice will not survive as the default.
+    persisted = True
+    try:
+        config.update({"aec_live": bool(req.enabled)})
+    except Exception as e:
+        persisted = False
+        print(f"[aec-live] toggle applied but the setting could not be saved: {e}", flush=True)
+    return {"aec_live_available": avail, "aec_live_active": active, "persisted": persisted}
+
+
 class ReconfigureRequest(BaseModel):
     # All optional; omit a field to leave it unchanged. language "" == auto-detect.
-    language: Optional[str] = None    # "af" | "en" | ""
+    language: Optional[str] = None    # "af" | "en" | "sa" | a code like "zu"/"de" | ""
     tier: Optional[str] = None        # quality/model key (a model size like "medium", or "auto")
     engine: Optional[str] = None      # "auto" | "fluister" | "whisper"
 
@@ -463,7 +512,12 @@ def reconfigure(req: ReconfigureRequest):
         compute = engine._compute_type
         threads = engine._cpu_threads
         cur_size = engine.size
-        cur_language = engine.language            # None (auto) | "af" | "en"
+        # The engine stores the DECODE token, which is None for auto-detect AND for every South
+        # African language (see transcribe.decode_language), so it cannot stand in for the user's
+        # language here: an isiZulu session would read as auto-detect and a tier-only change would
+        # re-route the family off Swivuriso. The canonical user-selected code lives in
+        # STATE.language ("zu" / "sa" / "af" / ... / "auto").
+        cur_language = None if STATE.language in (None, "auto") else STATE.language
         cur_engine_pref = engine.engine
         cur_family = engine.family                # "fluister" | "whisper" | "swivuriso"
 
@@ -501,13 +555,16 @@ def reconfigure(req: ReconfigureRequest):
         if not (STATE.running and STATE.transcribing and not STATE.stopping
                 and STATE.source_kind == "live" and STATE.engine is engine):
             raise HTTPException(status_code=409, detail="The session changed before the new settings could apply.")
-        # Swivuriso has no faster-whisper codes for the South African languages, so it always decodes on
-        # auto-detect; every other family uses the chosen language.
+        # Swivuriso (and any South African code on any family) decodes on auto-detect; every
+        # other explicit code is forced as-is (see transcribe.decode_language).
         eff_family = family if family is not None else cur_family
-        decode_lang = None if eff_family == "swivuriso" else new_lang
+        decode_lang = transcribe.decode_language(eff_family, new_lang)
         engine.request_change(language=decode_lang, engine=new_engine_pref,
                               model=model, model_name=model_name, size=new_size, family=family)
-        STATE.language = (new_lang or "auto")
+        # Only a request that actually carries a language change may rewrite the session's
+        # canonical language; a tier/engine-only change keeps it exactly as the user chose it.
+        if change_lang:
+            STATE.language = (new_lang or "auto")
         if model is not None:
             if new_tier is not None:
                 STATE.tier = new_tier
@@ -596,6 +653,7 @@ def start(req: StartRequest):
         if STATE.running:
             raise HTTPException(status_code=409, detail="Session already running")
         STATE.sink_error = None  # fresh session: clear any prior write error
+        STATE.notice = None
 
         transcribe_on = bool(req.transcribe)
         record_on = bool(req.record)
@@ -730,6 +788,9 @@ class TranscribeFileRequest(BaseModel):
     prompt: str = ""
     engine: str = "auto"           # model family override, mirrors StartRequest
     aec: Optional[bool] = None     # echo cancellation on a re-transcribe (None -> settings default)
+    stereo_split: bool = False     # upload option: a 2-channel file is an interview, one speaker
+                                   # per channel (e.g. Samsung Interview mode); transcribe L and R
+                                   # separately. Mono files fall back to the normal single track.
 
 
 @app.post("/api/transcribe-file")
@@ -772,6 +833,7 @@ def transcribe_file(req: TranscribeFileRequest):
         if STATE.running:
             raise HTTPException(status_code=409, detail="A session is already running")
         STATE.sink_error = None  # fresh session: clear any prior write error
+        STATE.notice = None
         tier, language, prompt, engine_pref = _resolve_tier_lang_prompt(req)
         chunk_seconds = default_chunk_seconds(tier)
         # Echo cancellation on a re-transcribe: only when both channels (MIC + SYS) are present
@@ -800,8 +862,16 @@ def transcribe_file(req: TranscribeFileRequest):
                 output_path.unlink()
             except OSError:
                 pass
-        md_sink = sinks.MarkdownSink(output_path)
-        browser_sink = BrowserSink()
+        # Stereo interview mode is an UPLOAD option only, never for a saved Volksmond recording
+        # (whose stereo file means MIC/SYS = you/everyone-else, handled by the branch below).
+        stereo_split = bool(req.stereo_split) and not base
+        # Presentation seam for interview mode: the pipeline keeps its two internal source tags
+        # (MIC = left, SYS = right) so chunking, echo dedup, and merging all work unchanged, and
+        # only the sinks relabel them at write/stream time. An interview upload must not claim
+        # the channels are "your mic" and "your computer's audio".
+        src_labels = {"MIC": "Speaker L", "SYS": "Speaker R"} if stereo_split else None
+        md_sink = sinks.MarkdownSink(output_path, source_labels=src_labels)
+        browser_sink = BrowserSink(source_labels=src_labels)
         engine.subscribe(md_sink)
         engine.subscribe(browser_sink)
         engine.start()
@@ -866,6 +936,49 @@ def transcribe_file(req: TranscribeFileRequest):
                             if src == "MIC" and gate_on and float(_np.sqrt(_np.mean(chunk * chunk))) < 1.8e-3:
                                 continue
                             items.append((i / 16000.0, src, chunk))
+
+            # Stereo interview upload: one speaker per channel. Decode the channels separately
+            # (any rate/codec; PyAV resamples to 16k) and feed them through the same two-source
+            # merge as a saved recording, so each side transcribes on its own and the sinks
+            # label them Speaker L / Speaker R. The cross-channel bleed gate is applied
+            # SYMMETRICALLY (each side gated against a pristine copy of the other), unlike the
+            # saved-recording branch which only gates MIC: the close-time text dedup and the
+            # engine's echo veto both clean only the MIC side, so ungated bleed in the RIGHT
+            # channel would survive as ghost lines. Measured on the real Samsung Interview-mode
+            # test recording the channels sit a median 22 dB apart, so the shipped 10 dB
+            # threshold separates cleanly; genuine double-talk (within 10 dB) is kept on both
+            # sides. The SysEnergyRing echo veto is NOT wired here: it is one-directional
+            # (MIC-only) and the symmetric gate already removed the bleed it would judge.
+            # A mono source upmixes to two identical channels, detected exactly and sent down
+            # the normal single-track path with a notice for the UI.
+            if not items and stereo_split and len(files) == 1:
+                import numpy as _np
+                left = right = None
+                try:
+                    left, right = decode_audio(files[0], sampling_rate=16000, split_stereo=True)
+                except Exception as e:
+                    print(f"[transcribe-file] stereo split decode failed ({e}); using the normal path", flush=True)
+                if left is not None and not _np.array_equal(left, right):
+                    gate_on = os.environ.get("SA_LIVE_XCHAN_GATE", "1") != "0"
+                    if gate_on:
+                        gl, _sl, _tl = transcribe.xchan_gate_mic(left, right)
+                        gr, _sr, _tr = transcribe.xchan_gate_mic(right, left)
+                        print(f"[transcribe-file] stereo interview gate: L {_sl}/{_tl}, R {_sr}/{_tr} frames silenced", flush=True)
+                        left, right = gl, gr
+                    for src, chan in (("MIC", left), ("SYS", right)):
+                        for i in range(0, len(chan), win):
+                            chunk = _np.ascontiguousarray(chan[i:i + win])
+                            # A chunk the gate reduced to near-silence is pure bleed: skip it so
+                            # Whisper never hallucinates on it (same guard as the saved-recording
+                            # branch, applied to both sides because the gate ran on both).
+                            if gate_on and float(_np.sqrt(_np.mean(chunk * chunk))) < 1.8e-3:
+                                continue
+                            items.append((i / 16000.0, src, chunk))
+                    print("[transcribe-file] stereo interview split: left/right transcribed as two speakers", flush=True)
+                elif left is not None:
+                    with STATE.lock:
+                        STATE.notice = "File is mono, transcribed as a single track"
+                    print("[transcribe-file] stereo split requested but the file is mono; single track", flush=True)
 
             if not items:
                 # Legacy / import path. When the file set has both a MIC and a SYS channel (an old
@@ -1295,6 +1408,7 @@ class SettingsPatch(BaseModel):
     business_nudge_seen: Optional[bool] = None
     summary_footer: Optional[bool] = None
     calendar_reminders: Optional[bool] = None
+    live_notes_width: Optional[int] = None  # live-screen notes column width (px); 0 = default
     # summary_model is intentionally NOT settable here: only the verified downloader
     # (modeldl.py) sets it, to a pinned catalogue filename, so an arbitrary or
     # unverified path cannot be made the active summary model via the settings API.

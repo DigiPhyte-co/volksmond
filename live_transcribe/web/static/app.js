@@ -144,7 +144,10 @@ function freshLive() {
     startedAt: null, outputPath: null, audioStem: null, tier: null, model: null, family: null,
     language: null, engine: null, stopping: false, segments: [], es: null, title: "", importName: "",
     micDevice: null, loopbackDevice: null, switching: false, reconfiguring: false,
-    notes: "", notesOpen: false,
+    notes: "", notesOpen: false, notesTouched: false,
+    // Live AEC toggle: rendered from the ENGINE'S confirmed state (/api/status, /api/aec-live),
+    // never from stored settings, so it can never show a value the engine does not have.
+    aecAvailable: false, aecActive: false, aecBusy: false, noticeShown: "",
   };
 }
 var S = {
@@ -153,7 +156,7 @@ var S = {
   sessions: [], sessionsFolder: "", sessionsActive: null, sessionsSummarising: [],
   live: freshLive(),
   starting: { active: false, kind: null, title: "", error: null, startedAt: null },
-  form: { title: "", language: "af", tier: "auto", device: "auto", engine: "auto", participants: [], terms: [], record: false, aec: false, mic: null, loopback: null, advancedOpen: false },
+  form: { title: "", language: "af", moreLang: null, tier: "auto", device: "auto", engine: "auto", participants: [], terms: [], record: false, aec: false, stereoSplit: false, mic: null, loopback: null, advancedOpen: false },
   setup: { stage: "welcome", choice: "transcribe" },
   finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null },
   reader: { name: "", title: "", text: "", summarising: false, summary: null },
@@ -167,7 +170,7 @@ var S = {
 };
 
 // transient refs + timers (not part of render state)
-var liveDocEl = null, liveBodyEl = null, elapsedEl = null, recTimerEl = null;
+var liveDocEl = null, liveBodyEl = null, elapsedEl = null, recTimerEl = null, returnPillTimeEl = null;
 var pollTimer = null, elapsedTimer = null, toastTimer = null, levelTimer = null, warmTimer = null, histTimer = null, reminderTimer = null;
 var startingTimer = null, startingElapsedEl = null;
 
@@ -248,6 +251,12 @@ if (window.matchMedia) {
 }
 
 /* ── navigation ───────────────────────────────────────────── */
+// The live-family route for the CURRENT running session, so the sidebar and the
+// return pill can navigate back to it instead of a fresh pre-meeting form.
+function liveRoute() {
+  if (S.live.sourceKind === "file") return "importing";
+  return S.live.transcribing ? "live" : "recordonly";
+}
 function go(route) {
   if ((S.route === "live" || S.route === "importing" || S.route === "recordonly") &&
       route !== S.route && !S.live.running) {
@@ -307,10 +316,13 @@ function onSegment(seg) {
 }
 function segRow(seg) {
   var src = (seg.source || "").toUpperCase();
-  var cls = src === "MIC" ? "mic" : (src === "SYS" ? "sys" : "file");
+  // Stereo interview mode streams "Speaker L"/"Speaker R"; keep their case (no shouting) and
+  // reuse the mic/sys colouring so the two sides stay visually distinct.
+  var cls = (src === "MIC" || src === "SPEAKER L") ? "mic" : ((src === "SYS" || src === "SPEAKER R") ? "sys" : "file");
+  var disp = (src === "SPEAKER L" || src === "SPEAKER R") ? (seg.source || "") : src;
   return el("div", { class: "row" }, [
     el("div", { class: "t", text: fmtTs(seg.t_start) }),
-    el("div", {}, [el("span", { class: "src " + cls, text: "[" + src + "]" }), raw(seg.text || "")]),
+    el("div", {}, [el("span", { class: "src " + cls, text: "[" + disp + "]" }), raw(seg.text || "")]),
   ]);
 }
 
@@ -389,6 +401,49 @@ async function reconfigureLive(patch, okMsg) {
     S.live.reconfiguring = false; render();
   }
 }
+// Pull the engine's ACTUAL live-AEC state into S.live (available + active). The in-meeting
+// toggle renders only from this server-confirmed state, never from S.form or stored settings,
+// so a long-running app instance can never show a value the engine does not have.
+function refreshLiveAec() {
+  api.get("/api/status").then(function (st) {
+    if (!st || !st.running) return;
+    S.live.aecAvailable = !!st.aec_live_available;
+    S.live.aecActive = !!st.aec_live_active;
+    if (S.route === "live" || S.route === "recordonly") render();
+  }).catch(function () {});
+}
+// Toggle live echo cancellation mid-meeting. The UI reflects the CONFIRMED new state from the
+// server response, not an optimistic flip; the server also persists the choice as the new
+// default, so the pre-meeting toggle and disk stay in sync.
+async function toggleLiveAec() {
+  if (S.live.aecBusy) return;
+  S.live.aecBusy = true; render();
+  try {
+    var resp = await api.post("/api/aec-live", { enabled: !S.live.aecActive });
+    S.live.aecAvailable = !!resp.aec_live_available;
+    S.live.aecActive = !!resp.aec_live_active;
+    S.form.aecLive = S.live.aecActive;
+    if (S.settings) S.settings.aec_live = S.live.aecActive;
+    // The toggle itself worked either way; if the server could not save it as the new default
+    // (persisted false), warn softly so the user knows the next meeting starts from the old value.
+    if (resp.persisted === false) toast("Echo cancellation changed for this meeting, but the choice could not be saved as your default.");
+    else toast(S.live.aecActive ? "Echo cancellation on." : "Echo cancellation off.");
+  } catch (e) {
+    toast(e.message || "Could not change echo cancellation.", true);
+  } finally {
+    S.live.aecBusy = false; render();
+  }
+}
+// Compact in-meeting AEC control for the live audio strip. Hidden when the canceller never
+// engaged this session (mic-only capture, or the binding is missing): the toggle would lie.
+function liveAecToggle() {
+  if (S.live.sourceKind !== "live" || !S.live.aecAvailable) return null;
+  return el("div", { class: "row gap-6", style: { alignItems: "center", flex: "0 0 auto" },
+    title: tr("Remove the other side's voice that your speakers leak into your microphone, live as the meeting happens. Best on speakers when you are mostly listening; it can blur your words during heavy crosstalk, and does nothing on headphones.") }, [
+    el("span", { class: "ink-3", style: { fontSize: "11.5px" }, text: "Cancel echo live" }),
+    S.live.aecBusy ? el("span", { class: "spinner sm" }) : toggleEl(!!S.live.aecActive, toggleLiveAec),
+  ]);
+}
 // Compact strip for the live + record-only screens: per source, a dropdown to switch the
 // device on the fly and a level meter. An empty device list degrades to "not detected".
 function liveAudioStrip() {
@@ -416,6 +471,7 @@ function liveAudioStrip() {
   return el("div", { class: "row gap-16", style: { flexWrap: "wrap", padding: "10px 16px", borderBottom: "1px solid var(--line)", background: "var(--surface-2)" } }, [
     channel("mic", "mic", dev.mics, S.live.micDevice, dev.default_mic_index, "vm-meter-mic"),
     channel("loopback", "speaker", dev.loopbacks, S.live.loopbackDevice, dev.default_loopback_index, "vm-meter-sys"),
+    liveAecToggle(),
   ]);
 }
 // Compact strip on the live screen to change the LANGUAGE and MODEL mid-meeting. Language alone
@@ -497,7 +553,7 @@ async function startLive() {
     S.live.engine = S.form.engine;
     S.live.title = S.form.title || "Live meeting";
     S.live.micDevice = S.form.mic; S.live.loopbackDevice = S.form.loopback;
-    go("live"); openStream(); startElapsed(); startLevels();
+    go("live"); openStream(); startElapsed(); startLevels(); refreshLiveAec();
   } catch (e) {
     // Surface the failure on the Starting screen (with Back), not just a toast that
     // vanishes; the model-load error ("Could not load model ...") needs to be readable.
@@ -516,7 +572,7 @@ async function startRecordOnly() {
     S.live.outputPath = resp.output_path; S.live.audioStem = resp.audio_stem;
     S.live.title = S.form.title || "Recording";
     S.live.micDevice = S.form.mic; S.live.loopbackDevice = S.form.loopback;
-    go("recordonly"); startElapsed(); startLevels();
+    go("recordonly"); startElapsed(); startLevels(); refreshLiveAec();
   } catch (e) { toast(e.message || "Could not start recording.", true); }
 }
 
@@ -546,7 +602,7 @@ function recordPreView() {
 }
 async function startImport(arg) {
   var body = { topic: arg.topic || "", tier: S.form.tier, device: S.form.device, language: S.form.language, engine: S.form.engine, aec: !!S.form.aec, prompt: (S.form.participants || []).concat(S.form.terms || []).join(", ") };
-  if (arg.path) body.paths = [arg.path];
+  if (arg.path) { body.paths = [arg.path]; body.stereo_split = !!S.form.stereoSplit; }
   if (arg.stem) body.stem = arg.stem;
   beginStarting("file", arg.topic || S.importName || "Recording");
   try {
@@ -558,8 +614,15 @@ async function startImport(arg) {
     S.live.outputPath = resp.output_path; S.live.tier = resp.tier; S.live.model = resp.model; S.live.family = resp.family;
     S.live.importName = baseName(arg.path) || (arg.topic || "recording");
     S.live.title = arg.topic || topicFromName(baseName(resp.output_path));
-    go("importing"); openStream();
-    pollStatus(function (st) { return !st.running; }, function () { gotoFinish(S.live.outputPath); });
+    go("importing"); openStream(); startElapsed();
+    // Surface a non-fatal server notice (e.g. "stereo requested but the file is mono") once,
+    // whether it lands mid-run or only on the final poll.
+    var showNotice = function (st) {
+      if (st && st.notice && S.live.noticeShown !== st.notice) { S.live.noticeShown = st.notice; toast(tr(st.notice)); }
+    };
+    pollStatus(function (st) { return !st.running; },
+      function (st) { showNotice(st); gotoFinish(S.live.outputPath); },
+      showNotice);
   } catch (e) {
     if (startingTimer) { clearInterval(startingTimer); startingTimer = null; }
     if (S.route === "starting") { S.starting.error = e.message || "Could not start transcription."; render(); }
@@ -571,6 +634,7 @@ function startElapsed() {
   elapsedTimer = setInterval(function () {
     if (elapsedEl) elapsedEl.textContent = fmtElapsed(S.live.startedAt);
     if (recTimerEl) recTimerEl.textContent = fmtElapsed(S.live.startedAt);
+    if (returnPillTimeEl) returnPillTimeEl.textContent = fmtElapsed(S.live.startedAt);
   }, 1000);
 }
 async function pickFile(kind) {
@@ -664,6 +728,7 @@ async function importFromPicker() {
   // then transcribe - same as a live meeting gets its pre-meeting setup.
   S.importPath = p; S.importStem = null; S.importName = baseName(p);
   S.form.title = ""; S.form.participants = []; S.form.terms = [];
+  S.form.stereoSplit = false;   // per-file choice, never carried from a previous upload
   go("importpre");
 }
 
@@ -971,7 +1036,7 @@ function render() {
   var keepScroll = (S.route === _renderedRoute);
   var prevScroller = keepScroll ? APP.querySelector(".screen, .solo, .live-body") : null;
   var prevScrollTop = prevScroller ? prevScroller.scrollTop : 0;
-  liveDocEl = liveBodyEl = elapsedEl = recTimerEl = null;
+  liveDocEl = liveBodyEl = elapsedEl = recTimerEl = returnPillTimeEl = null;
   clear(APP);
   var view;
   switch (S.route) {
@@ -981,9 +1046,11 @@ function render() {
     case "pre": view = shell("home", preView()); break;
     case "importpre": view = shell("home", importPreView()); break;
     case "recordpre": view = shell("home", recordPreView()); break;
-    case "live": view = liveView(); break;
-    case "recordonly": view = recordOnlyView(); break;
-    case "importing": view = importingView(); break;
+    // The live-family views render inside the shell so Meeting/History/Settings stay
+    // reachable during a session; capture is server-side, so navigating away loses nothing.
+    case "live": view = shell("home", liveView()); break;
+    case "recordonly": view = shell("home", recordOnlyView()); break;
+    case "importing": view = shell("home", importingView()); break;
     case "finish": view = shell("home", finishView()); break;
     case "history": view = shell("history", historyView()); break;
     case "reader": view = shell("history", readerView()); break;
@@ -1014,8 +1081,20 @@ function shell(active, mainNode) {
 }
 function sidebar(active) {
   function nav(id, label, ic, route) {
-    return el("button", { class: "nav-item" + (active === id ? " active" : ""), onclick: function () { go(route); } },
+    return el("button", { class: "nav-item" + (active === id ? " active" : ""), onclick: function () { go(typeof route === "function" ? route() : route); } },
       [icon(ic, 17), el("span", { text: label })]);
+  }
+  // While a session runs, a pulsing pill on every OTHER screen leads straight back to it.
+  // The elapsed time updates in place (startElapsed), never via render().
+  function returnPill() {
+    if (!S.live.running) return null;
+    if (S.route === "live" || S.route === "recordonly" || S.route === "importing") return null;
+    returnPillTimeEl = el("span", { class: "mono", text: fmtElapsed(S.live.startedAt) });
+    return el("button", { class: "return-pill", onclick: function () { go(liveRoute()); } }, [
+      el("span", { class: "dot" }),
+      el("span", { class: "rp-label", text: "Return to meeting" }),
+      returnPillTimeEl,
+    ]);
   }
   return el("aside", { class: "sidebar" }, [
     el("div", { class: "brand" }, [
@@ -1023,10 +1102,12 @@ function sidebar(active) {
       el("div", { class: "brand-sub", text: "by DigiPhyte" }),
     ]),
     el("nav", { class: "nav" }, [
-      nav("home", "Meeting", "mic", "home"),
+      // Meeting returns to the RUNNING session when there is one, never a fresh form.
+      nav("home", "Meeting", "mic", function () { return S.live.running ? liveRoute() : "home"; }),
       nav("history", "History", "clock", "history"),
       nav("settings", "Settings", "gear", "settings"),
     ]),
+    returnPill(),
     el("div", { class: "spacer" }),
     el("div", { class: "local-pill" }, [icon("lock", 14), el("span", { text: "Local only, no internet" })]),
     // The manual "Check for updates" is a user-initiated convenience (one outbound call, only on
@@ -1149,8 +1230,8 @@ function setupView() {
       // If the removed language was the saved default, move the default to a kept one, so an
       // English-only first run does not still start in Afrikaans/Fluister (mirrors transcriptionCard).
       var cur = S.settings && S.settings.transcription_language;
-      if (cur && cur !== "" && sel.indexOf(cur) < 0) patch.transcription_language = sel[0];
-      if (S.form && S.form.language && S.form.language !== "" && S.form.language !== "sa" && sel.indexOf(S.form.language) < 0) S.form.language = sel[0];
+      if (cur && langIsToggleable(cur) && sel.indexOf(cur) < 0) patch.transcription_language = sel[0];
+      if (S.form && S.form.language && langIsToggleable(S.form.language) && sel.indexOf(S.form.language) < 0) S.form.language = sel[0];
       saveSettings(patch);
     };
     inner = el("div", { class: "col-narrow stack", style: { gap: "18px" } }, [
@@ -1624,7 +1705,13 @@ var notesSaveTimer = null;
 function liveStem() { return baseName(S.live.outputPath || "").replace(/\.md$/, ""); }
 function scheduleNotesSave() {
   if (notesSaveTimer) clearTimeout(notesSaveTimer);
-  notesSaveTimer = setTimeout(saveNotesNow, 700);
+  // Capture the stem AND the text NOW: if the route or session changes before the debounce
+  // fires, the save still writes this text to the session it belongs to, never a later one's.
+  var stem = liveStem(), text = S.live.notes || "";
+  notesSaveTimer = setTimeout(function () {
+    notesSaveTimer = null;
+    if (stem) api.post("/api/notes", { stem: stem, text: text }).catch(function () {});
+  }, 700);
 }
 function saveNotesNow() {
   if (notesSaveTimer) { clearTimeout(notesSaveTimer); notesSaveTimer = null; }
@@ -1632,21 +1719,82 @@ function saveNotesNow() {
   if (!stem) return;
   api.post("/api/notes", { stem: stem, text: S.live.notes || "" }).catch(function () {});
 }
-function liveNotesPanel() {
-  var open = !!S.live.notesOpen;
-  var toggle = function () { S.live.notesOpen = !S.live.notesOpen; render(); };
-  var head = el("div", { class: "notes-head", role: "button", tabindex: "0", onclick: toggle, onkeydown: keyActivate(toggle) }, [
+// The notes now live in a resizable right-hand column on the live screen. notesOpen keeps its
+// old meaning: open = the full column, closed = a slim rail with a Notes button. The width is
+// dragged via the splitter, which mutates a CSS variable directly, NEVER render(): a render
+// mid-drag would rebuild the transcript DOM and steal the textarea's focus.
+var NOTES_W_DEFAULT = 300, NOTES_W_MIN = 220;
+var _notesW = 0;   // width picked up by the drag in progress, persisted on pointer-up
+function clampNotesWidth(w) {
+  var max = Math.max(NOTES_W_MIN, Math.floor(window.innerWidth * 0.6));
+  return Math.max(NOTES_W_MIN, Math.min(max, Math.round(w)));
+}
+function notesWidth() {
+  var w = 0;
+  try { w = parseInt(localStorage.getItem("vm_live_split") || "0", 10) || 0; } catch (e) {}
+  // localStorage first, settings.json as the durable mirror (the WebView can wipe localStorage).
+  if (!w && S.settings && S.settings.live_notes_width) w = parseInt(S.settings.live_notes_width, 10) || 0;
+  return w ? clampNotesWidth(w) : NOTES_W_DEFAULT;
+}
+function persistNotesWidth() {
+  if (!_notesW) return;
+  try { localStorage.setItem("vm_live_split", String(_notesW)); } catch (e) {}
+  api.post("/api/settings", { live_notes_width: _notesW })
+    .then(function (s) { if (s) S.settings = s; }).catch(function () {});
+}
+function resetNotesWidth(splitEl) {
+  _notesW = 0;
+  try { localStorage.removeItem("vm_live_split"); } catch (e) {}
+  api.post("/api/settings", { live_notes_width: 0 })
+    .then(function (s) { if (s) S.settings = s; }).catch(function () {});
+  splitEl.style.setProperty("--vm-notes-w", NOTES_W_DEFAULT + "px");
+}
+function splitHandle(splitEl) {
+  var h = el("div", { class: "split-handle", title: "Drag to resize. Double-click to reset." });
+  h.addEventListener("pointerdown", function (e) {
+    e.preventDefault();
+    try { h.setPointerCapture(e.pointerId); } catch (x) {}
+    h.classList.add("dragging");
+    function move(ev) {
+      var w = clampNotesWidth(splitEl.getBoundingClientRect().right - ev.clientX);
+      _notesW = w;
+      splitEl.style.setProperty("--vm-notes-w", w + "px");
+    }
+    function up() {
+      h.classList.remove("dragging");
+      h.removeEventListener("pointermove", move);
+      h.removeEventListener("pointerup", up);
+      h.removeEventListener("pointercancel", up);
+      persistNotesWidth();
+    }
+    h.addEventListener("pointermove", move);
+    h.addEventListener("pointerup", up);
+    h.addEventListener("pointercancel", up);
+  });
+  h.addEventListener("dblclick", function () { resetNotesWidth(splitEl); });
+  return h;
+}
+function notesCol() {
+  var collapse = function () { S.live.notesOpen = false; render(); };
+  var head = el("div", { class: "notes-head", role: "button", tabindex: "0", onclick: collapse, onkeydown: keyActivate(collapse), title: "Collapse notes" }, [
     icon("note", 14),
     el("span", { text: "Your notes" }),
     (S.live.notes && S.live.notes.trim()) ? el("span", { class: "chip muted", text: "saved on this computer" }) : null,
     el("span", { class: "grow" }),
-    icon(open ? "chevDown" : "chevRight", 14),
+    icon("chevRight", 14),
   ]);
-  if (!open) return el("div", { class: "notes-panel" }, head);
   var ta = el("textarea", { class: "field notes-ta", value: S.live.notes || "",
     placeholder: "Jot notes as the meeting goes: decisions, names, to-dos. Saved with this meeting on your computer. When you summarise, you choose whether to fold them in.",
-    oninput: function (e) { S.live.notes = e.target.value; scheduleNotesSave(); } });
-  return el("div", { class: "notes-panel open" }, [head, ta]);
+    oninput: function (e) { S.live.notes = e.target.value; S.live.notesTouched = true; scheduleNotesSave(); } });
+  return el("div", { class: "notes-col" }, [head, ta]);
+}
+function notesRail() {
+  var expand = function () { S.live.notesOpen = true; render(); };
+  return el("div", { class: "notes-rail" },
+    el("button", { class: "rail-btn", onclick: expand, title: "Open notes" }, [
+      icon("note", 15),
+      el("span", { class: "vert", text: "Notes" }),
+    ]));
 }
 
 function liveView() {
@@ -1692,7 +1840,13 @@ function liveView() {
     S.live.outputPath ? el("span", { class: "saving" }, ["Saving to ", el("span", { class: "mono", text: baseName(S.live.outputPath) })]) : null,
   ]);
 
-  return el("div", { class: "live" }, [header, liveAudioStrip(), liveTuneStrip(), liveBodyEl, liveNotesPanel(), footer]);
+  // Transcript left, notes right (or a slim rail when collapsed), splitter between.
+  var split = el("div", { class: "live-split" }, [liveBodyEl]);
+  split.style.setProperty("--vm-notes-w", notesWidth() + "px");
+  if (S.live.notesOpen) { split.appendChild(splitHandle(split)); split.appendChild(notesCol()); }
+  else { split.appendChild(notesRail()); }
+
+  return el("div", { class: "live" }, [header, liveAudioStrip(), liveTuneStrip(), split, footer]);
 }
 
 /* ── record only ──────────────────────────────────────────── */
@@ -1719,9 +1873,9 @@ function recordOnlyView() {
     ]);
     return el("div", { class: "live" }, [header, liveAudioStrip(), body, footer]);
   }
-  // stopped: handoff
+  // stopped: handoff (the shell supplies .main now that this route renders with the sidebar)
   var stem = S.finish.recordingStem;
-  return el("div", { class: "main" }, el("div", { class: "screen center" }, el("div", { class: "screen-inner col-narrow stack", style: { gap: "18px" } }, [
+  return el("div", { class: "screen center" }, el("div", { class: "screen-inner col-narrow stack", style: { gap: "18px" } }, [
     el("div", { class: "row gap-12" }, [
       el("div", { class: "tone-tile ok", style: { width: "40px", height: "40px" } }, icon("check", 20)),
       el("div", {}, [el("h1", { style: { fontSize: "24px" }, text: "Recording saved." }),
@@ -1739,7 +1893,7 @@ function recordOnlyView() {
       ]),
     ]),
     el("p", { class: "ink-3", style: { fontSize: "12px" } }, ["You can transcribe a recording any time from ", el("span", { class: "link", onclick: function () { go("history"); } }, "History"), ". Recordings are kept until you delete them."]),
-  ])));
+  ]));
 }
 
 /* ── importing ────────────────────────────────────────────── */
@@ -2266,6 +2420,17 @@ function appearanceCard() {
     ]),
   ]);
 }
+// A saved default language must reach the CURRENT app instance too (S.form seeds only at boot),
+// so the next pre-meeting screen already shows the new default without a restart.
+function saveDefaultLanguage(patch) {
+  return saveSettings(patch).then(function () {
+    var v = patch.transcription_language;
+    if (S.settings && S.settings.transcription_language === v) {
+      S.form.language = v;
+      if (langMode(v) === "more") S.form.moreLang = v;
+    }
+  });
+}
 function transcriptionCard(st) {
   var draft = S.settingsDraft || {};
   var ctxVal = draft.default_context != null ? draft.default_context : (st.default_context || "");
@@ -2275,12 +2440,21 @@ function transcriptionCard(st) {
     if (i >= 0) { if (sel.length <= 1) return; sel.splice(i, 1); }   // keep at least one language
     else sel.push(code);
     var patch = { transcribe_languages: sel };
-    // Keep the default language valid if we just removed it.
-    if (st.transcription_language !== "" && sel.indexOf(st.transcription_language) < 0) patch.transcription_language = sel[0];
+    // Keep the default language valid if we just removed it. Only the individually
+    // toggleable codes are clamped; "sa", world codes and auto-detect always stay valid.
+    if (langIsToggleable(st.transcription_language) && sel.indexOf(st.transcription_language) < 0) {
+      patch.transcription_language = sel[0];
+      saveDefaultLanguage(patch);
+      return;
+    }
     saveSettings(patch);
   }
   var afOn = sel.indexOf("af") >= 0;
+  // Every pre-meeting language mode is defaultable: the ticked languages above, the
+  // South African group, each world language, and auto-detect.
   var defOpts = sel.map(function (c) { return [c, langName(c)]; });
+  defOpts.push(["sa", "South African languages"]);
+  WORLD_LANGS.forEach(function (w) { defOpts.push(w.slice()); });
   defOpts.push(["", "Auto-detect"]);
   return el("div", { class: "card settings-card" }, [
     el("div", { class: "card-title section-label", text: "Transcription" }),
@@ -2297,7 +2471,8 @@ function transcriptionCard(st) {
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("globe", 18)),
       el("div", { class: "body" }, [el("div", { class: "t", text: "Default language" }), el("div", { class: "s", text: "Used unless you change it for a meeting." })]),
-      el("div", { class: "ctl" }, selectEl(defOpts, st.transcription_language || "af", function (v) { saveSettings({ transcription_language: v }); })),
+      // "" is a real value (Auto-detect), so only null/undefined may fall back to "af".
+      el("div", { class: "ctl" }, selectEl(defOpts, st.transcription_language != null ? st.transcription_language : "af", function (v) { saveDefaultLanguage({ transcription_language: v }); })),
     ]),
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("cpu", 18)),
@@ -2974,9 +3149,23 @@ var SUPPORTED_LANGS = [
   { code: "ve", name: "Tshivenda", family: "swivuriso" },
 ];
 var SWIVURISO_LANGS = ["zu", "xh", "st", "tn", "ts", "nr", "ve"];
+// Major world languages standard Whisper handles well, offered under "More languages" so a
+// known single-language meeting can FORCE its token instead of relying on auto-detect (which
+// can flap between languages from chunk to chunk).
+var WORLD_LANGS = [
+  ["de", "German"], ["fr", "French"], ["es", "Spanish"], ["pt", "Portuguese"],
+  ["it", "Italian"], ["nl", "Dutch"], ["zh", "Mandarin"], ["ar", "Arabic"],
+  ["hi", "Hindi"], ["ru", "Russian"], ["ja", "Japanese"], ["ko", "Korean"],
+  ["pl", "Polish"], ["tr", "Turkish"], ["sv", "Swedish"], ["no", "Norwegian"],
+  ["da", "Danish"], ["el", "Greek"],
+];
 var LANG_NAMES = { "af": "Afrikaans", "en": "English", "": "Auto-detect", "sa": "South African languages",
   "zu": "isiZulu", "xh": "isiXhosa", "st": "Sesotho", "tn": "Setswana", "ts": "Xitsonga", "nr": "isiNdebele", "ve": "Tshivenda" };
+WORLD_LANGS.forEach(function (w) { LANG_NAMES[w[0]] = w[1]; });
 function langName(code) { return LANG_NAMES[code] != null ? LANG_NAMES[code] : code; }
+// True for codes the Settings "Languages you transcribe" checkboxes cover; only those get
+// clamped when a language is un-ticked. The "sa" group code and world codes are never clamped.
+function langIsToggleable(code) { return SUPPORTED_LANGS.some(function (l) { return l.code === code; }); }
 function familyForLang(lang) { var l = (lang || "").toLowerCase().split("-")[0]; if (l === "sa" || SWIVURISO_LANGS.indexOf(l) >= 0) return "swivuriso"; return (l === "" || l === "auto" || /^af/.test(l)) ? "fluister" : "whisper"; }
 // True once the matching model is actually installed; until then a session honestly runs (and is
 // labelled) as stock Whisper.
@@ -3007,20 +3196,57 @@ function familyChip(family, model) {
   if (family === "fluister") return el("span", { class: "chip accent", title: tr("Afrikaans-optimised model") }, [icon("sparkle", 12), el("span", {}, raw(label))]);
   return el("span", { class: "chip" }, [el("span", {}, raw(label))]);
 }
-// The pre-meeting / import language picker: the three model families plus Auto-detect. The seven
-// South African languages (Swivuriso) are collapsed into one "sa" option so they are reachable in a
-// single tap without cluttering the picker. "sa" is a UI group code that routes to Swivuriso (see
-// familyForLang and transcribe.family_for_language); af -> Fluister, en -> Whisper. The Settings
-// "languages you transcribe" list still drives which models first-run offers to download.
+// The pre-meeting / import language picker: Afrikaans and English one tap away, everything else
+// behind "More languages" (one dropdown: the seven Swivuriso South African languages first, then
+// major world languages on standard Whisper), plus Auto-detect. "sa" stays the group code that
+// routes to Swivuriso (see familyForLang and transcribe.family_for_language); a specific code
+// forces that language token so the decoder cannot flap between languages mid-meeting. The
+// Settings "languages you transcribe" list still drives which models first-run offers to download.
+function langModeOpts() {
+  return [["af", "Afrikaans"], ["en", "English"], ["more", "More languages"], ["", "Auto-detect"]];
+}
+// Which segment a language value belongs to: af / en / "" map to their own segments,
+// everything else ("sa", zu..., de...) lives under More languages.
+function langMode(lang) {
+  var l = lang || "";
+  return (l === "" || l === "af" || l === "en") ? l : "more";
+}
+// The grouped options for the More-languages dropdown: [groupLabel, [[code, name], ...]].
+function moreLangOpts() {
+  var sa = [["sa", "Any South African language"]];
+  SWIVURISO_LANGS.forEach(function (c) { sa.push([c, langName(c)]); });
+  return [["South African languages (Swivuriso)", sa],
+          ["World languages (Whisper)", WORLD_LANGS.map(function (w) { return w.slice(); })]];
+}
+// Flat list of EVERY language mode, for the native selects that need one (the live tune strip
+// and the re-transcribe dialog).
 function transcribeLangOpts() {
-  return [["af", "Afrikaans"], ["en", "English"], ["sa", "South African languages"], ["", "Auto-detect"]];
+  var flat = [["af", "Afrikaans"], ["en", "English"], ["sa", "South African languages"]];
+  SWIVURISO_LANGS.forEach(function (c) { flat.push([c, langName(c)]); });
+  WORLD_LANGS.forEach(function (w) { flat.push(w.slice()); });
+  flat.push(["", "Auto-detect"]);
+  return flat;
+}
+function moreLangSelect() {
+  var sel = el("select", {
+    class: "field", style: { width: "auto", minWidth: "220px", marginTop: "8px" },
+    onchange: function (e) { S.form.language = S.form.moreLang = e.target.value; warmUp(); render(); },
+  }, moreLangOpts().map(function (g) {
+    return el("optgroup", { label: tr(g[0]) }, g[1].map(function (o) { return el("option", { value: o[0], text: o[1] }); }));
+  }));
+  sel.value = S.form.language;
+  return sel;
 }
 // Language is the hero control on the pre-meeting screens. Switching it re-warms the matching
-// family so Begin stays instant.
+// family so Begin stays instant. Picking "More languages" reveals the grouped dropdown; the
+// last specific pick is remembered (S.form.moreLang) so the segment toggles back to it.
 function languageField() {
-  return formField("Language", null, segmented(transcribeLangOpts(), S.form.language, function (v) {
-    S.form.language = v; warmUp(); render();
-  }), true);
+  var mode = langMode(S.form.language);
+  var seg = segmented(langModeOpts(), mode, function (v) {
+    S.form.language = (v === "more") ? (S.form.moreLang || "sa") : v;
+    warmUp(); render();
+  });
+  return formField("Language", null, mode === "more" ? el("div", {}, [seg, moreLangSelect()]) : seg, true);
 }
 // One honest line: which engine this session will use (the language decides, unless the Advanced
 // Engine override forces a family), and that the size is automatic.
@@ -3045,7 +3271,9 @@ function engineLine() {
     msg = (lang === "")
       ? "Auto-detect uses Fluister, our Afrikaans-tuned model. The size is chosen automatically for your computer."
       : "Best for Afrikaans and mixed Afrikaans and English meetings. The size is chosen automatically for your computer.";
-  else msg = "English uses standard Whisper. The size is chosen automatically for your computer.";
+  else msg = (lang === "en")
+    ? "English uses standard Whisper. The size is chosen automatically for your computer."
+    : tr(langName(lang)) + " " + tr("uses standard Whisper. The size is chosen automatically for your computer.");
   return el("div", { class: "card", style: { padding: "11px 13px", display: "flex", gap: "10px", alignItems: "center", marginBottom: "16px" } }, [
     el("div", { class: "tone-tile" + ((label === "Fluister" || label === "Swivuriso") ? " accent" : ""), style: { width: "30px", height: "30px", flex: "0 0 auto" } }, icon(label === "Fluister" ? "sparkle" : (label === "Swivuriso" ? "language" : "globe"), 15)),
     el("div", {}, [
@@ -3065,14 +3293,29 @@ function advancedTranscribeControls(live) {
     el("div", { class: "card", style: { padding: "14px", marginTop: "8px" } }, [
       formField("Engine", el("span", { class: "label-muted", text: " (auto follows the language)" }),
         el("div", {}, [segmented([["auto", "Auto"], ["fluister", "Fluister"], ["whisper", "Whisper"]], S.form.engine || "auto", function (v) { S.form.engine = v; saveSettings({ engine: v }); warmUp(); render(); }),
-          el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Auto picks Fluister for Afrikaans and auto-detect, Whisper for English. Force one to override." })]), true),
+          el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Auto picks the model for your language: Fluister for Afrikaans and auto-detect, Swivuriso for South African languages, Whisper for the rest. Force one to override." })]), true),
       formField("Model size", el("span", { class: "label-muted", text: " (auto is recommended)" }),
         el("div", { style: { marginTop: "12px" } }, [qualitySelector(),
           el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Auto picks the best model your computer can run. Bigger is more accurate but slower." })]), true),
       runOnField(),
       live ? aecLiveControl() : aecRetranscribeControl(),
+      (!live && S.route === "importpre" && S.importPath) ? stereoSplitControl() : null,
     ]),
   ]);
+}
+// Stereo interview mode for an UPLOADED file: transcribe the left and right channels as two
+// separate speakers (Speaker L / Speaker R). Per-file choice, not persisted: it only makes
+// sense for recordings whose channels really carry one speaker each (e.g. Samsung Interview
+// mode). Not shown for saved Volksmond recordings, whose stereo channels mean you/everyone-else.
+function stereoSplitControl() {
+  return el("div", { style: { marginTop: "12px", paddingTop: "12px", borderTop: "1px solid var(--line)" } },
+    el("div", { class: "row gap-10", style: { alignItems: "flex-start" } }, [
+      el("div", { class: "grow" }, [
+        el("div", { style: { fontWeight: "600", fontSize: "13px" }, text: "Stereo interview mode" }),
+        el("p", { class: "ink-3", style: { fontSize: "11px", margin: "4px 0 0" }, text: "For phone recordings where the two speakers sit in the left and right channels (e.g. Samsung Interview mode). Transcribes each side separately, labelled Speaker L and Speaker R. A mono file is transcribed as a single track." }),
+      ]),
+      toggleEl(!!S.form.stereoSplit, function () { S.form.stereoSplit = !S.form.stereoSplit; render(); }),
+    ]));
 }
 // Echo cancellation for a re-transcribe / upload (the non-live Advanced panel). Mirrors
 // aecLiveControl but persists the `aec` setting; only does anything when the file set has both a
@@ -3215,8 +3458,11 @@ async function boot() {
   if (S.settings) {
     S.form.language = S.settings.transcription_language != null ? S.settings.transcription_language : "af";
     // Keep the default within the languages the user transcribes, so the picker highlights it.
+    // Only individually toggleable codes are clamped; "sa", world codes and "" pass through.
     var tl = S.settings.transcribe_languages || ["af", "en"];
-    if (S.form.language !== "" && tl.indexOf(S.form.language) < 0) S.form.language = tl[0] || "af";
+    if (langIsToggleable(S.form.language) && tl.indexOf(S.form.language) < 0) S.form.language = tl[0] || "af";
+    // A default under "More languages" pre-selects itself in the dropdown.
+    if (langMode(S.form.language) === "more") S.form.moreLang = S.form.language;
     S.form.tier = normalizeQuality(S.settings.tier);
     S.form.device = S.settings.device || "auto";
     S.form.engine = S.settings.engine || "auto";
@@ -3272,16 +3518,103 @@ function adoptRunning(status) {
   S.live.title = topicFromName(baseName(status.output_path));
   S.live.micDevice = status.mic_device != null ? status.mic_device : null;
   S.live.loopbackDevice = status.loopback_device != null ? status.loopback_device : null;
+  S.live.aecAvailable = !!status.aec_live_available;
+  S.live.aecActive = !!status.aec_live_active;
+  // /api/status does not carry the recording stem; the server derives it from the transcript
+  // path (output_path minus ".md"), so reconstruct it for the record-only finish flow.
+  S.live.audioStem = (status.recording && status.output_path) ? status.output_path.replace(/\.md$/, "") : null;
   openStream(); startElapsed();
+  seedFromTranscript();
+  seedNotes();
   if (status.source_kind !== "file") startLevels();
   if (status.source_kind === "file") {
     S.route = "importing";
-    pollStatus(function (st) { return !st.running; }, function () { gotoFinish(S.live.outputPath); });
+    // Mirror startImport: surface the sticky server notice (e.g. "stereo requested but the file
+    // is mono") once, whether it is already on the adopted status, lands mid-run, or only
+    // arrives on the final poll.
+    var showNotice = function (st) {
+      if (st && st.notice && S.live.noticeShown !== st.notice) { S.live.noticeShown = st.notice; toast(tr(st.notice)); }
+    };
+    showNotice(status);
+    pollStatus(function (st) { return !st.running; },
+      function (st) { showNotice(st); gotoFinish(S.live.outputPath, st && st.sink_error); },
+      showNotice);
   } else if (status.transcribing) {
     S.route = "live";
   } else {
     S.route = "recordonly";
   }
+  // A reload can land while a live or record-only session is already stopping. The in-page
+  // stop's completion polling died with the old page, so restart it here and route exactly as
+  // the normal stop does when the drain finishes (a file import already polls to completion
+  // above, so it never installs this second poll).
+  if (status.stopping && status.source_kind !== "file") {
+    pollStatus(
+      function (st) { return !st.running || (!st.stopping && !st.transcribing); },
+      function (st) {
+        S.live.stopping = false;
+        if (st.running) {
+          // Transcription-only stop finished; the recording carries on (doStop "transcription").
+          S.live.transcribing = false; S.live.recording = true; go("recordonly"); return;
+        }
+        if (S.live.transcribing) {
+          // A transcribing session ended: same handoff as doStop ("all").
+          gotoFinish(S.live.outputPath, st && st.sink_error); return;
+        }
+        // Record-only ended: mirror stopRecordOnly's completion.
+        var stem = S.live.audioStem;
+        teardownLive();
+        S.live.running = false;
+        S.finish.recordingStem = stem;
+        S.finish.outputPath = S.live.outputPath;
+        S.finish.sinkError = (st && st.sink_error) || null;
+        if (S.finish.sinkError) toast(S.finish.sinkError, true);
+        go("recordonly");
+      }
+    );
+  }
+}
+
+// After a full reload mid-session, S.live.segments only holds lines that arrived AFTER the
+// reload (the SSE stream has no replay). The saved transcript has everything so far, in the
+// exact "[mm:ss] [SRC] text" format MarkdownSink writes: fetch it and seed the earlier lines.
+// Any failure just leaves the post-reload view; the stream carries on regardless.
+function seedFromTranscript() {
+  var name = baseName(S.live.outputPath || "");
+  if (!/\.md$/.test(name)) return;
+  api.text("/sessions/" + encodeURIComponent(name)).then(function (txt) {
+    var re = /^\[(\d+):(\d{2})\]\s+\[([A-Za-z]+(?: [A-Za-z]+)?)\]\s+(.*)$/;   // "MIC" or "Speaker L"
+    var out = [];
+    var lines = txt.split(/\r?\n/);
+    for (var i = 0; i < lines.length; i++) {
+      var m = re.exec(lines[i]);
+      if (m) out.push({ t_start: parseInt(m[1], 10) * 60 + parseInt(m[2], 10), source: m[3], text: m[4] });
+    }
+    if (!out.length) return;
+    // Dedupe against segments that already arrived over SSE while the file was in flight.
+    var seen = {};
+    function key(s) { return fmtTs(s.t_start) + "|" + (s.source || "") + "|" + (s.text || ""); }
+    for (var j = 0; j < S.live.segments.length; j++) seen[key(S.live.segments[j])] = true;
+    var earlier = out.filter(function (s) { return !seen[key(s)]; });
+    if (!earlier.length) return;
+    S.live.segments = earlier.concat(S.live.segments);
+    if (S.route === "live" || S.route === "importing") render();
+  }).catch(function () {});
+}
+// Same idea for the user's own notes: repopulate the live panel from the saved sidecar so
+// typing after a reload extends the notes instead of starting from a blank textarea.
+function seedNotes() {
+  var stem = liveStem();
+  if (!stem) return;
+  api.get("/api/notes?stem=" + encodeURIComponent(stem)).then(function (n) {
+    // Apply the disk text only if the user has not typed (or deleted) anything since the
+    // adoption AND we are still on the same session: a late response must never resurrect
+    // old notes over an edit, or seed another session's panel.
+    if (n && n.text && !S.live.notes && !S.live.notesTouched && stem === liveStem()) {
+      S.live.notes = n.text;
+      if (S.route === "live") render();
+    }
+  }).catch(function () {});
 }
 
 // Global keyboard shortcuts: Escape closes the stop popover; Cmd/Ctrl+Enter

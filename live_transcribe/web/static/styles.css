@@ -517,11 +517,34 @@ html, body { margin: 0; padding: 0; height: 100%; }
 .live-footer .rec-ind { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--record); font-weight: 500; }
 .live-footer .rec-ind i { width: 6px; height: 6px; border-radius: 50%; background: var(--record); animation: vm-pulse 1.6s ease-in-out infinite; }
 
-/* Meeting notes panel (typed live in the transcribe screen; saved beside the transcript) */
-.notes-panel { flex: 0 0 auto; border-top: 1px solid var(--line); background: var(--surface); }
+/* Meeting notes (typed live in the transcribe screen; saved beside the transcript).
+   On the live screen the notes live in a resizable right-hand column (.live-split wraps
+   transcript + splitter + column); the reader's My notes tab reuses .notes-ta as before. */
 .notes-head { display: flex; align-items: center; gap: 8px; padding: 9px 24px; font-size: 12px; font-weight: 600; color: var(--ink-2); cursor: pointer; user-select: none; }
 .notes-head:hover { color: var(--ink); }
 .notes-ta.field { display: block; margin: 2px 24px 12px; min-height: 84px; max-height: 220px; resize: vertical; }
+
+/* Live screen split: transcript left (flexible), notes column right (fixed width). The width
+   lives in a CSS variable mutated directly during drag, so resizing never re-renders. */
+.live-split { flex: 1; display: flex; min-height: 0; }
+.live-split > .live-body { min-width: 0; }
+.notes-col { flex: 0 0 auto; width: var(--vm-notes-w, 300px); max-width: 70vw; display: flex; flex-direction: column; border-left: 1px solid var(--line); background: var(--surface); }
+.notes-col .notes-head { padding: 9px 14px; flex: 0 0 auto; }
+.notes-col .notes-ta.field { flex: 1; margin: 0 14px 12px; min-height: 0; max-height: none; resize: none; }
+.split-handle { flex: 0 0 7px; cursor: col-resize; position: relative; touch-action: none; }
+.split-handle::after { content: ""; position: absolute; top: 0; bottom: 0; left: 2px; width: 2px; background: var(--line); }
+.split-handle:hover::after, .split-handle.dragging::after { background: var(--accent); }
+.notes-rail { flex: 0 0 auto; display: flex; flex-direction: column; border-left: 1px solid var(--line); background: var(--surface); }
+.notes-rail .rail-btn { border: 0; background: transparent; cursor: pointer; color: var(--ink-2); display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 12px 9px; font: 600 12px/1 var(--font-sans); }
+.notes-rail .rail-btn:hover { background: var(--surface-2); color: var(--ink); }
+.notes-rail .rail-btn .vert { writing-mode: vertical-rl; letter-spacing: 0.04em; }
+
+/* Running-session return pill (sidebar): visible on every shell screen while a session runs,
+   one click back to the live view. Uses the record colours; NOT the .chip component. */
+.sidebar .return-pill { display: flex; align-items: center; gap: 8px; width: 100%; margin: 8px 0 2px; padding: 10px 12px; border-radius: 8px; border: 1px solid color-mix(in oklch, var(--record) 30%, transparent); background: var(--record-soft); color: var(--record); font: 600 12px/1.3 var(--font-sans); cursor: pointer; text-align: left; }
+.sidebar .return-pill:hover { filter: brightness(0.97); }
+.sidebar .return-pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--record); animation: vm-pulse 1.6s ease-in-out infinite; flex: 0 0 auto; }
+.sidebar .return-pill .mono { font-weight: 500; font-size: 11px; margin-left: auto; font-variant-numeric: tabular-nums; }
 
 /* Transcript: document variant */
 .doc { max-width: 760px; margin: 0 auto; font-family: var(--font-transcript); font-size: 17px; line-height: 1.65; }
@@ -615,4 +638,14 @@ html, body { margin: 0; padding: 0; height: 100%; }
   .sidebar { width: 64px; flex-basis: 64px; }
   .sidebar .nav-item span, .sidebar .brand span, .sidebar .brand-sub, .sidebar .local-pill span { display: none; }
   .sidebar .side-update { display: none; }
+  .sidebar .return-pill { justify-content: center; padding: 10px 0; }
+  .sidebar .return-pill .rp-label, .sidebar .return-pill .mono { display: none; }
+  /* Narrow window: fall back to the stacked layout (notes below transcript), no splitter. */
+  .live-split { flex-direction: column; }
+  .split-handle { display: none; }
+  .notes-col { width: auto; max-width: none; border-left: 0; border-top: 1px solid var(--line); }
+  .notes-col .notes-ta.field { flex: 0 0 auto; min-height: 84px; max-height: 220px; resize: vertical; }
+  .notes-rail { flex-direction: row; border-left: 0; border-top: 1px solid var(--line); }
+  .notes-rail .rail-btn { flex-direction: row; flex: 1; padding: 9px 14px; }
+  .notes-rail .rail-btn .vert { writing-mode: horizontal-tb; }
 }

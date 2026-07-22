@@ -325,6 +325,82 @@ def test_summary_device_and_capability():
     print("  OK  /api/models reports summary GPU capability + device; summary_device round-trips")
 
 
+def test_live_notes_width_roundtrip():
+    # The live-screen notes column width persists to disk (settings.json) as well as
+    # localStorage, because the WebView can wipe localStorage between launches.
+    from live_transcribe import config
+    orig = config.load().get("live_notes_width")
+    try:
+        assert client.post("/api/settings", json={"live_notes_width": 340}).json()["live_notes_width"] == 340
+        assert client.get("/api/settings").json()["live_notes_width"] == 340
+        assert client.post("/api/settings", json={"live_notes_width": 0}).json()["live_notes_width"] == 0
+    finally:
+        config.update({"live_notes_width": orig or 0})
+    print("  OK  live_notes_width round-trips through /api/settings")
+
+
+def test_default_language_roundtrip():
+    # Settings must accept EVERY pre-meeting language mode as the default: the classics
+    # ("af"/"en"), the Swivuriso group ("sa"), a specific South African language, a world
+    # language, and auto-detect (""). Save and restore the real value (repo convention).
+    orig = client.get("/api/settings").json()["transcription_language"]
+    try:
+        for v in ("af", "en", "sa", "zu", "de", ""):
+            assert client.post("/api/settings", json={"transcription_language": v}).json()["transcription_language"] == v, v
+            assert client.get("/api/settings").json()["transcription_language"] == v, v
+    finally:
+        client.post("/api/settings", json={"transcription_language": orig})
+    print("  OK  default language round-trips for every mode (af/en/sa/zu/de/auto)")
+
+
+def test_language_mode_tokens():
+    # Each pre-meeting mode maps to the right FAMILY, and to the decode token faster-whisper
+    # actually receives. A specific world language forces its token (no per-chunk language
+    # flapping); the South African codes never leak into a family that has no token for them.
+    from live_transcribe import transcribe as T
+    assert T.family_for_language("de") == "whisper"
+    assert T.family_for_language("fr-FR") == "whisper"
+    assert T.family_for_language("tn") == "swivuriso"
+    assert T.decode_language("whisper", "de") == "de"
+    assert T.decode_language("whisper", "en") == "en"
+    assert T.decode_language("fluister", "af") == "af"
+    assert T.decode_language("fluister", "") is None       # auto-detect stays auto
+    assert T.decode_language("fluister", "auto") is None
+    assert T.decode_language("swivuriso", "zu") is None    # Swivuriso always decodes on auto
+    assert T.decode_language("swivuriso", "sa") is None
+    assert T.decode_language("whisper", "zu") is None      # SA code on stock Whisper: no token exists
+    assert T.decode_language("whisper", "sa") is None      # "sa" must never decode as Sanskrit
+    print("  OK  language mode -> family + decode token (world forced, SA codes auto, no Sanskrit trap)")
+
+
+def test_settings_migration_old_default_language():
+    # A settings.json written by an older build (default language "af" or "en", no knowledge
+    # of the new modes) must load exactly as before: same value out, every other key at its
+    # default. Sandboxed: config is pointed at a temp folder, never the user's real file.
+    import json as _json
+    import tempfile
+    from pathlib import Path
+    from live_transcribe import config as C
+    orig_dir, orig_path = C._DIR, C._SETTINGS_PATH
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            C._DIR = Path(td)
+            C._SETTINGS_PATH = C._DIR / "settings.json"
+            for old in ("af", "en"):
+                C._SETTINGS_PATH.write_text(_json.dumps({"transcription_language": old,
+                                                         "transcribe_languages": ["af", "en"]}), encoding="utf-8")
+                s = C.load()
+                assert s["transcription_language"] == old, s
+                assert s["tier"] == "auto" and s["engine"] == "auto", s
+            # The new mode values persist and survive a reload unchanged.
+            for new in ("sa", "zu", "de", ""):
+                C.update({"transcription_language": new})
+                assert C.load()["transcription_language"] == new, new
+    finally:
+        C._DIR, C._SETTINGS_PATH = orig_dir, orig_path
+    print("  OK  old settings files ('af'/'en') load unchanged; new mode values persist (sandboxed)")
+
+
 def test_fits_on_gpu_logic():
     # The GPU fit check: full offload only when the model file plus a working-memory
     # headroom fits in VRAM. A tiny real file fits a big card; nothing fits an unknown
@@ -438,6 +514,95 @@ def test_reconfigure_session_gated():
     bare = TestClient(app, base_url="http://localhost")
     assert bare.post("/api/reconfigure", json={"language": "en"}).status_code == 403
     print("  OK  /api/reconfigure: empty patch 400, idle 409, CSRF-protected")
+
+
+def test_reconfigure_keeps_user_language():
+    # Review wave 1, F1: the engine stores the DECODE token, which is None for every South
+    # African language (Swivuriso decodes on auto-detect), so it must never stand in for the
+    # user's language. A mid-meeting Quality-only change on an isiZulu session must keep the
+    # session language "zu" and the family Swivuriso, not read None as auto-detect, re-route
+    # the family to Fluister and rewrite the language to "auto". Simulated session with the
+    # loader stubbed: no audio and no model weights are touched.
+    from live_transcribe import transcribe as T
+
+    class _FakeEngine:
+        _is_cpu = True
+        _compute_type = "int8"
+        _cpu_threads = 4
+        size = "medium"
+        language = None          # the decode token a zu session really stores
+        engine = "auto"
+        family = "swivuriso"
+
+        def __init__(self):
+            self.changes = []
+
+        def request_change(self, **kw):
+            self.changes.append(kw)
+
+    st = webapp.STATE
+    fake = _FakeEngine()
+    saved = (st.running, st.transcribing, st.stopping, st.source_kind, st.engine,
+             st.language, st.tier, st.model, st.family)
+    orig_load, orig_hosted = T.load_model, T.SWIVURISO_HOSTED
+    try:
+        T.load_model = lambda *a, **k: object()   # never load real weights
+        T.SWIVURISO_HOSTED = True                 # Swivuriso resolvable on any machine
+        st.running, st.transcribing, st.stopping = True, True, False
+        st.source_kind, st.engine = "live", fake
+        st.language, st.tier, st.model, st.family = "zu", "cpu-mid", T.swivuriso_model(), "swivuriso"
+        r = client.post("/api/reconfigure", json={"tier": "small"})
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert j["language"] == "zu", j            # NOT rewritten to "auto"
+        assert j["family"] == "swivuriso", j       # NOT re-routed to fluister
+        assert st.language == "zu" and st.family == "swivuriso", (st.language, st.family)
+        assert client.get("/api/status").json()["language"] == "zu"
+        # The engine still receives the decode token (None: Swivuriso decodes on auto-detect).
+        assert fake.changes and fake.changes[-1]["language"] is None, fake.changes
+    finally:
+        T.load_model, T.SWIVURISO_HOSTED = orig_load, orig_hosted
+        (st.running, st.transcribing, st.stopping, st.source_kind, st.engine,
+         st.language, st.tier, st.model, st.family) = saved
+    print("  OK  reconfigure: tier-only change on a zu session keeps language zu + family swivuriso (decode token stays auto)")
+
+
+def test_aec_live_reports_persistence():
+    # Review wave 1, F7: /api/aec-live must keep working when the settings file cannot be
+    # written (the live toggle already took effect on the engine), but must report it via
+    # persisted: false so the UI can warn instead of the choice silently reverting next
+    # meeting. Simulated live session; config.update stubbed, the real settings never touched.
+    from live_transcribe import config as C
+
+    class _FakeCapture:
+        def set_aec(self, on):
+            return True
+
+        def aec_state(self):
+            return (True, True)
+
+    st = webapp.STATE
+    saved = (st.running, st.stopping, st.source_kind, st.capture)
+    orig_update = C.update
+    try:
+        st.running, st.stopping, st.source_kind, st.capture = True, False, "live", _FakeCapture()
+
+        def _boom(d):
+            raise OSError("disk full")
+        C.update = _boom
+        r = client.post("/api/aec-live", json={"enabled": True})
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert j["aec_live_active"] is True and j["persisted"] is False, j
+        # When persistence works the flag is True, and only aec_live is written.
+        wrote = {}
+        C.update = lambda d: wrote.update(d)
+        j2 = client.post("/api/aec-live", json={"enabled": False}).json()
+        assert j2["persisted"] is True and wrote == {"aec_live": False}, (j2, wrote)
+    finally:
+        C.update = orig_update
+        st.running, st.stopping, st.source_kind, st.capture = saved
+    print("  OK  /api/aec-live: toggle survives a failed settings write; persisted reported honestly")
 
 
 def test_warm_up():
@@ -557,12 +722,18 @@ if __name__ == "__main__":
                test_filename_allow_list,
                test_license_pubkey_precedence,
                test_summary_device_and_capability,
+               test_live_notes_width_roundtrip,
+               test_default_language_roundtrip,
+               test_language_mode_tokens,
+               test_settings_migration_old_default_language,
                test_fits_on_gpu_logic,
                test_levels_and_switch_device,
                test_recording_channel_bundling,
                test_recorder_stereo_fold,
                test_feed_raw_mic_routing,
                test_reconfigure_session_gated,
+               test_reconfigure_keeps_user_language,
+               test_aec_live_reports_persistence,
                test_warm_up,
                test_summarise_accepts_instruction,
                test_model_update_status_logic,
