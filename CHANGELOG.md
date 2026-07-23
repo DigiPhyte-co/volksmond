@@ -1,6 +1,13 @@
 # Changelog, SA-Live-Transcribe
 
-## 2026-07-23, v1.11.0: notes beside the transcript, browse while recording, stereo interview uploads, a live echo-cancel toggle, and more languages
+## 2026-07-23, v1.11.1: recordings stay in sync, and uploads stop cutting words in half
+
+`licensing.APP_VERSION` 1.11.0 -> 1.11.1.
+
+- **Saved recordings no longer drift out of sync when the call is quiet at the start.** Windows delivers no system-audio frames while nothing is playing, and the recorder used to stitch the microphone and system channels together by raw position, so pressing Begin before a call's audio started shifted the whole system side earlier in the saved file (one real meeting ended up 20 seconds out, and the flaw goes back to at least v1.7.0). The recorder now places every piece of audio at its true wall-clock position and fills quiet periods with silence, so both channels always line up, whether the gap is at the start, in the middle, or at the end. Live transcription was never affected, only the saved audio file. (`sinks.py`.)
+- **Uploaded recordings are chunked at natural pauses, not on a blind timer.** File uploads used to be sliced every 8 seconds regardless of who was mid-word, which garbled speech at every seam; live meetings already cut at silences. Uploads (including stereo interview mode and re-transcribed recordings) now use the same silence-aware boundaries as live, validated on a real 33-minute meeting recording: mid-word seam damage gone, no content lost, no speed cost. (`capture_core.py`, `web/app.py`.)
+
+Verified: 155-test suite green (script-run and pytest), independent adversarial review of both fixes (all findings addressed, test assertions mutation-checked), the recorder fix proven on a real-device repro (audio played 35 s into a silent-start session lands at 35.2 s in the file, previously at 0), and the chunking fix proven on a real meeting upload (81% of chunk boundaries were locked to the 8 s grid before, 18% after, with word recovery at the seams and word count within 0.5%). notes beside the transcript, browse while recording, stereo interview uploads, a live echo-cancel toggle, and more languages
 
 `licensing.APP_VERSION` 1.10.0 -> 1.11.0.
 
