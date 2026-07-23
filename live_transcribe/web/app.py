@@ -233,6 +233,7 @@ class StartRequest(BaseModel):
     record: bool = False          # also save the audio (POPIA: needs consent)
     transcribe: bool = True       # False == record-only (for machines too slow to keep up live)
     aec_live: Optional[bool] = None  # live echo cancellation (None -> settings default)
+    agc_live: Optional[bool] = None  # live mic auto-gain (None -> settings default)
 
 
 def _slugify(s: str) -> str:
@@ -702,7 +703,10 @@ def start(req: StartRequest):
         # Recorder is tapped BEFORE the engine (see _feed), so the recording stays complete
         # even when transcription drops chunks under load.
         aec_live = req.aec_live if req.aec_live is not None else bool(config.load().get("aec_live", False))
-        agc_live = bool(config.load().get("agc_live", True))   # settings-only; the pre-meeting toggle persists it
+        # Explicit request value wins (exactly like aec_live): the pre-meeting toggle's
+        # settings save is async and unawaited, so toggle-then-immediately-Begin must not
+        # start with the stale on-disk value. None -> settings default.
+        agc_live = req.agc_live if req.agc_live is not None else bool(config.load().get("agc_live", True))
         cap = capture.AudioCapture(
             mic_device=req.mic_device,
             loopback_device=req.loopback_device,
@@ -904,14 +908,18 @@ def transcribe_file(req: TranscribeFileRequest):
             def _boost(name, chan):
                 """Quiet-channel auto boost (audioboost.py): a channel captured well below
                 normal level makes Whisper loop and hallucinate (measured: -33.6 dBFS
-                active median looped, -28.3 dBFS was fine). Boosts a channel to -20 dBFS
-                active median only when it sits below -30 dBFS; healthy audio passes
-                through byte-identical. Engine input only, never the source file."""
-                out, g = audioboost.boost_if_quiet(chan)
+                active median looped, -28.3 dBFS was fine). Boosts a channel toward
+                -20 dBFS active median only when it sits below -30 dBFS; healthy audio
+                passes through byte-identical. Engine input only, never the source file.
+                The logged landing is the MEASURED post-chain median: when the +20 dB
+                static cap or the +-3 dB trim clamp engages, it is short of -20."""
+                out, g, landing = audioboost.boost_if_quiet(chan)
                 if g:
                     boosts.append(g)
+                    where = (f"to {landing:.1f} dBFS" if landing is not None
+                             else f"toward {audioboost.TARGET_DB:.0f} dBFS")
                     print(f"[transcribe-file] quiet-channel boost: {name} +{g:.1f} dB "
-                          f"to {audioboost.TARGET_DB:.0f} dBFS active median", flush=True)
+                          f"{where} active median", flush=True)
                 return out
             # New single stereo recording (<stem>.wav: left = MIC, right = SYS), already
             # echo-cancelled at capture. Split the channels and skip offline AEC entirely.

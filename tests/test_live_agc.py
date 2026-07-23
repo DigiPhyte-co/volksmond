@@ -217,6 +217,271 @@ def test_agc_constructor_fail_open_with_fake_binding():
     print("  OK  LiveAEC.start(): AGC-less binding keeps AEC alive; mic-only raises for the caller")
 
 
+class _FailsOnNthForward:
+    """Main-APM stub whose process_stream raises on the Nth near frame."""
+    def __init__(self, n):
+        self.n = n
+        self.calls = 0
+
+    def process_reverse_stream(self, frame):
+        pass
+
+    def process_stream(self, frame):
+        self.calls += 1
+        if self.calls == self.n:
+            raise RuntimeError("synthetic main-APM forward failure")
+
+
+class _FailsOnReverse:
+    """Main-APM stub whose process_reverse_stream raises on the Nth far frame."""
+    def __init__(self, n=1):
+        self.n = n
+        self.calls = 0
+
+    def process_reverse_stream(self, frame):
+        self.calls += 1
+        if self.calls >= self.n:
+            raise RuntimeError("synthetic main-APM reverse failure")
+
+    def process_stream(self, frame):
+        pass
+
+
+def _install_fake_livekit(apm_cls):
+    """Install a fake livekit module tree so _retire_main's AEC-only rebuild can
+    succeed; returns the saved modules for restoration."""
+    fake_apm_mod = types.ModuleType("livekit.rtc.apm")
+    fake_apm_mod.AudioProcessingModule = apm_cls
+    fake_rtc_mod = types.ModuleType("livekit.rtc")
+    fake_rtc_mod.apm = fake_apm_mod
+    fake_rtc_mod.AudioFrame = _StubFrame
+    fake_root = types.ModuleType("livekit")
+    fake_root.rtc = fake_rtc_mod
+    saved = {k: sys.modules.get(k) for k in ("livekit", "livekit.rtc", "livekit.rtc.apm")}
+    sys.modules["livekit"] = fake_root
+    sys.modules["livekit.rtc"] = fake_rtc_mod
+    sys.modules["livekit.rtc.apm"] = fake_apm_mod
+    return saved
+
+
+def _restore_modules(saved):
+    for k, v in saved.items():
+        if v is None:
+            sys.modules.pop(k, None)
+        else:
+            sys.modules[k] = v
+
+
+def test_main_apm_forward_failure_retires_and_flows():
+    # F1: the main (AEC+AGC) APM raising in process_stream must NOT kill the worker.
+    # With AGC compiled into the failed main, it is retried ONCE as AEC-only (fake
+    # binding installed so the rebuild succeeds); the failing frame is emitted via
+    # the AGC-only fallback and every later frame flows through the rebuilt main.
+    from live_transcribe.aec_live import FRAME
+
+    class _RebuiltAPM:
+        """What the retire path rebuilds: a passthrough AEC-only APM."""
+        def __init__(self, *, echo_cancellation=False, noise_suppression=False,
+                     high_pass_filter=False, auto_gain_control=False):
+            assert echo_cancellation and not auto_gain_control, \
+                "retire must rebuild AEC-only (no AGC)"
+
+        def process_reverse_stream(self, frame):
+            pass
+
+        def process_stream(self, frame):
+            pass
+
+    saved = _install_fake_livekit(_RebuiltAPM)
+    try:
+        la, near_out, _far = _mk_worker(bypass=False, agc=True)
+        la._apm = _FailsOnNthForward(2)   # frame 1 OK, frame 2 raises
+        la._apm_agc = _GainAPM(4.0)
+        sig = np.full(FRAME * 4, 0.05, dtype=np.float32)
+        la.push_near(sig.copy())
+        la._pump()   # must not raise
+        got = np.concatenate(near_out)
+        assert len(got) == len(sig), "frames must keep flowing through the failure"
+        f1, f2, f3, f4 = (got[i * FRAME:(i + 1) * FRAME] for i in range(4))
+        assert np.allclose(f1, 0.05, atol=1e-3), "frame before the failure: main APM output"
+        assert np.allclose(f2, 0.20, atol=1e-3), \
+            "the failing frame must be emitted via the AGC-only fallback, not dropped"
+        assert np.allclose(f3, 0.05, atol=1e-3) and np.allclose(f4, 0.05, atol=1e-3), \
+            "frames after the retry must flow through the rebuilt AEC-only main"
+        assert isinstance(la._apm, _RebuiltAPM), "main APM must be rebuilt AEC-only"
+        assert la.aec_capable is True, "a successful AEC-only retry keeps AEC available"
+        assert la.agc is False, "the rebuilt main carries no AGC"
+        # A SECOND failure (retry already spent) retires AEC for good: frames still
+        # flow (AGC-only fallback) and the worker reports honestly unavailable.
+        la._apm = _FailsOnNthForward(1)
+        la.push_near(sig.copy())
+        la._pump()
+        got2 = np.concatenate(near_out)[len(sig):]
+        assert len(got2) == len(sig), "frames must keep flowing after the final retire"
+        assert np.allclose(got2, 0.20, atol=1e-3), "post-retire mic takes the AGC-only path"
+        assert la._apm is None and la.aec_capable is False
+    finally:
+        _restore_modules(saved)
+    print("  OK  LiveAEC: forward main-APM failure -> AEC-only retry, then honest retire; frames never stop")
+
+
+def test_main_apm_reverse_failure_retires_and_flows():
+    # F1: process_reverse_stream raising must not kill the worker either. Main built
+    # WITHOUT AGC (no retry path, no livekit needed): one failure retires AEC, far
+    # frames keep flowing to the transcript, the near end falls back to raw, and
+    # aec_state() reports unavailable so /api/status and the UI toggle go honest.
+    from live_transcribe.aec_live import FRAME
+    from live_transcribe.capture_core import CaptureBase
+
+    la, near_out, far_out = _mk_worker(bypass=False, agc=False)
+    la._apm = _FailsOnReverse(1)
+    sig = np.full(FRAME * 3, 0.05, dtype=np.float32)
+    la.push_far(sig.copy())
+    la.push_near(sig.copy())
+    la._pump()   # must not raise
+    far_got = np.concatenate(far_out)
+    assert len(far_got) == len(sig), "far frames must keep flowing after the reverse failure"
+    assert np.allclose(far_got, 0.05, atol=1e-6), "far passthrough must be emitted unchanged"
+    near_got = np.concatenate(near_out)
+    assert len(near_got) == len(sig), "near frames must keep flowing after the reverse failure"
+    assert np.array_equal(near_got, sig), "with no AGC the fallback near output is the raw mic"
+    assert la._apm is None and la.aec_capable is False, "failed main must be retired for the session"
+    cap = CaptureBase(aec=True)
+    cap._live_aec = la
+    assert cap.aec_state() == (False, False), "aec_state must report AEC unavailable after the retire"
+    assert cap.set_aec(True) is False, "the toggle must refuse ON after the retire"
+    # The worker keeps pumping on later blocks too.
+    la.push_far(sig.copy())
+    la.push_near(sig.copy())
+    la._pump()
+    assert sum(len(a) for a in near_out) == 2 * len(sig)
+    assert sum(len(a) for a in far_out) == 2 * len(sig)
+    print("  OK  LiveAEC: reverse-stream failure -> retire, far + near keep flowing, aec_state honest")
+
+
+def test_late_far_blocks_bypass_agc_only_worker():
+    # F2: a worker built far_rate=None (mic-only start; the macOS deferred TCC-grant
+    # path) must NOT be handed late SYS blocks - it has no main APM and no on_far
+    # sink, so they would be drained and discarded. They must land in SYS's own
+    # native-rate buffer (the same path a no-worker session uses), with the SYS
+    # meter fed from the raw block, while the mic keeps routing through the worker.
+    from live_transcribe.capture_core import CaptureBase
+
+    class _AgcOnlyWorker:
+        aec_capable = False
+        has_far = False        # far_rate=None: no far pipeline at all
+
+        def __init__(self):
+            self.near, self.far = [], []
+            self.push_near = self.near.append
+            self.push_far = self.far.append
+
+    cap = CaptureBase(agc=True)
+    cap._register_source("MIC", 16000, 1)
+    w = _AgcOnlyWorker()
+    cap._live_aec = w
+    # The macOS deferred-permission handshake registers SYS late, at native rate.
+    cap._register_source("SYS", 16000, 1)
+    sys_block = np.full((800, 1), 0.25, dtype=np.float32)
+    cap._ingest_block("SYS", sys_block)
+    assert not w.far, "late SYS blocks must never reach an AGC-only worker's far queue"
+    assert cap._buffer_counts["SYS"] == 800, "late SYS blocks must land in the native SYS buffer"
+    assert cap._buffers["SYS"] and cap._buffers["SYS"][0] is sys_block, \
+        "the SYS block must reach the downstream sink, not the void"
+    assert cap.levels().get("SYS", {}).get("peak") == 0.25, "SYS meter must show the raw block"
+    # Mic AGC unaffected: MIC still routes through the worker (meter fed post-APM).
+    mic_block = np.full((800, 1), 0.10, dtype=np.float32)
+    cap._ingest_block("MIC", mic_block)
+    assert len(w.near) == 1 and cap._buffer_counts["MIC"] == 0, \
+        "MIC must keep routing through the AGC worker"
+    # Regression guard: a REAL two-ended worker still takes SYS blocks.
+    class _FullWorker(_AgcOnlyWorker):
+        aec_capable = True
+        has_far = True
+    cap2 = CaptureBase(aec=True)
+    cap2._register_source("MIC", 16000, 1)
+    cap2._register_source("SYS", 16000, 1)
+    w2 = _FullWorker()
+    cap2._live_aec = w2
+    cap2._ingest_block("SYS", sys_block)
+    assert len(w2.far) == 1 and cap2._buffer_counts["SYS"] == 0, \
+        "a far-capable worker must keep taking SYS blocks"
+    print("  OK  capture: late SYS blocks bypass an AGC-only worker into the native buffer (mac deferred-TCC path)")
+
+
+def test_start_request_agc_live_overrides_settings():
+    # F3: agc_live in the /api/start body must override the on-disk setting (the
+    # Advanced toggle's save is async and unawaited, so toggle-then-immediately-Begin
+    # must not start with the stale value); omitted -> settings default.
+    import time as _time
+    from live_transcribe import capture as capture_mod
+    from live_transcribe.web import app as webapp
+
+    calls = []
+
+    class _FakeCap:
+        def __init__(self, **kw):
+            calls.append(kw)
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def has_raw_mic(self):
+            return False
+
+        def attach_sys_ring(self, ring):
+            pass
+
+        def aec_state(self):
+            return (False, False)
+
+        def levels(self):
+            return {}
+
+    import tempfile
+    from pathlib import Path
+    d = Path(tempfile.mkdtemp())
+    st = webapp.STATE
+    orig_cap = capture_mod.AudioCapture
+    orig_bop = webapp._build_output_path
+    orig_bump = webapp._bump_session_count
+    orig_setting = config.load().get("agc_live", True)
+
+    def _start_and_stop(body, expect_agc):
+        r = client.post("/api/start", json=body)
+        assert r.status_code == 200, r.text
+        assert calls[-1]["agc"] is expect_agc, (body, calls[-1]["agc"])
+        r2 = client.post("/api/stop")
+        assert r2.status_code == 200, r2.text
+        deadline = _time.monotonic() + 10.0
+        while _time.monotonic() < deadline:
+            with st.lock:
+                if not st.running:
+                    return
+            _time.sleep(0.02)
+        raise AssertionError("session did not stop in time")
+
+    try:
+        capture_mod.AudioCapture = _FakeCap
+        webapp._build_output_path = lambda topic: d / "agc-start.md"
+        webapp._bump_session_count = lambda: None
+        base = {"record": True, "transcribe": False}
+        config.update({"agc_live": True})
+        _start_and_stop({**base, "agc_live": False}, False)   # explicit False beats True setting
+        config.update({"agc_live": False})
+        _start_and_stop({**base, "agc_live": True}, True)     # explicit True beats False setting
+        _start_and_stop(dict(base), False)                    # omitted -> settings default
+    finally:
+        capture_mod.AudioCapture = orig_cap
+        webapp._build_output_path = orig_bop
+        webapp._bump_session_count = orig_bump
+        config.update({"agc_live": orig_setting})
+    print("  OK  /api/start: explicit agc_live overrides the setting; omitted falls back to it")
+
+
 def test_capture_agc_only_worker_is_not_an_echo_canceller():
     # aec_state()/set_aec() honesty: an AGC-only worker must not present as an available
     # echo canceller, and set_aec must never flip its bypass (bypass=True IS the AGC route).
@@ -276,6 +541,10 @@ if __name__ == "__main__":
                test_agc_mic_only_worker,
                test_agc_fail_open_midstream,
                test_agc_constructor_fail_open_with_fake_binding,
+               test_main_apm_forward_failure_retires_and_flows,
+               test_main_apm_reverse_failure_retires_and_flows,
+               test_late_far_blocks_bypass_agc_only_worker,
+               test_start_request_agc_live_overrides_settings,
                test_capture_agc_only_worker_is_not_an_echo_canceller,
                test_capture_mic_only_degrades_without_binding):
         try:

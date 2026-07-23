@@ -11,11 +11,13 @@ untouched, byte-identical.
 The enhancement chain (validated A/B on that real recording):
   1. Static gain to bring the median ACTIVE-speech RMS (20 ms frames above
      -45 dBFS, the frame mask decided once on the PRE-gain signal so gain does
-     not shift the frame population) to -20 dBFS. Capped at +20 dB.
+     not shift the frame population) toward -20 dBFS. Capped at +20 dB, so a
+     channel below about -40 dBFS lands short of the target.
   2. Gentle downward compression: 10 ms RMS envelope, instant attack, 150 ms
      release, threshold -12 dBFS RMS, ratio 3:1, 6 dB soft knee.
-  3. Small post-trim (clipped to +-3 dB) to land the active median back on
-     exactly -20 dBFS after the compressor.
+  3. Small post-trim (clipped to +-3 dB) to pull the active median back toward
+     -20 dBFS after the compressor (again: when a clamp engages, the landing is
+     NOT exactly -20; the measured landing is reported, never assumed).
   4. tanh soft clipper above 0.85 FS so nothing hard-clips.
 No noise reduction, no gating, no EQ. Deterministic, numpy only.
 
@@ -68,7 +70,8 @@ def measure_active_rms(audio, rate=RATE):
 def _compress(x, rate=RATE, thresh_db=-12.0, ratio=3.0, knee_db=6.0,
               frame_s=0.010, release_s=0.150):
     """Gentle downward compressor: 10 ms RMS envelope, instant attack, 150 ms
-    release, soft knee. Frame gains are linearly interpolated back to samples."""
+    release, soft knee. Attack gain applies from the start of its frame (truly
+    instant); only release gains are ramped within their frame."""
     fw = max(1, int(frame_s * rate))
     m = len(x) // fw
     if m == 0:
@@ -91,8 +94,23 @@ def _compress(x, rate=RATE, thresh_db=-12.0, ratio=3.0, knee_db=6.0,
     gr_db[inknee] = (1.0 / ratio - 1.0) * (over[inknee] + knee_db / 2.0) ** 2 / (2.0 * knee_db)
     gr_db[above] = (1.0 / ratio - 1.0) * over[above]
     gain = 10.0 ** (gr_db / 20.0)
-    t_frames = (np.arange(m) + 0.5) * fw
-    g = np.interp(np.arange(len(x)), t_frames, gain, left=gain[0], right=gain[-1])
+    # Per-sample gain. A gain REDUCTION (the signal's rising edge: the instant attack)
+    # applies from the FIRST sample of its frame, flat across the frame, so the loud
+    # onset is fully reduced immediately and the preceding quiet frame is never
+    # pre-attenuated. Only a RISING gain (release) is ramped linearly across its frame
+    # (the frame-level release is already the exponential decay above; the in-frame
+    # ramp just avoids zipper steps). Centre-interpolating ALL transitions here used
+    # to smear the attack: the first ~half frame of a burst got partial reduction and
+    # the prior quiet frame's tail was pulled down with it.
+    g = np.repeat(gain, fw)
+    prev = np.concatenate(([gain[0]], gain[:-1]))
+    rising = np.nonzero(gain > prev)[0]
+    if rising.size:
+        ramp = np.arange(fw, dtype=np.float64) / fw
+        seg = prev[rising, None] + (gain[rising] - prev[rising])[:, None] * ramp
+        g[(rising[:, None] * fw + np.arange(fw)).ravel()] = seg.ravel()
+    if len(x) > g.size:   # tail shorter than a frame: hold the last frame's gain
+        g = np.concatenate([g, np.full(len(x) - g.size, gain[-1])])
     return x * g
 
 
@@ -109,17 +127,24 @@ def boost_if_quiet(audio, rate=RATE):
     """Boost a quiet mono float32 track for transcription; pass healthy audio through.
 
     Trigger: active-speech median RMS strictly below -30 dBFS. Below it, apply the
-    validated chain (static gain to -20 dBFS -> compressor -> trim -> soft clip);
+    validated chain (static gain toward -20 dBFS -> compressor -> trim -> soft clip);
     at or above it, return the INPUT OBJECT untouched, so healthy audio is
     byte-identical and costs nothing.
 
-    Returns (audio_out, gain_db): gain_db is the net static level change applied
-    to the active-speech median (0.0 when passed through, always > 0 otherwise).
+    Returns (audio_out, gain_db, landing_db):
+      gain_db:    the net static level change applied to the active-speech median
+                  (0.0 when passed through, always > 0 otherwise).
+      landing_db: the active-speech median MEASURED on the output (fresh mask, like
+                  a listener would), NOT the -20 dBFS target: when the +20 dB static
+                  cap or the +-3 dB trim clamp engages (input below about -40 dBFS),
+                  the landing falls short of the target, and callers must report
+                  this measured value. Equals the input's median (or None for
+                  silence) on pass-through.
     """
     x = np.asarray(audio, dtype=np.float32)
     med_db, mask = _active_median_db(x, rate=rate)
     if med_db is None or med_db >= TRIGGER_DB:
-        return audio, 0.0
+        return audio, 0.0, med_db
     g1_db = min(TARGET_DB - med_db, MAX_STATIC_GAIN_DB)
     y = x * 10.0 ** (g1_db / 20.0)
     y = _compress(y, rate=rate)
@@ -128,5 +153,6 @@ def boost_if_quiet(audio, rate=RATE):
     if med2_db is not None:
         trim_db = float(np.clip(TARGET_DB - med2_db, -3.0, 3.0))
         y = y * 10.0 ** (trim_db / 20.0)
-    y = _softclip(y)
-    return np.ascontiguousarray(y, dtype=np.float32), round(g1_db + trim_db, 1)
+    y = np.ascontiguousarray(_softclip(y), dtype=np.float32)
+    landing_db, _ = _active_median_db(y, rate=rate)
+    return y, round(g1_db + trim_db, 1), landing_db

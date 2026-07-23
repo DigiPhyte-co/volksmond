@@ -549,6 +549,7 @@ async function startLive() {
     record: !!S.form.record, transcribe: true,
     mic_device: S.form.mic, loopback_device: S.form.loopback,
     aec_live: !!S.form.aecLive,
+    agc_live: !!S.form.agcLive,
   };
   beginStarting("live", S.form.title || "Live meeting");
   try {

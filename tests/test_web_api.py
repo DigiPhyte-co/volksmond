@@ -447,12 +447,13 @@ def test_switch_device_preserves_recording_clock():
 
     class _FakeCapture:
         def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15,
-                     on_chunk=None, t0=None, aec=False, record_raw_mic=False):
+                     on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False):
             self._t0_init = t0
             self._t0 = t0 if t0 is not None else _time.monotonic()
             self.aec = aec
+            self.agc = agc   # switch_device carries agc across the rebuild (agc=old_cap.agc)
             self.record_raw_mic = record_raw_mic
-            built.append({"t0": t0, "aec": aec, "record_raw_mic": record_raw_mic})
+            built.append({"t0": t0, "aec": aec, "agc": agc, "record_raw_mic": record_raw_mic})
 
         def start(self):
             self._t0 = self._t0_init if self._t0_init is not None else _time.monotonic()
@@ -469,7 +470,7 @@ def test_switch_device_preserves_recording_clock():
     st = webapp.STATE
     session_t0 = _time.monotonic() - 12.0    # session started ~12s ago
     old_cap = _FakeCapture(mic_device="0", loopback_device="1", t0=session_t0,
-                           aec=True, record_raw_mic=True)
+                           aec=True, agc=True, record_raw_mic=True)
     old_cap.start()
     saved_factory = webapp.capture.AudioCapture
     saved = (st.running, st.stopping, st.source_kind, st.capture, st.engine,
@@ -485,8 +486,9 @@ def test_switch_device_preserves_recording_clock():
         assert built, "switch_device did not rebuild the capture"
         assert built[-1]["t0"] == session_t0, \
             f"switch_device must thread t0 through the rebuild, got {built[-1]['t0']} != {session_t0}"
-        # Settings carried across so the switch does not silently disable AEC / raw-mic recording.
-        assert built[-1]["aec"] is True and built[-1]["record_raw_mic"] is True, built[-1]
+        # Settings carried across so the switch does not silently disable AEC / AGC / raw-mic recording.
+        assert built[-1]["aec"] is True and built[-1]["agc"] is True \
+            and built[-1]["record_raw_mic"] is True, built[-1]
         # The new capture is on the same clock, so a chunk produced now reads ~12s, not ~0s.
         assert (_time.monotonic() - st.capture._t0) > 5.0, "post-switch clock restarted near zero"
     finally:

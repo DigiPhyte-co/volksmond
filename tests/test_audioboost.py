@@ -51,19 +51,19 @@ def test_measure_active_rms():
     # Silence and too-short audio measure as None, and must never boost.
     assert audioboost.measure_active_rms(np.zeros(SR, dtype=np.float32)) is None
     assert audioboost.measure_active_rms(np.zeros(8, dtype=np.float32)) is None
-    out, g = audioboost.boost_if_quiet(np.zeros(SR, dtype=np.float32))
-    assert g == 0.0 and float(np.abs(out).max()) == 0.0
+    out, g, landing = audioboost.boost_if_quiet(np.zeros(SR, dtype=np.float32))
+    assert g == 0.0 and float(np.abs(out).max()) == 0.0 and landing is None
     print("  OK  measure_active_rms: exact on synthetic speech, None on silence (never boosted)")
 
 
 def test_trigger_boundary():
     # Locked rule: boost only strictly below -30 dBFS active median.
     quiet = speech_at(-31.0)
-    out, g = audioboost.boost_if_quiet(quiet)
+    out, g, _ = audioboost.boost_if_quiet(quiet)
     assert g > 0.0, "a -31 dBFS channel must boost"
     assert out is not quiet
     healthy = speech_at(-29.0)
-    out2, g2 = audioboost.boost_if_quiet(healthy)
+    out2, g2, _ = audioboost.boost_if_quiet(healthy)
     assert g2 == 0.0, "a -29 dBFS channel must pass through"
     assert out2 is healthy, "pass-through must return the input object"
     print(f"  OK  trigger boundary: -31 dBFS boosts (+{g:.1f} dB), -29 dBFS passes through")
@@ -73,9 +73,10 @@ def test_landing_minus20():
     # The boosted channel lands on the -20 dBFS active median within +-0.5 dB,
     # measured post-hoc on the OUTPUT (fresh mask), like a listener would.
     for db in (-31.0, -33.6, -38.0):
-        out, g = audioboost.boost_if_quiet(speech_at(db, seed=int(-db)))
+        out, g, landing = audioboost.boost_if_quiet(speech_at(db, seed=int(-db)))
         got = audioboost.measure_active_rms(out)
         assert abs(got - audioboost.TARGET_DB) <= 0.5, (db, got, g)
+        assert landing is not None and abs(landing - got) <= 0.05, (landing, got)
     print("  OK  landing: -31/-33.6/-38 dBFS inputs all land on -20 dBFS +-0.5 dB")
 
 
@@ -90,7 +91,7 @@ def test_compression_engages_on_loud_bursts():
                np.abs(np.random.RandomState(4).randn(span.stop - span.start))
                .clip(0.2, 1.0).astype(np.float32))
     in_burst_db = 20.0 * np.log10(float(np.sqrt(np.mean(a[span] ** 2))) + 1e-12)
-    out, g = audioboost.boost_if_quiet(a)
+    out, g, _ = audioboost.boost_if_quiet(a)
     assert g > 0.0
     out_burst_db = 20.0 * np.log10(float(np.sqrt(np.mean(out[span] ** 2))) + 1e-12)
     static_only_db = in_burst_db + g
@@ -99,12 +100,67 @@ def test_compression_engages_on_loud_bursts():
     print(f"  OK  compressor: loud burst held {reduction:.1f} dB below the static-gain-only level")
 
 
+def test_compressor_instant_attack_frame_aligned():
+    # A frame-aligned quiet->loud step: the FIRST loud sample must get the full
+    # frame gain reduction (truly instant attack), the preceding quiet frame must
+    # be untouched (no pre-attenuation), and the release must recover smoothly.
+    fw = 160  # 10 ms at 16 k, the compressor's envelope frame
+    quiet_frames, loud_frames, tail_frames = 20, 10, 60
+    x = np.concatenate([
+        np.full(quiet_frames * fw, 0.01, dtype=np.float32),   # far below threshold
+        np.full(loud_frames * fw, 0.90, dtype=np.float32),    # far above -12 dBFS
+        np.full(tail_frames * fw, 0.01, dtype=np.float32),
+    ])
+    out = audioboost._compress(x)
+    g = out / x  # per-sample applied gain (input never zero)
+    first_loud = quiet_frames * fw
+    # No pre-attenuation: every quiet sample before the step keeps unity gain.
+    assert np.allclose(g[:first_loud], 1.0, atol=1e-9), \
+        f"quiet frame pre-attenuated (min gain {g[:first_loud].min():.6f})"
+    # Instant attack: the first loud sample already carries the frame's full
+    # reduction (identical to mid-frame), and it is a real reduction.
+    assert g[first_loud] < 0.7, f"first loud sample barely reduced (gain {g[first_loud]:.3f})"
+    assert abs(g[first_loud] - g[first_loud + fw // 2]) < 1e-9, \
+        "attack gain must be flat from the frame START, not ramped in"
+    # Smooth release: after the loud region the gain recovers monotonically toward
+    # 1.0 with no zipper steps (per-sample increments stay tiny).
+    rel = g[(quiet_frames + loud_frames + 1) * fw:]
+    d = np.diff(rel)
+    assert np.all(d >= -1e-9), "release gain must be monotone non-decreasing"
+    assert float(d.max()) < 0.01, f"release steps too coarse (max step {d.max():.4f})"
+    assert rel[-1] > 0.99, f"gain did not recover to ~1.0 (got {rel[-1]:.3f})"
+    print(f"  OK  instant attack: first loud sample gain {g[first_loud]:.3f} (flat over the frame), "
+          f"quiet frame untouched, release smooth (max step {d.max():.5f})")
+
+
+def test_capped_boost_reports_measured_landing():
+    # Near-floor channel: the +20 dB static cap (and the +-3 dB trim clamp) means
+    # the landing is NOT the -20 dBFS target. The reported landing_db must be the
+    # MEASURED post-chain median, matching an independent measurement of the
+    # output, not the target constant.
+    a = speech_at(-44.9, secs=10.0, seed=11)
+    out, g, landing = audioboost.boost_if_quiet(a)
+    assert g > 0.0, "a -44.9 dBFS channel must boost"
+    measured = audioboost.measure_active_rms(out)
+    assert landing is not None and measured is not None
+    assert abs(landing - measured) <= 0.05, \
+        f"reported landing {landing:.2f} != measured {measured:.2f} dBFS"
+    assert landing - audioboost.TARGET_DB < -1.0, \
+        f"capped boost cannot land on target; reported {landing:.2f} dBFS looks like the -20 claim"
+    print(f"  OK  capped boost: -44.9 dBFS in, +{g:.1f} dB applied, reported landing "
+          f"{landing:.1f} dBFS == measured {measured:.1f} (not the -20 target)")
+
+
 def test_softclip_bounded():
     # Even a near-full-scale spike inside a quiet channel must stay below 1.0 FS
-    # after the boost (the tanh clipper is asymptotically bounded at 1.0).
+    # after the boost (the tanh clipper is asymptotically bounded at 1.0). The spike
+    # is a SHORT transient (8 samples): it barely lifts its 10 ms frame's RMS, so the
+    # compressor's (now truly instant) attack only partially tames it and the sample
+    # itself still overshoots into the clipper region. A sustained full-frame spike
+    # is the compressor's job, not the clipper's, since the attack fix.
     a = speech_at(-34.0, secs=6.0, seed=5)
-    a[SR:SR + 320] = 0.95  # a spike that the +14 dB static gain would push to ~4.7 FS
-    out, g = audioboost.boost_if_quiet(a)
+    a[SR:SR + 8] = 0.95  # the +14 dB static gain pushes the spike sample to ~4.7 FS
+    out, g, _ = audioboost.boost_if_quiet(a)
     assert g > 0.0
     peak = float(np.abs(out).max())
     # tanh is asymptotically bounded at 1.0 and saturates TO 1.0 in float for an
@@ -120,8 +176,8 @@ def test_stereo_quiet_channel_only():
     # MIC -33.6 boosted, SYS -28.3 untouched).
     quiet = speech_at(-33.6, seed=6)
     healthy = speech_at(-28.3, seed=7)
-    out_q, g_q = audioboost.boost_if_quiet(quiet)
-    out_h, g_h = audioboost.boost_if_quiet(healthy)
+    out_q, g_q, _ = audioboost.boost_if_quiet(quiet)
+    out_h, g_h, _ = audioboost.boost_if_quiet(healthy)
     assert g_q > 0.0 and abs(audioboost.measure_active_rms(out_q) + 20.0) <= 0.5
     assert g_h == 0.0 and out_h is healthy
     assert out_h.tobytes() == healthy.tobytes()
@@ -131,7 +187,7 @@ def test_stereo_quiet_channel_only():
 def test_passthrough_byte_identity():
     healthy = speech_at(-20.0, seed=8)
     before = healthy.tobytes()
-    out, g = audioboost.boost_if_quiet(healthy)
+    out, g, _ = audioboost.boost_if_quiet(healthy)
     assert g == 0.0 and out is healthy and out.tobytes() == before
     print("  OK  pass-through: healthy audio returned as the same object, byte-identical")
 
@@ -223,6 +279,8 @@ if __name__ == "__main__":
                test_trigger_boundary,
                test_landing_minus20,
                test_compression_engages_on_loud_bursts,
+               test_compressor_instant_attack_frame_aligned,
+               test_capped_boost_reports_measured_landing,
                test_softclip_bounded,
                test_stereo_quiet_channel_only,
                test_passthrough_byte_identity,

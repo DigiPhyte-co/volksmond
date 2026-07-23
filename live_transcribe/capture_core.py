@@ -191,20 +191,36 @@ class CaptureBase:
         self._rates[source] = rate
         self._channels[source] = channels
 
+    def _worker_takes(self, la, source):
+        """Does the engaged APM worker `la` consume blocks from `source`?
+
+        MIC always routes to a live worker. SYS routes to it ONLY when the worker was
+        built with a far end (has_far): an AGC-only worker (mic-only start, far_rate=None)
+        has no far pipeline (no main APM, no on_far sink), so pushing far blocks at it
+        would silently DISCARD them. That happens for real on macOS when the system-audio
+        TCC grant lands after start() committed a mic-only AGC worker: those late SYS
+        blocks must instead take the native buffer path (registered at native rate by the
+        deferred-permission handshake), exactly as a no-worker session would. Chosen over
+        an in-place worker upgrade: rebuilding the worker mid-flight would have to swap
+        MIC's buffer rate and resampler state under audio callbacks, a much riskier move
+        for the same audible result (SYS captured + metered; AEC stays honestly
+        unavailable for the session, as aec_state() already reports)."""
+        return la is not None and (source == "MIC" or getattr(la, "has_far", True))
+
     def _ingest_block(self, source, arr):
         """Take one float32 block, shaped (frames, channels), from a backend's
         audio thread: level calc, SYS-ring feed, AEC routing, and the
         under-lock re-check before appending to the chunk buffer."""
         # Cheap per-block level for the live meter (peak + RMS, 0..1). A single
         # dict assignment, so the reader (levels()) never sees a torn value.
-        # When the APM worker is engaged the meter is fed from _append_16k instead,
-        # so it shows what the engine actually hears (AGC-boosted / echo-cancelled),
-        # not the raw device level; the SYS ring below ALWAYS reads the raw block
-        # (the echo veto keys off the true far-end level, which the worker passes
-        # through unchanged anyway).
+        # When the APM worker takes this source the meter is fed from _append_16k
+        # instead, so it shows what the engine actually hears (AGC-boosted /
+        # echo-cancelled), not the raw device level; the SYS ring below ALWAYS reads
+        # the raw block (the echo veto keys off the true far-end level, which the
+        # worker passes through unchanged anyway).
         if arr.size:
             _rms = float(np.sqrt(np.mean(arr * arr)))
-            if self._live_aec is None:
+            if not self._worker_takes(self._live_aec, source):
                 self._levels[source] = (float(np.max(np.abs(arr))), _rms)
             # Feed the SYS energy ring (engine echo veto): one RMS sample per block,
             # timestamped on the session clock (same _t0 as chunk t_start). SYS only.
@@ -213,9 +229,11 @@ class CaptureBase:
                 _ring.add(time.monotonic() - self._t0, 20.0 * np.log10(_rms + 1e-9))
         # Live echo cancellation (when engaged): hand the mono block to the APM worker
         # instead of the native chunk buffer; the worker resamples + cancels and feeds
-        # the (now 16k) chunk buffer itself.
+        # the (now 16k) chunk buffer itself. A SYS block a mic-only (AGC-only) worker
+        # cannot consume bypasses the worker (see _worker_takes) and lands in its own
+        # native-rate buffer below.
         la = self._live_aec
-        if la is not None:
+        if self._worker_takes(la, source):
             mono = arr.mean(axis=1) if (arr.ndim > 1 and arr.shape[1] > 1) else arr[:, 0]
             (la.push_near if source == "MIC" else la.push_far)(mono)
             # Tap the RAW mic (pre-AEC) into MIC_RAW for the recorder, so a recording
@@ -232,7 +250,7 @@ class CaptureBase:
             # then would mix sample rates in one buffer, so route to the worker instead.
             with self._buffer_locks[source]:
                 la = self._live_aec
-                if la is not None:
+                if self._worker_takes(la, source):
                     mono = arr.mean(axis=1) if (arr.ndim > 1 and arr.shape[1] > 1) else arr[:, 0]
                     (la.push_near if source == "MIC" else la.push_far)(mono)
                 else:
