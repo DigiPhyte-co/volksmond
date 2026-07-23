@@ -405,7 +405,7 @@ def switch_device(req: SwitchDeviceRequest):
             # recording side channel) off.
             c = capture.AudioCapture(mic_device=m, loopback_device=l, chunk_seconds=chunk,
                                      on_chunk=_feed, t0=old_cap._t0, aec=old_cap.aec,
-                                     record_raw_mic=old_cap.record_raw_mic)
+                                     agc=old_cap.agc, record_raw_mic=old_cap.record_raw_mic)
             eng = STATE.engine
             if eng is not None and getattr(eng, "sys_env", None) is not None:
                 c.attach_sys_ring(eng.sys_env)   # keep the echo-veto reference fed across the switch
@@ -702,12 +702,14 @@ def start(req: StartRequest):
         # Recorder is tapped BEFORE the engine (see _feed), so the recording stays complete
         # even when transcription drops chunks under load.
         aec_live = req.aec_live if req.aec_live is not None else bool(config.load().get("aec_live", False))
+        agc_live = bool(config.load().get("agc_live", True))   # settings-only; the pre-meeting toggle persists it
         cap = capture.AudioCapture(
             mic_device=req.mic_device,
             loopback_device=req.loopback_device,
             chunk_seconds=chunk_seconds,
             on_chunk=_feed,
             aec=aec_live,
+            agc=agc_live,
             record_raw_mic=False,   # record the AEC-cleaned mic into the single stereo file, not a raw stem
         )
         # Feed a SYS energy ring from live capture so the engine vetoes MIC echo segments in real
@@ -1396,6 +1398,7 @@ class SettingsPatch(BaseModel):
     engine: Optional[str] = None
     aec: Optional[bool] = None
     aec_live: Optional[bool] = None
+    agc_live: Optional[bool] = None
     summary_device: Optional[str] = None
     save_location: Optional[str] = None
     default_context: Optional[str] = None

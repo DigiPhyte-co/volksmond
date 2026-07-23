@@ -613,6 +613,9 @@ window.VM_I18N = {
     "Could not check the GPU.": "Kon nie die GPU toets nie.",
     "CPU": "SVE",
     "Transcript": "Transkripsie",
+    "Auto mic volume": "Outomatiese mikrofoonvolume",
+    "Automatically boosts a quiet microphone to a healthy level, the way Meet and Teams do. Leave it on unless your microphone levels are already set exactly how you want them.":
+      "Versterk 'n sagte mikrofoon outomaties tot 'n gesonde vlak, soos Meet en Teams dit doen. Los dit aan tensy jou mikrofoonvlakke reeds presies reg gestel is.",
     "Cancel echo live": "Kanselleer eggo regstreeks",
     "beta": "beta",
     "Remove the other side's voice that your speakers leak into your microphone, live as the meeting happens. Best on speakers when you are mostly listening; it can blur your words during heavy crosstalk, and does nothing on headphones.": "Verwyder die ander kant se stem wat jou luidsprekers in jou mikrofoon laat lek, regstreeks soos die vergadering plaasvind. Beste op luidsprekers wanneer jy meestal luister; dit kan jou woorde vertroebel tydens baie gelyktydige gepratery, en doen niks op oorfone nie.",

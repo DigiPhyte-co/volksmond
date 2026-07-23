@@ -499,10 +499,10 @@ class _AudioTapHelper:
 # ---- the capture backend ---------------------------------------------------
 
 class AudioCapture(CaptureBase):
-    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None, t0=None, aec=False, record_raw_mic=False):
+    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False):
         super().__init__(mic_device=mic_device, loopback_device=loopback_device,
                          chunk_seconds=chunk_seconds, on_chunk=on_chunk, t0=t0,
-                         aec=aec, record_raw_mic=record_raw_mic)
+                         aec=aec, agc=agc, record_raw_mic=record_raw_mic)
         self._mic_stream = None
         self._helper = None
         self._sys_await_thread = None   # deferred permission-wait completion thread
