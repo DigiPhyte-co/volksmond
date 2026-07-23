@@ -28,7 +28,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .. import buildflags, capture, config, licensing, paths, sinks, transcribe
+from .. import audioboost, buildflags, capture, config, licensing, paths, sinks, transcribe
 from ..__main__ import default_chunk_seconds, pick_tier, resolve_tier
 
 app = FastAPI(title="SA-Live-Transcribe")
@@ -897,6 +897,20 @@ def transcribe_file(req: TranscribeFileRequest):
             from ..capture_core import iter_silence_chunks
             items = []  # (t_start, source, window), merged across files by time
             aborted = False  # set True on user cancel; controls drain-vs-abort in the finally
+            boosts = []  # net dB applied per quiet-boosted channel, for the UI notice
+
+            def _boost(name, chan):
+                """Quiet-channel auto boost (audioboost.py): a channel captured well below
+                normal level makes Whisper loop and hallucinate (measured: -33.6 dBFS
+                active median looped, -28.3 dBFS was fine). Boosts a channel to -20 dBFS
+                active median only when it sits below -30 dBFS; healthy audio passes
+                through byte-identical. Engine input only, never the source file."""
+                out, g = audioboost.boost_if_quiet(chan)
+                if g:
+                    boosts.append(g)
+                    print(f"[transcribe-file] quiet-channel boost: {name} +{g:.1f} dB "
+                          f"to {audioboost.TARGET_DB:.0f} dBFS active median", flush=True)
+                return out
             # New single stereo recording (<stem>.wav: left = MIC, right = SYS), already
             # echo-cancelled at capture. Split the channels and skip offline AEC entirely.
             if base and len(files) == 1:
@@ -922,6 +936,24 @@ def transcribe_file(req: TranscribeFileRequest):
                     if gate_on:
                         mic_ch, _sil, _tot = transcribe.xchan_gate_mic(mic_ch, sys_ch)
                         print(f"[transcribe-file] cross-channel gate silenced {_sil}/{_tot} mic frames", flush=True)
+                    # Quiet-channel boost, deliberately AFTER the cross-channel gate and BEFORE
+                    # the SysEnergyRing. The gate's 10 dB relative margin (and -50 dBFS sys
+                    # floor) were calibrated on UNBOOSTED audio; the boost is per channel, so
+                    # boosting first would shift the MIC/SYS relative levels by the gain
+                    # difference (up to 13.6 dB on the measured recording) and stop the gate
+                    # catching bleed. Gating first keeps both channels on the same unboosted
+                    # decision basis (the calibrated one, exactly); the boost then only scales
+                    # the kept frames, and gate-zeroed bleed stays zero at any gain. Boosting
+                    # BOTH channels jointly when either qualifies was rejected: it still shifts
+                    # the relative levels (each channel needs a different gain to reach -20)
+                    # and needlessly rewrites a healthy channel. The ring below is built from
+                    # the boosted SYS so the engine's echo veto sees the same signal it
+                    # transcribes; the veto's relative margin loosens by the gain difference
+                    # for MIC segments, which is safe because the gate has already zeroed the
+                    # bleed the veto exists to catch, and a boosted MIC clears the veto's
+                    # -28 dBFS absolute ceiling, so quiet REAL speech can no longer be vetoed.
+                    mic_ch = _boost("MIC", mic_ch)
+                    sys_ch = _boost("SYS", sys_ch)
                     # Build the SYS energy ring from the aligned far-end channel so the engine's echo
                     # veto has a reference for every MIC segment (the same mechanism it uses live).
                     _ring = transcribe.SysEnergyRing(retain_s=len(sys_ch) / 16000.0 + 60.0)
@@ -965,6 +997,13 @@ def transcribe_file(req: TranscribeFileRequest):
                         gr, _sr, _tr = transcribe.xchan_gate_mic(right, left)
                         print(f"[transcribe-file] stereo interview gate: L {_sl}/{_tl}, R {_sr}/{_tr} frames silenced", flush=True)
                         left, right = gl, gr
+                    # Quiet-channel boost AFTER the symmetric gate, for the same reason as the
+                    # saved-recording branch above: the gate's relative thresholds are
+                    # calibrated on unboosted audio, and gating first keeps both sides on that
+                    # same decision basis while each side still gets its own trigger decision
+                    # (an interview file often has one quiet speaker). No SysEnergyRing here.
+                    left = _boost("Speaker L", left)
+                    right = _boost("Speaker R", right)
                     for src, chan in (("MIC", left), ("SYS", right)):
                         for i, chunk in iter_silence_chunks(chan, 16000, chunk_seconds):
                             chunk = _np.ascontiguousarray(chunk)
@@ -1009,8 +1048,21 @@ def transcribe_file(req: TranscribeFileRequest):
                     audio = decoded.get(fp)
                     if audio is None:
                         audio = decode_audio(fp, sampling_rate=16000)
+                    # Quiet-channel boost, per track. No cross-channel gate or energy ring in
+                    # this branch, so each file is independent; for a legacy MIC/SYS pair with
+                    # AEC on, the boost measures the echo-cleaned MIC (the audio that will
+                    # actually be transcribed), which is the right basis.
+                    audio = _boost(src, audio)
                     for i, chunk in iter_silence_chunks(audio, 16000, chunk_seconds):
                         items.append((i / 16000.0, src, chunk))
+            if boosts:
+                # Sticky notice for the UI toast (same channel as the mono-fallback notice).
+                # The fixed phrase is an i18n key (trNotice in app.js translates it and keeps
+                # the dynamic dB values); notices combine with " · " so neither is lost.
+                msg = ("Quiet audio boosted for transcription ("
+                       + ", ".join(f"+{g:.1f} dB" for g in boosts) + ")")
+                with STATE.lock:
+                    STATE.notice = (STATE.notice + " · " + msg) if STATE.notice else msg
             items.sort(key=lambda x: x[0])
             for t_start, src, window in items:
                 with STATE.lock:

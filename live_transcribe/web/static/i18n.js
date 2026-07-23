@@ -628,6 +628,8 @@ window.VM_I18N = {
     "For phone recordings where the two speakers sit in the left and right channels (e.g. Samsung Interview mode). Transcribes each side separately, labelled Speaker L and Speaker R. A mono file is transcribed as a single track.":
       "Vir foonopnames waar die twee sprekers in die linker- en regterkanale sit (bv. Samsung se onderhoudmodus). Transkribeer elke kant apart, gemerk Spreker L en Spreker R. 'n Mono-lêer word as een enkele baan getranskribeer.",
     "File is mono, transcribed as a single track": "Die lêer is mono en is as een enkele baan getranskribeer",
+    // Quiet-channel auto boost notice; app.js trNotice() re-attaches the dynamic "(+13.6 dB)" tail.
+    "Quiet audio boosted for transcription": "Stil klank is vir transkripsie versterk",
     "[Speaker L]": "[Spreker L]",
     "[Speaker R]": "[Spreker R]",
 
