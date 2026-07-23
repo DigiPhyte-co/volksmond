@@ -1,0 +1,20 @@
+# Keep the Linux build context small and cache-stable (linux/Dockerfile only COPYs
+# requirements.txt; the repo itself is bind-mounted at run time, never sent as context).
+.git
+.venv
+venv
+__pycache__
+sessions
+dist-linux
+build
+dist
+docs
+.claude
+AEC Recordings
+*.zip
+*.pdf
+*.dmg
+*.exe
+*.wav
+*.mp4
+*.mov
