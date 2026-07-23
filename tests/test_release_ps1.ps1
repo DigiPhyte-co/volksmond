@@ -19,7 +19,12 @@
 # Exit: 0 = all checks passed, 1 = failures (count printed either way).
 
 param(
-    [string]$BaselineCommit = "bbd39d7"
+    # Newest pre-generalisation (two-platform) release.ps1: it already carries the 2026-07-23
+    # Windows url policy (latest.json "url" = the versioned installer on
+    # dl.volksmond.digiphyte.com) and the wrangler .cmd-shim fix. An older baseline (e.g.
+    # bbd39d7) emits the marketing-site url, so section D would flag that INTENTIONAL policy
+    # change as a byte difference.
+    [string]$BaselineCommit = "2b59167"
 )
 
 $here = Split-Path -Parent $PSScriptRoot   # repo root (this file lives in tests\)

@@ -79,12 +79,15 @@ param(
     # find a jurisdictioned bucket without this flag on every object op (nor a standard bucket
     # with it). Keep "eu" unless targeting a standard-jurisdiction bucket, then pass "".
     [string]$Jurisdiction = "eu",
-    # Where the in-app "Download" link (latest.json "url") sends the user. MUST be an https URL on
-    # digiphyte.com or a *.digiphyte.com subdomain (or github.com): the shipped app (app.js
-    # openUpdateLink allowlist, live_transcribe/web/static/app.js:2166-2176) REJECTS any other
-    # host, so a bare volksmond.com link is refused by every installed client. The host
-    # volksmond.digiphyte.com 308-redirects to volksmond.com, which the browser follows AFTER the
-    # app has opened the link. Do not "fix" this back to volksmond.com. See RELEASE.md.
+    # The marketing-site URL, used for the MAC latest.json entry only. Since 2026-07-23 the
+    # WINDOWS "url" is the direct versioned installer link on dl.volksmond.digiphyte.com (see
+    # $winDownloadUrl in the manifest step): the in-app Download button downloads the exe
+    # instead of opening the site. Any url in latest.json MUST be https on an allowlisted
+    # family: digiphyte.com / *.digiphyte.com, volksmond.com / *.volksmond.com, or github.com
+    # (the shipped app's openUpdateLink allowlist, web/static/app.js, rejects every other
+    # host). Installed Windows and mac clients up to v1.11.0 only carry the digiphyte.com and
+    # github.com entries, so their urls stay on the digiphyte.com family; Linux clients all
+    # ship with the volksmond.com entry, so the linux url stays pinned to dl.volksmond.com.
     [string]$SiteUrl = "https://volksmond.digiphyte.com/",
     [string]$Notes,
     [string]$AccountId,
@@ -135,10 +138,29 @@ function Fail($msg) { Write-Host "  $msg" -ForegroundColor Red; exit 1 }
 # on PATH; otherwise run it via npx, which ships with Node and needs no global install or PATH
 # entry. Returns the leading command tokens (e.g. @("npx","--yes","wrangler")), or $null.
 function Get-WranglerBase {
+    # doppler exec()s the resolved command directly (CreateProcess), so a PowerShell shim
+    # (.ps1) is not runnable ("%1 is not a valid Win32 application"); npm installs a .cmd
+    # shim beside it, prefer that. Same applies to npx itself.
     $cmd = Get-Command wrangler -ErrorAction SilentlyContinue
-    if ($cmd -and $cmd.Source) { return @($cmd.Source) }
+    if ($cmd -and $cmd.Source) {
+        $src = $cmd.Source
+        if ($src -like "*.ps1") {
+            $sibling = [System.IO.Path]::ChangeExtension($src, ".cmd")
+            if (Test-Path $sibling) { return @($sibling) }
+        } else {
+            return @($src)
+        }
+    }
     $npx = Get-Command npx -ErrorAction SilentlyContinue
-    if ($npx -and $npx.Source) { return @($npx.Source, "--yes", "wrangler") }
+    if ($npx -and $npx.Source) {
+        $nsrc = $npx.Source
+        if ($nsrc -like "*.ps1") {
+            $nsibling = [System.IO.Path]::ChangeExtension($nsrc, ".cmd")
+            if (Test-Path $nsibling) { return @($nsibling, "--yes", "wrangler") }
+        } else {
+            return @($nsrc, "--yes", "wrangler")
+        }
+    }
     return $null
 }
 
@@ -804,7 +826,16 @@ foreach ($pk in $PlatformKeys) {
     try { $v = ($baseTrustRaw  | ConvertFrom-Json).$pk; if ($v) { $prevPlatTrust[$pk]  = $v } } catch { }
 }
 
-$latestObj = [ordered]@{ version = $ver; url = $SiteUrl; notes = $Notes }
+# The Windows "url" is the DIRECT versioned installer link, on the legacy digiphyte.com alias
+# host: installed Windows and mac clients up to v1.11.0 shipped an openUpdateLink allowlist
+# (app.js) that only follows https links on digiphyte.com / *.digiphyte.com / github.com, so
+# the installed base decides the host. Builds from this branch onward also allow the
+# volksmond.com family (Linux clients all ship with that entry). dl.volksmond.digiphyte.com
+# is bound Active on the same R2 bucket as dl.volksmond.com, so the same object serves.
+# Sean's call 2026-07-23: the in-app Download button must download the installer, not open
+# the marketing site.
+$winDownloadUrl = "https://dl.volksmond.digiphyte.com/Volksmond-Setup-$ver.exe"
+$latestObj = [ordered]@{ version = $ver; url = $winDownloadUrl; notes = $Notes }
 foreach ($pk in $prevPlatLatest.Keys) { $latestObj[$pk] = $prevPlatLatest[$pk] }
 Write-JsonNoBom $manifestPath $latestObj
 # trust.json: contract shared with trust.html. REQUIRED: version, filename, sha256 (UPPERCASE
