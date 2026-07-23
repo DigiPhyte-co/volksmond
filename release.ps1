@@ -59,12 +59,13 @@ param(
     # find a jurisdictioned bucket without this flag on every object op (nor a standard bucket
     # with it). Keep "eu" unless targeting a standard-jurisdiction bucket, then pass "".
     [string]$Jurisdiction = "eu",
-    # Where the in-app "Download" link (latest.json "url") sends the user. MUST be an https URL on
-    # digiphyte.com or a *.digiphyte.com subdomain (or github.com): the shipped app (app.js
-    # openUpdateLink allowlist, live_transcribe/web/static/app.js:2166-2176) REJECTS any other
-    # host, so a bare volksmond.com link is refused by every installed client. The host
-    # volksmond.digiphyte.com 308-redirects to volksmond.com, which the browser follows AFTER the
-    # app has opened the link. Do not "fix" this back to volksmond.com. See RELEASE.md.
+    # The marketing-site URL, used for the MAC latest.json entry only. Since 2026-07-23 the
+    # WINDOWS "url" is the direct versioned installer link on dl.volksmond.digiphyte.com (see
+    # $winDownloadUrl in the manifest step): the in-app Download button downloads the exe
+    # instead of opening the site. Any url in latest.json MUST be https on digiphyte.com /
+    # *.digiphyte.com (or github.com): the shipped app's openUpdateLink allowlist
+    # (web/static/app.js) rejects every other host, so a bare volksmond.com link is refused by
+    # every installed client.
     [string]$SiteUrl = "https://volksmond.digiphyte.com/",
     [string]$Notes,
     [string]$AccountId,
@@ -554,7 +555,13 @@ $prevMacLatest = $null; $prevMacTrust = $null
 try { $prevMacLatest = ($baseLatestRaw | ConvertFrom-Json).mac } catch { }
 try { $prevMacTrust  = ($baseTrustRaw  | ConvertFrom-Json).mac } catch { }
 
-$latestObj = [ordered]@{ version = $ver; url = $SiteUrl; notes = $Notes }
+# The Windows "url" is the DIRECT versioned installer link, on the legacy digiphyte.com alias
+# host because the shipped app's openUpdateLink allowlist (app.js) only follows https links on
+# digiphyte.com / *.digiphyte.com / github.com. dl.volksmond.digiphyte.com is bound Active on
+# the same R2 bucket as dl.volksmond.com, so the same object serves. Sean's call 2026-07-23:
+# the in-app Download button must download the installer, not open the marketing site.
+$winDownloadUrl = "https://dl.volksmond.digiphyte.com/Volksmond-Setup-$ver.exe"
+$latestObj = [ordered]@{ version = $ver; url = $winDownloadUrl; notes = $Notes }
 if ($prevMacLatest) { $latestObj["mac"] = $prevMacLatest }
 Write-JsonNoBom $manifestPath $latestObj
 # trust.json: contract shared with trust.html. REQUIRED: version, filename, sha256 (UPPERCASE
