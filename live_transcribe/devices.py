@@ -28,11 +28,25 @@ elif sys.platform == "darwin":
             "macOS device enumeration backend (live_transcribe.devices_mac) is "
             "not available in this build yet; see docs/mac-port-plan.md."
         ) from e
+elif sys.platform.startswith("linux"):
+    try:
+        from .devices_linux import (
+            list_ui_devices,
+            print_devices,
+            resolve_loopback,
+            resolve_mic,
+        )
+    except ImportError as e:
+        raise ImportError(
+            "Linux device enumeration backend (live_transcribe.devices_linux) "
+            "failed to import; see docs/linux-port-plan.md."
+        ) from e
 else:
     raise ImportError(
         f"no device enumeration backend for platform {sys.platform!r}: "
-        "live_transcribe.devices_win covers Windows and "
-        "live_transcribe.devices_mac (planned) covers macOS."
+        "live_transcribe.devices_win covers Windows, "
+        "live_transcribe.devices_mac covers macOS and "
+        "live_transcribe.devices_linux covers Linux."
     )
 
 __all__ = ["list_ui_devices", "print_devices", "resolve_loopback", "resolve_mic"]
