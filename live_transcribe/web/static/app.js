@@ -2323,6 +2323,7 @@ function openUpdateLink(u) {
     var host = url.hostname.toLowerCase();
     var ok = url.protocol === "https:" && (
       host === "digiphyte.com" || host.endsWith(".digiphyte.com") ||
+      host === "volksmond.com" || host.endsWith(".volksmond.com") ||
       host === "github.com" || host.endsWith(".github.com") || host.endsWith(".githubusercontent.com"));
     if (ok) { openExternal(u); return; }
   } catch (e) {}

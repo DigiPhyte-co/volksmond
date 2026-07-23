@@ -191,6 +191,8 @@ def set_cloud_api_key(key) -> None:
             raw["cloud_api_key"] = {"dpapi": base64.b64encode(enc).decode("ascii")}
         else:
             # Not real protection; replaced with the Keychain when macOS lands.
+            # Linux intentionally shares this base64 fallback with macOS (parity
+            # decision; a keyring/Secret Service backend is parked future work).
             raw["cloud_api_key"] = {"b64": base64.b64encode(key.encode("utf-8")).decode("ascii")}
         _write_raw(raw)
 

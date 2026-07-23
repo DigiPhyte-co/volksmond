@@ -12,7 +12,10 @@
 #   3. docker run    smoke.sh              -> CLEAN ubuntu:22.04 AND debian:12:
 #                                             apt-get install ./<deb> (Depends must
 #                                             resolve), volksmond --server-only,
-#                                             HTTP 200 on the web UI root
+#                                             HTTP 200 on the web UI root; ubuntu
+#                                             additionally runs the xvfb window
+#                                             stage (default pywebview/GTK window
+#                                             boot; catches missing gi typelibs)
 #   4. docker run    pulse-fixture.sh      -> null-sink capture fixture (real backend,
 #                                             MIC + SYS non-silent; optional stage)
 #
@@ -95,10 +98,13 @@ if ($SkipSmoke) {
     Write-Host "  [3/4] SKIPPED (-SkipSmoke): clean-container smoke on ubuntu:22.04 + debian:12" -ForegroundColor Yellow
 } else {
     foreach ($image in @("ubuntu:22.04", "debian:12")) {
+        # The xvfb window stage (default pywebview/GTK window boot) runs on the
+        # ubuntu smoke only; debian stays server-only for wall time.
+        $stage2 = if ($image -eq "ubuntu:22.04") { " window" } else { "" }
         Write-Host ""
-        Write-Host "  [3/4] smoke.sh on $image" -ForegroundColor Cyan
+        Write-Host "  [3/4] smoke.sh on $image$(if ($stage2) { ' (+ window stage)' })" -ForegroundColor Cyan
         Invoke-ContainerScript @("run", "--rm", "-v", "${here}:/src:ro", "-v", "${out}:/out:ro", $image) `
-            "/src/linux/smoke.sh" "/out/Volksmond-$ver.deb"
+            "/src/linux/smoke.sh" "/out/Volksmond-$ver.deb$stage2"
         if ($LASTEXITCODE -ne 0) { Write-Host "  Smoke FAILED on $image (rc=$LASTEXITCODE)." -ForegroundColor Red; exit 1 }
         Write-Host "  Smoke passed on $image." -ForegroundColor Green
     }

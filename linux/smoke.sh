@@ -12,9 +12,21 @@
 # headless (--server-only) and serve HTTP 200 on the web UI root. curl + CA certs
 # are harness tooling, installed separately BEFORE the .deb so they can never mask
 # a hole in the Depends line.
+#
+# Optional second stage ("window" as $2, run on the ubuntu:22.04 smoke only; debian
+# stays server-only for wall time): the server-only boot never imports pywebview or
+# the GTK/gi stack, so a frozen build with missing gi typelibs would pass stage 1
+# and crash on a real desktop. The window stage installs xvfb AND a headless
+# pulseaudio server (both harness tooling, like curl: a virtual display/audio
+# server is environment, not a package Depends; the .deb declares libpulse0, the
+# CLIENT) and boots the app in DEFAULT window mode under xvfb-run; PASS = the
+# process is still alive after ~20 s with no Python traceback in its log. Without
+# the pulse server the strict no-traceback criterion would trip on a purely
+# environmental /api/devices connect failure once the window's UI JS loads.
 set -euo pipefail
 
-DEB="${1:?usage: smoke.sh /path/to/Volksmond-<ver>.deb}"
+DEB="${1:?usage: smoke.sh /path/to/Volksmond-<ver>.deb [window]}"
+WINDOW_STAGE="${2:-}"
 export DEBIAN_FRONTEND=noninteractive
 
 . /etc/os-release
@@ -59,4 +71,40 @@ fi
 
 kill "$APP_PID" 2>/dev/null || true
 wait "$APP_PID" 2>/dev/null || true
+
+if [ "$WINDOW_STAGE" = "window" ]; then
+    echo "==> Window stage: xvfb-run volksmond (default pywebview/GTK window mode)"
+    apt-get install -y -qq --no-install-recommends xvfb pulseaudio >/dev/null
+    # Headless pulse server so the UI's /api/devices probe has something to talk
+    # to (same daemon recipe as linux/pulse-fixture.sh; module-always-sink gives
+    # it a null sink + monitor with zero hardware).
+    export XDG_RUNTIME_DIR=/tmp/pulse-rt
+    mkdir -p "$XDG_RUNTIME_DIR"
+    pulseaudio --daemonize=yes --exit-idle-time=-1 --disallow-exit \
+        --log-target=file:/tmp/pulse-smoke.log \
+        || { echo "ERROR: headless pulseaudio failed to start for the window stage" >&2; exit 1; }
+    WLOG=/tmp/volksmond-window.log
+    : > "$WLOG"
+    xvfb-run -a -s "-screen 0 1280x800x24" volksmond > "$WLOG" 2>&1 &
+    WIN_PID=$!
+    sleep 20
+    if ! kill -0 "$WIN_PID" 2>/dev/null; then
+        echo "ERROR: window-mode app exited within 20 s; log tail:" >&2
+        tail -n 60 "$WLOG" >&2 || true
+        exit 1
+    fi
+    if grep -q "Traceback (most recent call last)" "$WLOG"; then
+        echo "ERROR: window-mode app logged a Python traceback:" >&2
+        grep -A 40 "Traceback (most recent call last)" "$WLOG" >&2 || true
+        kill "$WIN_PID" 2>/dev/null || true
+        exit 1
+    fi
+    echo "==> WINDOW STAGE PASS ($PRETTY_NAME): process alive after 20 s, no traceback"
+    # Kill the xvfb-run wrapper and the frozen app; the container teardown
+    # reaps anything that lingers.
+    kill "$WIN_PID" 2>/dev/null || true
+    pkill -f /opt/volksmond/volksmond 2>/dev/null || true
+    wait "$WIN_PID" 2>/dev/null || true
+fi
+
 echo "==> SMOKE PASS ($PRETTY_NAME)"
