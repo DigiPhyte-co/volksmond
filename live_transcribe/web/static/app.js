@@ -165,7 +165,7 @@ var S = {
   sessions: [], sessionsFolder: "", sessionsActive: null, sessionsSummarising: [],
   live: freshLive(),
   starting: { active: false, kind: null, title: "", error: null, startedAt: null },
-  form: { title: "", language: "af", moreLang: null, tier: "auto", device: "auto", engine: "auto", participants: [], terms: [], record: false, aec: false, stereoSplit: false, mic: null, loopback: null, advancedOpen: false },
+  form: { title: "", language: "af", moreLang: null, tier: "auto", device: "auto", engine: "auto", participants: [], terms: [], record: false, aec: false, agcLive: true, stereoSplit: false, mic: null, loopback: null, advancedOpen: false },
   setup: { stage: "welcome", choice: "transcribe" },
   finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null },
   reader: { name: "", title: "", text: "", summarising: false, summary: null },
@@ -3307,6 +3307,7 @@ function advancedTranscribeControls(live) {
         el("div", { style: { marginTop: "12px" } }, [qualitySelector(),
           el("p", { class: "ink-3", style: { fontSize: "11px", margin: "6px 0 0" }, text: "Auto picks the best model your computer can run. Bigger is more accurate but slower." })]), true),
       runOnField(),
+      live ? agcLiveControl() : null,
       live ? aecLiveControl() : aecRetranscribeControl(),
       (!live && S.route === "importpre" && S.importPath) ? stereoSplitControl() : null,
     ]),
@@ -3337,6 +3338,18 @@ function aecRetranscribeControl() {
         el("p", { class: "ink-3", style: { fontSize: "11px", margin: "4px 0 0" }, text: "Off by default. When you re-transcribe a recording, remove the other side's voice that your microphone re-heard through the speakers. Best when you are mostly listening (a video or a one-sided talk). It can blur your own words when you and the other side talk over each other, so leave it off for normal back-and-forth meetings. No effect on headphones." }),
       ]),
       toggleEl(!!S.form.aec, function () { S.form.aec = !S.form.aec; saveSettings({ aec: S.form.aec }); }),
+    ]));
+}
+// Live mic auto-gain toggle (live pre-meeting only). Default ON; persisted as agc_live.
+// Independent of the echo-cancellation toggle below: AGC applies in both AEC states.
+function agcLiveControl() {
+  return el("div", { style: { marginTop: "12px", paddingTop: "12px", borderTop: "1px solid var(--line)" } },
+    el("div", { class: "row gap-10", style: { alignItems: "flex-start" } }, [
+      el("div", { class: "grow" }, [
+        el("div", { style: { fontWeight: "600", fontSize: "13px" }, text: tr("Auto mic volume") }),
+        el("p", { class: "ink-3", style: { fontSize: "11px", margin: "4px 0 0" }, text: tr("Automatically boosts a quiet microphone to a healthy level, the way Meet and Teams do. Leave it on unless your microphone levels are already set exactly how you want them.") }),
+      ]),
+      toggleEl(!!S.form.agcLive, function () { S.form.agcLive = !S.form.agcLive; saveSettings({ agc_live: S.form.agcLive }); }),
     ]));
 }
 // Live echo cancellation toggle (live pre-meeting only; re-transcribe AEC has its own setting).
@@ -3476,6 +3489,7 @@ async function boot() {
     S.form.device = S.settings.device || "auto";
     S.form.engine = S.settings.engine || "auto";
     S.form.aecLive = !!S.settings.aec_live;
+    S.form.agcLive = S.settings.agc_live !== false;   // default ON (an old settings file has no key)
     S.form.aec = !!S.settings.aec;
   }
   if (S.devices) {

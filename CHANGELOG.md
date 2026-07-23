@@ -1,5 +1,9 @@
 # Changelog, SA-Live-Transcribe
 
+## unreleased (targets v1.11.2): a quiet microphone no longer starves the engine
+
+- **Live mic auto-gain, the way Meet and Teams do it.** The microphone path now runs WebRTC automatic gain control, so a quiet mic (a real Samson C01U delivered speech at -34 dBFS even with Windows at 95%) reaches the engine at a healthy level instead of feeding it near-silence, which is exactly the audio Whisper hallucinates and false-vetoes on. AGC applies in BOTH echo-cancellation states (with AEC on it runs inside the same processor, Meet's configuration; with AEC off the mic routes through a dedicated AGC-only pass instead of raw), and mic-only sessions (no system audio captured) now engage the processor purely for AGC. System audio never gets AGC (it is a digital signal at a known level, and gain-riding music would audibly pump). New "Auto mic volume" toggle under the pre-meeting Advanced panel, ON by default, persisted as `agc_live`; the live level meter now shows the processed mic, so the boost is visible. Fail-open: if the gain controller cannot start or errors mid-stream, capture continues exactly as before with a log line. Validated on the real quiet-mic meeting (offline replay, control vs AGC through the live pipeline): active speech lifted ~6 dB into the healthy range, false echo-vetoes of real speech halved (16 -> 7), a real utterance recovered that the control lost entirely, silence handling and force-cut rate unchanged, and a real-bleed recording still vetoes echo correctly. (`aec_live.py`, `capture_core.py`, `capture_win.py`, `capture_mac.py`, `config.py`, `web/app.py`, `web/static/app.js`, `web/static/i18n.js`.)
+
 ## 2026-07-23, v1.11.1: recordings stay in sync, and uploads stop cutting words in half
 
 `licensing.APP_VERSION` 1.11.0 -> 1.11.1.
