@@ -431,6 +431,71 @@ def test_levels_and_switch_device():
     print("  OK  /api/levels idle-safe; /api/switch-device session-gated + validated + CSRF; capture keeps t0")
 
 
+def test_switch_device_preserves_recording_clock():
+    # A mid-recording device switch rebuilds the capture but must NOT restart the session
+    # clock: it threads the original t0 into the new capture, so post-switch chunk t_starts
+    # keep climbing on the session clock. That is exactly what the recorder's time-aligned
+    # fold relies on: the ~1s switch gap becomes a zero-filled gap at its true wall-clock
+    # position, not a "behind" chunk that gets appended as-is and shifts SYS forever.
+    #
+    # test_levels_and_switch_device only proves the CONSTRUCTOR stores a passed t0; this
+    # drives the real handler end-to-end and proves it PASSES t0 through the rebuild. If a
+    # refactor ever drops `t0=old_cap._t0` from switch_device, the stereo recording after a
+    # device switch silently misaligns, and this test fails.
+    import time as _time
+    built = []   # kwargs each rebuilt AudioCapture is constructed with
+
+    class _FakeCapture:
+        def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15,
+                     on_chunk=None, t0=None, aec=False, record_raw_mic=False):
+            self._t0_init = t0
+            self._t0 = t0 if t0 is not None else _time.monotonic()
+            self.aec = aec
+            self.record_raw_mic = record_raw_mic
+            built.append({"t0": t0, "aec": aec, "record_raw_mic": record_raw_mic})
+
+        def start(self):
+            self._t0 = self._t0_init if self._t0_init is not None else _time.monotonic()
+
+        def stop(self):
+            pass
+
+        def attach_sys_ring(self, ring):
+            pass
+
+        def has_raw_mic(self):
+            return self.record_raw_mic
+
+    st = webapp.STATE
+    session_t0 = _time.monotonic() - 12.0    # session started ~12s ago
+    old_cap = _FakeCapture(mic_device="0", loopback_device="1", t0=session_t0,
+                           aec=True, record_raw_mic=True)
+    old_cap.start()
+    saved_factory = webapp.capture.AudioCapture
+    saved = (st.running, st.stopping, st.source_kind, st.capture, st.engine,
+             st.mic_device, st.loopback_device, st.chunk_seconds, st.record_raw_mic)
+    try:
+        webapp.capture.AudioCapture = _FakeCapture
+        st.running = True; st.stopping = False; st.source_kind = "live"
+        st.capture = old_cap; st.engine = None
+        st.mic_device = "0"; st.loopback_device = "1"; st.chunk_seconds = 15
+        built.clear()
+        r = client.post("/api/switch-device", json={"which": "mic", "device": "2"})
+        assert r.status_code == 200, (r.status_code, r.text)
+        assert built, "switch_device did not rebuild the capture"
+        assert built[-1]["t0"] == session_t0, \
+            f"switch_device must thread t0 through the rebuild, got {built[-1]['t0']} != {session_t0}"
+        # Settings carried across so the switch does not silently disable AEC / raw-mic recording.
+        assert built[-1]["aec"] is True and built[-1]["record_raw_mic"] is True, built[-1]
+        # The new capture is on the same clock, so a chunk produced now reads ~12s, not ~0s.
+        assert (_time.monotonic() - st.capture._t0) > 5.0, "post-switch clock restarted near zero"
+    finally:
+        webapp.capture.AudioCapture = saved_factory
+        (st.running, st.stopping, st.source_kind, st.capture, st.engine,
+         st.mic_device, st.loopback_device, st.chunk_seconds, st.record_raw_mic) = saved
+    print("  OK  /api/switch-device threads t0 through the rebuild: recording clock survives a device switch")
+
+
 def test_recording_channel_bundling():
     # Uploading ONE channel of a saved recording must pull in its MIC+SYS pair (so a single-file
     # upload still transcribes both sides and can cancel echo), and drop the summed -MIXED. A normal
@@ -728,6 +793,7 @@ if __name__ == "__main__":
                test_settings_migration_old_default_language,
                test_fits_on_gpu_logic,
                test_levels_and_switch_device,
+               test_switch_device_preserves_recording_clock,
                test_recording_channel_bundling,
                test_recorder_stereo_fold,
                test_feed_raw_mic_routing,
