@@ -24,9 +24,9 @@ the level-meter and SYS-ring cadence identical to the Windows callbacks.
 Streams are requested at PA_SAMPLE_FLOAT32LE and the source's native rate and
 channel count; the server converts as needed, so there is no channel-count
 fallback ladder here (unlike WASAPI, a Pulse open does not fail on format).
-If the float constant is ever missing, the reader falls back to
-PA_SAMPLE_S16LE and scales by 1/32768 (capture_core ingests float32 either
-way).
+If the float constant is missing, or a FLOAT32LE open fails, the stream falls
+back to PA_SAMPLE_S16LE (one retry, no ladder) and the reader scales by
+1/32768 (capture_core ingests float32 either way).
 
 Why not PortAudio/sounddevice: the released PortAudio builds (wheel-bundled
 and distro alike) have no PulseAudio/PipeWire host API, so monitor sources
@@ -46,6 +46,7 @@ imports cleanly on Windows for the test suite, which drives the backend with
 fake pulsectl/pasimple modules.
 """
 import threading
+import time
 
 import numpy as np
 
@@ -61,9 +62,12 @@ APP_NAME = "Volksmond"
 # so flooding it at 50 Hz would be wasteful).
 READ_SECONDS = 0.02
 
-# How long _close_sources waits for a reader to notice the stop flag and exit
-# on its own before force-closing its stream from the closing thread.
-_JOIN_TIMEOUT_S = 3.0
+# One SHARED deadline across ALL reader joins at stop time (not per reader, so
+# a stop can never stall for readers x timeout). Readers do ~READ_SECONDS
+# blocking reads and check the stop flag between reads, so they normally exit
+# almost instantly; the deadline only bites when a stalled server wedges a
+# reader inside read().
+_JOIN_DEADLINE_S = 4.0
 
 
 class AudioCapture(CaptureBase):
@@ -72,6 +76,7 @@ class AudioCapture(CaptureBase):
                          chunk_seconds=chunk_seconds, on_chunk=on_chunk, t0=t0,
                          aec=aec, record_raw_mic=record_raw_mic)
         self._streams = []                     # [{"source", "stream", "thread"}]
+        self._stalled = []                     # readers that missed the stop deadline (see _close_sources)
         self._capture_stop = threading.Event()  # our own flag: _close_sources runs BEFORE CaptureBase sets _stop_event
 
     def _open_sources(self):
@@ -134,36 +139,50 @@ class AudioCapture(CaptureBase):
         channels = max(1, int(desc["channels"]))
 
         # PA_SAMPLE_FLOAT32LE is the primary path (matches _ingest_block's
-        # float32 contract with zero conversion). The S16 fallback exists per
-        # the plan in case the float constant is unavailable; one multiply in
-        # the reader covers it.
-        fmt = getattr(pasimple, "PA_SAMPLE_FLOAT32LE", None)
-        if fmt is not None:
-            width, scale = 4, None
-        else:
-            fmt, width, scale = pasimple.PA_SAMPLE_S16LE, 2, 1.0 / 32768.0
-
-        frame_bytes = width * channels
-        read_bytes = max(1, int(rate * READ_SECONDS)) * frame_bytes
+        # float32 contract with zero conversion). The S16 fallback (one
+        # multiply in the reader covers it) engages when the float constant is
+        # unavailable OR when the FLOAT32LE open itself fails: one retry with
+        # S16LE for this source, no further ladder.
+        float_fmt = getattr(pasimple, "PA_SAMPLE_FLOAT32LE", None)
+        attempts = []  # (fmt, sample width in bytes, reader scale)
+        if float_fmt is not None:
+            attempts.append((float_fmt, 4, None))
+        attempts.append((pasimple.PA_SAMPLE_S16LE, 2, 1.0 / 32768.0))
 
         self._register_source(source, rate, channels)
         try:
-            # fragsize sized to one read so the server delivers in low-latency
-            # fragments (the simple API's default is about 2 s, far too coarse
-            # for a live meter).
-            # TODO(linux-hw): validate fragsize behaviour and capture latency
-            # under both PulseAudio (Mint 21) and pipewire-pulse (Mint 22 /
-            # Debian 12) with the null-sink Docker fixture and on the Mint box.
-            stream = pasimple.PaSimple(
-                pasimple.PA_STREAM_RECORD,
-                fmt,
-                channels,
-                rate,
-                app_name=APP_NAME,
-                stream_name=f"{APP_NAME} {source}",
-                device_name=desc["source"],
-                fragsize=read_bytes,
-            )
+            stream = None
+            read_bytes = None
+            scale = None
+            for i, (fmt, width, fmt_scale) in enumerate(attempts):
+                # Sample-width-consistent read size: fragsize sized to one read
+                # so the server delivers in low-latency fragments (the simple
+                # API's default is about 2 s, far too coarse for a live meter).
+                # TODO(linux-hw): validate fragsize behaviour and capture
+                # latency under both PulseAudio (Mint 21) and pipewire-pulse
+                # (Mint 22 / Debian 12) with the null-sink Docker fixture and
+                # on the Mint box.
+                frame_bytes = width * channels
+                attempt_read_bytes = max(1, int(rate * READ_SECONDS)) * frame_bytes
+                try:
+                    stream = pasimple.PaSimple(
+                        pasimple.PA_STREAM_RECORD,
+                        fmt,
+                        channels,
+                        rate,
+                        app_name=APP_NAME,
+                        stream_name=f"{APP_NAME} {source}",
+                        device_name=desc["source"],
+                        fragsize=attempt_read_bytes,
+                    )
+                except Exception as e:
+                    if i + 1 < len(attempts):
+                        print(f"[{source}] FLOAT32LE open failed ({e}); "
+                              "retrying once with S16LE", flush=True)
+                        continue
+                    raise
+                read_bytes, scale = attempt_read_bytes, fmt_scale
+                break
         except Exception:
             # Clear the partial per-source state so a failure doesn't leave
             # half-initialised buffers behind (mirrors capture_win).
@@ -178,10 +197,28 @@ class AudioCapture(CaptureBase):
             daemon=True,
             name=f"pulse-reader-{source}",
         )
-        self._streams.append({"source": source, "stream": stream, "thread": t})
+        entry = {"source": source, "stream": stream, "thread": t}
+        self._streams.append(entry)
         print(f"[{source}] opened '{desc['name']}' @ {rate} Hz x{channels}ch "
               f"(pulse source '{desc['source']}')", flush=True)
-        t.start()
+        try:
+            t.start()
+        except Exception:
+            # A thread that never started can neither drain nor close its
+            # stream, and _close_sources skips not-alive threads, so the
+            # transactional rollback would miss it: close the stream here (no
+            # reader is inside read(), so this close is safe), drop its entry,
+            # unregister its source, then re-raise into the existing
+            # transactional path (_open_sources -> _close_sources).
+            try:
+                stream.close()
+            except Exception:
+                pass
+            self._streams.remove(entry)
+            for d in (self._buffers, self._buffer_counts, self._buffer_locks,
+                      self._rates, self._channels):
+                d.pop(source, None)
+            raise
 
     def _reader(self, source, stream, rate, channels, read_bytes, scale):
         """Drain one record stream: short blocking reads, aggregated to
@@ -235,23 +272,39 @@ class AudioCapture(CaptureBase):
 
     def _close_sources(self):
         self._capture_stop.set()
+        deadline = time.monotonic() + _JOIN_DEADLINE_S
         for s in self._streams:
             t = s["thread"]
             if t.is_alive():
-                t.join(timeout=_JOIN_TIMEOUT_S)
-        for s in self._streams:
-            if s["thread"].is_alive():
-                # Last resort: the reader is stuck in a blocking read (a
-                # stalled server delivering no data). Closing the stream from
-                # this thread errors that read out so the daemon thread dies.
-                # TODO(linux-hw): pa_simple makes no thread-safety promise;
-                # confirm this path is benign (or never hit) on real hardware
-                # before 1.0, and prefer a server-side fix if it ever fires.
-                try:
-                    s["stream"].close()
-                except Exception:
-                    pass
+                t.join(timeout=max(0.0, deadline - time.monotonic()))
+        # A reader that missed the shared deadline may still be INSIDE a
+        # blocking read(); pa_simple makes no thread-safety promise, so
+        # closing (freeing) its stream from this thread risks a use-after-free
+        # in libpulse. Accepted trade-off: on a pathological hang we keep the
+        # stream handle referenced (a leak) rather than free it under the
+        # reader, and _release_backend attempts one final short rejoin.
+        self._stalled = [s for s in self._streams if s["thread"].is_alive()]
+        for s in self._stalled:
+            print(f"[{s['source']}] reader did not exit within "
+                  f"{_JOIN_DEADLINE_S:.0f}s; keeping its stream open rather "
+                  "than freeing it under a blocked read", flush=True)
         self._streams = []
 
-    # No _release_backend override: unlike PortAudio on Windows there is no
-    # host-API singleton to terminate; each stream is closed by its reader.
+    def _release_backend(self):
+        # Unlike PortAudio on Windows there is no host-API singleton to
+        # terminate; each stream is closed by its reader. This late hook only
+        # gives readers that missed the _close_sources deadline one final
+        # short rejoin (the reader's finally block closes its own stream).
+        # Anything still alive after that stays referenced in self._stalled
+        # for the life of this capture object: a leaked stream on a wedged
+        # daemon thread is freed at process exit and is the accepted
+        # trade-off over a use-after-free.
+        for s in self._stalled:
+            t = s["thread"]
+            if t.is_alive():
+                t.join(timeout=0.5)
+        self._stalled = [s for s in self._stalled if s["thread"].is_alive()]
+        for s in self._stalled:
+            print(f"[{s['source']}] reader still blocked after the final "
+                  "rejoin; leaking its stream (daemon thread, reclaimed at "
+                  "process exit)", flush=True)

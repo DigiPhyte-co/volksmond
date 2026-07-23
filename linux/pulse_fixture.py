@@ -26,29 +26,7 @@ CAPTURE_SECONDS = 7
 MIN_PEAK = 0.05
 
 
-def _quarantine_wp_l1_sample_spec_bug():
-    """TODO(wp-l1-bug): REMOVE this patch once devices_linux stops trusting
-    src.sample_spec. Found by this fixture on real pulsectl (2026-07-23):
-    pulsectl exposes source.sample_spec as a RAW ctypes PA_SAMPLE_SPEC whose
-    memory is not valid on the returned info objects, so _spec_rate and
-    _spec_channels read garbage (observed rate=0/32764, channels=24/176), and
-    pasimple then fails every stream open with PA_ERR_INVALID (error 3) - live
-    capture is broken on any real Linux box, not just in Docker. The reliable
-    field is the UNPACKED channel_count; rate needs a safe source (or just the
-    48 kHz fallback, the server resamples record streams anyway). The Windows
-    suite never sees this because its fake pulsectl hands back plain objects
-    with valid .rate/.channels. Patched here (not in live_transcribe/: that is
-    WP-L1's file) so this gate still proves the rest of the backend end to end:
-    enumeration split, resolution, pasimple opens, reader threads, chunking,
-    MIC/SYS tagging."""
-    from live_transcribe import devices_linux
-    devices_linux._spec_rate = lambda src: 44100  # the fixture sink's real rate
-    devices_linux._spec_channels = (
-        lambda src: max(1, int(getattr(src, "channel_count", 1) or 1)))
-
-
 def main():
-    _quarantine_wp_l1_sample_spec_bug()
     from live_transcribe.capture_linux import AudioCapture
     from live_transcribe.devices_linux import (list_ui_devices, resolve_loopback,
                                                resolve_mic)

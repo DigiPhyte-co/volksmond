@@ -106,10 +106,12 @@ class _FakePaSimpleError(Exception):
 
 
 def _make_fake_pasimple(float_value=0.25, with_float32=True, fail_devices=(),
-                        s16_value=16384):
+                        s16_value=16384, float_fail_devices=()):
     """Build a fake pasimple module. Streams synthesise a constant signal:
     float32 `float_value` on the float path, int16 `s16_value` on the S16
-    path. `fail_devices` lists device_name values whose open raises."""
+    path. `fail_devices` lists device_name values whose open always raises;
+    `float_fail_devices` lists device_name values whose open raises only for
+    PA_SAMPLE_FLOAT32LE (exercising the S16 open-retry fallback)."""
 
     class _FakePaSimple:
         instances = []
@@ -119,6 +121,9 @@ def _make_fake_pasimple(float_value=0.25, with_float32=True, fail_devices=(),
                      maxlength=-1, tlength=-1, prebuf=-1, minreq=-1, fragsize=-1):
             if device_name in fail_devices:
                 raise _FakePaSimpleError(f"open failed for {device_name!r}")
+            if (device_name in float_fail_devices
+                    and format == getattr(mod, "PA_SAMPLE_FLOAT32LE", None)):
+                raise _FakePaSimpleError(f"FLOAT32LE open failed for {device_name!r}")
             self.direction = direction
             self.format = format
             self.channels = channels
@@ -255,6 +260,57 @@ def test_monitor_label_strips_prefix():
     s = _fixture_sources()[1]
     assert devices_linux._monitor_label(s) == "System audio: Built-in Audio Analog Stereo"
     print("  OK  monitor label renders as 'System audio: <sink description>'")
+
+
+# ---- sample_spec garbage (real-libpulse regression, wp-l1-bug) -----------------
+
+def test_sample_spec_garbage_resolves_to_channel_count_and_48k():
+    # Real pulsectl exposes source.sample_spec as a raw ctypes struct whose
+    # memory is invalid on the returned info objects (observed garbage on real
+    # libpulse: rate 0/32764, channels 24/176). channel_count (unpacked by
+    # pulsectl) is the trustworthy channel field; an implausible spec rate
+    # falls back to 48000.
+    garbage = _FakeSource(3, _MIC0, "Samson C01U Mono", 0, 176)
+    garbage.channel_count = 2
+    assert devices_linux._spec_rate(garbage) == 48000
+    assert devices_linux._spec_channels(garbage) == 2
+    # Implausibly high rate is also rejected; channels NEVER come from the
+    # spec, even when the spec's channels field looks harmless.
+    high = _FakeSource(4, _MIC1, "Built-in", 4_000_000, 2)
+    high.channel_count = 1
+    assert devices_linux._spec_rate(high) == 48000
+    assert devices_linux._spec_channels(high) == 1
+    # A plausible spec rate is still trusted (the server resamples record
+    # streams, so wrong-but-plausible is safe and right-and-plausible is best).
+    sane = _FakeSource(5, _MIC0, "Samson", 44100, 24)
+    sane.channel_count = 1
+    assert devices_linux._spec_rate(sane) == 44100
+    assert devices_linux._spec_channels(sane) == 1
+    print("  OK  sample_spec garbage: channel_count wins, implausible rates -> 48000")
+
+
+def test_sample_spec_raising_attribute_resolves_safely():
+    # A sample_spec attribute that raises on ACCESS (ctypes reading freed
+    # memory can do exactly that) must still resolve: channel_count channels
+    # and the 48 kHz fallback rate, end to end through the descriptor path.
+    class _ExplodingSpecSource:
+        index = 11
+        name = _MIC0
+        description = "Samson C01U Mono"
+        channel_count = 2
+        monitor_of_sink = devices_linux.PA_INVALID_INDEX
+        monitor_of_sink_name = None
+
+        @property
+        def sample_spec(self):
+            raise RuntimeError("invalid ctypes memory")
+
+    src = _ExplodingSpecSource()
+    assert devices_linux._spec_rate(src) == 48000
+    assert devices_linux._spec_channels(src) == 2
+    d = devices_linux._descriptor(0, src, devices_linux._mic_label(src))
+    assert d["rate"] == 48000 and d["channels"] == 2
+    print("  OK  raising sample_spec: descriptor still resolves (48000 Hz, channel_count ch)")
 
 
 # ---- list_ui_devices -----------------------------------------------------------
@@ -470,6 +526,35 @@ def test_s16_fallback_scales_to_float():
     print("  OK  S16 fallback: PA_SAMPLE_S16LE requested, samples scaled by 1/32768")
 
 
+def test_s16_fallback_on_float_open_failure():
+    # PA_SAMPLE_FLOAT32LE exists but the FLOAT32LE stream OPEN raises: the
+    # backend must retry that source ONCE with S16LE (same rate/channels,
+    # consistent width/scale/read-size), not fail the open.
+    pas = _make_fake_pasimple(with_float32=True, s16_value=16384,
+                              float_fail_devices=(_MIC0,))
+    sources = [_fixture_sources()[0]]  # mic only
+    _fake, restore = _install_fakes(sources=sources, pasimple_mod=pas)
+    cap = capture_linux.AudioCapture()
+    cap._t0 = 0.0
+    try:
+        cap._open_sources()
+        assert set(cap._buffers) == {"MIC"}
+        opened = [s for s in pas.PaSimple.instances if s.device_name == _MIC0]
+        assert len(opened) == 1, "retry must construct exactly one surviving stream"
+        assert opened[0].format == pas.PA_SAMPLE_S16LE
+        # read size arithmetic must match the 2-byte S16 width (mono 44100).
+        assert opened[0].fragsize == 2 * int(44100 * capture_linux.READ_SECONDS)
+        assert _wait_for(lambda: cap._buffer_counts.get("MIC", 0) > 0)
+        with cap._buffer_locks["MIC"]:
+            block = cap._buffers["MIC"][0]
+        assert block.dtype == np.float32
+        assert np.allclose(block, 0.5, atol=1e-4), block[:4]  # 16384/32768
+    finally:
+        cap._close_sources()
+        restore()
+    print("  OK  FLOAT32LE open failure retries once with S16LE (scaled ingest)")
+
+
 def test_open_sources_nothing_available_raises():
     _fake, restore = _install_fakes(sources=[], pasimple_mod=_make_fake_pasimple())
     cap = capture_linux.AudioCapture()
@@ -604,6 +689,8 @@ TESTS = [
     test_modules_import_without_pulse_packages,
     test_is_monitor_classification,
     test_monitor_label_strips_prefix,
+    test_sample_spec_garbage_resolves_to_channel_count_and_48k,
+    test_sample_spec_raising_attribute_resolves_safely,
     test_list_ui_devices_shape_and_defaults,
     test_list_ui_devices_default_mic_unset_when_ambiguous,
     test_resolve_loopback_default_is_default_sinks_monitor,
@@ -615,6 +702,7 @@ TESTS = [
     test_resolve_mic_no_mics_raises,
     test_open_sources_registers_mic_and_sys,
     test_s16_fallback_scales_to_float,
+    test_s16_fallback_on_float_open_failure,
     test_open_sources_nothing_available_raises,
     test_open_failure_names_the_dropdown,
     test_close_sources_flushes_partial_tail,

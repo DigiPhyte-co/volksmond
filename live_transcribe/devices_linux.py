@@ -34,9 +34,19 @@ package is absent there).
 # monitor_of_sink == PA_INVALID_INDEX.
 PA_INVALID_INDEX = 0xFFFFFFFF
 
-# Fallback rate when a source's sample spec is unreadable; 48 kHz is what
-# PulseAudio and PipeWire both default to.
+# Fallback rate when a source's sample spec is unreadable or implausible;
+# 48 kHz is what PulseAudio and PipeWire both default to. Safe either way:
+# Pulse resamples record streams server-side, so a wrong-but-plausible rate
+# still yields a working stream at the rate we asked for.
 _FALLBACK_RATE = 48000
+
+# Plausibility window for a sample-spec rate. Real pulsectl exposes
+# source.sample_spec as a RAW ctypes PA_SAMPLE_SPEC whose backing memory is
+# NOT valid on the returned info objects (observed garbage on real libpulse:
+# rate 0/32764, channels 24/176; every pasimple open then fails
+# PA_ERR_INVALID), so a spec rate is trusted only inside this window.
+_MIN_PLAUSIBLE_RATE = 8000
+_MAX_PLAUSIBLE_RATE = 384000
 
 
 def _pulse():
@@ -59,36 +69,36 @@ def _is_monitor(src):
 
 
 def _spec_rate(src):
-    """The source's native sample rate from its sample spec (struct or dict)."""
-    ss = getattr(src, "sample_spec", None)
-    rate = None
-    if isinstance(ss, dict):
-        rate = ss.get("rate")
-    elif ss is not None:
-        rate = getattr(ss, "rate", None)
+    """The source's sample rate: sample_spec.rate ONLY when it is a plausible
+    integer (see _MIN/_MAX_PLAUSIBLE_RATE: the spec struct can be garbage
+    memory on real libpulse), else the 48 kHz fallback. Access is fully
+    guarded; a sample_spec that raises must not break enumeration."""
     try:
+        ss = getattr(src, "sample_spec", None)
+        if isinstance(ss, dict):
+            rate = ss.get("rate")
+        elif ss is not None:
+            rate = getattr(ss, "rate", None)
+        else:
+            rate = None
         rate = int(rate)
-    except (TypeError, ValueError):
-        rate = None
-    return rate if rate and rate > 0 else _FALLBACK_RATE
+    except Exception:
+        return _FALLBACK_RATE
+    if _MIN_PLAUSIBLE_RATE <= rate <= _MAX_PLAUSIBLE_RATE:
+        return rate
+    return _FALLBACK_RATE
 
 
 def _spec_channels(src):
-    """The source's native channel count (sample spec first, channel_count as
-    the fallback), clamped to at least 1."""
-    ss = getattr(src, "sample_spec", None)
-    ch = None
-    if isinstance(ss, dict):
-        ch = ss.get("channels")
-    elif ss is not None:
-        ch = getattr(ss, "channels", None)
-    if not ch:
-        ch = getattr(src, "channel_count", None)
+    """The source's native channel count from the UNPACKED channel_count
+    field, clamped to at least 1. Never sample_spec.channels: on real libpulse
+    that struct reads garbage memory (see _spec_rate), while channel_count is
+    unpacked by pulsectl and verified correct on real hardware."""
     try:
-        ch = int(ch)
-    except (TypeError, ValueError):
-        ch = None
-    return ch if ch and ch >= 1 else 1
+        ch = int(getattr(src, "channel_count", None))
+    except Exception:
+        return 1
+    return ch if ch >= 1 else 1
 
 
 def _mic_label(src):
