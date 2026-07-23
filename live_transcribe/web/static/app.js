@@ -66,6 +66,15 @@ var VM_AF = (window.VM_I18N && window.VM_I18N.af) || {};
 var LANG = "en";
 function afLang(s) { return (s && /^af/i.test(s.interface_language || "")) ? "af" : "en"; }
 function tr(s) { return (LANG === "af" && VM_AF[s] != null) ? VM_AF[s] : s; }
+// Server notices can carry a dynamic tail (e.g. "Quiet audio boosted for transcription
+// (+13.6 dB)") and combine with " · ", which exact-key tr() cannot match. Translate the
+// fixed phrase per part and keep the dynamic values verbatim.
+function trNotice(s) {
+  return String(s == null ? "" : s).split(" · ").map(function (p) {
+    var m = /^Quiet audio boosted for transcription \((.+)\)$/.exec(p);
+    return m ? tr("Quiet audio boosted for transcription") + " (" + m[1] + ")" : tr(p);
+  }).join(" · ");
+}
 // Make a non-button clickable element keyboard-operable (Enter/Space).
 function keyActivate(fn) {
   return function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fn(e); } };
@@ -618,7 +627,7 @@ async function startImport(arg) {
     // Surface a non-fatal server notice (e.g. "stereo requested but the file is mono") once,
     // whether it lands mid-run or only on the final poll.
     var showNotice = function (st) {
-      if (st && st.notice && S.live.noticeShown !== st.notice) { S.live.noticeShown = st.notice; toast(tr(st.notice)); }
+      if (st && st.notice && S.live.noticeShown !== st.notice) { S.live.noticeShown = st.notice; toast(trNotice(st.notice)); }
     };
     pollStatus(function (st) { return !st.running; },
       function (st) { showNotice(st); gotoFinish(S.live.outputPath); },
@@ -3533,7 +3542,7 @@ function adoptRunning(status) {
     // is mono") once, whether it is already on the adopted status, lands mid-run, or only
     // arrives on the final poll.
     var showNotice = function (st) {
-      if (st && st.notice && S.live.noticeShown !== st.notice) { S.live.noticeShown = st.notice; toast(tr(st.notice)); }
+      if (st && st.notice && S.live.noticeShown !== st.notice) { S.live.noticeShown = st.notice; toast(trNotice(st.notice)); }
     };
     showNotice(status);
     pollStatus(function (st) { return !st.running; },
