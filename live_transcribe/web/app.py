@@ -894,7 +894,7 @@ def transcribe_file(req: TranscribeFileRequest):
     def _run():
         try:
             from faster_whisper.audio import decode_audio
-            win = int(16000 * chunk_seconds)
+            from ..capture_core import iter_silence_chunks
             items = []  # (t_start, source, window), merged across files by time
             aborted = False  # set True on user cancel; controls drain-vs-abort in the finally
             # New single stereo recording (<stem>.wav: left = MIC, right = SYS), already
@@ -929,8 +929,8 @@ def transcribe_file(req: TranscribeFileRequest):
                         _ring.add_block(_i / 16000.0, sys_ch[_i:_i + 8000])
                     engine.sys_env = _ring
                     for src, chan in (("MIC", mic_ch), ("SYS", sys_ch)):
-                        for i in range(0, len(chan), win):
-                            chunk = _np.ascontiguousarray(chan[i:i + win])
+                        for i, chunk in iter_silence_chunks(chan, 16000, chunk_seconds):
+                            chunk = _np.ascontiguousarray(chunk)
                             # A MIC chunk the gate left as near-silence is pure far-end bleed: skip it
                             # so Whisper never runs on it (no words to echo, no silence hallucination).
                             if src == "MIC" and gate_on and float(_np.sqrt(_np.mean(chunk * chunk))) < 1.8e-3:
@@ -966,8 +966,8 @@ def transcribe_file(req: TranscribeFileRequest):
                         print(f"[transcribe-file] stereo interview gate: L {_sl}/{_tl}, R {_sr}/{_tr} frames silenced", flush=True)
                         left, right = gl, gr
                     for src, chan in (("MIC", left), ("SYS", right)):
-                        for i in range(0, len(chan), win):
-                            chunk = _np.ascontiguousarray(chan[i:i + win])
+                        for i, chunk in iter_silence_chunks(chan, 16000, chunk_seconds):
+                            chunk = _np.ascontiguousarray(chunk)
                             # A chunk the gate reduced to near-silence is pure bleed: skip it so
                             # Whisper never hallucinates on it (same guard as the saved-recording
                             # branch, applied to both sides because the gate ran on both).
@@ -1009,8 +1009,8 @@ def transcribe_file(req: TranscribeFileRequest):
                     audio = decoded.get(fp)
                     if audio is None:
                         audio = decode_audio(fp, sampling_rate=16000)
-                    for i in range(0, len(audio), win):
-                        items.append((i / 16000.0, src, audio[i:i + win]))
+                    for i, chunk in iter_silence_chunks(audio, 16000, chunk_seconds):
+                        items.append((i / 16000.0, src, chunk))
             items.sort(key=lambda x: x[0])
             for t_start, src, window in items:
                 with STATE.lock:
