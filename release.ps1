@@ -17,7 +17,7 @@
 #      manifest) and site/trust.json (version + hash + scan record, for trust.html to read) -
 #      both BOM-free. A failed live fetch fails the publish; -DryRun warns and falls back to
 #      the local site/ files. A publish-time byte-preservation gate proves the merge did not
-#      touch the OTHER platform's fields.
+#      touch any OTHER platform's fields (Windows top level, "mac" and "linux" sub-keys).
 #   6. Uploads to the R2 bucket served at dl.volksmond.com (via doppler run -p infra-ops -c prd,
 #      which injects the Cloudflare R2 credentials):
 #        Volksmond-Setup-<ver>.exe      versioned installer (immutable, cached forever)
@@ -47,6 +47,20 @@
 #
 #   .\release.ps1 -MacDmg <path> -NotarisationJson <path>   # publish the mac DMG
 #   .\release.ps1 -MacDmg <path> -DryRun                    # local only; prints the manifest diff
+#
+# LINUX LANE (docs/linux-port-plan.md section 2.7 + WP-L4). The .deb is built in Docker on
+# this machine (WP-L3); publishing stays here too. -LinuxDeb cross-checks the .deb filename
+# version against APP_VERSION, hashes the .deb, runs the SAME mandatory local Defender scan
+# over it (Linux has no notarisation analogue, so SHA-256 + the Defender record ARE the
+# attestation), merges the "linux" keys into the LIVE latest.json + trust.json WITHOUT
+# touching any Windows or mac field, and uploads Volksmond-<ver>.deb first (plus
+# Volksmond-<ver>-linux-x64.tar.gz if it sits beside the .deb), then both manifests, then
+# the Volksmond-latest.deb alias last (so nothing public ever points at bytes that are not
+# up yet). All three lanes ship independently: each writes only its own platform's keys,
+# and the byte-preservation gate proves every other platform's fields survived the merge.
+#
+#   .\release.ps1 -LinuxDeb <path>          # publish the Linux .deb
+#   .\release.ps1 -LinuxDeb <path> -DryRun  # local only; prints the manifest diff
 [CmdletBinding()]
 param(
     # The canonical release bucket: the PRE-EXISTING `volksmond` bucket in the EU JURISDICTION,
@@ -92,6 +106,16 @@ param(
     # THIS artifact). Recorded in trust.json's mac entry as the notarisation attestation.
     # REQUIRED for a real mac publish; may be omitted only with -DryRun.
     [string]$NotarisationJson,
+    # LINUX LANE: path to the .deb built by the Docker build lane (docs/linux-port-plan.md,
+    # WP-L3). Switches the whole run to the linux lane: version cross-check against the .deb
+    # filename, hash + the SAME mandatory local Defender scan of the .deb (Linux has no
+    # notarisation analogue, so SHA-256 + the Defender record of the exact published bytes
+    # ARE the attestation), merge the "linux" keys into site/latest.json + site/trust.json
+    # (every Windows and mac field passes through untouched), upload Volksmond-<ver>.deb
+    # versioned (+ Volksmond-<ver>-linux-x64.tar.gz if it sits beside the .deb) + both
+    # manifests + the Volksmond-latest.deb alias last. Mutually exclusive with -Build /
+    # -TrustOnly / -VirusTotal / -VtUrl / -MacDmg.
+    [string]$LinuxDeb,
     [switch]$DryRun
 )
 
@@ -249,36 +273,63 @@ function Get-MergeBaseRaw($name, $localPath) {
     }
 }
 
-# JSON of a manifest projected onto (keep only) or away from (drop) the "mac" key, for the
-# byte-preservation gate below. Both sides go through the same ConvertFrom/ConvertTo-Json
-# round trip, so formatting differences cancel out and only real value/shape changes remain.
-function Get-ProjectedJson($raw, $keepMacOnly) {
+# The non-Windows platform sub-keys a manifest may carry. Windows fields live at the TOP
+# LEVEL of both manifests (a frozen contract with trust.html; never restructure them into a
+# "windows" sub-key) and are addressed below by the pseudo-platform name "windows" = every
+# property that is NOT one of these sub-keys. A new platform lane adds its key here and
+# every other lane's byte-preservation gate starts protecting it automatically.
+$PlatformKeys = @("mac", "linux")
+
+# JSON of a manifest projected onto ONE platform, for the byte-preservation gate below:
+# "windows" keeps every property that is not a platform sub-key (the top level); any other
+# name keeps only that sub-key. Both sides of a comparison go through the same
+# ConvertFrom/ConvertTo-Json round trip, so formatting differences cancel out and only real
+# value/shape changes remain.
+function Get-ProjectedJson($raw, $platform) {
     if (-not $raw) { return "" }
     $o = $raw | ConvertFrom-Json
     $proj = [ordered]@{}
     foreach ($p in $o.PSObject.Properties) {
-        $isMac = ($p.Name -eq "mac")
-        if (($keepMacOnly -and $isMac) -or ((-not $keepMacOnly) -and (-not $isMac))) { $proj[$p.Name] = $p.Value }
+        $isPlatKey = ($PlatformKeys -contains $p.Name)
+        $keep = if ($platform -eq "windows") { -not $isPlatKey } else { $p.Name -eq $platform }
+        if ($keep) { $proj[$p.Name] = $p.Value }
     }
     return ($proj | ConvertTo-Json -Depth 10)
 }
 
-# PUBLISH-TIME byte-preservation gate: re-serialise the merge base and the merged result
-# WITHOUT this platform's key(s); any difference means the merge touched the OTHER platform's
-# fields. Publish: fail the release, naming the manifest. -DryRun: print the before/after for
-# inspection and continue (it is the dry run's job to surface this).
-function Assert-OtherPlatformPreserved($beforeRaw, $afterRaw, $what, $keepMacOnly) {
-    $before = Get-ProjectedJson $beforeRaw $keepMacOnly
-    $after  = Get-ProjectedJson $afterRaw  $keepMacOnly
-    $label = if ($keepMacOnly) { "mac" } else { "Windows" }
-    if ($before -eq $after) {
-        Write-Host "    $($what): $label fields byte-identical." -ForegroundColor Green
-        return
+# PUBLISH-TIME byte-preservation gate, N platforms: when publishing platform $publishing,
+# EVERY other platform's projection (the Windows top level and each other platform sub-key)
+# must be byte-identical between the merge base and the merged result; any difference means
+# the merge touched another platform's fields. Publish: fail the release, naming the
+# manifest and the platform. -DryRun: print the before/after for inspection and continue
+# (it is the dry run's job to surface this).
+function Assert-OtherPlatformsPreserved($beforeRaw, $afterRaw, $what, $publishing) {
+    $others = @(@("windows") + $PlatformKeys | Where-Object { $_ -ne $publishing })
+    foreach ($plat in $others) {
+        $label = if ($plat -eq "windows") { "Windows" } else { $plat }
+        $before = Get-ProjectedJson $beforeRaw $plat
+        $after  = Get-ProjectedJson $afterRaw  $plat
+        if ($before -eq $after) {
+            Write-Host "    $($what): $label fields byte-identical." -ForegroundColor Green
+            continue
+        }
+        Write-Host "    $($what): $label FIELDS CHANGED by the merge:" -ForegroundColor Red
+        Write-Host "    --- before ---`n$before" -ForegroundColor Red
+        Write-Host "    --- after ----`n$after" -ForegroundColor Red
+        if (-not $DryRun) { Fail "Byte-preservation gate failed for ${what}: the merge changed the $label fields. Not publishing." }
     }
-    Write-Host "    $($what): $label FIELDS CHANGED by the merge:" -ForegroundColor Red
-    Write-Host "    --- before ---`n$before" -ForegroundColor Red
-    Write-Host "    --- after ----`n$after" -ForegroundColor Red
-    if (-not $DryRun) { Fail "Byte-preservation gate failed for ${what}: the merge changed the $label fields. Not publishing." }
+}
+
+# Merge one platform's sub-key into a manifest: every existing property passes through in
+# its original order with its original value, then the platform key is (re)appended last.
+# Used by the -MacDmg and -LinuxDeb lanes; the Windows lane rebuilds the top level instead
+# and carries the platform keys through (see step 5 below).
+function Merge-PlatformKey($baseRaw, $key, $obj) {
+    $cur = $baseRaw | ConvertFrom-Json
+    $merged = [ordered]@{}
+    foreach ($p in $cur.PSObject.Properties) { if ($p.Name -ne $key) { $merged[$p.Name] = $p.Value } }
+    $merged[$key] = $obj
+    return $merged
 }
 
 # --- 1. Version (same read as build-app.ps1) --------------------------------------------
@@ -294,6 +345,7 @@ Write-Host "  Releasing Volksmond $ver" -ForegroundColor Cyan
 # Self-contained on purpose: it exits before the Windows lane below, so a mac publish can
 # never touch the Windows objects (and vice versa). See docs/mac-port-plan.md WP-G.
 if ($NotarisationJson -and -not $MacDmg) { Fail "-NotarisationJson only makes sense with -MacDmg." }
+if ($MacDmg -and $LinuxDeb) { Fail "-MacDmg and -LinuxDeb are separate lanes; publish one platform per run." }
 if ($MacDmg) {
     if ($Build -or $TrustOnly -or $VirusTotal -or $VtUrl) {
         Fail "-MacDmg is its own lane and cannot be combined with -Build, -TrustOnly, -VirusTotal or -VtUrl."
@@ -370,14 +422,6 @@ if ($MacDmg) {
     $beforeLatest = Get-MergeBaseRaw "latest.json" $manifestPath
     $beforeTrust  = Get-MergeBaseRaw "trust.json"  $trustPath
 
-    function Merge-MacKey($baseRaw, $macObj) {
-        $cur = $baseRaw | ConvertFrom-Json
-        $merged = [ordered]@{}
-        foreach ($p in $cur.PSObject.Properties) { if ($p.Name -ne "mac") { $merged[$p.Name] = $p.Value } }
-        $merged["mac"] = $macObj
-        return $merged
-    }
-
     if (-not $PSBoundParameters.ContainsKey('Notes')) {
         $Notes = ""
         try { $Notes = "$(($beforeLatest | ConvertFrom-Json).mac.notes)" } catch { $Notes = "" }
@@ -399,15 +443,16 @@ if ($MacDmg) {
     if ($notarisation) { $macTrust["notarisation"] = $notarisation }
     $macTrust["defender"] = $macDefender
 
-    Write-JsonNoBom $manifestPath (Merge-MacKey $beforeLatest $macLatest)
-    Write-JsonNoBom $trustPath    (Merge-MacKey $beforeTrust  $macTrust)
+    Write-JsonNoBom $manifestPath (Merge-PlatformKey $beforeLatest "mac" $macLatest)
+    Write-JsonNoBom $trustPath    (Merge-PlatformKey $beforeTrust  "mac" $macTrust)
     Write-Host "  Wrote:     site\latest.json + site\trust.json (mac version=$ver merged into the live manifests)" -ForegroundColor Green
 
     # Byte-preservation gate (publish-time, not just a dry-run display): the merge must not
-    # have changed a single Windows field of either manifest. Fails the release on a publish.
-    Write-Host "  Byte-preservation gate (manifest minus its 'mac' key, merge base vs merged):" -ForegroundColor Cyan
-    Assert-OtherPlatformPreserved $beforeLatest (Get-Content $manifestPath -Raw) "latest.json" $false
-    Assert-OtherPlatformPreserved $beforeTrust  (Get-Content $trustPath -Raw)    "trust.json"  $false
+    # have changed a single field of any OTHER platform (Windows top level, linux sub-key)
+    # in either manifest. Fails the release on a publish.
+    Write-Host "  Byte-preservation gate (every other platform's projection, merge base vs merged):" -ForegroundColor Cyan
+    Assert-OtherPlatformsPreserved $beforeLatest (Get-Content $manifestPath -Raw) "latest.json" "mac"
+    Assert-OtherPlatformsPreserved $beforeTrust  (Get-Content $trustPath -Raw)    "trust.json"  "mac"
 
     # --- M6. Upload to R2 (same bucket, same doppler/wrangler pattern as the Windows lane) --
     if ($DryRun) {
@@ -471,6 +516,177 @@ if ($MacDmg) {
     exit 0
 }
 
+# ===========================  LINUX LANE (-LinuxDeb)  =====================================
+# Self-contained on purpose, same as the mac lane: it exits before the Windows lane below,
+# so a linux publish can never touch the Windows or mac objects (and vice versa). See
+# docs/linux-port-plan.md WP-L4.
+if ($LinuxDeb) {
+    if ($Build -or $TrustOnly -or $VirusTotal -or $VtUrl) {
+        Fail "-LinuxDeb is its own lane and cannot be combined with -Build, -TrustOnly, -VirusTotal or -VtUrl."
+    }
+    Write-Host "  Linux lane: publishing the Linux .deb" -ForegroundColor Cyan
+
+    # --- L1. The .deb (built and smoke-gated by the Docker build lane; WP-L3) --------------
+    if (-not (Test-Path $LinuxDeb)) { Fail ".deb not found: $LinuxDeb" }
+    if ([System.IO.Path]::GetExtension($LinuxDeb).ToLower() -ne ".deb") { Fail "-LinuxDeb expects a .deb file, got: $LinuxDeb" }
+    $deb = (Resolve-Path $LinuxDeb).Path
+    $debMb = [math]::Round((Get-Item $deb).Length / 1MB, 1)
+    Write-Host "  Deb:       $deb  ($debMb MB)" -ForegroundColor Green
+
+    # --- L2. Version cross-check against the .deb filename ---------------------------------
+    # Linux has no notarisation sidecar tying artifact to version, so the filename is the
+    # version carrier: the build lane names the .deb after the APP_VERSION it baked in. A
+    # missing or different version in the filename means the wrong artifact was picked up
+    # (publishing would ship bytes under a version they were not built as). Hard-fails a
+    # publish; -DryRun warns and continues so the lane stays testable end to end.
+    function Deb-Problem($msg) {
+        if ($DryRun) { Write-Host "  WARNING: $msg (-DryRun continues; a real publish fails here)" -ForegroundColor Yellow }
+        else { Fail $msg }
+    }
+    $debName = [System.IO.Path]::GetFileName($deb)
+    if ($debName -match '([0-9]+\.[0-9]+\.[0-9]+)') {
+        if ($Matches[1] -ne $ver) {
+            Deb-Problem ".deb filename version '$($Matches[1])' does not match APP_VERSION '$ver' (licensing.py). Wrong .deb, wrong checkout, or a stale build."
+        } else {
+            Write-Host "  Version:   .deb filename matches APP_VERSION $ver" -ForegroundColor Green
+        }
+    } else {
+        Deb-Problem ".deb filename '$debName' carries no x.y.z version to cross-check against APP_VERSION '$ver' (licensing.py)."
+    }
+
+    # --- L3. SHA-256 of the exact bytes to be published ------------------------------------
+    $debSha = (Get-FileHash -Path $deb -Algorithm SHA256).Hash   # UPPERCASE hex, same as Windows
+    Write-Host "  SHA-256:   $debSha" -ForegroundColor Green
+
+    # --- L4. Mandatory local Defender scan of the .deb --------------------------------------
+    # No notarisation analogue exists on Linux: SHA-256 + this Defender record of the exact
+    # published bytes ARE the trust.json attestation for the linux entry.
+    $linuxDefender = Invoke-DefenderScan $deb "the .deb"
+
+    # --- L5. Optional tarball beside the .deb ------------------------------------------------
+    # The Docker build emits a plain tarball of the onedir as a zero-cost byproduct for
+    # non-apt users. If it sits beside the .deb under the pinned name, it is published
+    # versioned-only (immutable; no mutable alias for the tarball).
+    $tarball = Join-Path (Split-Path $deb -Parent) "Volksmond-$ver-linux-x64.tar.gz"
+    $hasTarball = Test-Path $tarball
+    if ($hasTarball) { Write-Host "  Tarball:   $tarball (published versioned-only)" -ForegroundColor Green }
+    else { Write-Host "  Tarball:   none (looked for Volksmond-$ver-linux-x64.tar.gz beside the .deb); publishing the .deb only." -ForegroundColor Gray }
+
+    # --- L6. Merge the "linux" keys into the LIVE manifests ---------------------------------
+    # The merge base is what is actually published (Get-MergeBaseRaw): read the live
+    # manifest, add the one key, write. Every existing Windows and mac field passes through
+    # in its original order with its original value; the local site\ files become the
+    # working copy of the merged result. The other lanes never write the "linux" key, so
+    # all three lanes ship independently.
+    $siteDir      = Join-Path $here "site"
+    if (-not (Test-Path $siteDir)) { New-Item -ItemType Directory -Path $siteDir | Out-Null }
+    $manifestPath = Join-Path $siteDir "latest.json"
+    $trustPath    = Join-Path $siteDir "trust.json"
+
+    $beforeLatest = Get-MergeBaseRaw "latest.json" $manifestPath
+    $beforeTrust  = Get-MergeBaseRaw "trust.json"  $trustPath
+
+    if (-not $PSBoundParameters.ContainsKey('Notes')) {
+        $Notes = ""
+        try { $Notes = "$(($beforeLatest | ConvertFrom-Json).linux.notes)" } catch { $Notes = "" }
+    }
+
+    # latest.json linux entry: same shape as the top-level Windows fields ({version, url,
+    # notes}), but unlike Windows/mac the url points STRAIGHT at the versioned .deb (pinned
+    # interface, docs/linux-port-plan.md section 2.7): updatecheck's linux arm hands the
+    # user a direct download rather than the marketing site.
+    $linuxLatest = [ordered]@{ version = $ver; url = "https://$Domain/Volksmond-$ver.deb"; notes = $Notes }
+    # trust.json linux entry: version, filename, sha256 (UPPERCASE hex), published, then
+    # defender (the mandatory local scan; no notarisation field, Linux has no analogue).
+    # The Windows top-level field names are a contract with trust.html; never touched here.
+    $linuxTrust = [ordered]@{
+        version   = $ver
+        filename  = "Volksmond-$ver.deb"
+        sha256    = $debSha
+        published = (Get-Date -Format 'yyyy-MM-dd')
+        defender  = $linuxDefender
+    }
+
+    Write-JsonNoBom $manifestPath (Merge-PlatformKey $beforeLatest "linux" $linuxLatest)
+    Write-JsonNoBom $trustPath    (Merge-PlatformKey $beforeTrust  "linux" $linuxTrust)
+    Write-Host "  Wrote:     site\latest.json + site\trust.json (linux version=$ver merged into the live manifests)" -ForegroundColor Green
+
+    # Byte-preservation gate (publish-time, not just a dry-run display): the merge must not
+    # have changed a single field of any OTHER platform (Windows top level, mac sub-key)
+    # in either manifest. Fails the release on a publish.
+    Write-Host "  Byte-preservation gate (every other platform's projection, merge base vs merged):" -ForegroundColor Cyan
+    Assert-OtherPlatformsPreserved $beforeLatest (Get-Content $manifestPath -Raw) "latest.json" "linux"
+    Assert-OtherPlatformsPreserved $beforeTrust  (Get-Content $trustPath -Raw)    "trust.json"  "linux"
+
+    # --- L7. Upload to R2 (same bucket, same doppler/wrangler pattern as the other lanes) ---
+    if ($DryRun) {
+        Write-Host ""
+        Write-Host "  -DryRun: skipping the R2 uploads (Defender already ran locally). Would upload, in order:" -ForegroundColor Yellow
+        $would = @("Volksmond-$ver.deb")
+        if ($hasTarball) { $would += "Volksmond-$ver-linux-x64.tar.gz" }
+        $would += @("latest.json", "trust.json", "Volksmond-latest.deb")
+        $would | ForEach-Object { Write-Host "    $Bucket/$_" -ForegroundColor Yellow }
+    } else {
+        $wBase = Get-WranglerBase
+        if (-not $wBase) { Fail "wrangler not found (checked PATH and npx). Install it with: npm i -g wrangler" }
+        $doppler = (Get-Command doppler -ErrorAction SilentlyContinue).Source
+        if (-not $doppler) { Fail "Doppler CLI not found. R2 uploads inject the Cloudflare R2 credentials via 'doppler run -p infra-ops -c prd'. Install Doppler and log in." }
+        Write-Host "  Uploading via doppler run -p infra-ops -c prd -- $($wBase -join ' ')" -ForegroundColor DarkGray
+
+        $savedToken = $env:DOPPLER_TOKEN
+        if ($null -ne $savedToken) { Remove-Item Env:DOPPLER_TOKEN }
+        try {
+            function Put-R2Linux($key, $file, $ct, $cc) {
+                Write-Host "  Uploading $key ..." -ForegroundColor Gray
+                $j = @(); if ($Jurisdiction) { $j = @("--jurisdiction", $Jurisdiction) }
+                $wr = @("r2", "object", "put", "$Bucket/$key", "--file", $file, "--remote", "--content-type", $ct, "--cache-control", $cc) + $j
+                $dArgs = @("run", "-p", "infra-ops", "-c", "prd", "--") + $wBase + $wr
+                & $doppler @dArgs
+                if ($LASTEXITCODE -ne 0) { Fail "Upload of $key failed (rc=$LASTEXITCODE). Check bucket '$Bucket', jurisdiction '$Jurisdiction', and that Doppler infra-ops/prd holds the Cloudflare R2 credentials." }
+            }
+            # Order matters: the versioned .deb (and tarball) go up FIRST (nothing public
+            # references them yet), then the manifests that point at them, and the mutable
+            # Volksmond-latest.deb alias LAST, so at no point does anything public reference
+            # bytes that are not up yet. Versioned artifacts: immutable, cached forever.
+            # Alias + manifests: short cache.
+            Put-R2Linux "Volksmond-$ver.deb"  $deb          "application/octet-stream" "public, max-age=31536000, immutable"
+            if ($hasTarball) {
+                Put-R2Linux "Volksmond-$ver-linux-x64.tar.gz" $tarball "application/octet-stream" "public, max-age=31536000, immutable"
+            }
+            Put-R2Linux "latest.json"          $manifestPath "application/json"         "public, max-age=300"
+            Put-R2Linux "trust.json"           $trustPath    "application/json"         "public, max-age=300"
+            Put-R2Linux "Volksmond-latest.deb" $deb          "application/octet-stream" "public, max-age=300"
+            $count = if ($hasTarball) { 5 } else { 4 }
+            Write-Host "  Uploaded $count objects to $Bucket." -ForegroundColor Green
+        } finally {
+            if ($null -ne $savedToken) { $env:DOPPLER_TOKEN = $savedToken }
+        }
+    }
+
+    # --- L8. Verify + summary ---------------------------------------------------------------
+    if (-not $DryRun) {
+        try {
+            $live = (Invoke-WebRequest "https://$Domain/latest.json" -UseBasicParsing -TimeoutSec 20).Content | ConvertFrom-Json
+            if ($live.linux.version -eq $ver) { Write-Host "  Verified:  https://$Domain/latest.json linux entry reports $ver" -ForegroundColor Green }
+            else { Write-Host "  WARNING: https://$Domain/latest.json linux entry reports '$($live.linux.version)', expected '$ver'. Check the cache." -ForegroundColor Yellow }
+        } catch {
+            Write-Host "  WARNING: could not fetch https://$Domain/latest.json yet ($($_.Exception.Message))." -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host ""
+    if ($DryRun) { Write-Host "  ===============  LINUX DRY RUN $ver COMPLETE  ===============" -ForegroundColor Cyan }
+    else { Write-Host "  ===============  LINUX RELEASE $ver PUBLISHED  ===============" -ForegroundColor Cyan }
+    Write-Host "  Download (versioned) : https://$Domain/Volksmond-$ver.deb"
+    if ($hasTarball) { Write-Host "  Tarball (versioned)  : https://$Domain/Volksmond-$ver-linux-x64.tar.gz" }
+    Write-Host "  Download (stable)    : https://$Domain/Volksmond-latest.deb"
+    Write-Host "  SHA-256              : $debSha"
+    Write-Host "  Defender             : $($linuxDefender.result) (engine $($linuxDefender.engine), definitions $($linuxDefender.definitions))"
+    Write-Host "  Manifest / trust     : https://$Domain/latest.json  |  https://$Domain/trust.json"
+    Write-Host ""
+    exit 0
+}
+
 # --- 2. Installer ------------------------------------------------------------------------
 $exe = Join-Path $here "Volksmond-Setup-$ver.exe"
 if ($Build -or -not (Test-Path $exe)) {
@@ -528,21 +744,25 @@ if (-not $PSBoundParameters.ContainsKey('Notes')) {
 $downloadUrl = "https://$Domain/Volksmond-Setup-$ver.exe"   # versioned, matches the hash
 $latestAlias = "https://$Domain/Volksmond-Setup-latest.exe" # stable, for the site DOWNLOAD_URL
 
-# Carry over the LIVE "mac" entry unchanged: the mac lane (-MacDmg) owns that key, and a
-# Windows release must not drop or alter it (the two lanes ship independently). When no mac
-# key exists the output is byte-identical to the pre-mac-lane format.
-$prevMacLatest = $null; $prevMacTrust = $null
-try { $prevMacLatest = ($baseLatestRaw | ConvertFrom-Json).mac } catch { }
-try { $prevMacTrust  = ($baseTrustRaw  | ConvertFrom-Json).mac } catch { }
+# Carry over every LIVE platform sub-key unchanged: the platform lanes (-MacDmg, -LinuxDeb)
+# own those keys, and a Windows release must not drop or alter them (the lanes ship
+# independently). When no platform key exists the output is byte-identical to the
+# pre-platform-lane format.
+$prevPlatLatest = [ordered]@{}; $prevPlatTrust = [ordered]@{}
+foreach ($pk in $PlatformKeys) {
+    try { $v = ($baseLatestRaw | ConvertFrom-Json).$pk; if ($v) { $prevPlatLatest[$pk] = $v } } catch { }
+    try { $v = ($baseTrustRaw  | ConvertFrom-Json).$pk; if ($v) { $prevPlatTrust[$pk]  = $v } } catch { }
+}
 
 $latestObj = [ordered]@{ version = $ver; url = $SiteUrl; notes = $Notes }
-if ($prevMacLatest) { $latestObj["mac"] = $prevMacLatest }
+foreach ($pk in $prevPlatLatest.Keys) { $latestObj[$pk] = $prevPlatLatest[$pk] }
 Write-JsonNoBom $manifestPath $latestObj
 # trust.json: contract shared with trust.html. REQUIRED: version, filename, sha256 (UPPERCASE
 # hex), published. OPTIONAL: virustotal (lowercase-hash GUI permalink, only when a link was
 # supplied or a VT scan ran) and defender (the local scan record). Do not rename fields.
-# OPTIONAL "mac" key (owned by the -MacDmg lane, passed through here): {version, filename,
-# sha256, published, notarisation{submission_id, status, date}, defender{...}}.
+# OPTIONAL platform sub-keys, passed through here: "mac" (owned by the -MacDmg lane:
+# {version, filename, sha256, published, notarisation{submission_id, status, date},
+# defender{...}}) and "linux" (owned by the -LinuxDeb lane: same minus notarisation).
 $trust = [ordered]@{
     version  = $ver
     filename = "Volksmond-Setup-$ver.exe"
@@ -551,15 +771,15 @@ $trust = [ordered]@{
 if ($vtLink) { $trust["virustotal"] = $vtLink }
 $trust["published"] = (Get-Date -Format 'yyyy-MM-dd')
 if ($defender) { $trust["defender"] = $defender }
-if ($prevMacTrust) { $trust["mac"] = $prevMacTrust }
+foreach ($pk in $prevPlatTrust.Keys) { $trust[$pk] = $prevPlatTrust[$pk] }
 Write-JsonNoBom $trustPath $trust
-Write-Host "  Wrote:     site\latest.json + site\trust.json (version=$ver; mac key carried through from the merge base)" -ForegroundColor Green
+Write-Host "  Wrote:     site\latest.json + site\trust.json (version=$ver; platform keys carried through from the merge base)" -ForegroundColor Green
 
-# Byte-preservation gate (publish-time): this lane owns every top-level field, so the only
-# thing it must preserve byte-for-byte is the other platform's "mac" key. Fails a publish.
-Write-Host "  Byte-preservation gate (manifest's 'mac' key only, merge base vs merged):" -ForegroundColor Cyan
-Assert-OtherPlatformPreserved $baseLatestRaw (Get-Content $manifestPath -Raw) "latest.json" $true
-Assert-OtherPlatformPreserved $baseTrustRaw  (Get-Content $trustPath -Raw)    "trust.json"  $true
+# Byte-preservation gate (publish-time): this lane owns every top-level field, so what it
+# must preserve byte-for-byte is every other platform's sub-key. Fails a publish.
+Write-Host "  Byte-preservation gate (every other platform's projection, merge base vs merged):" -ForegroundColor Cyan
+Assert-OtherPlatformsPreserved $baseLatestRaw (Get-Content $manifestPath -Raw) "latest.json" "windows"
+Assert-OtherPlatformsPreserved $baseTrustRaw  (Get-Content $trustPath -Raw)    "trust.json"  "windows"
 
 # --- 6. Upload to R2 ---------------------------------------------------------------------
 if ($DryRun) {
