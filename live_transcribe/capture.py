@@ -16,11 +16,20 @@ elif sys.platform == "darwin":
             "macOS audio capture backend (live_transcribe.capture_mac) is not "
             "available in this build yet; see docs/mac-port-plan.md."
         ) from e
+elif sys.platform.startswith("linux"):
+    try:
+        from .capture_linux import AudioCapture
+    except ImportError as e:
+        raise ImportError(
+            "Linux audio capture backend (live_transcribe.capture_linux) "
+            "failed to import; see docs/linux-port-plan.md."
+        ) from e
 else:
     raise ImportError(
         f"no audio capture backend for platform {sys.platform!r}: "
-        "live_transcribe.capture_win covers Windows and "
-        "live_transcribe.capture_mac (planned) covers macOS."
+        "live_transcribe.capture_win covers Windows, "
+        "live_transcribe.capture_mac covers macOS and "
+        "live_transcribe.capture_linux covers Linux."
     )
 
 __all__ = ["AudioCapture"]
