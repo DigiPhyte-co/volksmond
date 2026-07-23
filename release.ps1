@@ -19,10 +19,14 @@
 #      the local site/ files. A publish-time byte-preservation gate proves the merge did not
 #      touch any OTHER platform's fields (Windows top level, "mac" and "linux" sub-keys).
 #   6. Uploads to the R2 bucket served at dl.volksmond.com (via doppler run -p infra-ops -c prd,
-#      which injects the Cloudflare R2 credentials):
+#      which injects the Cloudflare R2 credentials), in this order:
 #        Volksmond-Setup-<ver>.exe      versioned installer (immutable, cached forever)
-#        Volksmond-Setup-latest.exe     stable alias so the site's DOWNLOAD_URL never changes
-#        latest.json / models.json / trust.json   the three manifests (short cache)
+#        models.json / trust.json / latest.json   the three manifests (short cache);
+#                                       trust.json before latest.json so the attestation
+#                                       exists before the advertisement flips
+#        Volksmond-Setup-latest.exe     stable alias so the site's DOWNLOAD_URL never
+#                                       changes; LAST, so it never points at bytes whose
+#                                       manifests and attestation are not live
 #      A release touches ONLY the release host. The marketing site is never redeployed.
 #   7. Verifies the live manifest, prints the summary.
 #
@@ -41,9 +45,10 @@
 # local Defender scan over it (notarisation is the primary mac attestation; the Defender pass
 # is belt-and-braces since the DMG is published from this Windows machine anyway), merges the
 # "mac" keys into the LIVE latest.json + trust.json WITHOUT touching any Windows field, and
-# uploads Volksmond-<ver>.dmg first, then both manifests, then the Volksmond-latest.dmg alias
-# last (so nothing public ever points at bytes that are not up yet). Windows and Mac releases
-# ship independently: each lane only writes its own platform's keys.
+# uploads Volksmond-<ver>.dmg first, then trust.json, then latest.json, then the
+# Volksmond-latest.dmg alias last (so nothing public ever points at bytes whose manifests and
+# attestation are not live). Windows and Mac releases ship independently: each lane only
+# writes its own platform's keys.
 #
 #   .\release.ps1 -MacDmg <path> -NotarisationJson <path>   # publish the mac DMG
 #   .\release.ps1 -MacDmg <path> -DryRun                    # local only; prints the manifest diff
@@ -54,10 +59,11 @@
 # over it (Linux has no notarisation analogue, so SHA-256 + the Defender record ARE the
 # attestation), merges the "linux" keys into the LIVE latest.json + trust.json WITHOUT
 # touching any Windows or mac field, and uploads Volksmond-<ver>.deb first (plus
-# Volksmond-<ver>-linux-x64.tar.gz if it sits beside the .deb), then both manifests, then
-# the Volksmond-latest.deb alias last (so nothing public ever points at bytes that are not
-# up yet). All three lanes ship independently: each writes only its own platform's keys,
-# and the byte-preservation gate proves every other platform's fields survived the merge.
+# Volksmond-<ver>-linux-x64.tar.gz if it sits beside the .deb), then trust.json, then
+# latest.json, then the Volksmond-latest.deb alias last (so nothing public ever points at
+# bytes whose manifests and attestation are not live). All three lanes ship independently:
+# each writes only its own platform's keys, and the byte-preservation gate proves every
+# other platform's fields survived the merge.
 #
 #   .\release.ps1 -LinuxDeb <path>          # publish the Linux .deb
 #   .\release.ps1 -LinuxDeb <path> -DryRun  # local only; prints the manifest diff
@@ -255,21 +261,62 @@ function Write-JsonNoBom($path, $obj) {
 # lane stays testable offline. Returns the raw JSON string of the merge base.
 function Get-MergeBaseRaw($name, $localPath) {
     $url = "https://$Domain/$name"
+    $raw = $null; $origin = $null
     try {
-        $raw = (Invoke-WebRequest $url -UseBasicParsing -TimeoutSec 15).Content
+        # Cache-bust the live fetch: the manifests are served with max-age=300, so a CDN or
+        # proxy cache could hand back a copy that predates another lane's publish, and a
+        # stale merge base silently drops that release. A unique query param plus no-cache
+        # request headers forces a fresh read.
+        $cb = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        $raw = (Invoke-WebRequest "${url}?cb=$cb" -UseBasicParsing -TimeoutSec 15 `
+                -Headers @{ "Cache-Control" = "no-cache"; "Pragma" = "no-cache" }).Content
         if (-not $raw) { throw "empty response" }
-        $null = $raw | ConvertFrom-Json   # must be JSON, or the merge below writes garbage
+        $origin = "live"
         Write-Host "  Merge base: live $url" -ForegroundColor Green
-        return $raw
     } catch {
         if (-not $DryRun) {
             Fail "Could not fetch the live $url ($($_.Exception.Message)). The merge base for a publish is the LIVE manifest, not the machine-local site\$name (which may be stale). Fix connectivity / the domain binding and retry; not publishing."
         }
         if (Test-Path $localPath) {
             Write-Host "  Merge base: live fetch of $url failed ($($_.Exception.Message)); -DryRun falls back to the LOCAL site\$name." -ForegroundColor Yellow
-            return Get-Content $localPath -Raw
+            $raw = Get-Content $localPath -Raw
+            $origin = "-DryRun local site\$name fallback"
+        } else {
+            Fail "-DryRun: live fetch of $url failed AND there is no local site\$name to fall back to. Fetch it once: Invoke-WebRequest $url -OutFile site\$name"
         }
-        Fail "-DryRun: live fetch of $url failed AND there is no local site\$name to fall back to. Fetch it once: Invoke-WebRequest $url -OutFile site\$name"
+    }
+    Assert-MergeBaseShape $name $raw $origin
+    return $raw
+}
+
+# Fail-closed shape gate on the merge base: a malformed base (an error page that still
+# parsed as a JSON scalar, a truncated or wrapped array, a mangled platform key) would
+# otherwise flow straight into the merge and publish garbage manifests. Requires: a JSON
+# OBJECT (not an array or scalar); the mandatory Windows top-level fields (latest.json:
+# version + url; trust.json: version + filename + sha256 - the frozen contract with
+# updatecheck.py and trust.html); and every PRESENT platform sub-key ("mac", "linux") to
+# itself be an object. Fails closed naming exactly what is malformed, even in -DryRun.
+function Assert-MergeBaseShape($name, $raw, $origin) {
+    $obj = $null
+    try { $obj = $raw | ConvertFrom-Json } catch {
+        Fail "Merge base $name ($origin) is not valid JSON ($($_.Exception.Message)). Not publishing."
+    }
+    if ($obj -is [System.Array]) {
+        Fail "Merge base $name ($origin) is a JSON ARRAY, not an object. Not publishing."
+    }
+    if ($obj -isnot [System.Management.Automation.PSCustomObject]) {
+        Fail "Merge base $name ($origin) is a JSON scalar ('$obj'), not an object. Not publishing."
+    }
+    $mandatory = if ($name -eq "trust.json") { @("version", "filename", "sha256") } else { @("version", "url") }
+    foreach ($f in $mandatory) {
+        if (-not ($obj.PSObject.Properties.Name -contains $f) -or -not $obj.$f) {
+            Fail "Merge base $name ($origin) is missing the mandatory Windows top-level field '$f'. Not publishing."
+        }
+    }
+    foreach ($pk in $PlatformKeys) {
+        if (($obj.PSObject.Properties.Name -contains $pk) -and ($obj.$pk -isnot [System.Management.Automation.PSCustomObject])) {
+            Fail "Merge base $name ($origin): platform sub-key '$pk' is not a JSON object. Not publishing."
+        }
     }
 }
 
@@ -458,7 +505,7 @@ if ($MacDmg) {
     if ($DryRun) {
         Write-Host ""
         Write-Host "  -DryRun: skipping the R2 uploads (Defender already ran locally). Would upload, in order:" -ForegroundColor Yellow
-        @("Volksmond-$ver.dmg", "latest.json", "trust.json", "Volksmond-latest.dmg") |
+        @("Volksmond-$ver.dmg", "trust.json", "latest.json", "Volksmond-latest.dmg") |
             ForEach-Object { Write-Host "    $Bucket/$_" -ForegroundColor Yellow }
     } else {
         $wBase = Get-WranglerBase
@@ -479,12 +526,14 @@ if ($MacDmg) {
                 if ($LASTEXITCODE -ne 0) { Fail "Upload of $key failed (rc=$LASTEXITCODE). Check bucket '$Bucket', jurisdiction '$Jurisdiction', and that Doppler infra-ops/prd holds the Cloudflare R2 credentials." }
             }
             # Order matters: the versioned DMG goes up FIRST (nothing public references it
-            # yet), then the manifests that point at it, and the mutable Volksmond-latest.dmg
-            # alias LAST, so at no point does anything public reference bytes that are not up
-            # yet. Versioned DMG: immutable, cached forever. Alias + manifests: short cache.
+            # yet), then trust.json (the attestation must exist before the advertisement
+            # flips), then latest.json (the commit point that advertises the release), and
+            # the mutable Volksmond-latest.dmg alias LAST, so at no point does anything
+            # public reference bytes whose manifests and attestation are not live.
+            # Versioned DMG: immutable, cached forever. Alias + manifests: short cache.
             Put-R2Mac "Volksmond-$ver.dmg"    $dmg          "application/octet-stream" "public, max-age=31536000, immutable"
-            Put-R2Mac "latest.json"           $manifestPath "application/json"         "public, max-age=300"
             Put-R2Mac "trust.json"            $trustPath    "application/json"         "public, max-age=300"
+            Put-R2Mac "latest.json"           $manifestPath "application/json"         "public, max-age=300"
             Put-R2Mac "Volksmond-latest.dmg"  $dmg          "application/octet-stream" "public, max-age=300"
             Write-Host "  Uploaded 4 objects to $Bucket." -ForegroundColor Green
         } finally {
@@ -624,7 +673,7 @@ if ($LinuxDeb) {
         Write-Host "  -DryRun: skipping the R2 uploads (Defender already ran locally). Would upload, in order:" -ForegroundColor Yellow
         $would = @("Volksmond-$ver.deb")
         if ($hasTarball) { $would += "Volksmond-$ver-linux-x64.tar.gz" }
-        $would += @("latest.json", "trust.json", "Volksmond-latest.deb")
+        $would += @("trust.json", "latest.json", "Volksmond-latest.deb")
         $would | ForEach-Object { Write-Host "    $Bucket/$_" -ForegroundColor Yellow }
     } else {
         $wBase = Get-WranglerBase
@@ -645,16 +694,17 @@ if ($LinuxDeb) {
                 if ($LASTEXITCODE -ne 0) { Fail "Upload of $key failed (rc=$LASTEXITCODE). Check bucket '$Bucket', jurisdiction '$Jurisdiction', and that Doppler infra-ops/prd holds the Cloudflare R2 credentials." }
             }
             # Order matters: the versioned .deb (and tarball) go up FIRST (nothing public
-            # references them yet), then the manifests that point at them, and the mutable
-            # Volksmond-latest.deb alias LAST, so at no point does anything public reference
-            # bytes that are not up yet. Versioned artifacts: immutable, cached forever.
-            # Alias + manifests: short cache.
+            # references them yet), then trust.json (the attestation must exist before the
+            # advertisement flips), then latest.json (the commit point that advertises the
+            # release), and the mutable Volksmond-latest.deb alias LAST, so at no point does
+            # anything public reference bytes whose manifests and attestation are not live.
+            # Versioned artifacts: immutable, cached forever. Alias + manifests: short cache.
             Put-R2Linux "Volksmond-$ver.deb"  $deb          "application/octet-stream" "public, max-age=31536000, immutable"
             if ($hasTarball) {
                 Put-R2Linux "Volksmond-$ver-linux-x64.tar.gz" $tarball "application/octet-stream" "public, max-age=31536000, immutable"
             }
-            Put-R2Linux "latest.json"          $manifestPath "application/json"         "public, max-age=300"
             Put-R2Linux "trust.json"           $trustPath    "application/json"         "public, max-age=300"
+            Put-R2Linux "latest.json"          $manifestPath "application/json"         "public, max-age=300"
             Put-R2Linux "Volksmond-latest.deb" $deb          "application/octet-stream" "public, max-age=300"
             $count = if ($hasTarball) { 5 } else { 4 }
             Write-Host "  Uploaded $count objects to $Bucket." -ForegroundColor Green
@@ -785,7 +835,7 @@ Assert-OtherPlatformsPreserved $baseTrustRaw  (Get-Content $trustPath -Raw)    "
 if ($DryRun) {
     Write-Host ""
     Write-Host "  -DryRun: skipping the R2 uploads (Defender already ran locally). Would upload:" -ForegroundColor Yellow
-    $would = @("Volksmond-Setup-$ver.exe", "Volksmond-Setup-latest.exe", "latest.json", "models.json", "trust.json")
+    $would = @("Volksmond-Setup-$ver.exe", "models.json", "trust.json", "latest.json", "Volksmond-Setup-latest.exe")
     if ($TrustOnly) { $would = @("trust.json") }
     $would | ForEach-Object { Write-Host "    $Bucket/$_" -ForegroundColor Yellow }
 } else {
@@ -808,16 +858,24 @@ if ($DryRun) {
             & $doppler @dArgs
             if ($LASTEXITCODE -ne 0) { Fail "Upload of $key failed (rc=$LASTEXITCODE). Check bucket '$Bucket', jurisdiction '$Jurisdiction', and that Doppler infra-ops/prd holds the Cloudflare R2 credentials." }
         }
-        # Versioned installer: safe to cache forever. Everything overwritten each release: short cache.
-        if (-not $TrustOnly) {
+        # Order matters (same invariant as the mac and linux lanes): the versioned installer
+        # goes up FIRST (nothing public references it yet), then models.json, then
+        # trust.json (the attestation must exist before the advertisement flips), then
+        # latest.json (the commit point that advertises the release), and the mutable
+        # Volksmond-Setup-latest.exe alias LAST, so at no point does anything public
+        # reference bytes whose manifests and attestation are not live. Versioned
+        # installer: safe to cache forever. Everything overwritten each release: short cache.
+        if ($TrustOnly) {
+            Put-R2 "trust.json"                 $trustPath    "application/json"         "public, max-age=300"
+            Write-Host "  -TrustOnly: uploaded trust.json only." -ForegroundColor Green
+        } else {
             Put-R2 "Volksmond-Setup-$ver.exe"   $exe          "application/octet-stream" "public, max-age=31536000, immutable"
-            Put-R2 "Volksmond-Setup-latest.exe" $exe          "application/octet-stream" "public, max-age=300"
-            Put-R2 "latest.json"                $manifestPath "application/json"         "public, max-age=300"
             Put-R2 "models.json"                $modelsPath   "application/json"         "public, max-age=300"
+            Put-R2 "trust.json"                 $trustPath    "application/json"         "public, max-age=300"
+            Put-R2 "latest.json"                $manifestPath "application/json"         "public, max-age=300"
+            Put-R2 "Volksmond-Setup-latest.exe" $exe          "application/octet-stream" "public, max-age=300"
+            Write-Host "  Uploaded 5 objects to $Bucket." -ForegroundColor Green
         }
-        Put-R2 "trust.json"                 $trustPath    "application/json"         "public, max-age=300"
-        if ($TrustOnly) { Write-Host "  -TrustOnly: uploaded trust.json only." -ForegroundColor Green }
-        else { Write-Host "  Uploaded 5 objects to $Bucket." -ForegroundColor Green }
     } finally {
         if ($null -ne $savedToken) { $env:DOPPLER_TOKEN = $savedToken }
     }

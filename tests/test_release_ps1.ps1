@@ -200,7 +200,7 @@ $deb = Join-Path $sbLin "Volksmond-$ver.deb"
 $r = Invoke-Lane $sbLin @("-LinuxDeb", $deb, "-DryRun")
 Check "C8 -LinuxDeb -DryRun exits 0" ($r.Rc -eq 0)
 $ul = Get-UploadList $r.Out
-Check "C9 upload order: versioned .deb, manifests, latest alias LAST" (($ul -join "|") -eq "Volksmond-$ver.deb|latest.json|trust.json|Volksmond-latest.deb")
+Check "C9 upload order: versioned .deb, trust, latest, alias LAST" (($ul -join "|") -eq "Volksmond-$ver.deb|trust.json|latest.json|Volksmond-latest.deb")
 $mergedLatest = Get-Content (Join-Path $sbLin "site\latest.json") -Raw
 $mergedTrust = Get-Content (Join-Path $sbLin "site\trust.json") -Raw
 $ml = $mergedLatest | ConvertFrom-Json; $mt = $mergedTrust | ConvertFrom-Json
@@ -227,8 +227,8 @@ $deb = Join-Path $sbTar "Volksmond-$ver.deb"
 [System.IO.File]::WriteAllText((Join-Path $sbTar "Volksmond-$ver-linux-x64.tar.gz"), "dummy tarball", $utf8)
 $r = Invoke-Lane $sbTar @("-LinuxDeb", $deb, "-DryRun")
 $ul = Get-UploadList $r.Out
-Check "C15 tarball variant: deb, tarball, manifests, alias LAST" ($r.Rc -eq 0 -and
-    (($ul -join "|") -eq "Volksmond-$ver.deb|Volksmond-$ver-linux-x64.tar.gz|latest.json|trust.json|Volksmond-latest.deb"))
+Check "C15 tarball variant: deb, tarball, trust, latest, alias LAST" ($r.Rc -eq 0 -and
+    (($ul -join "|") -eq "Volksmond-$ver.deb|Volksmond-$ver-linux-x64.tar.gz|trust.json|latest.json|Volksmond-latest.deb"))
 
 # --- C16-C17: -MacDmg -DryRun regression on three-platform fixtures ------------------------
 $sbMac = New-Sandbox "mac" $releasePs1 $fxLatest3 $fxTrust3
@@ -236,8 +236,8 @@ $dmg = Join-Path $sbMac "Volksmond-$ver.dmg"
 [System.IO.File]::WriteAllText($dmg, "dummy dmg bytes", $utf8)
 $r = Invoke-Lane $sbMac @("-MacDmg", $dmg, "-DryRun")
 $ul = Get-UploadList $r.Out
-Check "C16 -MacDmg -DryRun exits 0, upload order dmg/manifests/alias" ($r.Rc -eq 0 -and
-    (($ul -join "|") -eq "Volksmond-$ver.dmg|latest.json|trust.json|Volksmond-latest.dmg"))
+Check "C16 -MacDmg -DryRun exits 0, upload order dmg/trust/latest/alias" ($r.Rc -eq 0 -and
+    (($ul -join "|") -eq "Volksmond-$ver.dmg|trust.json|latest.json|Volksmond-latest.dmg"))
 $mergedLatest = Get-Content (Join-Path $sbMac "site\latest.json") -Raw
 $mergedTrust = Get-Content (Join-Path $sbMac "site\trust.json") -Raw
 Check "C17 mac publish left Windows AND linux fields byte-identical" (
@@ -251,8 +251,13 @@ $sbWin = New-Sandbox "windows" $releasePs1 $fxLatest3 $fxTrust3
 [System.IO.File]::WriteAllText((Join-Path $sbWin "Volksmond-Setup-$ver.exe"), "dummy exe bytes", $utf8)
 $r = Invoke-Lane $sbWin @("-DryRun")
 $ul = Get-UploadList $r.Out
-Check "C18 Windows -DryRun exits 0, upload list unchanged (5 objects)" ($r.Rc -eq 0 -and
-    (($ul -join "|") -eq "Volksmond-Setup-$ver.exe|Volksmond-Setup-latest.exe|latest.json|models.json|trust.json"))
+Check "C18 Windows -DryRun exits 0, upload order exe/models/trust/latest/alias" ($r.Rc -eq 0 -and
+    (($ul -join "|") -eq "Volksmond-Setup-$ver.exe|models.json|trust.json|latest.json|Volksmond-Setup-latest.exe"))
+# The dedicated alias-last check: the mutable Setup-latest alias flipping before the
+# manifests is the exact regression class that once slipped through, so it gets its own
+# check independent of the full-order string above.
+Check "C18b Windows lane: mutable Setup-latest.exe alias uploads LAST" (
+    $ul.Count -eq 5 -and $ul[$ul.Count - 1] -eq "Volksmond-Setup-latest.exe")
 $mergedLatest = Get-Content (Join-Path $sbWin "site\latest.json") -Raw
 $mergedTrust = Get-Content (Join-Path $sbWin "site\trust.json") -Raw
 $ml = $mergedLatest | ConvertFrom-Json
@@ -262,6 +267,37 @@ Check "C19 Windows publish: top-level version updated, mac + linux byte-identica
     ((Get-ProjectedJson $fxLatest3 "linux") -eq (Get-ProjectedJson $mergedLatest "linux")) -and
     ((Get-ProjectedJson $fxTrust3 "mac") -eq (Get-ProjectedJson $mergedTrust "mac")) -and
     ((Get-ProjectedJson $fxTrust3 "linux") -eq (Get-ProjectedJson $mergedTrust "linux")))
+
+# --- C20-C23: malformed merge-base fixtures fail closed (Assert-MergeBaseShape) ------------
+# -DryRun with the unreachable test domain falls back to the LOCAL fixture manifests, so a
+# malformed local fixture exercises the shape gate end to end; each must fail the lane with
+# a message naming what is malformed.
+$fxArr = '[ { "version": "1.9.0" } ]'
+$sbBad = New-Sandbox "bad-array" $releasePs1 $fxArr $fxTrust3
+$deb = Join-Path $sbBad "Volksmond-$ver.deb"
+[System.IO.File]::WriteAllText($deb, "dummy deb bytes", $utf8)
+$r = Invoke-Lane $sbBad @("-LinuxDeb", $deb, "-DryRun")
+Check "C20 merge base latest.json = JSON array fails closed" ($r.Rc -eq 1 -and $r.Out -match "JSON ARRAY, not an object")
+
+$sbBad = New-Sandbox "bad-scalar" $releasePs1 '"just a string"' $fxTrust3
+$deb = Join-Path $sbBad "Volksmond-$ver.deb"
+[System.IO.File]::WriteAllText($deb, "dummy deb bytes", $utf8)
+$r = Invoke-Lane $sbBad @("-LinuxDeb", $deb, "-DryRun")
+Check "C21 merge base latest.json = JSON scalar fails closed" ($r.Rc -eq 1 -and $r.Out -match "JSON scalar")
+
+$fxNoUrl = '{ "version": "1.9.0", "notes": "win notes" }'
+$sbBad = New-Sandbox "bad-nourl" $releasePs1 $fxNoUrl $fxTrust3
+$deb = Join-Path $sbBad "Volksmond-$ver.deb"
+[System.IO.File]::WriteAllText($deb, "dummy deb bytes", $utf8)
+$r = Invoke-Lane $sbBad @("-LinuxDeb", $deb, "-DryRun")
+Check "C22 merge base latest.json missing 'url' fails closed" ($r.Rc -eq 1 -and $r.Out -match "mandatory Windows top-level field 'url'")
+
+$fxBadPlat = '{ "version": "1.9.0", "filename": "Volksmond-Setup-1.9.0.exe", "sha256": "AB12", "published": "2026-07-01", "mac": "not-an-object" }'
+$sbBad = New-Sandbox "bad-plat" $releasePs1 $fxLatest3 $fxBadPlat
+$deb = Join-Path $sbBad "Volksmond-$ver.deb"
+[System.IO.File]::WriteAllText($deb, "dummy deb bytes", $utf8)
+$r = Invoke-Lane $sbBad @("-LinuxDeb", $deb, "-DryRun")
+Check "C23 merge base trust.json with non-object 'mac' sub-key fails closed" ($r.Rc -eq 1 -and $r.Out -match "platform sub-key 'mac' is not a JSON object")
 
 # ==== D. old-vs-new behavioural baseline (two-platform fixtures, byte-identical outputs) ===
 Write-Host "`n[D] old-vs-new equivalence (baseline $BaselineCommit)" -ForegroundColor Cyan
