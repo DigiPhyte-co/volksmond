@@ -105,10 +105,29 @@ function Fail($msg) { Write-Host "  $msg" -ForegroundColor Red; exit 1 }
 # on PATH; otherwise run it via npx, which ships with Node and needs no global install or PATH
 # entry. Returns the leading command tokens (e.g. @("npx","--yes","wrangler")), or $null.
 function Get-WranglerBase {
+    # doppler exec()s the resolved command directly (CreateProcess), so a PowerShell shim
+    # (.ps1) is not runnable ("%1 is not a valid Win32 application"); npm installs a .cmd
+    # shim beside it, prefer that. Same applies to npx itself.
     $cmd = Get-Command wrangler -ErrorAction SilentlyContinue
-    if ($cmd -and $cmd.Source) { return @($cmd.Source) }
+    if ($cmd -and $cmd.Source) {
+        $src = $cmd.Source
+        if ($src -like "*.ps1") {
+            $sibling = [System.IO.Path]::ChangeExtension($src, ".cmd")
+            if (Test-Path $sibling) { return @($sibling) }
+        } else {
+            return @($src)
+        }
+    }
     $npx = Get-Command npx -ErrorAction SilentlyContinue
-    if ($npx -and $npx.Source) { return @($npx.Source, "--yes", "wrangler") }
+    if ($npx -and $npx.Source) {
+        $nsrc = $npx.Source
+        if ($nsrc -like "*.ps1") {
+            $nsibling = [System.IO.Path]::ChangeExtension($nsrc, ".cmd")
+            if (Test-Path $nsibling) { return @($nsibling, "--yes", "wrangler") }
+        } else {
+            return @($nsrc, "--yes", "wrangler")
+        }
+    }
     return $null
 }
 
