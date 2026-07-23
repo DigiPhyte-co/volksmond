@@ -75,6 +75,47 @@ def _find_last_silence(audio: np.ndarray, sample_rate: int,
     return None
 
 
+def iter_silence_chunks(audio: np.ndarray, sample_rate: int = TARGET_RATE,
+                        chunk_seconds: float = 15.0):
+    """Silence-aware chunking for a whole in-memory array (file transcription).
+
+    Yields (start_sample, chunk) pairs. Each chunk targets `chunk_seconds` but
+    the boundary snaps to the latest silent window `_find_last_silence` can see,
+    replaying the live path's behaviour: grow the candidate in BLOCK_SECONDS
+    steps past the target (the 2s lookback slides with it), force-cut at
+    `chunk_seconds * MAX_CHUNK_MULTIPLIER` when no silence exists, and never
+    emit a chunk shorter than MIN_EMIT_SECONDS except the final tail.
+    Chunks tile the input exactly: no overlap, no lost samples.
+    """
+    n = audio.shape[0]
+    chunk_samples = int(sample_rate * chunk_seconds)
+    max_samples = int(chunk_samples * MAX_CHUNK_MULTIPLIER)
+    min_emit = int(sample_rate * MIN_EMIT_SECONDS)
+    block = max(1, int(sample_rate * BLOCK_SECONDS))
+    pos = 0
+    while True:
+        remaining = n - pos
+        if remaining <= chunk_samples:
+            if remaining > 0:
+                yield pos, audio[pos:n]
+            return
+        limit = min(max_samples, remaining)
+        cut = None
+        buf_len = chunk_samples
+        while True:
+            c = _find_last_silence(audio[pos:pos + buf_len], sample_rate)
+            if c is not None and c >= min_emit:
+                cut = c
+                break
+            if buf_len >= limit:
+                break
+            buf_len = min(buf_len + block, limit)
+        if cut is None:
+            cut = limit  # no silence within 1.5x target: force-cut (or take the short remainder)
+        yield pos, audio[pos:pos + cut]
+        pos += cut
+
+
 class CaptureBase:
     """Shared capture state + logic. Backends implement `_open_sources()`
     (open devices, register each via `_register_source`, raise if nothing
