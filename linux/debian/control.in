@@ -1,0 +1,19 @@
+Package: volksmond
+Version: @VERSION@
+Section: sound
+Priority: optional
+Architecture: amd64
+Installed-Size: @SIZE_KB@
+Depends: gir1.2-webkit2-4.1, gir1.2-gtk-3.0, libgtk-3-0, libpulse0, xdg-utils
+Maintainer: DigiPhyte (Pty) Ltd <info@digiphyte.com>
+Homepage: https://volksmond.com
+Description: private, offline meeting transcription (Afrikaans + English)
+ Volksmond live-transcribes meetings locally on this machine: South
+ African Afrikaans, English, and mixed-language audio. No cloud ASR,
+ no telemetry, POPIA-friendly by design.
+ .
+ Captures the microphone and the system audio (PulseAudio/PipeWire
+ monitor sources), transcribes with faster-whisper (CPU int8), and
+ serves the app UI in a native WebKitGTK window. Transcripts and
+ settings live in ~/.local/share/volksmond. The speech model is
+ downloaded on first transcription (not bundled).

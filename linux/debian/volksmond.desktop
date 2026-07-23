@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Volksmond
+GenericName=Meeting transcription
+Comment=Private, offline meeting transcription (Afrikaans + English)
+Comment[af]=Privaat, aflyn vergadering-transkripsie (Afrikaans + Engels)
+Exec=/usr/bin/volksmond
+Icon=volksmond
+Terminal=false
+Categories=AudioVideo;Audio;Recorder;Utility;
+Keywords=transcribe;transcription;meeting;notule;Afrikaans;POPIA;
+StartupNotify=true
+StartupWMClass=volksmond

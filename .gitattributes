@@ -1,0 +1,10 @@
+# Shell scripts run inside Linux containers (and on the Mac build host) straight from
+# a Windows checkout: they must stay LF or bash reads stray \r as part of commands.
+# (Defence in depth: build-linux.ps1 also CR-strips scripts before running them, and
+# build-app-linux.sh CR-strips the debian text assets it stages.)
+*.sh text eol=lf
+linux/debian/* text eol=lf
+# Dockerfiles too: a CRLF checkout puts \r after the backslash line-continuations
+# inside RUN blocks, which silently breaks the docker build.
+linux/Dockerfile text eol=lf
+.dockerignore text eol=lf
