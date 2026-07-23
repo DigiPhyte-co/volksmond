@@ -62,8 +62,14 @@ def check(current_version):
     # One manifest, platform-keyed: the top level is the Windows entry (shipped Windows clients
     # parse only top-level version/url and ignore unknown keys), and the mac build reads the
     # "mac" object, falling back to the top level so a manifest without a mac key still answers.
+    # The linux build reads "linux" the same way; shipped Windows and mac clients ignore the
+    # unknown key by construction.
     if sys.platform == "darwin":
         entry = data.get("mac") or data
+        if not isinstance(entry, dict):
+            entry = data
+    elif sys.platform.startswith("linux"):
+        entry = data.get("linux") or data
         if not isinstance(entry, dict):
             entry = data
     else:
