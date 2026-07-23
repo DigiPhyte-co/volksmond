@@ -154,11 +154,22 @@ class AudioRecorder:
     do not enable by default.
     """
     TARGET_RATE = 16000
+    # Zero-fill a source only when its written samples lag the chunk's wall-clock
+    # position (t_start) by more than this. The chunker derives t_start from the
+    # session clock minus the buffered span, so its jitter is bounded by the WASAPI
+    # block size (~0.5 s), the 0.1 s chunker poll, and resampler latency: well under
+    # 1 s in practice. 2 s sits comfortably above all of that (a normal session never
+    # zero-fills) yet far below the real failure, WASAPI loopback delivering nothing
+    # for tens of seconds while no application renders audio.
+    GAP_TOLERANCE_S = 2.0
+    _FILL_BLOCK = TARGET_RATE * 10   # write gap silence in 10 s blocks to bound memory
 
     def __init__(self, path_stem):
         self.stem = Path(path_stem)
         self.stem.parent.mkdir(parents=True, exist_ok=True)
         self._writers = {}     # source -> wave.Wave_write
+        self._samples_written = {}   # source -> samples on disk, to place chunks on the session clock
+        self._gap_warned = set()     # sources already warned about a backwards t_start
         self._lock = threading.Lock()
         self._closed = False
         self.last_error = None      # human-readable write/close failure, surfaced in the UI
@@ -176,10 +187,39 @@ class AudioRecorder:
                 w.setsampwidth(2)          # int16
                 w.setframerate(self.TARGET_RATE)
                 self._writers[source] = w
+                self._samples_written[source] = 0
                 print(f"[recorder] writing {path.name}", flush=True)
+            # Place the chunk at its wall-clock position. WASAPI loopback delivers NO
+            # callbacks while no application renders audio, so a source can simply stop
+            # producing for a while (start of session before the call renders, or a call
+            # ending mid-session); appending by raw sample index would shift everything
+            # after the gap earlier and permanently misalign the stereo fold. The expected
+            # index is recomputed from t_start each chunk (absolute, not accumulated), so
+            # rounding never drifts.
+            written = self._samples_written[source]
+            expected = int(t_start * self.TARGET_RATE)
+            gap = expected - written
+            if gap > int(self.GAP_TOLERANCE_S * self.TARGET_RATE):
+                print(f"[recorder] {source}: no audio for {gap / self.TARGET_RATE:.1f}s "
+                      f"(source idle), filling with silence to stay time-aligned", flush=True)
+            elif gap < -int(self.GAP_TOLERANCE_S * self.TARGET_RATE):
+                # Overlap: chunk starts before what we already wrote (should not happen;
+                # chunks arrive in order per source). Append as-is rather than corrupt
+                # what is on disk; warn once per source.
+                if source not in self._gap_warned:
+                    self._gap_warned.add(source)
+                    print(f"[recorder] warning: {source} chunk at t={t_start:.1f}s is "
+                          f"{-gap / self.TARGET_RATE:.1f}s behind the audio already written; "
+                          f"appending as-is", flush=True)
+                gap = 0
+            else:
+                gap = 0     # within normal chunker jitter: append, no fill
             pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
             try:
+                for off in range(0, gap, self._FILL_BLOCK):
+                    w.writeframes(b"\x00\x00" * min(self._FILL_BLOCK, gap - off))
                 w.writeframes(pcm16)
+                self._samples_written[source] = written + gap + len(pcm16) // 2
             except Exception as e:
                 self.last_error = f"Could not write audio ({source}): {e}"
                 print(f"[recorder] write error ({source}): {e}", flush=True)
@@ -222,6 +262,10 @@ class AudioRecorder:
                 w.setsampwidth(2)
                 w.setframerate(self.TARGET_RATE)
                 if have_mic and have_sys:
+                    # Both channels are already wall-clock aligned internally (on_chunk
+                    # zero-fills any no-delivery gap at its true position), so tail-padding
+                    # both to the same final length, the session duration as seen by the
+                    # longer channel, is all that is left to do.
                     a, b = _read_wav_i16(mic), _read_wav_i16(sys_)
                     n = max(len(a), len(b))
                     a = np.pad(a, (0, n - len(a)))
