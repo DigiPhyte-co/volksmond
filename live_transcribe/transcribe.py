@@ -581,6 +581,120 @@ def _is_hallucination(text):
     return bare in _ENDCARD_PHRASES
 
 
+# ---------------------------------------------------------------------------
+# User-prompt-leak filter (WP-1)
+#
+# initial_prompt is decoder conditioning, and on silence/noise Whisper emits it
+# back verbatim. _HALLUCINATION_RE above only hand-codes the AF anchor's leaks;
+# nothing guarded the USER prompt (names, jargon), which on a 36-minute English
+# call produced 90 junk lines (14% of the transcript) built from the two names in
+# the pre-meeting context field.
+#
+# Two deliberately different matching modes:
+#   Mode A (user prompt) - unit/coverage matching. The prompt is a SHORT list of
+#     proper nouns, so a segment that is (almost) nothing but prompt units is junk.
+#   Mode B (AF anchor, and any over-long user prompt) - contiguous n-gram only.
+#     The anchor is ordinary Afrikaans ("ons", "kinders", "baie", "vergadering");
+#     token-membership matching against it would delete real speech. This is the
+#     single biggest correctness trap here: NEVER token-match the anchor.
+_LEAK_COVERAGE = 0.80          # >=80% of a segment's content tokens must be prompt units
+_LEAK_REPEAT = 2               # same unit twice in one segment -> leak regardless of coverage
+_LEAK_MIN_CONTENT = 2          # A1 needs 2+ content tokens unless the matched unit is multi-token
+_LEAK_NGRAM = 5                # anchor/long-prompt match length; below 5 common Afrikaans collides
+_LEAK_LONG_PROMPT = 60         # a prompt longer than this is prose -> n-gram-only (safety valve)
+
+# Short, language-agnostic (EN+AF) filler list, derived from the observed leaks: these are
+# the words that pad a leak ("and Danica Freimond.", "... , yeah.") and must not count
+# against coverage. Written with the same normalisation as segments ("'n" -> "n").
+_LEAK_FILLERS = frozenset(
+    "and en the die a n of van is dit it i ek yeah ja yes no nee ok okay um uh uhm mm mmm hmm so".split()
+)
+
+
+def _norm_tokens(text):
+    """Lowercase, punctuation-stripped, whitespace-collapsed token list.
+
+    Shared by the prompt-leak filter and the cross-segment loop guard so both compare
+    text the same way ("Bye." == "bye", "Suid-Afrikaanse" -> "suid afrikaanse")."""
+    return re.sub(r"[^\w\s]", " ", (text or "").lower()).split()
+
+
+def _content_tokens(toks):
+    """Positions in `toks` that are not fillers (the tokens that carry meaning)."""
+    return [i for i, t in enumerate(toks) if t not in _LEAK_FILLERS]
+
+
+class PromptLeakMatcher:
+    """Detects a segment that is regurgitated initial_prompt rather than speech.
+
+    Built once per prompt/language combination (see Engine._rebuild_prompt_leak) so the
+    per-segment cost is a few tuple comparisons. Inert when there is no prompt.
+    """
+
+    def __init__(self, user_prompt, anchor=None):
+        self._units = []      # Mode A: normalised token tuples, matched as contiguous n-grams
+        self._ngrams = set()  # Mode B: every _LEAK_NGRAM-length n-gram of the anchor / long prompt
+        toks = _norm_tokens(user_prompt)
+        if len(toks) > _LEAK_LONG_PROMPT:
+            # Safety valve: a pasted agenda, not a name list. Unit/coverage matching over a
+            # large vocabulary is where false positives come from; prose leaks as verbatim
+            # runs anyway, so n-gram matching is both safer and sufficient.
+            self._add_ngrams(toks)
+        elif toks:
+            seen = set()
+            for part in re.split(r"[,;\n]", user_prompt):
+                unit = tuple(_norm_tokens(part))
+                if unit and unit not in seen:
+                    seen.add(unit)
+                    self._units.append(unit)
+            whole = tuple(toks)
+            if whole not in seen:
+                # R2: names written without commas ("Danica and Sean Freimond") still match.
+                self._units.append(whole)
+        self._add_ngrams(_norm_tokens(anchor))
+
+    def _add_ngrams(self, toks):
+        for i in range(len(toks) - _LEAK_NGRAM + 1):
+            self._ngrams.add(tuple(toks[i:i + _LEAK_NGRAM]))
+
+    def is_leak(self, text):
+        toks = _norm_tokens(text)
+        if not toks:
+            return False
+        # Mode B: a contiguous run of >=5 anchor/long-prompt tokens is never coincidence.
+        if self._ngrams:
+            for i in range(len(toks) - _LEAK_NGRAM + 1):
+                if tuple(toks[i:i + _LEAK_NGRAM]) in self._ngrams:
+                    return True
+        if not self._units:
+            return False
+        # Mode A: mark every token covered by a contiguous occurrence of a prompt unit.
+        covered = [False] * len(toks)
+        matched_len = 0
+        for unit in self._units:
+            n = len(unit)
+            hits = 0
+            for i in range(len(toks) - n + 1):
+                if tuple(toks[i:i + n]) == unit:
+                    hits += 1
+                    for j in range(i, i + n):
+                        covered[j] = True
+            if hits >= _LEAK_REPEAT:
+                return True   # A2: nobody says the same name twice in one 3-second breath
+            if hits:
+                matched_len = max(matched_len, n)
+        if not matched_len:
+            return False
+        content = _content_tokens(toks)
+        if not content:
+            return False
+        # A1: the segment is (almost) nothing but prompt units. Real speech that merely
+        # contains a name sits below 0.30, so the 0.80 floor leaves a wide dead band.
+        if sum(1 for i in content if covered[i]) / len(content) < _LEAK_COVERAGE:
+            return False
+        return len(content) >= _LEAK_MIN_CONTENT or matched_len > 1
+
+
 @dataclass
 class Segment:
     source: str       # "MIC" or "SYS"
@@ -606,6 +720,9 @@ class Engine:
         # live language change (request_change) can recompose the anchor for the new language.
         self._user_prompt = initial_prompt
         self.initial_prompt = _compose_prompt(language, initial_prompt)
+        # Matcher for prompt content leaking back out as "speech". Built from the same
+        # (prompt, language) pair _compose_prompt just used, and rebuilt wherever that is.
+        self._rebuild_prompt_leak(initial_prompt, language)
         cfg = TIER_CONFIG[tier]
         # size = the stock Whisper size for this tier (drives the CPU downgrade ladder); model_name
         # = the concrete model loaded, which is the Fluister tune of that size for an Afrikaans
@@ -629,6 +746,7 @@ class Engine:
         self.sys_env = None                   # optional SysEnergyRing -> enables the MIC echo veto
         self._xchan_veto = os.environ.get("SA_LIVE_XCHAN_VETO", "1") != "0"
         self._silence_gate = os.environ.get("SA_LIVE_SILENCE_GATE", "1") != "0"
+        self._prompt_leak_on = os.environ.get("SA_LIVE_PROMPT_LEAK_GUARD", "1") != "0"
         self._queue = queue.Queue(maxsize=32)
         self._stop = threading.Event()    # shutting down: stop accepting new audio
         self._abort = threading.Event()   # hard abort: discard the backlog instead of draining
@@ -637,6 +755,13 @@ class Engine:
         self._change_lock = threading.Lock()  # guards _pending_change (API thread queues, worker applies)
         self._pending_change = None           # a live language/model change to apply between chunks
         self._worker = threading.Thread(target=self._run, daemon=True, name="transcribe")
+
+    def _rebuild_prompt_leak(self, user_prompt, language):
+        """(Re)build the prompt-leak matcher. Must follow every _compose_prompt call: the AF
+        anchor is only in the prompt for an af session, and a live af->en switch recomposes
+        the prompt from anchor+names down to names alone (exactly the incident scenario)."""
+        self._prompt_leak = PromptLeakMatcher(
+            user_prompt, AF_ANCHOR_PROMPT if language == "af" else None)
 
     def subscribe(self, fn):
         self.subscribers.append(fn)
@@ -703,6 +828,7 @@ class Engine:
         pass the full string. Each subsequent chunk picks this up immediately.
         """
         self.initial_prompt = prompt
+        self._rebuild_prompt_leak(prompt, self.language)
 
     def request_change(self, *, language, engine, model=None, model_name=None, size=None, family=None):
         """Queue a live language and/or model change, applied by the worker between chunks.
@@ -736,6 +862,7 @@ class Engine:
             self.family = ch["family"]
             self.is_fluister = ch["family"] == "fluister"
         self.initial_prompt = _compose_prompt(self.language, self._user_prompt)
+        self._rebuild_prompt_leak(self._user_prompt, self.language)
         self._rtf.clear()   # judge the (possibly new) model fresh; never downgrade on the old RTF
         lang_name = {"af": "Afrikaans", "en": "English"}.get(self.language, self.language or "auto-detect")
         self._emit_notice(t_start, f"[engine: now {self.family} {self.size}, language {lang_name}]")
@@ -889,6 +1016,12 @@ class Engine:
                     if not text:
                         continue
                     if _is_hallucination(text):
+                        continue
+                    # initial_prompt leaking back out as "speech" (names, jargon, the AF
+                    # anchor). Toggle SA_LIVE_PROMPT_LEAK_GUARD=0.
+                    if self._prompt_leak_on and self._prompt_leak.is_leak(text):
+                        print(f"[engine] prompt-leak dropped {source} @ "
+                              f"{t_start + float(seg.start):.1f}s {text[:40]!r}", flush=True)
                         continue
                     # Phrase-loop artifact: a segment that is mostly one repeated multi-word unit
                     # ("ek het nie ek het nie ...") is a quiet-mic hallucination, not speech.
