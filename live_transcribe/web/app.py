@@ -2051,7 +2051,10 @@ if not buildflags.OFFLINE_ONLY:
             raise HTTPException(status_code=402, detail="Calendar reminders need a business licence.")
         from .. import outlook_local
         try:
-            meeting = outlook_local.current_or_next_meeting()
+            # 1 hour, not the 8-hour default: this poll only needs the reminder window (+2/-15 min),
+            # and the lookahead is what drives Outlook's recurrence expansion, now paid once per
+            # account. /api/calendar-seed keeps 8 hours, since that one is user-initiated.
+            meeting = outlook_local.current_or_next_meeting(look_ahead_hours=1)
         except outlook_local.OutlookUnavailable:
             return {"available": False, "found": False}
         if not meeting:
