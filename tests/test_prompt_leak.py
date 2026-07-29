@@ -36,8 +36,22 @@ def test_leak_bare_unit():
     assert m().is_leak("Sean Freimond") is True
 
 def test_leak_repeat_beats_coverage():
-    # A2 alone: coverage is low but the same unit appears twice in one short segment
-    assert m().is_leak("So I was saying to Sean Freimond and Sean Freimond about the thing") is True
+    # A2 alone: below A1's 0.80 coverage floor, but the same unit appears twice AND still
+    # accounts for most of the segment (0.67 >= _LEAK_REPEAT_COVERAGE).
+    assert m().is_leak("Sean Freimond, Sean Freimond, okay thanks everyone") is True
+
+
+# --- F2a: the repeat shortcut needs coverage too ---
+def test_repeat_shortcut_needs_coverage():
+    """A2 used to fire on ANY unit repeated twice, whatever else the segment contained, so a
+    speaker CORRECTING a mis-heard name (which necessarily says it twice) was deleted. The
+    repeat now has to be most of the segment as well."""
+    # the observed leak: nothing but prompt units, coverage 1.00 -> still dropped
+    assert m().is_leak("Danica Freimond, Sean Freimond, Sean Freimond,") is True
+    # a genuine correction: the unit twice, but only ~0.50 coverage -> kept
+    assert m().is_leak("I said Sean Freimond, not Shawn Freemont, Sean Freimond") is False
+    # the old A2-only case: two mentions inside a sentence (coverage 0.44) is no longer a leak
+    assert m().is_leak("So I was saying to Sean Freimond and Sean Freimond about the thing") is False
 
 
 # --- Mode A: what must survive ---
@@ -75,6 +89,51 @@ def test_real_afrikaans_made_of_anchor_words_kept():
     assert mm.is_leak("ons kinders is baie lekker vandag") is False
     assert mm.is_leak("die kollegas kuier lekker by die vergadering") is False
     assert mm.is_leak("baie dankie julle, ons praat more weer") is False
+
+def test_anchor_ngram_needs_coverage():
+    """F1: a single contiguous 5-gram used to be enough to delete a segment. The anchor is
+    ordinary Afrikaans, so a real sentence can legitimately contain one of its 5-grams and
+    still be mostly the speaker's own words. The matched spans must now cover most of the
+    segment's content tokens."""
+    mm = m(user_prompt=None, anchor=T.AF_ANCHOR_PROMPT)
+    # verbatim anchor regurgitation: the matched spans are the whole line (coverage ~1.0)
+    assert mm.is_leak("net soos dit gepraat word. Ons praat Suid-Afrikaanse Afrikaans") is True
+    assert mm.is_leak("Algemene woorde: baie, nogal, lekker, kuier") is True
+    # genuine speech that happens to contain the anchor's "net soos dit gepraat word"
+    # 5-gram but is mostly its own words (coverage ~0.57) -> kept
+    assert mm.is_leak("Dit moet net soos dit gepraat word neergeskryf word") is False
+
+
+# --- F2b: a free-form context sentence is n-gram matched, never unit matched ---
+# /api/start concatenates the saved default_context into the SAME prompt string as the
+# names (web/app.py:635), so an instruction sentence arrives here as one "unit".
+CONTEXT = "Please transcribe the meeting exactly as spoken"
+
+def test_long_unit_does_not_eat_speech_sharing_its_words():
+    # 5 of the sentence's words, contiguous, but only ~0.45 of the segment -> kept
+    assert T.PromptLeakMatcher(CONTEXT).is_leak(
+        "we should transcribe the meeting exactly as spoken by the client on Friday") is False
+
+def test_long_unit_still_eats_its_own_regurgitation():
+    assert T.PromptLeakMatcher(CONTEXT).is_leak("Please transcribe the meeting exactly as spoken.") is True
+
+def test_long_unit_repeated_is_not_an_automatic_leak():
+    # the A2 repeat shortcut must not apply to a long unit at all: this is one speaker
+    # restating an instruction, and the prompt words are ~0.57 of the segment
+    assert T.PromptLeakMatcher(CONTEXT).is_leak(
+        "Please transcribe the meeting exactly as spoken. That is what the client asked for "
+        "on the call this morning, so please transcribe the meeting exactly as spoken."
+    ) is False
+
+def test_context_sentence_and_names_in_one_prompt():
+    # the real shape: default_context + the user's names, comma-joined by /api/start.
+    mm = T.PromptLeakMatcher(f"{CONTEXT}, Danica Freimond, Sean Freimond")
+    assert mm.is_leak("Sean Freimond") is True                 # short unit: Mode A, unchanged
+    assert mm.is_leak("Danica Freimond, Sean Freimond, yeah.") is True
+    assert mm.is_leak("Please transcribe the meeting exactly as spoken.") is True
+    assert mm.is_leak(
+        "we should transcribe the meeting exactly as spoken by the client on Friday") is False
+
 
 def test_anchor_and_user_prompt_together():
     mm = m(user_prompt=PROMPT, anchor=T.AF_ANCHOR_PROMPT)

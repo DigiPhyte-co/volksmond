@@ -598,9 +598,12 @@ def _is_hallucination(text):
 #     token-membership matching against it would delete real speech. This is the
 #     single biggest correctness trap here: NEVER token-match the anchor.
 _LEAK_COVERAGE = 0.80          # >=80% of a segment's content tokens must be prompt units
-_LEAK_REPEAT = 2               # same unit twice in one segment -> leak regardless of coverage
+_LEAK_REPEAT = 2               # same unit twice in one segment...
+_LEAK_REPEAT_COVERAGE = 0.60   # ...AND that unit must still be most of the segment (see A2)
 _LEAK_MIN_CONTENT = 2          # A1 needs 2+ content tokens unless the matched unit is multi-token
 _LEAK_NGRAM = 5                # anchor/long-prompt match length; below 5 common Afrikaans collides
+_LEAK_NGRAM_COVERAGE = 0.75    # matched n-gram spans must cover this much of the content tokens
+_LEAK_UNIT_MAX = 4             # a "unit" is a name/jargon term; longer -> prose, n-gram it instead
 _LEAK_LONG_PROMPT = 60         # a prompt longer than this is prose -> n-gram-only (safety valve)
 
 # Short, language-agnostic (EN+AF) filler list, derived from the observed leaks: these are
@@ -624,6 +627,18 @@ def _content_tokens(toks):
     return [i for i, t in enumerate(toks) if t not in _LEAK_FILLERS]
 
 
+def _coverage(toks, covered):
+    """Fraction of `toks`'s CONTENT tokens that `covered` marks as prompt-derived.
+
+    The one measure both matching modes decide on: "how much of what this speaker
+    actually said came out of the prompt?". Fillers are excluded so a leak padded with
+    "and"/"yeah" still scores 1.0. 0.0 when there is nothing to measure."""
+    content = _content_tokens(toks)
+    if not content:
+        return 0.0
+    return sum(1 for i in content if covered[i]) / len(content)
+
+
 class PromptLeakMatcher:
     """Detects a segment that is regurgitated initial_prompt rather than speech.
 
@@ -643,15 +658,28 @@ class PromptLeakMatcher:
         elif toks:
             seen = set()
             for part in re.split(r"[,;\n]", user_prompt):
-                unit = tuple(_norm_tokens(part))
-                if unit and unit not in seen:
-                    seen.add(unit)
-                    self._units.append(unit)
-            whole = tuple(toks)
-            if whole not in seen:
-                # R2: names written without commas ("Danica and Sean Freimond") still match.
-                self._units.append(whole)
+                self._add_unit(tuple(_norm_tokens(part)), seen)
+            # R2: names written without commas ("Danica and Sean Freimond") still match.
+            self._add_unit(tuple(toks), seen)
         self._add_ngrams(_norm_tokens(anchor))
+
+    def _add_unit(self, unit, seen):
+        """File one comma-separated prompt part as a Mode A unit, or as Mode B n-grams.
+
+        A unit is meant to be a NAME or a jargon term. /api/start concatenates the user's
+        saved default_context into the same prompt string (web/app.py:635), so a free-form
+        instruction sentence ("Please transcribe the meeting exactly as spoken") arrives here
+        as one "unit" alongside the names. Unit/coverage matching a sentence deletes real
+        speech that merely re-uses its words, which is the exact trap Mode B exists to avoid,
+        so anything longer than _LEAK_UNIT_MAX tokens goes through the n-gram path instead.
+        Short units keep full Mode A treatment."""
+        if not unit or unit in seen:
+            return
+        seen.add(unit)
+        if len(unit) > _LEAK_UNIT_MAX:
+            self._add_ngrams(unit)
+        else:
+            self._units.append(unit)
 
     def _add_ngrams(self, toks):
         for i in range(len(toks) - _LEAK_NGRAM + 1):
@@ -661,16 +689,14 @@ class PromptLeakMatcher:
         toks = _norm_tokens(text)
         if not toks:
             return False
-        # Mode B: a contiguous run of >=5 anchor/long-prompt tokens is never coincidence.
-        if self._ngrams:
-            for i in range(len(toks) - _LEAK_NGRAM + 1):
-                if tuple(toks[i:i + _LEAK_NGRAM]) in self._ngrams:
-                    return True
+        if self._ngram_leak(toks):
+            return True
         if not self._units:
             return False
         # Mode A: mark every token covered by a contiguous occurrence of a prompt unit.
         covered = [False] * len(toks)
         matched_len = 0
+        repeated = False
         for unit in self._units:
             n = len(unit)
             hits = 0
@@ -680,7 +706,7 @@ class PromptLeakMatcher:
                     for j in range(i, i + n):
                         covered[j] = True
             if hits >= _LEAK_REPEAT:
-                return True   # A2: nobody says the same name twice in one 3-second breath
+                repeated = True
             if hits:
                 matched_len = max(matched_len, n)
         if not matched_len:
@@ -688,11 +714,37 @@ class PromptLeakMatcher:
         content = _content_tokens(toks)
         if not content:
             return False
+        cov = _coverage(toks, covered)
+        # A2: nobody says the same name twice in one 3-second breath - PROVIDED the repeat is
+        # most of the segment. A correction ("I said Sean Freimond, not Shawn Freemont, Sean
+        # Freimond") repeats the name deliberately and is real speech, so the repeat shortcut
+        # needs its own (lower than A1) coverage floor rather than none at all.
+        if repeated and cov >= _LEAK_REPEAT_COVERAGE:
+            return True
         # A1: the segment is (almost) nothing but prompt units. Real speech that merely
         # contains a name sits below 0.30, so the 0.80 floor leaves a wide dead band.
-        if sum(1 for i in content if covered[i]) / len(content) < _LEAK_COVERAGE:
+        if cov < _LEAK_COVERAGE:
             return False
         return len(content) >= _LEAK_MIN_CONTENT or matched_len > 1
+
+    def _ngram_leak(self, toks):
+        """Mode B: the anchor / long prompt / long unit, matched as contiguous n-grams.
+
+        A single >=_LEAK_NGRAM run is NOT enough on its own. The anchor is ordinary Afrikaans,
+        so a genuine sentence can legitimately contain one 5-gram of it ("...net soos dit
+        gepraat word...") and still be mostly the speaker's own words. A real regurgitation is
+        the prompt end to end, so require the union of the matched spans to cover
+        _LEAK_NGRAM_COVERAGE of the segment's content tokens."""
+        if not self._ngrams:
+            return False
+        covered = [False] * len(toks)
+        hit = False
+        for i in range(len(toks) - _LEAK_NGRAM + 1):
+            if tuple(toks[i:i + _LEAK_NGRAM]) in self._ngrams:
+                hit = True
+                for j in range(i, i + _LEAK_NGRAM):
+                    covered[j] = True
+        return hit and _coverage(toks, covered) >= _LEAK_NGRAM_COVERAGE
 
 
 # ---------------------------------------------------------------------------
@@ -830,6 +882,7 @@ class Engine:
         self._dropped = 0                 # chunks dropped to backpressure since last reported
         self._change_lock = threading.Lock()  # guards _pending_change (API thread queues, worker applies)
         self._pending_change = None           # a live language/model change to apply between chunks
+        self._pending_recent_reset = False    # a live device switch: forget the loop history
         self._worker = threading.Thread(target=self._run, daemon=True, name="transcribe")
 
     def _rebuild_prompt_leak(self, user_prompt, language):
@@ -921,6 +974,26 @@ class Engine:
                 "language": language, "engine": engine,
                 "model": model, "model_name": model_name, "size": size, "family": family,
             }
+
+    def request_loop_history_reset(self):
+        """Ask the worker to forget the cross-segment loop history (RecentEmissions).
+
+        Called from a REQUEST thread (a live device switch, web/app.py:switch_device). The
+        history is owned by the transcription worker, so this thread must not clear it
+        directly; it queues a flag the worker consumes between chunks, exactly like
+        request_change / _pending_change. A different microphone changes what the model
+        hears, so an already-armed loop must not swallow the first genuine identical line
+        from the new device."""
+        with self._change_lock:
+            self._pending_recent_reset = True
+
+    def _apply_pending_recent_reset(self):
+        """Consume a queued loop-history reset. Worker-loop only (single writer)."""
+        with self._change_lock:
+            pending = self._pending_recent_reset
+            self._pending_recent_reset = False
+        if pending:
+            self._recent.clear()
 
     def _apply_pending_change(self, t_start):
         """Apply a queued request_change. Called only from the worker loop, so self.model is read
@@ -1058,6 +1131,8 @@ class Engine:
             # Apply a queued live language/model change before this chunk (worker-thread only, so
             # self.model stays single-writer, like the adaptive downgrade further down).
             self._apply_pending_change(t_start)
+            # A live device switch asked us to forget the loop history (worker-owned).
+            self._apply_pending_recent_reset()
 
             # If chunks were dropped to backpressure before this one, record the
             # gap in the transcript so the reader knows audio is missing here.

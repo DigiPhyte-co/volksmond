@@ -99,8 +99,11 @@ def finalise_open_session(timeout=CLOSE_FINALISE_TIMEOUT, poll=0.05, lock_timeou
       * The stop call is made on a throwaway daemon thread, so even a stop that blocks
         forever cannot hold the window open.
       * This function never holds STATE.lock while waiting, and every acquisition is
-        bounded (`lock_timeout`); if the lock is busy we give up and let atexit do it.
-        So no lock held by a request thread can wedge the close.
+        bounded (`lock_timeout`). A busy lock is RETRIED until the overall close deadline
+        rather than abandoning finalisation on the first miss: closing right after Begin
+        finds /api/start holding STATE.lock through engine + capture construction, which
+        is seconds on a model load. The retry is still bounded by `timeout`, so no lock
+        held by a request thread can wedge the close.
       * The wait for the drain is a bounded poll (`timeout`), never a join on the drain
         thread, and `/api/stop` itself only holds STATE.lock briefly before handing off
         to its own daemon thread.
@@ -117,15 +120,33 @@ def finalise_open_session(timeout=CLOSE_FINALISE_TIMEOUT, poll=0.05, lock_timeou
         print(f"[desktop] close: session state unavailable ({exc})", flush=True)
         return "unavailable"
     state = webapp.STATE
+    deadline = time.monotonic() + timeout
 
     def _flags():
-        """(running, stopping) or None if the lock did not come free in time."""
-        if not state.lock.acquire(timeout=lock_timeout):
-            return None
-        try:
-            return bool(state.running), bool(state.stopping)
-        finally:
-            state.lock.release()
+        """(running, stopping), or None once the close deadline passed with the lock busy.
+
+        Each acquisition stays bounded by `lock_timeout` (never a deadlock, never an
+        unbounded wait), but a single busy attempt no longer abandons the close: we keep
+        retrying inside the OVERALL `timeout` budget."""
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            if not state.lock.acquire(timeout=min(lock_timeout, left)):
+                continue
+            try:
+                return bool(state.running), bool(state.stopping)
+            finally:
+                state.lock.release()
+
+    def _dispatch_stop():
+        """Run /api/stop?what=all on a throwaway daemon thread (see the deadlock notes)."""
+        def _stop():
+            try:
+                webapp.stop(what="all")
+            except Exception as exc:   # 409 if the UI's own stop won the race - harmless
+                print(f"[desktop] close: stop reported {exc!r}", flush=True)
+        threading.Thread(target=_stop, daemon=True, name="close-stop").start()
 
     flags = _flags()
     if flags is None:
@@ -135,21 +156,28 @@ def finalise_open_session(timeout=CLOSE_FINALISE_TIMEOUT, poll=0.05, lock_timeou
     if not running:
         return "idle"          # the common case: nothing running, close immediately
 
+    dispatched = False
     if not stopping:           # a stop already in flight finalises on its own; don't start a second one
-        def _stop():
-            try:
-                webapp.stop(what="all")
-            except Exception as exc:   # 409 if the UI's own stop won the race - harmless
-                print(f"[desktop] close: stop reported {exc!r}", flush=True)
-        threading.Thread(target=_stop, daemon=True, name="close-stop").start()
+        dispatched = True
+        _dispatch_stop()
 
-    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(poll)
         flags = _flags()
-        if flags is not None and not flags[0]:
+        if flags is None:
+            break              # the deadline passed while the lock stayed busy
+        if not flags[0]:
             print("[desktop] close: session finalised", flush=True)
             return "finalised"
+        if not flags[1] and not dispatched:
+            # The stop that was in flight when the window closed was a PARTIAL one (the user
+            # had stopped transcription only, recording carried on). It has now finished:
+            # stopping is False again but the session is still running, and nothing will ever
+            # finalise it - the close would time out and the session would go uncounted.
+            # Upgrade to a full stop, once.
+            dispatched = True
+            print("[desktop] close: partial stop finished, upgrading to a full stop", flush=True)
+            _dispatch_stop()
     print(f"[desktop] close: session still finalising after {timeout:.1f}s; closing anyway "
           "(the transcript and recording are flushed by their atexit handlers)", flush=True)
     return "timeout"

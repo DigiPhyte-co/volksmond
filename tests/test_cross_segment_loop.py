@@ -97,6 +97,39 @@ def test_clear_resets_history():
     r.clear()                                        # e.g. a live language/model change
     assert r.observe("SYS", "Bye.", 5.0) == 0
 
+class _ResetSeam:
+    """Engine's loop-history reset seam without loading a model: the request thread queues a
+    flag (request_loop_history_reset) and the worker thread consumes it between chunks."""
+    request_loop_history_reset = T.Engine.request_loop_history_reset
+    _apply_pending_recent_reset = T.Engine._apply_pending_recent_reset
+
+    def __init__(self):
+        import threading
+        self._change_lock = threading.Lock()
+        self._pending_recent_reset = False
+        self._recent = T.RecentEmissions()
+
+
+def test_device_switch_reset_is_consumed_by_the_worker():
+    """F6: a live device switch must disarm the guard, else the first genuine identical line
+    from the NEW microphone is suppressed by the old device's run. The request thread may not
+    touch RecentEmissions (worker-owned), so it flags and the worker clears."""
+    e = _ResetSeam()
+    assert drive([("Bye.", i * 1.0) for i in range(5)], r=e._recent)[-1] == 1   # guard armed
+    e.request_loop_history_reset()          # /api/switch-device, on the request thread
+    assert e._pending_recent_reset is True
+    assert e._recent.observe("SYS", "Bye.", 5.0) == 1, "the request thread must not clear it itself"
+    e._apply_pending_recent_reset()         # the worker, between chunks
+    assert e._pending_recent_reset is False, "the flag must be one-shot"
+    assert e._recent.observe("SYS", "Bye.", 6.0) == 0, "history not cleared after the switch"
+    e._apply_pending_recent_reset()         # a second consume is a no-op
+
+
+def test_worker_loop_consumes_the_reset():
+    """The seam is only real if the worker loop actually calls it each chunk."""
+    assert "self._apply_pending_recent_reset()" in inspect.getsource(T.Engine._run)
+
+
 def test_engine_clears_on_pending_change():
     """R2: the history lives on the Engine and survives chunk boundaries, so a post-switch
     style change could false-trigger once if _apply_pending_change did not clear it."""

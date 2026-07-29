@@ -164,6 +164,91 @@ def test_close_is_bounded_when_the_stop_hangs():
     assert elapsed < 3.0, f"a hung stop blocked the close for {elapsed:.2f}s"
 
 
+def _patched_stop(stop_impl):
+    """Context manager: replace the /api/stop handler and restore the real STATE afterwards.
+
+    Returns the list every call appends its `what` to. Same stub discipline as
+    _finalise_case, but the test keeps the STATE object so it can drive it mid-close."""
+    import contextlib
+    from live_transcribe.web import app as webapp
+
+    @contextlib.contextmanager
+    def _cm():
+        st = webapp.STATE
+        calls = []
+        saved = (st.running, st.stopping, st.source_kind, st.session_counted)
+        orig_stop = webapp.stop
+        try:
+            def _stop(what="all"):
+                calls.append(what)
+                return stop_impl(st)
+            webapp.stop = _stop
+            yield st, calls
+        finally:
+            webapp.stop = orig_stop
+            (st.running, st.stopping, st.source_kind, st.session_counted) = saved
+    return _cm()
+
+
+def test_close_upgrades_a_finished_partial_stop():
+    """F3: the close used to decide ONCE whether to dispatch stop(all). Scenario: the user had
+    stopped transcription only (recording carried on) and that drain was still in flight
+    (STATE.stopping) when the window closed, so the close deliberately fired no stop. The drain
+    then ends with stopping=False but running=True and nothing ever finalises the session: the
+    close times out and the session goes uncounted (the session_count bug all over again). The
+    poll must notice and upgrade to a full stop."""
+    import threading
+    import time
+
+    def _stop(st):
+        st.session_counted = True   # what _bump_session_count does inside the real handler
+        st.running = False          # what STATE.reset() does at the end of the drain
+
+    with _patched_stop(_stop) as (st, calls):
+        st.running, st.stopping, st.source_kind = True, True, "live"
+        st.session_counted = False
+        # the partial-stop drain finishes just after the close starts polling
+        threading.Timer(0.15, lambda: setattr(st, "stopping", False)).start()
+        t0 = time.monotonic()
+        status = desktop_mod.finalise_open_session(timeout=3.0, poll=0.02)
+        elapsed = time.monotonic() - t0
+        assert calls == ["all"], f"the finished partial stop was never upgraded: {calls}"
+        assert status == "finalised", status
+        assert st.session_counted is True, "the session was not counted"
+        assert elapsed < 3.0, f"the close still ran to its timeout ({elapsed:.2f}s)"
+
+
+def test_close_retries_a_busy_lock_within_its_budget():
+    """F4: a single failed 0.5s STATE.lock acquisition used to abandon finalisation outright.
+    That is a realistic close: hitting the X right after Begin finds /api/start holding the
+    lock through engine + capture construction, which is seconds on a model load. The
+    acquisitions stay bounded, but they are retried until the overall close deadline."""
+    import threading
+    import time
+    from live_transcribe.web import app as webapp
+
+    held = threading.Event()
+    released = threading.Event()
+
+    def _hold():
+        with webapp.STATE.lock:
+            held.set()
+            time.sleep(1.5)         # longer than lock_timeout, well inside the close budget
+        released.set()
+
+    with _patched_stop(lambda st: setattr(st, "running", False)) as (st, calls):
+        st.running, st.stopping, st.source_kind = True, False, "live"
+        threading.Thread(target=_hold, daemon=True, name="lock-hog").start()
+        assert held.wait(5), "the test never acquired STATE.lock"
+        t0 = time.monotonic()
+        status = desktop_mod.finalise_open_session(timeout=5.0, poll=0.02)
+        elapsed = time.monotonic() - t0
+        released.wait(5)
+        assert calls == ["all"], f"a busy lock abandoned finalisation: {calls}"
+        assert status == "finalised", status
+        assert 1.0 < elapsed < 5.0, f"expected a ~1.5s wait inside the budget, took {elapsed:.2f}s"
+
+
 def test_closing_handler_never_vetoes_the_close():
     """pywebview cancels the close if a `closing` handler returns False, so the handler must
     return a non-False value even when finalisation blows up, and must take no arguments
@@ -189,6 +274,8 @@ if __name__ == "__main__":
     test_close_finalises_a_running_session()
     test_close_does_not_restart_a_stop_already_in_flight()
     test_close_is_bounded_when_the_stop_hangs()
+    test_close_upgrades_a_finished_partial_stop()
+    test_close_retries_a_busy_lock_within_its_budget()
     test_closing_handler_never_vetoes_the_close()
     print("OK: DesktopApi exposes only methods to pywebview's JS-API walker; "
           "window close finalises the session (bounded, idempotent).")

@@ -417,6 +417,19 @@ def switch_device(req: SwitchDeviceRequest):
                 c.attach_sys_ring(eng.sys_env)   # keep the echo-veto reference fed across the switch
             return c
 
+        def _reset_loop_history():
+            # A different device changes what the model hears, so an already-armed
+            # cross-segment loop guard must not suppress the first genuine identical line
+            # from the new one. RecentEmissions is owned by the transcription worker, so
+            # ASK (a pending flag the worker consumes between chunks) rather than mutate it
+            # from this request thread.
+            eng = STATE.engine
+            if eng is not None:
+                try:
+                    eng.request_loop_history_reset()
+                except Exception:
+                    pass
+
         try:
             old_cap.stop()
         except Exception:
@@ -439,6 +452,7 @@ def switch_device(req: SwitchDeviceRequest):
                 revert = _build(prev_mic, prev_loop)
                 revert.start()
                 STATE.capture = revert
+                _reset_loop_history()   # the revert is a device change too (capture gap included)
             except Exception:
                 if revert is not None:
                     try:
@@ -450,6 +464,7 @@ def switch_device(req: SwitchDeviceRequest):
         STATE.capture = new_cap
         STATE.record_raw_mic = new_cap.has_raw_mic()   # AEC may re-engage (or not) on the new device
         STATE.mic_device, STATE.loopback_device = mic, loop
+        _reset_loop_history()
         return {"which": req.which, "device": req.device, "mic_device": mic, "loopback_device": loop}
 
 
@@ -1226,6 +1241,7 @@ def stop(what: str = "all"):
                     pass
                 err = md_sink.last_error if md_sink else None
                 cap_to_stop = None
+                should_finalise = False
                 with STATE.lock:
                     STATE.engine = None
                     STATE.md_sink = None
@@ -1237,6 +1253,7 @@ def stop(what: str = "all"):
                         # Recording was also stopped while we were draining: nothing
                         # is left running, so finalise. Stop capture OUTSIDE the lock
                         # (it can block), then reset the session.
+                        should_finalise = True
                         cap_to_stop = STATE.capture
                         STATE.capture = None
                 if cap_to_stop is not None:
@@ -1244,10 +1261,16 @@ def stop(what: str = "all"):
                         cap_to_stop.stop()
                     except Exception:
                         pass
+                if should_finalise:
                     # This branch IS the end of the session (transcription was stopped
                     # first, recording stopped while we drained), so it must count like
-                    # any other finalise. Outside STATE.lock: _bump_session_count takes
-                    # it itself. Idempotent, so a racing what="all" cannot double-count.
+                    # any other finalise. Deliberately NOT conditional on there being a
+                    # capture to stop: a failed device switch can leave STATE.capture None
+                    # on a still-running session (see switch_device), and hanging the whole
+                    # count-and-reset off `cap_to_stop` then left STATE.running stuck True
+                    # forever, so every later session 409'd. Outside STATE.lock:
+                    # _bump_session_count takes it itself. Idempotent, so a racing
+                    # what="all" cannot double-count.
                     _bump_session_count()
                     with STATE.lock:
                         saved_err = STATE.sink_error

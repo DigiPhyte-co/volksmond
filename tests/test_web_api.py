@@ -873,6 +873,118 @@ def test_session_count_bumped_on_transcription_branch_finalise():
     print("  OK  the stop-transcription-then-recording finalise counts the session (WP-6 bug)")
 
 
+def test_transcription_drain_finalises_without_a_capture():
+    # F5: the drain's finalise block hung off `cap_to_stop is not None`, but STATE.capture can
+    # legitimately be None on a still-running session - a device switch whose new device fails
+    # AND whose revert fails clears it (switch_device). "Stop transcription" then "stop
+    # recording" would skip the whole count-and-reset block, leaving STATE.running stuck True
+    # so every later session 409'd. The finalise decision is now its own flag; only the
+    # cap.stop() call is conditional.
+    import threading as _th
+    gate = _th.Event()
+
+    class _GatedEngine:
+        def pending(self):
+            return 0
+
+        def stop(self, drain=False):
+            gate.wait(10)
+
+    st = webapp.STATE
+    saved = (st.running, st.stopping, st.source_kind, st.transcribing, st.recording,
+             st.engine, st.capture, st.md_sink, st.recorder, st.session_counted, st.sink_error)
+    try:
+        with _sandbox_settings() as C:
+            st.running, st.stopping, st.source_kind = True, False, "live"
+            st.transcribing, st.recording = True, True
+            st.engine, st.capture = _GatedEngine(), None      # the failed-switch state
+            st.md_sink = st.recorder = None
+            st.session_counted = False
+
+            assert client.post("/api/stop?what=transcription").status_code == 200
+            assert client.post("/api/stop?what=recording").status_code == 200
+            gate.set()
+            assert _wait_idle(st), "a capture-less drain never finalised: STATE.running stuck True"
+            assert C.load()["session_count"] == 1, \
+                f"a capture-less finalise did not count the session: {C.load()}"
+            assert st.stopping is False and st.engine is None, "STATE was not reset"
+    finally:
+        gate.set()
+        (st.running, st.stopping, st.source_kind, st.transcribing, st.recording,
+         st.engine, st.capture, st.md_sink, st.recorder, st.session_counted, st.sink_error) = saved
+    print("  OK  the stop-transcription drain finalises even with no capture (failed device switch)")
+
+
+def test_switch_device_resets_the_loop_history():
+    # F6: the cross-segment loop guard's history is per-source and survived a device switch, so
+    # an armed loop could suppress the FIRST genuine identical line from the new microphone.
+    # RecentEmissions belongs to the transcription worker, so the request thread must ASK
+    # (a pending flag the worker consumes) rather than clear it here. Both the successful
+    # switch and the revert-after-failure path have to ask.
+    import time as _time
+    resets = []
+
+    class _FakeEngine:
+        sys_env = None
+
+        def request_loop_history_reset(self):
+            resets.append(True)
+
+    class _FakeCapture:
+        fail_on = None      # mic_device value whose start() blows up
+
+        def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15,
+                     on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False):
+            self.mic_device = mic_device
+            self._t0 = t0 if t0 is not None else _time.monotonic()
+            self.aec, self.agc, self.record_raw_mic = aec, agc, record_raw_mic
+
+        def start(self):
+            if _FakeCapture.fail_on is not None and self.mic_device == _FakeCapture.fail_on:
+                raise OSError("device would not open")
+
+        def stop(self):
+            pass
+
+        def attach_sys_ring(self, ring):
+            pass
+
+        def has_raw_mic(self):
+            return self.record_raw_mic
+
+    st = webapp.STATE
+    saved_factory = webapp.capture.AudioCapture
+    saved = (st.running, st.stopping, st.source_kind, st.capture, st.engine,
+             st.mic_device, st.loopback_device, st.chunk_seconds, st.record_raw_mic)
+    try:
+        webapp.capture.AudioCapture = _FakeCapture
+        st.running, st.stopping, st.source_kind = True, False, "live"
+        st.engine = _FakeEngine()
+        st.mic_device, st.loopback_device, st.chunk_seconds = "0", "1", 15
+
+        # 1. a successful switch asks for the reset
+        _FakeCapture.fail_on = None
+        st.capture = _FakeCapture(mic_device="0", loopback_device="1")
+        resets.clear()
+        assert client.post("/api/switch-device", json={"which": "mic", "device": "2"}).status_code == 200
+        assert len(resets) == 1, f"a successful switch did not reset the loop history: {resets}"
+
+        # 2. a failed switch that reverts to the previous device asks too (the revert is a
+        #    device change as well, complete with its own capture gap)
+        _FakeCapture.fail_on = "9"
+        st.capture = _FakeCapture(mic_device="0", loopback_device="1")
+        st.mic_device = "0"
+        resets.clear()
+        assert client.post("/api/switch-device", json={"which": "mic", "device": "9"}).status_code == 500
+        assert len(resets) == 1, f"the revert did not reset the loop history: {resets}"
+    finally:
+        _FakeCapture.fail_on = None
+        webapp.capture.AudioCapture = saved_factory
+        (st.running, st.stopping, st.source_kind, st.capture, st.engine,
+         st.mic_device, st.loopback_device, st.chunk_seconds, st.record_raw_mic) = saved
+    print("  OK  /api/switch-device asks the worker to clear the loop history (switch and revert)")
+
+
 def test_session_count_never_double_bumps():
     # WP-6: the finalisation paths can overlap (a window close while a UI stop is in flight),
     # so the count is guarded by an explicit session-scoped flag, not by call-site discipline.
@@ -971,6 +1083,8 @@ if __name__ == "__main__":
                test_model_update_endpoints,
                test_session_count_bumped_on_full_stop,
                test_session_count_bumped_on_transcription_branch_finalise,
+               test_transcription_drain_finalises_without_a_capture,
+               test_switch_device_resets_the_loop_history,
                test_session_count_never_double_bumps,
                test_session_count_failure_is_logged_not_raised):
         try:
