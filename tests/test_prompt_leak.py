@@ -54,6 +54,37 @@ def test_repeat_shortcut_needs_coverage():
     assert m().is_leak("So I was saying to Sean Freimond and Sean Freimond about the thing") is False
 
 
+# --- F7: leaks that start MID-unit (real-audio validation gap) ---
+# Whisper enters the prompt wherever the decoder lands, so the leading unit arrives as a
+# dangling half. Whole-unit matching alone covers only the intact unit; once ANY whole unit
+# has matched, the prompt's unit vocabulary counts as covered too. Arithmetic per case below
+# (this prompt's unit vocabulary = {danica, freimond, sean}).
+def test_leak_starting_mid_unit():
+    # "freimond sean freimond": the unit match covers 2/3, the vocabulary covers the dangling
+    # leading "Freimond" -> 3/3 = 1.00 >= 0.80. This fixture fails without F7 (0.667).
+    assert m().is_leak("Freimond, Sean Freimond") is True
+
+def test_leak_starting_mid_unit_with_filler():
+    # "yeah" is a filler, so the content tokens are the same three -> 3/3 = 1.00
+    assert m().is_leak("Freimond, Sean Freimond, yeah.") is True
+
+def test_mid_unit_vocabulary_does_not_widen_a_correction():
+    # 8 content tokens, 4 of them (sean/freimond twice) in the vocabulary -> 0.50 < 0.60, so
+    # the A2 repeat floor still keeps a spoken correction. F7 adds no coverage here at all.
+    assert m().is_leak("I said Sean Freimond, not Shawn Freemont, Sean Freimond") is False
+
+def test_exclamation_around_a_name_kept():
+    # "oh sean freimond": "oh" is neither a filler nor vocabulary -> 2/3 = 0.667 < 0.80
+    assert m().is_leak("Oh, Sean Freimond!") is False
+
+def test_bare_single_vocabulary_token_kept():
+    # No WHOLE unit matches, so the vocabulary expansion never arms and a bare surname stays.
+    # Deliberate: one word is not enough evidence to delete a line, and the real answer for it
+    # is the audio-evidence gate in a later work package, not a wider text rule.
+    assert m().is_leak("Freimond") is False
+    assert m().is_leak("Freimond.") is False
+
+
 # --- Mode A: what must survive ---
 def test_embedded_prose_kept():
     # The fabricated "keynote speaker" line: prompt tokens embedded in prose. Coverage ~0.13.

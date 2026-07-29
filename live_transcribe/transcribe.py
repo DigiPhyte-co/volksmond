@@ -648,6 +648,7 @@ class PromptLeakMatcher:
 
     def __init__(self, user_prompt, anchor=None):
         self._units = []      # Mode A: normalised token tuples, matched as contiguous n-grams
+        self._vocab = set()   # Mode A: every token of those units (see the F7 note in is_leak)
         self._ngrams = set()  # Mode B: every _LEAK_NGRAM-length n-gram of the anchor / long prompt
         toks = _norm_tokens(user_prompt)
         if len(toks) > _LEAK_LONG_PROMPT:
@@ -680,6 +681,7 @@ class PromptLeakMatcher:
             self._add_ngrams(unit)
         else:
             self._units.append(unit)
+            self._vocab.update(unit)
 
     def _add_ngrams(self, toks):
         for i in range(len(toks) - _LEAK_NGRAM + 1):
@@ -711,6 +713,18 @@ class PromptLeakMatcher:
                 matched_len = max(matched_len, n)
         if not matched_len:
             return False
+        # F7 (real-audio validation gap): Whisper regurgitates the prompt from wherever the
+        # decoder happens to enter it, so a leak often starts MID-unit - "Freimond, Sean
+        # Freimond" for the prompt "Danica Freimond, Sean Freimond". Whole-unit matching covers
+        # only the intact "Sean Freimond", scoring 0.667 and keeping the line (0 of 20 such
+        # lines caught in the replay harness). Once at least one WHOLE unit has matched (that
+        # is the gate - never on vocabulary alone), any other token from the unit vocabulary
+        # counts as covered too, which reads the dangling half correctly. Deliberately Mode A
+        # only: the anchor / long-prompt vocabulary is ordinary speech, and token-membership
+        # matching against THAT is the trap Mode B exists to avoid.
+        for i, t in enumerate(toks):
+            if t in self._vocab:
+                covered[i] = True
         content = _content_tokens(toks)
         if not content:
             return False
