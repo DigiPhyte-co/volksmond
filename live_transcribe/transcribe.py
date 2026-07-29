@@ -1341,10 +1341,12 @@ class Engine:
                     # (_collapse_repetition handles single-token runs; this catches word groups.)
                     if _is_phrase_loop(text):
                         continue
-                    # Residual silence hallucination the window-level no_speech guard
-                    # let through: drop a segment the model is very sure is non-speech.
-                    if getattr(seg, "no_speech_prob", 0.0) > 0.85:
-                        continue
+                    # (There used to be a `no_speech_prob > 0.85` per-segment drop here. Measured
+                    # across 640 real segments on this stack - faster-whisper 1.2.1 / ctranslate2
+                    # 4.7.2, vad_filter either way - seg.no_speech_prob is identically 0.000, so the
+                    # guard had never once fired. Removed as dead code, not as a loosening. The
+                    # field exists on the segment; any future guard that wants it must first verify
+                    # it actually VARIES on the pinned versions before depending on it.)
                     out = Segment(
                         source=source,
                         t_start=t_start + float(seg.start),
