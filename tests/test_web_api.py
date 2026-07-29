@@ -1060,6 +1060,80 @@ def test_session_count_failure_is_logged_not_raised():
     print("  OK  a failed session count logs the reason and never raises")
 
 
+def test_notify_meeting_needs_a_business_licence():
+    # WP-10: the meeting toast is the calendar reminder wearing a different coat, so it carries the
+    # same Business entitlement. The generic notification machinery is NOT gated; this use of it is.
+    from live_transcribe import notify
+    orig_current, orig_show = webapp.licensing.current, notify.show
+    calls = []
+    try:
+        notify.show = lambda *a, **k: calls.append((a, k)) or True
+        webapp.licensing.current = lambda *a, **k: licensing.FREE
+        r = client.post("/api/notify-meeting", json={"subject": "Board pack review"})
+        assert r.status_code == 402, f"expected 402 without a licence, got {r.status_code}: {r.text}"
+        assert calls == [], f"an unlicensed request still reached notify.show: {calls}"
+    finally:
+        webapp.licensing.current = orig_current
+        notify.show = orig_show
+    print("  OK  /api/notify-meeting 402s without a business licence, and shows nothing")
+
+
+def test_notify_meeting_shows_one_toast_with_the_subject():
+    # A licensed call must produce exactly ONE notification, carrying the meeting subject, tagged
+    # so a repeat cannot stack. No pywin32 here: notify.show itself is replaced.
+    from live_transcribe import notify
+    orig_current, orig_show = webapp.licensing.current, notify.show
+    calls = []
+    pro = licensing.Entitlements(tier="pro", features=frozenset({"calendar"}),
+                                 max_major=None, valid_until=None, seats=1)
+    try:
+        webapp.licensing.current = lambda *a, **k: pro
+        notify.show = lambda *a, **k: calls.append((a, k)) or True
+        r = client.post("/api/notify-meeting", json={"subject": "  Board pack review  "})
+        assert r.status_code == 200, r.text
+        assert r.json() == {"shown": True}, r.json()
+        assert len(calls) == 1, f"expected exactly one notification, got {calls}"
+        args, kwargs = calls[0]
+        assert args[0] == "A meeting is starting", args
+        assert args[1] == "Board pack review", f"the subject was not passed through cleanly: {args}"
+        assert kwargs.get("tag") == "meeting", kwargs
+        # A missing subject must still notify (an untitled meeting is still a meeting).
+        calls.clear()
+        assert client.post("/api/notify-meeting", json={}).status_code == 200
+        assert len(calls) == 1 and calls[0][0][1] == "", calls
+    finally:
+        webapp.licensing.current = orig_current
+        notify.show = orig_show
+    print("  OK  /api/notify-meeting: one toast, titled, carrying the subject, tagged 'meeting'")
+
+
+def test_offline_build_registers_no_calendar_routes():
+    # The offline edition compiles the calendar out, so the meeting-notification route must not
+    # exist there either: it lives inside the same OFFLINE_ONLY guard. Checked in a SUBPROCESS with
+    # SA_LIVE_OFFLINE=1 rather than by reloading the module in place, because reloading web.app
+    # rebinds this module's CSRF token and session state under the other tests' feet. The subprocess
+    # also exercises the real switch (buildflags reads the environment at import) instead of a patch.
+    import json
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = ("import json\n"
+            "from live_transcribe import buildflags\n"
+            "from live_transcribe.web.app import app\n"
+            "assert buildflags.OFFLINE_ONLY is True\n"
+            "print('ROUTES=' + json.dumps(sorted({r.path for r in app.routes})))\n")
+    env = dict(os.environ, SA_LIVE_OFFLINE="1")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         cwd=root, env=env, timeout=300)
+    assert out.returncode == 0, f"the offline app failed to import:\n{out.stdout}\n{out.stderr}"
+    line = [ln for ln in out.stdout.splitlines() if ln.startswith("ROUTES=")]
+    assert line, f"no route list from the offline import:\n{out.stdout}\n{out.stderr}"
+    paths = json.loads(line[-1][len("ROUTES="):])
+    for gone in ("/api/notify-meeting", "/api/calendar-upcoming", "/api/calendar-seed"):
+        assert gone not in paths, f"the offline build still registers {gone}"
+    assert "/api/settings" in paths, f"the offline build lost its ordinary routes: {paths}"
+    print("  OK  the offline build registers no calendar routes, meeting notifications included")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_app_info,
@@ -1103,7 +1177,10 @@ if __name__ == "__main__":
                test_transcription_drain_finalises_without_a_capture,
                test_switch_device_resets_the_loop_history,
                test_session_count_never_double_bumps,
-               test_session_count_failure_is_logged_not_raised):
+               test_session_count_failure_is_logged_not_raised,
+               test_notify_meeting_needs_a_business_licence,
+               test_notify_meeting_shows_one_toast_with_the_subject,
+               test_offline_build_registers_no_calendar_routes):
         try:
             fn()
         except AssertionError as e:

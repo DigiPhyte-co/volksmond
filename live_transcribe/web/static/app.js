@@ -1411,9 +1411,16 @@ function startReminderPoll() {
   reminderTick();
 }
 async function reminderTick() {
-  // Guard cheaply BEFORE any request: only Business licences with the setting on, and never while a
+  // ONE poll, TWO independent outputs (WP-10): the in-app reminder card, gated on
+  // calendar_reminders, and the Windows notification, gated on os_toasts. They are separately
+  // switchable because they answer different situations: the card is for when you are looking at
+  // Volksmond, the notification is for when you are not. So poll while EITHER is on, and gate each
+  // output on its own switch. Guard cheaply BEFORE any request: Business only, and never while a
   // session is already running or being set up.
-  if (!isPro() || !(S.settings && S.settings.calendar_reminders !== false)) return;
+  if (!isPro()) return;
+  var bannerOn = !(S.settings && S.settings.calendar_reminders === false);   // default on
+  var toastOn = !(S.settings && S.settings.os_toasts === false);             // default on
+  if (!bannerOn && !toastOn) return;
   if (S.reminder || (S.live && S.live.running)) return;
   if (["live", "recordonly", "importing", "starting", "setup"].indexOf(S.route) >= 0) return;
   var r;
@@ -1424,8 +1431,24 @@ async function reminderTick() {
   if (r.starts_in_min > 2 || r.starts_in_min < -15) return;
   var key = reminderKey(r);
   if (reminderHandled[key]) return;
-  S.reminder = { subject: r.subject, attendees: r.attendees || [], start: r.start, key: key };
-  render();
+  // Marked before either output fires, so a meeting is nudged at most once per session whichever
+  // output is on. The card used to rely on S.reminder blocking re-entry for this, which is no help
+  // in toast-only mode: there is no card to block on, and the poll would fire a notification every
+  // minute for a quarter of an hour.
+  reminderHandled[key] = true;
+  if (toastOn) notifyMeetingToast(r.subject || "");
+  if (bannerOn) {
+    S.reminder = { subject: r.subject, attendees: r.attendees || [], start: r.start, key: key };
+    render();
+  }
+}
+function notifyMeetingToast(subject) {
+  // Fire and forget. The server hands the text to the Windows shell; a failure (no licence, no
+  // pywin32, notifications switched off, offline edition with no such route) is not worth a word to
+  // the user and must never disturb the reminder card. Clicking the notification only brings the
+  // window forward, where the card is already waiting: there is deliberately no action channel
+  // from a toast back into the app.
+  api.post("/api/notify-meeting", { subject: subject }).catch(function () {});
 }
 function acceptReminder() {
   var r = S.reminder; if (!r) return;
@@ -2419,11 +2442,13 @@ function licenceCard() {
     ]) : null,
     // Business only: the calendar reminder toggle. Reads the local Outlook calendar while the app is
     // open and offers to start transcribing when a meeting begins. Local only, never auto-starts.
+    // The copy names the CARD specifically, because since WP-10 the same calendar poll also drives a
+    // Windows notification, switched by the row above; this row governs only the in-app card.
     pro ? el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("calendar", 18)),
       el("div", { class: "body" }, [
-        el("div", { class: "t", text: "Remind me when a meeting starts" }),
-        el("div", { class: "s", text: "While Volksmond is open, it checks your Outlook calendar on this computer and offers to start transcribing when a meeting begins. Nothing is sent anywhere, and it never starts on its own." }),
+        el("div", { class: "t", text: "Show a reminder card when a meeting starts" }),
+        el("div", { class: "s", text: "While Volksmond is open, it checks your Outlook calendar on this computer and shows a reminder card, inside the app, offering to start transcribing when a meeting begins. Windows notifications are switched separately, above. Nothing is sent anywhere, and it never starts on its own." }),
       ]),
       el("div", { class: "ctl" }, toggleEl(remindersOn, function () { saveSettings({ calendar_reminders: !remindersOn }); })),
     ]) : null,
