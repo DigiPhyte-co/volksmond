@@ -21,6 +21,10 @@ cudadl.register_dll_dir()
 
 from faster_whisper import WhisperModel
 
+# The fuzzy word matcher the end-of-session echo strip already uses; the live fuzzy echo veto
+# (fuzzy_echo_veto below) reuses it so both places call the same two words "the same word".
+from . import dedup
+
 
 # Fluister: our Afrikaans-optimised Whisper models (LoRA fine-tunes merged to ctranslate2 int8).
 # Much better on Afrikaans, equal-or-better on English, no Afrikaans leakage on pure-English
@@ -732,6 +736,144 @@ def _coverage(toks, covered):
     return sum(1 for i in content if covered[i]) / len(content)
 
 
+# --- Cross-channel echo veto, arm 2: energy-armed fuzzy echo ---------------------------------
+#
+# Arm 1 (sys_echo_veto, above) fires only on a CONTINUOUSLY loud far end (coverage >= 0.60), and
+# it should: energy is its only evidence, so it cannot afford less. The bleed it therefore refuses
+# is the GAPPY far end - a remote speaker who pauses mid-sentence leaves coverage below the floor
+# while the mic is still re-hearing them, and the fabricated MIC line survives.
+#
+# This arm supplies the missing evidence from the TEXT. It keeps arm 1's asymmetry test (a mic that
+# never really spoke, a far end much louder) and adds: the line substantially echoes what the far
+# end actually said in the surrounding seconds. Both halves must agree before anything is dropped.
+#
+# Offline-validated on 2026-07-29 against two real meetings (spprac + ashley wavs): 4/4 and 3/3
+# junk precision, zero adjudicated real-speech loss. Every threshold below comes from that run.
+# Lives here rather than beside arm 1 because it needs the token helpers defined just above.
+_XCHAN2_MIN_DUR = 0.5         # seconds; same sub-blip exemption as arm 1
+_XCHAN2_MIC_CEILING = -27.0   # dBFS; p90 of the RAW mic frames must sit below this ("never spoke")
+_XCHAN2_MARGIN_DB = 10.0      # dB the far end's p90 must sit ABOVE the mic's p90
+_XCHAN2_MIN_TOKENS = 4        # content words; a short line is never judged on text overlap
+_XCHAN2_MIN_OVERLAP = 0.30    # fraction of the MIC line's content words the far end already said
+_XCHAN2_TEXT_WINDOW = 6.0     # +/- seconds around the MIC span to look for the far-end original
+_XCHAN2_TOL = 0.3             # window padding for the energy lookups (arm 1's `tol`)
+
+
+def _content_words(text):
+    """The meaning-carrying WORDS of `text`, normalised: what _content_tokens indexes.
+
+    _content_tokens returns positions (its callers score coverage per position); the echo arm
+    needs the words themselves to match against the far end."""
+    toks = _norm_tokens(text)
+    return [toks[i] for i in _content_tokens(toks)]
+
+
+class SysTextRing:
+    """Content words of recently PUBLISHED SYS segments: the echo reference for arm 2.
+
+    Deliberately NOT RecentEmissions, which looks similar and is wrong for this job three ways:
+    it is cleared on a model change AND on a live device switch (either would silently disarm this
+    veto for the following minutes), it only fills while the loop guard is enabled, and it records
+    SUPPRESSED candidates - text that was never real far-end speech and must never serve as proof
+    that the far end said something. This ring holds published SYS only, and is cleared only on
+    engine start.
+
+    Bounded twice: `maxlen` entries and a retention window. Measured SYS cadence is ~11 s per
+    segment, so 8 entries / 20 s comfortably span the +/- 6 s the veto looks at. Locked like
+    SysEnergyRing: both ends are the transcription worker today, but the ring is reachable from
+    the Engine, so a future reader (a debug endpoint) cannot tear the deque.
+    """
+
+    def __init__(self, maxlen=8, retain_s=20.0):
+        self._items = deque(maxlen=maxlen)   # (t_start, [content words])
+        self._retain = retain_s
+        self._lock = threading.Lock()
+
+    def clear(self):
+        """Forget everything. Engine start only - see the class note."""
+        with self._lock:
+            self._items.clear()
+
+    def add(self, t_start, text):
+        """Record a published SYS segment. A line with no content words is not a reference."""
+        words = _content_words(text)
+        if not words:
+            return
+        t = float(t_start)
+        with self._lock:
+            self._items.append((t, words))
+            cut = t - self._retain
+            while self._items and self._items[0][0] < cut:
+                self._items.popleft()
+
+    def near(self, t_lo, t_hi):
+        """Content-word lists of the SYS segments whose start falls in [t_lo, t_hi]."""
+        with self._lock:
+            return [w for t, w in self._items if t_lo <= t <= t_hi]
+
+
+def fuzzy_echo_veto(text, abs_start, abs_end, mic_ring, sys_ring, sys_text, *,
+                    min_dur=_XCHAN2_MIN_DUR, mic_ceiling=_XCHAN2_MIC_CEILING,
+                    margin_db=_XCHAN2_MARGIN_DB, min_tokens=_XCHAN2_MIN_TOKENS,
+                    min_overlap=_XCHAN2_MIN_OVERLAP, window_s=_XCHAN2_TEXT_WINDOW,
+                    tol=_XCHAN2_TOL):
+    """Drop a MIC segment as bleed-echo fabrication iff ALL of:
+
+      1. it lasts at least `min_dur`;
+      2. the mic's own loud frames (p90 of the RAW mic ring over the padded span) sit below
+         `mic_ceiling` - on its calibrated absolute basis, this speaker never actually spoke here;
+      3. the far end was at least `margin_db` louder, measured as p90 of ALL SYS frames in the same
+         window. Plain p90, NOT arm 1's p70-of-the-active-subset: a gappy far end is precisely the
+         case this arm exists for, so its quiet frames must not be filtered out of the reference
+         first (p90 already ignores the gaps by construction);
+      4. the line has at least `min_tokens` content words. This is the decisive protection: it is
+         what keeps "Yeah, it's a pleasure." (2 content words) however quiet the mic was;
+      5. at least `min_overlap` of those content words were already said by the far end within
+         +/- `window_s` of this segment's span, counted with dedup's fuzzy one-to-one matcher so
+         the mic's mis-hearings still count as the same word. The denominator is the MIC line:
+         "how much of what this speaker allegedly said came from the far end?".
+
+    Every missing input fails safe (keep): no mic ring, no mic or SYS frames for the window, no SYS
+    ring, no published SYS text. Returns (drop, own_p90, margin, overlap, why); the three numbers
+    are None until measured and all three are set whenever `drop` is True.
+    """
+    import numpy as np
+    if abs_end - abs_start < min_dur:
+        return False, None, None, None, "short"
+    if mic_ring is None:
+        return False, None, None, None, "nomicring"
+    own = mic_ring.frames_in(abs_start - tol, abs_end + tol)
+    if not own:
+        return False, None, None, None, "nomic"
+    own_p90 = float(np.percentile(own, 90))
+    if own_p90 >= mic_ceiling:
+        return False, own_p90, None, None, "loud"
+    if sys_ring is None:
+        return False, own_p90, None, None, "nosysring"
+    far = sys_ring.frames_in(abs_start - tol, abs_end + tol)
+    if not far:
+        return False, own_p90, None, None, "nosys"
+    margin = float(np.percentile(far, 90)) - own_p90
+    if margin < margin_db:
+        return False, own_p90, margin, None, f"marg={margin:.1f}"
+    mic_words = _content_words(text)
+    if len(mic_words) < min_tokens:
+        return False, own_p90, margin, None, f"tok={len(mic_words)}"
+    if sys_text is None:
+        return False, own_p90, margin, None, "nosystext"
+    overlap = 0.0
+    for words in sys_text.near(abs_start - window_s, abs_end + window_s):
+        # dedup._shared_count: maximum one-to-one pairing, exact or near-spelled (ratio >= 0.78).
+        # Reused rather than reimplemented so "same word" means the same thing live and at the
+        # end-of-session strip; private only because dedup has had no outside caller until now.
+        overlap = max(overlap, dedup._shared_count(mic_words, words) / len(mic_words))
+        if overlap >= min_overlap:
+            break                       # already decided; skip the remaining matchings
+    if overlap < min_overlap:
+        return False, own_p90, margin, overlap, f"ov={overlap:.2f}"
+    return True, own_p90, margin, overlap, f"ov={overlap:.2f}"
+
+
 class PromptLeakMatcher:
     """Detects a segment that is regurgitated initial_prompt rather than speech.
 
@@ -981,10 +1123,15 @@ class Engine:
                                               # mic levels for the silence gate + the echo veto
         self._raw_mic_ring = raw_mic_ring_on()
         self._xchan_veto = os.environ.get("SA_LIVE_XCHAN_VETO", "1") != "0"
+        # Arm 2 of the echo veto (energy-armed fuzzy echo) has its own switch: SA_LIVE_XCHAN_VETO
+        # continues to govern arm 1 alone, so either can be turned off in a support session without
+        # losing the other. "0" makes arm 2 fully inert, ring included.
+        self._xchan_veto2 = os.environ.get("SA_LIVE_XCHAN_VETO2", "1") != "0"
         self._silence_gate = os.environ.get("SA_LIVE_SILENCE_GATE", "1") != "0"
         self._prompt_leak_on = os.environ.get("SA_LIVE_PROMPT_LEAK_GUARD", "1") != "0"
         self._loop_guard_on = os.environ.get("SA_LIVE_LOOP_GUARD", "1") != "0"
         self._recent = RecentEmissions()   # cross-segment loop history, per source
+        self._sys_text = SysTextRing()     # published SYS text: the echo reference for arm 2
         self._queue = queue.Queue(maxsize=32)
         self._stop = threading.Event()    # shutting down: stop accepting new audio
         self._abort = threading.Event()   # hard abort: discard the backlog instead of draining
@@ -1055,6 +1202,7 @@ class Engine:
 
     def start(self):
         self._recent.clear()
+        self._sys_text.clear()   # the ONLY place this is cleared: see SysTextRing
         self._worker.start()
 
     def stop(self, drain=True, timeout=None):
@@ -1193,6 +1341,11 @@ class Engine:
         if seg.source == "MIC":
             self._pending_mic.append((time.monotonic() + MIC_PUBLISH_DELAY, seg))
         else:
+            # Published SYS is the echo reference for veto arm 2. Recorded here because this is
+            # the single point SYS reaches the transcript: notices and backpressure markers go
+            # straight to _fanout, so no synthetic line can ever become an echo reference.
+            if seg.source == "SYS" and self._xchan_veto2:
+                self._sys_text.add(seg.t_start, seg.text)
             self._fanout(seg)
 
     def _flush_pending_mic(self, force=False):
@@ -1366,6 +1519,22 @@ class Engine:
                                                     mic_ring=self._ring_for("MIC"))
                         if _drop:
                             print(f"[engine] echo-veto dropped MIC @ {out.t_start:.1f}s [{_why}] {text[:40]!r}", flush=True)
+                            continue
+                    # Arm 2: energy-armed fuzzy echo. Catches the quiet-but-GAPPY far end that arm
+                    # 1 correctly refuses, by demanding the text echo what the far end just said on
+                    # top of the same energy asymmetry. Runs after arm 1 (the cheaper, purely
+                    # absolute test) and before the loop guard, so a vetoed line never seeds the
+                    # loop history. Toggle SA_LIVE_XCHAN_VETO2=0.
+                    if source == "MIC" and self._xchan_veto2:
+                        # (the reason string is only interesting on a keep, and the numbers below
+                        # already say why on a drop)
+                        _d2, _own, _marg, _ov, _ = fuzzy_echo_veto(
+                            text, out.t_start, out.t_end,
+                            self._ring_for("MIC"), self.sys_env, self._sys_text)
+                        if _d2:
+                            print(f"[engine] xchan-echo dropped MIC @ {out.t_start:.1f}s "
+                                  f"[own={_own:.1f} marg={_marg:.1f} ov={_ov:.2f}] {text[:40]!r}",
+                                  flush=True)
                             continue
                     # Cross-segment loop: this line is the 5th+ cycle of a short, fast
                     # repeat on this source. Silent drop, stdout log only - the first four
