@@ -293,6 +293,103 @@ def test_gate_sys_ring_also_gates():
     assert e._chunk_is_silence("SYS", tone(-20.0, 15.0), 600.0) is False   # no frames -> fallback
 
 
+def test_gate_kill_switch_ignores_the_sys_ring_too():
+    """SA_LIVE_RAW_MIC_RING=0 means "gate on chunk samples, like before WP-4" for BOTH sources.
+    A switch that left SYS on its ring while MIC fell back restored neither behaviour."""
+    r = ring_with(-52.0, 9.0, 25.0)
+    boosted = tone(-20.0, 15.0)
+    assert T._is_silence(boosted) is False, "precondition: the chunk itself looks like speech"
+    assert _GateEngine(sys_ring=r, on=True)._chunk_is_silence("SYS", boosted, 10.0) is True
+    assert _GateEngine(sys_ring=r, on=False)._chunk_is_silence("SYS", boosted, 10.0) is False, \
+        "with the ring switched off the SYS gate must read the chunk, not the ring"
+    # _ring_for itself is unchanged for SYS: the switch is applied by the gate, so the echo veto
+    # keeps its far-end reference (see the note at the arm-1 call site).
+    assert _GateEngine(sys_ring=r, on=False)._ring_for("SYS") is r
+
+
+# --- the dead-channel baseline is measured BEFORE the window -------------------------------
+
+def test_dead_channel_baseline_excludes_the_judged_window():
+    """The bug: noise_floor() included the chunk under judgement, so the FIRST chunk of a
+    sustained quiet talker (-40 dBFS throughout, p10 also -40) read as "0 dB above the room
+    tone" and was eaten. The baseline now comes from frames strictly before t_start."""
+    r = T.EnergyRing(retain_s=1e6)
+    t = 0.0
+    while t < 15.0:                          # nothing but this speaker, from the first frame
+        r.add(t, -40.0); t += 0.1
+    e = _GateEngine(mic_ring=r)
+    assert -45.0 < -40.0, "precondition: -40 dBFS is above the absolute speech floor"
+    assert e._chunk_is_silence("MIC", tone(-20.0, 15.0), 0.0) is False, \
+        "sustained quiet speech must not be judged against itself and eaten"
+
+
+def test_dead_channel_still_skips_against_an_established_room():
+    # The case the arm exists for, unchanged: an established room tone, then a window only 6 dB
+    # above it. The baseline is real history, so this is still a dead channel.
+    r = T.EnergyRing(retain_s=1e6)
+    t = 0.0
+    while t < 40.0:                          # 40 s of room tone at -46 sets the baseline
+        r.add(t, -46.0); t += 0.1
+    while t < 55.0:                          # the judged window: 6 dB above that
+        r.add(t, -40.0); t += 0.1
+    e = _GateEngine(mic_ring=r)
+    assert e._chunk_is_silence("MIC", tone(-20.0, 15.0), 40.0) is True, \
+        "a window 6 dB above an ESTABLISHED room tone is still a dead channel"
+
+
+def test_dead_channel_arm_inert_without_enough_history():
+    """Under min_history_s of pre-window frames the relative arm is inert: a baseline measured
+    over a second or two of a session that has only just begun is not a room tone. The absolute
+    floor still does its job, so nothing is lost - only guessing is."""
+    r = T.EnergyRing(retain_s=1e6)
+    t = 0.0
+    while t < 5.0:                           # only 5 s of history before the window
+        r.add(t, -46.0); t += 0.1
+    while t < 20.0:
+        r.add(t, -40.0); t += 0.1
+    e = _GateEngine(mic_ring=r)
+    assert e._chunk_is_silence("MIC", tone(-20.0, 15.0), 5.0) is False, \
+        "with under 10 s of history the relative arm must not fire"
+    # 10 s of the same history and the same window: now it fires (the boundary is the history,
+    # not the levels).
+    r2 = T.EnergyRing(retain_s=1e6)
+    t = 0.0
+    while t < 10.0:
+        r2.add(t, -46.0); t += 0.1
+    while t < 25.0:
+        r2.add(t, -40.0); t += 0.1
+    assert _GateEngine(mic_ring=r2)._chunk_is_silence("MIC", tone(-20.0, 15.0), 10.0) is True, \
+        "exactly min_history_s of history is enough (the bound is inclusive)"
+    # and the absolute arm is untouched by any of this: a genuinely silent room with no history
+    # at all is still skipped.
+    assert _GateEngine(mic_ring=ring_with(-52.0, 0.0, 15.0))._chunk_is_silence(
+        "MIC", tone(-20.0, 15.0), 0.0) is True
+
+
+def test_noise_floor_before_is_strictly_before_and_needs_history():
+    r = T.EnergyRing(retain_s=1e6)
+    t = 0.0
+    while t < 30.0:
+        r.add(t, -50.0); t += 0.1
+    while t < 45.0:
+        r.add(t, -10.0); t += 0.1
+    # the loud window after t=30 must not move the baseline at all
+    nf = r.noise_floor_before(30.0)
+    assert nf is not None and abs(nf - (-50.0)) < 0.6, f"baseline must exclude the window: {nf}"
+    assert r.noise_floor_before(0.0) is None, "nothing before the start -> no baseline"
+    assert r.noise_floor_before(5.0) is None, "under 10 s of history -> no baseline"
+    assert r.noise_floor_before(10.0) is not None, "10 s of history is enough"
+    # the window_s bound still applies: only recent history is the current room
+    r2 = T.EnergyRing(retain_s=1e6)
+    t = 0.0
+    while t < 100.0:                          # an old, quiet room
+        r2.add(t, -60.0); t += 0.1
+    while t < 130.0:                          # the aircon came on 30 s ago
+        r2.add(t, -38.0); t += 0.1
+    nf2 = r2.noise_floor_before(130.0, window_s=20.0)
+    assert nf2 is not None and abs(nf2 - (-38.0)) < 0.6, f"baseline must follow the room: {nf2}"
+
+
 def test_gate_liveness_on_an_agc_lifted_quiet_set():
     """Instrumented acceptance number: on a synthetic set of AGC-lifted quiet chunks (raw room
     tone at -52 dBFS, boosted to about -20 in the chunk the engine sees), what fraction does each

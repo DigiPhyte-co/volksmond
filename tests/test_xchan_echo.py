@@ -35,6 +35,10 @@ REAL_SHORT = "Yeah, it's a pleasure."
 REAL_SHORT_FAR = "It is a real pleasure to work with the team, thank you."
 REAL_PARTIAL = "There should be no hesitation, et cetera."
 REAL_PARTIAL_FAR = "So we can move ahead with that, etcetera, on the next point."
+# Sequential dialogue: a real, quiet reply to a far-end line that had already FINISHED. It shares
+# most of its words with that line by nature, which is what a proximity-only rule mistook for echo.
+REPLY_MIC = "I will send the updated budget tomorrow"
+REPLY_FAR = "Please send the updated budget tomorrow"
 
 MIC_T0, MIC_T1 = 30.0, 33.0      # the MIC segment span used throughout
 
@@ -49,20 +53,26 @@ def ring(db, t0, t1, step=0.1):
 
 
 def sys_text(*items):
-    """A SysTextRing pre-loaded with (t_start, text) far-end segments."""
+    """A SysTextRing pre-loaded with (t_start, t_end, text) far-end segments.
+
+    Spans, not just arrival times: the veto only counts a far-end line that was SOUNDING while the
+    mic segment ran, so every fixture here has to say when its far end stopped talking."""
     ring_ = T.SysTextRing()
-    for t, text in items:
-        ring_.add(t, text)
+    for t0, t1, text in items:
+        ring_.add(t0, text, t1)
     return ring_
 
 
 def veto(text, own_db=-29.0, far_db=-18.0, far_text=None, t0=MIC_T0, t1=MIC_T1,
-         mic_ring=True, sys_ring=True, text_ring=True, far_t=27.0):
+         mic_ring=True, sys_ring=True, text_ring=True, far_t=27.0, far_end=None):
     """Run arm 2 over one MIC segment. Defaults are the measured bleed case: silent mic, far end
-    11 dB louder, the far-end original published a few seconds earlier."""
+    11 dB louder, and the far-end original STILL SOUNDING across the mic segment (it started a few
+    seconds earlier and runs half a second past the end), which is what bleed physically is."""
     mr = ring(own_db, t0 - 0.5, t1 + 0.5) if mic_ring else None
     sr = ring(far_db, t0 - 0.5, t1 + 0.5) if sys_ring else None
-    tr = sys_text((far_t, far_text)) if (text_ring and far_text) else (T.SysTextRing() if text_ring else None)
+    fe = (t1 + 0.5) if far_end is None else far_end
+    tr = (sys_text((far_t, fe, far_text)) if (text_ring and far_text)
+          else (T.SysTextRing() if text_ring else None))
     return T.fuzzy_echo_veto(text, t0, t1, mr, sr, tr)
 
 
@@ -138,7 +148,7 @@ def test_no_mic_ring_kept():
 def test_empty_mic_window_kept():
     # the ring exists but holds nothing for this segment (backlog past its retention)
     drop, _, _, _, why = T.fuzzy_echo_veto(GHOST_2, MIC_T0, MIC_T1, ring(-29.0, 0.0, 5.0),
-                                           ring(-18.0, 29.5, 33.5), sys_text((27.0, ORIG_2)))
+                                           ring(-18.0, 29.5, 33.5), sys_text((27.0, 33.5, ORIG_2)))
     assert not drop and why == "nomic", why
 
 
@@ -149,7 +159,7 @@ def test_no_sys_ring_kept():
 
 def test_empty_sys_window_kept():
     drop, _, _, _, why = T.fuzzy_echo_veto(GHOST_2, MIC_T0, MIC_T1, ring(-29.0, 29.5, 33.5),
-                                           ring(-18.0, 0.0, 5.0), sys_text((27.0, ORIG_2)))
+                                           ring(-18.0, 0.0, 5.0), sys_text((27.0, 33.5, ORIG_2)))
     assert not drop and why == "nosys", why
 
 
@@ -173,10 +183,76 @@ def test_far_end_text_outside_the_window_kept():
     assert drop and ov == 1.0, why
 
 
+# --- simultaneity: bleed is concurrent audio, dialogue is not ---------------------------------
+def test_sequential_reply_kept_when_the_far_end_had_finished():
+    """THE regression this rule exists for. A real, quiet reply to a far-end request repeats most
+    of its words ("Please send the updated budget tomorrow" -> "I will send the updated budget
+    tomorrow"), so the text evidence is damning and the energy asymmetry is exactly bleed's. The
+    only thing that separates it from bleed is time: the far end had STOPPED 1.5 s before this
+    speaker started. A proximity-only rule dropped a real sentence here."""
+    drop, own, marg, ov, why = veto(REPLY_MIC, far_text=REPLY_FAR,
+                                    far_t=24.0, far_end=MIC_T0 - 1.5)
+    assert not drop, f"a reply to a FINISHED far-end line must never be dropped: {why}"
+    assert (own, marg, ov) == (-29.0, 11.0, 0.0), (own, marg, ov)
+    # and it would have scored well over the threshold had the spans overlapped
+    assert overlap_of(REPLY_MIC, REPLY_FAR) >= 0.8
+    assert veto(REPLY_MIC, far_text=REPLY_FAR, far_t=24.0, far_end=31.0)[0] is True, \
+        "the same words WHILE the far end was still talking are bleed and must drop"
+
+
+def test_overlapping_span_echo_dropped():
+    # The far end starts before the mic segment and is still going a second into it: the mic can
+    # only be re-hearing it. Dropped on the same text evidence the sequential case is spared.
+    drop, _, _, ov, why = veto(GHOST_2, far_text=ORIG_2, far_t=27.0, far_end=31.0)
+    assert drop and ov == 1.0, why
+    # a far end that starts DURING the mic segment and runs past it: also concurrent, also dropped
+    assert veto(GHOST_2, far_text=ORIG_2, far_t=31.0, far_end=36.0)[0] is True
+
+
+def test_simultaneity_pad_is_the_boundary():
+    """The 1.0 s pad absorbs segmentation slop and nothing more. A far end that stops exactly one
+    second before the mic segment starts still counts (boundaries touch); a tenth of a second
+    earlier does not."""
+    pad = T._XCHAN2_SIMUL_PAD
+    assert veto(GHOST_2, far_text=ORIG_2, far_t=24.0, far_end=MIC_T0 - pad)[0] is True
+    assert veto(GHOST_2, far_text=ORIG_2, far_t=24.0, far_end=MIC_T0 - pad - 0.1)[0] is False
+    # symmetrical at the other end: a far end that starts just after the mic segment stops
+    assert veto(GHOST_2, far_text=ORIG_2, far_t=MIC_T1 + pad, far_end=38.0)[0] is True
+    assert veto(GHOST_2, far_text=ORIG_2, far_t=MIC_T1 + pad + 0.1, far_end=38.0)[0] is False
+
+
+def test_the_six_second_window_is_only_the_scan_bound():
+    """+/- 6 s survives as the ring-scan bound, so the two rules are visibly independent: inside
+    the window but not overlapping is a KEEP, and overlapping is checked within it."""
+    src = inspect.getsource(T.fuzzy_echo_veto)
+    assert "sys_text.near(abs_start - window_s, abs_end + window_s," in src
+    assert "span=(abs_start - simul_pad, abs_end + simul_pad)" in src
+    # 5 s before the segment: well inside +/- 6 s, and still kept because the spans do not touch
+    assert veto(GHOST_2, far_text=ORIG_2, far_t=MIC_T0 - 5.0, far_end=MIC_T0 - 2.0)[0] is False
+
+
+def test_ordering_race_fails_safe():
+    """ACCEPTED recall limitation, pinned so it stays a limitation and never becomes a wrong drop:
+    a MIC segment can be judged before the concurrent SYS text has been published into the ring
+    (see the note at the arm-2 call site). With the reference absent the arm scores nothing and
+    KEEPS the line. Deferring the judgement to the MIC publish-delay flush is the known future
+    improvement; guessing without a reference is not."""
+    e = _RouteSeam()
+    mr, sr = ring(-29.0, 29.5, 33.5), ring(-18.0, 29.5, 33.5)
+    # the SYS original has NOT reached _route yet (the transcription worker is mid-race)
+    drop, _, _, ov, why = T.fuzzy_echo_veto(GHOST_2, MIC_T0, MIC_T1, mr, sr, e._sys_text)
+    assert not drop and ov == 0.0, f"a missing reference must fail safe (keep): {why}"
+    # once the same SYS segment IS published, the identical MIC line drops: only the ordering
+    # changed the verdict, which is what makes this a recall limit rather than a rule
+    e._route(T.Segment("SYS", 27.0, 33.5, ORIG_2))
+    assert T.fuzzy_echo_veto(GHOST_2, MIC_T0, MIC_T1, mr, sr, e._sys_text)[0] is True
+
+
 # --- thresholds pinned ------------------------------------------------------------------------
 def test_threshold_constants():
     assert (T._XCHAN2_MIN_DUR, T._XCHAN2_MIC_CEILING, T._XCHAN2_MARGIN_DB) == (0.5, -27.0, 10.0)
     assert (T._XCHAN2_MIN_TOKENS, T._XCHAN2_MIN_OVERLAP, T._XCHAN2_TEXT_WINDOW) == (4, 0.30, 6.0)
+    assert T._XCHAN2_SIMUL_PAD == 1.0
 
 
 def test_ceiling_and_margin_are_inclusive_boundaries():
@@ -203,7 +279,7 @@ def test_plain_p90_not_the_active_subset():
         gappy.add(29.5 + i * 0.1, -18.0 if i % 2 else -60.0)
     drop, own, marg, ov, why = T.fuzzy_echo_veto(GHOST_2, MIC_T0, MIC_T1,
                                                  ring(-31.0, 29.5, 33.5), gappy,
-                                                 sys_text((27.0, ORIG_2)))
+                                                 sys_text((27.0, 33.5, ORIG_2)))
     assert drop, f"a gappy but loud far end must still arm the veto: {why}"
     assert marg == 13.0, marg
     # the same ring under arm 1: coverage is below its 0.60 floor, so arm 1 correctly refuses
@@ -252,7 +328,7 @@ def test_two_shared_words_in_a_six_word_line_drops():
 
 # --- SysTextRing ------------------------------------------------------------------------------
 def test_text_ring_window_is_inclusive_and_bounded():
-    r = sys_text((10.0, ORIG_1), (20.0, ORIG_2))
+    r = sys_text((10.0, 14.0, ORIG_1), (20.0, 24.0, ORIG_2))
     assert len(r.near(10.0, 20.0)) == 2
     assert r.near(10.1, 19.9) == []
     assert r.near(0.0, 5.0) == []
@@ -270,6 +346,27 @@ def test_text_ring_retention_and_maxlen():
     assert len(r2.near(0.0, 1e6)) == 3, "maxlen must bound the ring independently of time"
 
 
+def test_text_ring_span_filter():
+    """near(span=...) is the simultaneity rule: START inside the scan bound AND the segment's own
+    span intersecting `span`. Checked at both edges and for the containment cases."""
+    r = sys_text((10.0, 14.0, ORIG_1))
+    scan = (0.0, 1e6)
+    assert r.near(*scan, span=(14.0, 20.0)) and r.near(*scan, span=(0.0, 10.0)), \
+        "touching boundaries must count as overlap"
+    assert r.near(*scan, span=(14.01, 20.0)) == [], "a span that starts after the SYS line ended"
+    assert r.near(*scan, span=(0.0, 9.99)) == [], "a span that ends before the SYS line began"
+    assert r.near(*scan, span=(11.0, 12.0)), "a span wholly inside the SYS line still overlaps"
+    assert r.near(20.0, 30.0, span=(10.0, 14.0)) == [], "the scan bound still applies"
+
+
+def test_text_ring_defaults_to_a_zero_length_span():
+    # A caller that does not know the end contributes no echo evidence rather than a guessed one.
+    r = T.SysTextRing()
+    r.add(10.0, ORIG_1)
+    assert r.near(0.0, 1e6) and r.near(0.0, 1e6, span=(10.0, 10.0)), "the start still counts"
+    assert r.near(0.0, 1e6, span=(10.1, 20.0)) == [], "no end means no span to overlap with"
+
+
 def test_text_ring_ignores_contentless_lines():
     r = T.SysTextRing()
     r.add(10.0, "...")
@@ -278,7 +375,7 @@ def test_text_ring_ignores_contentless_lines():
 
 
 def test_text_ring_clear():
-    r = sys_text((10.0, ORIG_1))
+    r = sys_text((10.0, 14.0, ORIG_1))
     r.clear()
     assert r.near(0.0, 1e6) == []
 
@@ -305,6 +402,10 @@ def test_published_sys_becomes_the_echo_reference():
     e._route(T.Segment("MIC", 30.0, 33.0, GHOST_2))
     assert len(seen) == 1 and seen[0].source == "SYS", "SYS publishes at once, MIC is held"
     assert e._sys_text.near(20.0, 40.0) == [T._content_words(ORIG_2)]
+    # BOTH ends of the published segment are recorded, or the simultaneity test has nothing to
+    # work with: the reference here really does span 27.0-33.0.
+    assert e._sys_text.near(20.0, 40.0, span=(32.9, 40.0)), "the SYS end time was not recorded"
+    assert e._sys_text.near(20.0, 40.0, span=(33.1, 40.0)) == [], "the end time is wrong"
     assert len(e._pending_mic) == 1, "the MIC hold must be untouched"
 
 

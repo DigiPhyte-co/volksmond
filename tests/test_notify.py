@@ -27,17 +27,27 @@ from live_transcribe import config, notify
 
 
 class FakeBackend:
-    """Stands in for _Notifier: records what show() hands down, raises on demand."""
+    """Stands in for _Notifier: records what show() hands down, raises or refuses on demand.
 
-    def __init__(self, boom=False):
+    `balloon_timeout()` does exactly what the real wndproc does when the shell reports
+    NIN_BALLOONTIMEOUT (see _Notifier._on_tray): the balloon has left the screen, so the
+    coalescing memory is cleared. That is the only part of the pump thread this seam can stand
+    in for, and it is the part the coalescing rules depend on.
+    """
+
+    def __init__(self, boom=False, refuse=False):
         self.calls = []
         self.boom = boom
+        self.refuse = refuse          # delivered nothing, but did not raise (PostMessage failed)
 
     def notify(self, title, body, *, tag=None, on_click=None):
         self.calls.append({"title": title, "body": body, "tag": tag, "on_click": on_click})
         if self.boom:
             raise RuntimeError("the shell said no")
-        return True
+        return not self.refuse
+
+    def balloon_timeout(self):
+        notify._forget_shown()
 
 
 class FakeGui:
@@ -209,6 +219,90 @@ def test_tag_coalescing():
     print("  OK  tag coalescing: identical same-tag swallowed, new text replaces, untagged never")
 
 
+def test_balloon_timeout_ends_coalescing():
+    """The defect: coalescing was only ever cleared when the user CLICKED a balloon, so an ignored
+    one gagged its tag for the life of the process. A second identical silence nudge an hour later
+    was silently swallowed. Every way a balloon can leave the screen must end its coalescing."""
+    backend = FakeBackend()
+    restore = _install(backend=backend)
+    try:
+        assert notify.show("Nothing heard", "for 5 minutes", tag="silence") is True
+        assert notify.show("Nothing heard", "for 5 minutes", tag="silence") is False, \
+            "precondition: an identical same-tag toast coalesces while the balloon is up"
+        backend.balloon_timeout()          # the shell reports NIN_BALLOONTIMEOUT
+        assert notify.show("Nothing heard", "for 5 minutes", tag="silence") is True, \
+            "the same nudge must be showable again once its balloon is gone"
+        assert len(backend.calls) == 2, backend.calls
+    finally:
+        restore()
+    print("  OK  a balloon that times out (not only one that is clicked) ends its coalescing")
+
+
+def test_the_wndproc_clears_coalescing_on_timeout_and_hide():
+    # The constants and the dispatch, pinned: the values are WM_USER + 3/4/5 (shellapi.h), and
+    # _on_tray routes all three at the coalescing memory. The pump thread itself cannot be run
+    # here (no pywin32), so the wiring is checked at the source.
+    import inspect
+    assert (notify.NIN_BALLOONHIDE, notify.NIN_BALLOONTIMEOUT, notify.NIN_BALLOONUSERCLICK) \
+        == (1027, 1028, 1029), "the NIN_* balloon constants are WM_USER + 3, + 4 and + 5"
+    src = inspect.getsource(notify._Notifier._on_tray)
+    assert "NIN_BALLOONTIMEOUT" in src and "NIN_BALLOONHIDE" in src, src
+    assert "_forget_shown()" in src, src
+    # and _forget_shown is what actually empties the memory
+    notify._shown["x"] = ("a", "b")
+    notify._forget_shown()
+    assert notify._shown == {}, notify._shown
+    print("  OK  the wndproc routes NIN_BALLOONTIMEOUT/HIDE at the coalescing memory")
+
+
+def test_failed_delivery_does_not_poison_the_tag():
+    """A tag reserved for a toast that was never delivered used to gag that text forever: the
+    shell showed nothing, and every later attempt was coalesced away as already outstanding."""
+    backend = FakeBackend(refuse=True)
+    restore = _install(backend=backend)
+    try:
+        assert notify.show("Nothing heard", "for 5 minutes", tag="silence") is False
+        assert notify._shown == {}, f"a failed delivery left a coalescing entry: {notify._shown}"
+        backend.refuse = False
+        assert notify.show("Nothing heard", "for 5 minutes", tag="silence") is True, \
+            "the same text must still be showable after a failed attempt"
+        assert len(backend.calls) == 2, backend.calls
+    finally:
+        restore()
+    # A raising backend is the same story, and neither may lose an EARLIER good entry for the tag.
+    backend2 = FakeBackend()
+    restore = _install(backend=backend2)
+    try:
+        assert notify.show("A meeting is starting", "Standup", tag="meeting:1") is True
+        backend2.boom = True
+        assert notify.show("A meeting is starting", "Board pack", tag="meeting:1") is False
+        assert notify._shown.get("meeting:1") == ("A meeting is starting", "Standup"), \
+            "a failed replacement must roll back to the toast that IS on screen, not to nothing"
+        backend2.boom = False
+        assert notify.show("A meeting is starting", "Standup", tag="meeting:1") is False, \
+            "and the balloon that is genuinely up must still coalesce"
+    finally:
+        restore()
+    print("  OK  a failed or raising delivery rolls its coalescing entry back")
+
+
+def test_distinct_meeting_tags_never_coalesce():
+    # How /api/notify-meeting uses this: the tag carries the occurrence, so a recurring meeting
+    # with an unchanging subject still notifies every week.
+    backend = FakeBackend()
+    restore = _install(backend=backend)
+    try:
+        for start in ("2026-07-30T09:00:00", "2026-08-06T09:00:00", "2026-08-13T09:00:00"):
+            assert notify.show("A meeting is starting", "Standup", tag=f"meeting:{start}") is True
+        assert len(backend.calls) == 3, backend.calls
+        assert notify.show("A meeting is starting", "Standup",
+                           tag="meeting:2026-08-13T09:00:00") is False, \
+            "the SAME occurrence must still coalesce"
+    finally:
+        restore()
+    print("  OK  distinct meeting starts are distinct tags; the same one still coalesces")
+
+
 def test_backend_failure_never_raises():
     backend = FakeBackend(boom=True)
     restore = _install(backend=backend)
@@ -339,6 +433,10 @@ if __name__ == "__main__":
              test_non_windows_is_unavailable,
              test_backend_receives_title_body_and_tag,
              test_tag_coalescing,
+             test_balloon_timeout_ends_coalescing,
+             test_the_wndproc_clears_coalescing_on_timeout_and_hide,
+             test_failed_delivery_does_not_poison_the_tag,
+             test_distinct_meeting_tags_never_coalesce,
              test_backend_failure_never_raises,
              test_backend_build_failure_is_memoised,
              test_show_survives_junk_input,

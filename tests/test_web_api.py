@@ -1092,22 +1092,31 @@ def test_notify_meeting_shows_one_toast_with_the_subject():
     try:
         webapp.licensing.current = lambda *a, **k: pro
         notify.show = lambda *a, **k: calls.append((a, k)) or True
-        r = client.post("/api/notify-meeting", json={"subject": "  Board pack review  "})
+        r = client.post("/api/notify-meeting", json={"subject": "  Board pack review  ",
+                                                     "start": "2026-07-30T09:00:00"})
         assert r.status_code == 200, r.text
         assert r.json() == {"shown": True}, r.json()
         assert len(calls) == 1, f"expected exactly one notification, got {calls}"
         args, kwargs = calls[0]
         assert args[0] == "A meeting is starting", args
         assert args[1] == "Board pack review", f"the subject was not passed through cleanly: {args}"
-        assert kwargs.get("tag") == "meeting", kwargs
-        # A missing subject must still notify (an untitled meeting is still a meeting).
+        assert kwargs.get("tag") == "meeting:2026-07-30T09:00:00", kwargs
+        # The tag is per OCCURRENCE: the same recurring subject at a different start time must be
+        # a different tag, or notify.show would coalesce next week's standup into this week's.
+        calls.clear()
+        assert client.post("/api/notify-meeting", json={"subject": "Standup",
+                                                        "start": "2026-08-06T09:00:00"}).status_code == 200
+        assert calls[0][1]["tag"] == "meeting:2026-08-06T09:00:00", calls
+        # A missing subject must still notify (an untitled meeting is still a meeting), and a
+        # missing start is accepted rather than rejected: the tag simply carries no occurrence.
         calls.clear()
         assert client.post("/api/notify-meeting", json={}).status_code == 200
         assert len(calls) == 1 and calls[0][0][1] == "", calls
+        assert calls[0][1]["tag"] == "meeting:", calls
     finally:
         webapp.licensing.current = orig_current
         notify.show = orig_show
-    print("  OK  /api/notify-meeting: one toast, titled, carrying the subject, tagged 'meeting'")
+    print("  OK  /api/notify-meeting: one toast, titled, carrying the subject, tagged per occurrence")
 
 
 def test_offline_build_registers_no_calendar_routes():

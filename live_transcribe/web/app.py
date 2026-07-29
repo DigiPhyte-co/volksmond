@@ -324,6 +324,17 @@ def _silence_tick(engine, watch, now):
         # on purpose, and the user is watching the drain.
         if STATE.stopping:
             return None
+        # Re-check the watch itself, under the lock, immediately before publishing. sample()
+        # decided to trip a few microseconds ago on the watcher thread; in that gap the request
+        # thread can have answered the banner (mute) or the session can have been replaced by a
+        # device switch or a new start. Publishing then puts a nudge on screen the user has
+        # already dismissed, or attributes one session's silence to another. SilenceWatch's own
+        # lock makes each transition atomic; this is the second half of the same problem, and it
+        # has to be settled here because only STATE knows which watch is current.
+        if STATE.silence_watch is not watch:
+            return None
+        if watch.state().get("muted"):
+            return None
         STATE.silence_nudge = nudge
     # Best-effort desktop notification: notify.show() is a no-op when os_toasts is off, on
     # a non-Windows machine or without pywin32, and never raises. Clicking it brings the
@@ -369,6 +380,16 @@ def _silence_start(cap):
     """
     on, threshold_s = _silence_settings()
     if not on:
+        return None
+    # Record-only (no engine) has no energy rings, because the rings live on the engine and are
+    # fed by the capture callback for it. A watcher started here would read an empty levels dict
+    # every tick, which sample() correctly treats as absence of evidence rather than silence: it
+    # could never trip, but /api/status would report an armed watch and the feature would look
+    # like it was covering a session it cannot see. Say so once and stay out. Giving record-only
+    # real coverage means moving the rings off the engine (or feeding a second pair from
+    # capture_core); that is future work, deliberately not smuggled in behind a nudge.
+    if STATE.engine is None:
+        print("[silence] watcher not started (record-only session has no energy rings)", flush=True)
         return None
     t0 = getattr(cap, "_t0", None)
     if t0 is None:
@@ -2342,6 +2363,10 @@ if not buildflags.OFFLINE_ONLY:
 
     class NotifyMeetingRequest(BaseModel):
         subject: Optional[str] = None
+        # The meeting's start time, as the UI already has it (app.js reminderTick). Only used to
+        # make the coalescing tag unique per OCCURRENCE: a weekly "Standup" is the same subject
+        # every week, and a tag of just "meeting" would swallow every one after the first.
+        start: Optional[str] = None
 
     @app.post("/api/notify-meeting")
     def notify_meeting(req: NotifyMeetingRequest):
@@ -2360,7 +2385,12 @@ if not buildflags.OFFLINE_ONLY:
         if not licensing.current().has("calendar"):
             raise HTTPException(status_code=402, detail="Calendar reminders need a business licence.")
         from .. import notify
-        shown = notify.show("A meeting is starting", (req.subject or "").strip(), tag="meeting")
+        # Tag per occurrence, not per feature: notify.show swallows an identical same-tag toast
+        # while its balloon is outstanding, which is right for a 1 Hz watchdog and wrong for a
+        # recurring meeting whose subject never changes. The start time is what makes two
+        # occurrences of "Standup" two different notifications.
+        shown = notify.show("A meeting is starting", (req.subject or "").strip(),
+                            tag=f"meeting:{(req.start or '').strip()}")
         return {"shown": bool(shown)}
 
 

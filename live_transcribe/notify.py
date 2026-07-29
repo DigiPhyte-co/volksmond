@@ -49,11 +49,19 @@ from collections import deque
 WM_TOAST = 0x8000 + 1
 WM_TRAY = 0x8000 + 2
 
-# WM_USER + 5. The pinned pywin32 does not define NIN_BALLOONUSERCLICK in win32con
-# (verified on the build venv), so it is spelled out here rather than depending on a
-# constant that may or may not exist. It arrives as the lParam of WM_TRAY when the user
-# clicks the balloon body (as opposed to dismissing it with the X, which is
-# NIN_BALLOONTIMEOUT).
+# The NIN_* balloon notifications, spelled out because the pinned pywin32 does not define them
+# in win32con (verified on the build venv) and depending on a constant that may or may not exist
+# is how a toast path breaks in a frozen build. They arrive as the lParam of WM_TRAY.
+# Values are WM_USER (0x0400 = 1024) plus the offsets in shellapi.h:
+#   NIN_BALLOONSHOW      WM_USER + 2 = 1026   (not needed here)
+#   NIN_BALLOONHIDE      WM_USER + 3 = 1027   the balloon was withdrawn (the icon was deleted,
+#                                             or the shell hid it) - NOT sent on a user dismiss
+#   NIN_BALLOONTIMEOUT   WM_USER + 4 = 1028   it timed out OR the user dismissed it with the X
+#   NIN_BALLOONUSERCLICK WM_USER + 5 = 1029   the user clicked the balloon BODY
+# All three mean the same thing to this module: that balloon is off the screen, so the tag it
+# was coalescing under is no longer outstanding.
+NIN_BALLOONHIDE = 1027
+NIN_BALLOONTIMEOUT = 1028
 NIN_BALLOONUSERCLICK = 1029
 
 HWND_MESSAGE = -3          # parent for a message-only window: no paint, no taskbar, no focus
@@ -154,6 +162,32 @@ def _backend():
         return _notifier
 
 
+def _forget_shown() -> None:
+    """Forget which toasts are outstanding, so the same text can be shown again.
+
+    Called when a balloon leaves the screen for ANY reason (clicked, dismissed, timed out). The
+    coalescing memory exists to stop a 1 Hz watchdog stacking sixty copies of one balloon; once
+    that balloon is gone the memory is a gag order. Without this, a SECOND identical silence nudge
+    an hour later, or the next occurrence of a recurring meeting with the same subject, would be
+    swallowed for the rest of the process life unless the user happened to CLICK the first one.
+    """
+    with _lock:
+        _shown.clear()
+
+
+def _rollback_tag(tag, prev) -> None:
+    """Undo the coalescing entry show() reserved when the toast was not actually delivered.
+
+    A failed delivery that leaves the entry behind poisons the tag: the shell never showed
+    anything, but every later attempt at the same text is coalesced away as "already outstanding".
+    """
+    with _lock:
+        if prev is None:
+            _shown.pop(tag, None)
+        else:
+            _shown[tag] = prev
+
+
 def show(title, body="", *, tag=None, on_click=None) -> bool:
     """Show a desktop notification. Returns True if one was handed to the shell.
 
@@ -163,10 +197,15 @@ def show(title, body="", *, tag=None, on_click=None) -> bool:
     replaces the old one (one tray icon means the shell shows one balloon at a time
     anyway). tag=None never coalesces.
 
+    Coalescing lasts only as long as the balloon does: the wndproc clears it when the balloon is
+    clicked, dismissed or times out (see _forget_shown), and a delivery that fails clears its own
+    entry (see _rollback_tag), so nothing is ever silently swallowed forever.
+
     `on_click` is called (guarded) if the user clicks the balloon, before the app window
     is brought forward. Never raises, whatever happens.
     """
     global _warned
+    held = None                            # (tag, previous entry) to undo if delivery fails
     try:
         title = str(title or "")
         body = str(body or "")
@@ -181,14 +220,21 @@ def show(title, body="", *, tag=None, on_click=None) -> bool:
             with _lock:
                 if _shown.get(tag) == (title, body):
                     return False           # identical toast already outstanding for this tag
+                held = (tag, _shown.get(tag))
                 _shown[tag] = (title, body)
         backend = _backend()
         if backend is None:
             return False
-        return bool(backend.notify(title, body, tag=tag, on_click=on_click))
+        ok = bool(backend.notify(title, body, tag=tag, on_click=on_click))
+        if ok:
+            held = None                    # delivered: the coalescing entry has earned its place
+        return ok
     except Exception as exc:               # a notification must never break its caller
         print(f"[notify] show failed: {exc!r}", flush=True)
         return False
+    finally:
+        if held is not None:
+            _rollback_tag(*held)
 
 
 # --- focusing the app window ----------------------------------------------
@@ -393,16 +439,25 @@ class _Notifier:
                 else:
                     self._clicks[tag] = on_click
             except Exception as exc:
+                # Nothing reached the screen, so this tag must not go on coalescing against a
+                # balloon that does not exist (the same defect show()'s rollback covers for the
+                # synchronous half of the path).
+                if tag is not None:
+                    _rollback_tag(tag, None)
                 print(f"[notify] the shell refused a notification: {exc!r}", flush=True)
 
     def _on_tray(self, hwnd, msg, wparam, lparam):
         """The tray icon's callback message. lParam says what happened to it."""
-        if lparam in (NIN_BALLOONUSERCLICK, self._con.WM_LBUTTONUP):
+        clicked = lparam in (NIN_BALLOONUSERCLICK, self._con.WM_LBUTTONUP)
+        # The balloon is off the screen: clicked, dismissed with the X, timed out, or withdrawn.
+        # ALL of those end the coalescing window - a click used to be the only one, which meant an
+        # ignored balloon gagged its tag for the life of the process.
+        if clicked or lparam in (NIN_BALLOONTIMEOUT, NIN_BALLOONHIDE):
+            _forget_shown()         # the outstanding toasts are gone; let them be shown again
+        if clicked:
             callbacks = list(self._clicks.values()) + [self._last_click]
             self._clicks.clear()
             self._last_click = None
-            with _lock:
-                _shown.clear()      # the outstanding toasts are gone; let them be shown again
             for cb in callbacks:
                 if cb is None:
                     continue

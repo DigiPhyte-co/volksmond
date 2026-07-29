@@ -480,6 +480,27 @@ class SysEnergyRing:
             return None
         return float(np.percentile(f, 10))
 
+    def noise_floor_before(self, t_start, window_s=120.0, min_history_s=10.0):
+        """p10 of the frames STRICTLY BEFORE `t_start`: the room tone this channel had going IN.
+
+        The baseline a relative test needs. noise_floor() includes the window under judgement, so
+        the first chunk of a sustained quiet talker is compared against ITSELF: a whole chunk of
+        low-gain speech at -40 dBFS gives p10 ~ -40 and peak -40, "0 dB above the floor", and the
+        speech is eaten. Frames before the window cannot be contaminated that way.
+
+        None (so the caller skips the relative test entirely) when there is nothing before
+        `t_start`, or when the oldest frame in the pre-window is younger than `min_history_s`: a
+        baseline measured over a second or two of a session that has only just begun is not a room
+        tone, and guessing one is how real speech gets deleted. 10 s is comfortably longer than any
+        single chunk (0.5-15 s) yet short enough that the test is live within the first half minute.
+        """
+        import numpy as np
+        with self._lock:
+            f = [(t, d) for t, d in zip(self._t, self._db) if t_start - window_s <= t < t_start]
+        if not f or (t_start - f[0][0]) < min_history_s:
+            return None
+        return float(np.percentile([d for _, d in f], 10))
+
 
 # Neutral alias: there is one ring per channel now, not just a SYS one. The old name stays
 # because app.py, capture_core's docstrings and two test files use it.
@@ -755,7 +776,16 @@ _XCHAN2_MIC_CEILING = -27.0   # dBFS; p90 of the RAW mic frames must sit below t
 _XCHAN2_MARGIN_DB = 10.0      # dB the far end's p90 must sit ABOVE the mic's p90
 _XCHAN2_MIN_TOKENS = 4        # content words; a short line is never judged on text overlap
 _XCHAN2_MIN_OVERLAP = 0.30    # fraction of the MIC line's content words the far end already said
-_XCHAN2_TEXT_WINDOW = 6.0     # +/- seconds around the MIC span to look for the far-end original
+_XCHAN2_TEXT_WINDOW = 6.0     # +/- seconds around the MIC span: the ring SCAN bound, nothing more
+_XCHAN2_SIMUL_PAD = 1.0       # seconds the MIC span is grown by before demanding the SYS span
+                              # INTERSECT it. Bleed is simultaneous audio: the far end has to have
+                              # been talking WHILE the mic allegedly did, or the mic was not
+                              # re-hearing it. The pad absorbs honest segmentation slop (ASR
+                              # boundaries, the 100 ms ring cadence, a chunk cut) without admitting
+                              # sequential dialogue - a real reply to what the far end just finished
+                              # saying shares most of its words by nature ("Please send the updated
+                              # budget tomorrow" / "I will send the updated budget tomorrow") and
+                              # would be dropped by a proximity-only rule, however quiet the mic.
 _XCHAN2_TOL = 0.3             # window padding for the energy lookups (arm 1's `tol`)
 
 
@@ -785,7 +815,7 @@ class SysTextRing:
     """
 
     def __init__(self, maxlen=8, retain_s=20.0):
-        self._items = deque(maxlen=maxlen)   # (t_start, [content words])
+        self._items = deque(maxlen=maxlen)   # (t_start, t_end, [content words])
         self._retain = retain_s
         self._lock = threading.Lock()
 
@@ -794,29 +824,50 @@ class SysTextRing:
         with self._lock:
             self._items.clear()
 
-    def add(self, t_start, text):
-        """Record a published SYS segment. A line with no content words is not a reference."""
+    def add(self, t_start, text, t_end=None):
+        """Record a published SYS segment. A line with no content words is not a reference.
+
+        `t_end` is kept because WHEN the far end was talking is half the evidence: the veto only
+        counts a SYS line that overlaps the MIC segment in time (see near()). It defaults to
+        t_start, i.e. a zero-length span, which the overlap test then almost always rejects - a
+        caller that does not know the end contributes no echo evidence, which is the safe way to
+        be ignorant.
+        """
         words = _content_words(text)
         if not words:
             return
         t = float(t_start)
         with self._lock:
-            self._items.append((t, words))
+            self._items.append((t, t if t_end is None else float(t_end), words))
             cut = t - self._retain
             while self._items and self._items[0][0] < cut:
                 self._items.popleft()
 
-    def near(self, t_lo, t_hi):
-        """Content-word lists of the SYS segments whose start falls in [t_lo, t_hi]."""
+    def near(self, t_lo, t_hi, span=None):
+        """Content-word lists of the SYS segments whose START falls in [t_lo, t_hi].
+
+        `span` as (lo, hi) additionally requires the SYS segment's OWN span to INTERSECT [lo, hi]:
+        the simultaneity test that separates bleed (the far end audible while the mic recorded)
+        from ordinary turn-taking (the far end finished, then somebody replied). [t_lo, t_hi] stays
+        the cheap ring-scan bound; `span` is the actual rule.
+        """
         with self._lock:
-            return [w for t, w in self._items if t_lo <= t <= t_hi]
+            items = list(self._items)
+        out = []
+        for t0, t1, w in items:
+            if not (t_lo <= t0 <= t_hi):
+                continue
+            if span is not None and (t0 > span[1] or t1 < span[0]):
+                continue
+            out.append(w)
+        return out
 
 
 def fuzzy_echo_veto(text, abs_start, abs_end, mic_ring, sys_ring, sys_text, *,
                     min_dur=_XCHAN2_MIN_DUR, mic_ceiling=_XCHAN2_MIC_CEILING,
                     margin_db=_XCHAN2_MARGIN_DB, min_tokens=_XCHAN2_MIN_TOKENS,
                     min_overlap=_XCHAN2_MIN_OVERLAP, window_s=_XCHAN2_TEXT_WINDOW,
-                    tol=_XCHAN2_TOL):
+                    tol=_XCHAN2_TOL, simul_pad=_XCHAN2_SIMUL_PAD):
     """Drop a MIC segment as bleed-echo fabrication iff ALL of:
 
       1. it lasts at least `min_dur`;
@@ -828,10 +879,14 @@ def fuzzy_echo_veto(text, abs_start, abs_end, mic_ring, sys_ring, sys_text, *,
          first (p90 already ignores the gaps by construction);
       4. the line has at least `min_tokens` content words. This is the decisive protection: it is
          what keeps "Yeah, it's a pleasure." (2 content words) however quiet the mic was;
-      5. at least `min_overlap` of those content words were already said by the far end within
-         +/- `window_s` of this segment's span, counted with dedup's fuzzy one-to-one matcher so
-         the mic's mis-hearings still count as the same word. The denominator is the MIC line:
-         "how much of what this speaker allegedly said came from the far end?".
+      5. at least `min_overlap` of those content words were said by the far end in a published SYS
+         segment whose span OVERLAPS this one (the MIC span grown by `simul_pad` on each side),
+         counted with dedup's fuzzy one-to-one matcher so the mic's mis-hearings still count as the
+         same word. The denominator is the MIC line: "how much of what this speaker allegedly said
+         came from the far end?". The overlap requirement is physical, not stylistic: bleed is the
+         mic hearing audio that is playing AT THE SAME TIME. `window_s` only bounds the ring scan;
+         on its own it would make sequential dialogue self-incriminating, because a real reply
+         repeats the words of the thing it is replying to.
 
     Every missing input fails safe (keep): no mic ring, no mic or SYS frames for the window, no SYS
     ring, no published SYS text. Returns (drop, own_p90, margin, overlap, why); the three numbers
@@ -862,7 +917,8 @@ def fuzzy_echo_veto(text, abs_start, abs_end, mic_ring, sys_ring, sys_text, *,
     if sys_text is None:
         return False, own_p90, margin, None, "nosystext"
     overlap = 0.0
-    for words in sys_text.near(abs_start - window_s, abs_end + window_s):
+    for words in sys_text.near(abs_start - window_s, abs_end + window_s,
+                               span=(abs_start - simul_pad, abs_end + simul_pad)):
         # dedup._shared_count: maximum one-to-one pairing, exact or near-spelled (ratio >= 0.78).
         # Reused rather than reimplemented so "same word" means the same thing live and at the
         # end-of-session strip; private only because dedup has had no outside caller until now.
@@ -1152,7 +1208,10 @@ class Engine:
     def _ring_for(self, source):
         """This source's energy ring, or None when it has none (or the kill switch is off).
 
-        MIC honours SA_LIVE_RAW_MIC_RING; SYS's ring predates it and is unaffected."""
+        MIC honours SA_LIVE_RAW_MIC_RING here, because the mic ring IS what that switch was added
+        for. The SYS ring predates it, so this accessor hands it back regardless; the silence gate
+        applies the switch to SYS itself (see _chunk_is_silence), which is the one place the switch
+        is meant to restore pre-WP-4 behaviour for both channels."""
         if source == "MIC":
             return self.mic_env if self._raw_mic_ring else None
         return self.sys_env if source == "SYS" else None
@@ -1168,19 +1227,28 @@ class Engine:
            -45 dBFS floor, so the chunk-fed gate was effectively dead on a quiet mic, the exact
            condition Whisper fabricates on.
         2. Dead channel (relative): the loudest frame sits <= `dead_margin_db` above this
-           channel's OWN measured room tone (ring p10), i.e. nothing here rose meaningfully above
-           the background. Measured on the incident recording, fabrication-bearing windows sit at
+           channel's room tone as measured STRICTLY BEFORE the chunk (ring p10 of the frames
+           preceding t_start), i.e. nothing here rose meaningfully above the background it
+           arrived into. Measured on the incident recording, fabrication-bearing windows sit at
            <= 6 dB above floor while the nearest real line sits 25.8 dB above it, so 8 dB leaves
-           ~18 dB of headroom. Guarded by an absolute cap: a window louder than
-           `dead_ceiling_db` is never skipped on the relative test alone, so a never-quiet
-           channel (HVAC, music, a constant-tone feed) whose p10 is poisoned upward cannot be
-           eaten - a loud-but-flat channel keeps every chunk.
+           ~18 dB of headroom. Guarded three ways: an absolute cap, so a window louder than
+           `dead_ceiling_db` is never skipped on the relative test alone (a never-quiet channel -
+           HVAC, music, a constant-tone feed - whose p10 is poisoned upward cannot be eaten); a
+           baseline that EXCLUDES the judged window, so a chunk cannot be measured against
+           itself; and a minimum of history before the window (see noise_floor_before), without
+           which this arm stays inert. The last two are what keep the first chunk of a sustained
+           quiet talker: at -40 dBFS throughout, p10 and peak are both -40, and a
+           self-referential baseline would call that a dead channel and eat real speech.
 
-        Without a ring (uploads, ring-less paths) it falls back to `_is_silence(audio)` verbatim,
-        which keeps its four pinned tests untouched. A ring with no frames covering the window also
-        falls back: never gate on missing evidence. Both tests share SA_LIVE_SILENCE_GATE=0.
+        Without a ring (uploads, ring-less paths, SA_LIVE_RAW_MIC_RING=0 for EITHER source) it
+        falls back to `_is_silence(audio)` verbatim, which keeps its four pinned tests untouched.
+        A ring with no frames covering the window also falls back: never gate on missing evidence.
+        Both tests share SA_LIVE_SILENCE_GATE=0.
         """
-        ring = self._ring_for(source)
+        # The gate is the one consumer that honours SA_LIVE_RAW_MIC_RING for BOTH sources: the
+        # switch exists to restore pre-WP-4 gate behaviour wholesale, and a switch that left SYS
+        # chunks judged on their ring while MIC fell back to chunk samples restored neither.
+        ring = self._ring_for(source) if self._raw_mic_ring else None
         if ring is None:
             return _is_silence(audio)
         try:
@@ -1193,7 +1261,7 @@ class Engine:
             return _is_silence(audio)
         if peak < _silence_floor_db(ring, t_hi):
             return True
-        floor = ring.noise_floor(t_hi)
+        floor = ring.noise_floor_before(t_start)
         return (floor is not None and peak <= dead_ceiling_db
                 and (peak - floor) <= dead_margin_db)
 
@@ -1345,7 +1413,9 @@ class Engine:
             # the single point SYS reaches the transcript: notices and backpressure markers go
             # straight to _fanout, so no synthetic line can ever become an echo reference.
             if seg.source == "SYS" and self._xchan_veto2:
-                self._sys_text.add(seg.t_start, seg.text)
+                # Both ends: the arm only counts a far-end line that was SOUNDING while the mic
+                # segment ran, so the span is the evidence, not just the arrival time.
+                self._sys_text.add(seg.t_start, seg.text, seg.t_end)
             self._fanout(seg)
 
     def _flush_pending_mic(self, force=False):
@@ -1513,6 +1583,14 @@ class Engine:
                     # the comparison comes from self.mic_env (RAW, pre-AGC) when that ring exists,
                     # so the calibrated 10 dB margin and -28 dBFS ceiling mean what they were
                     # measured to mean; without it the chunk samples are used, as before.
+                    # Honest note on the SYS reference both arms read: the ring is fed per 100 ms
+                    # frame from the RAW capture blocks, stamped at BLOCK START
+                    # (capture_core._ring_frames). SA_LIVE_RAW_MIC_RING does NOT gate that feed and
+                    # is not meant to: the finer granularity and the corrected timestamps replaced a
+                    # 0.5 s arrival-stamped feed that mis-timed the reference, and putting a
+                    # known-wrong reference back behind a switch would be a worse veto, not an older
+                    # one. The switch's job is the MIC ring (and, in the silence gate, the ring-fed
+                    # gate itself), not the far-end reference.
                     if source == "MIC" and self._xchan_veto and self.sys_env is not None:
                         _mic = audio[int(float(seg.start) * 16000):int(float(seg.end) * 16000)]
                         _drop, _why = sys_echo_veto(_mic, self.sys_env, out.t_start, out.t_end, len(text.split()),
@@ -1526,6 +1604,16 @@ class Engine:
                     # absolute test) and before the loop guard, so a vetoed line never seeds the
                     # loop history. Toggle SA_LIVE_XCHAN_VETO2=0.
                     if source == "MIC" and self._xchan_veto2:
+                        # ACCEPTED recall limitation, stated here so it is not rediscovered as a
+                        # bug: the MIC segment is judged the moment its chunk finishes
+                        # transcribing, which can be BEFORE the SYS segment it echoes has been
+                        # published into _sys_text. The far-end original then simply is not in the
+                        # ring, the arm scores no overlap, and the line is kept. That is the right
+                        # way to lose: a missing reference must never become evidence. The known
+                        # future improvement is to defer this judgement to the MIC publish-delay
+                        # flush (_flush_pending_mic, MIC_PUBLISH_DELAY later, by which time the
+                        # concurrent SYS text has landed) rather than to widen the text window,
+                        # which would only re-admit sequential dialogue as false evidence.
                         # (the reason string is only interesting on a keep, and the numbers below
                         # already say why on a drop)
                         _d2, _own, _marg, _ov, _ = fuzzy_echo_veto(

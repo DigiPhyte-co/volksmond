@@ -17,7 +17,9 @@ object with max_db), notify.show (monkeypatched) and STATE (hand-set and restore
 
 Run:  python tests/test_silence_nudge.py   (from the project root; exit 0 = pass)
 """
+import contextlib
 import inspect
+import io
 import os
 import sys
 import threading
@@ -267,6 +269,7 @@ def test_tick_publishes_one_nudge_and_one_toast():
         webapp.STATE.silence_nudge = None
         eng = FakeEngine(FakeRing([-70.0]), FakeRing([-70.0]))
         w = SilenceWatch(threshold_s=5.0, arm_s=0.0)
+        webapp.STATE.silence_watch = w    # the tick publishes only for the CURRENT watch
         trips = [webapp._silence_tick(eng, w, float(t)) for t in range(0, 20)]
         fired = [t for t in trips if t is not None]
         assert len(fired) == 1, f"expected exactly one published nudge, got {len(fired)}"
@@ -290,6 +293,7 @@ def test_tick_never_fires_while_stopping():
         webapp.STATE.silence_nudge = None
         eng = FakeEngine(FakeRing([-70.0]), FakeRing([-70.0]))
         w = SilenceWatch(threshold_s=5.0, arm_s=0.0)
+        webapp.STATE.silence_watch = w
         for t in range(0, 20):
             assert webapp._silence_tick(eng, w, float(t)) is None, "nudged a stopping session"
         assert webapp.STATE.silence_nudge is None and calls == [], (webapp.STATE.silence_nudge, calls)
@@ -297,6 +301,83 @@ def test_tick_never_fires_while_stopping():
         restore_notify()
         _restore_state(saved)
     print("  OK  a session that is finishing is never nudged (no banner, no toast)")
+
+
+class MutingWatch(SilenceWatch):
+    """A watch muted from "the request thread" in the exact window the re-check exists for:
+    after sample() has decided to trip, before _silence_tick publishes. state() is the first
+    thing the tick calls after a trip, so overriding it lands the mute precisely there."""
+
+    def state(self):
+        self.mute()
+        return super().state()
+
+
+def test_tick_does_not_publish_a_nudge_the_user_just_muted():
+    # The race: sample() trips on the watcher thread, and before the publish the user closes the
+    # banner. Without the under-lock re-check the nudge reappears on screen a moment after the
+    # click, with a toast to match.
+    saved = _save_state()
+    calls, restore_notify = _catch_toasts()
+    try:
+        webapp.STATE.stopping = False
+        webapp.STATE.silence_nudge = None
+        eng = FakeEngine(FakeRing([-70.0]), FakeRing([-70.0]))
+        w = MutingWatch(threshold_s=5.0, arm_s=0.0)
+        webapp.STATE.silence_watch = w
+        for t in range(0, 20):
+            assert webapp._silence_tick(eng, w, float(t)) is None, \
+                "a nudge was published for a watch that had just been muted"
+        assert webapp.STATE.silence_nudge is None, webapp.STATE.silence_nudge
+        assert calls == [], f"a toast escaped for a muted watch: {calls}"
+        assert w.state()["muted"] is True
+        # And the other half of the same re-check: a trip belonging to a watch that is no longer
+        # the session's (a device switch, a new session) must not publish either.
+        w2 = SilenceWatch(threshold_s=5.0, arm_s=0.0)
+        webapp.STATE.silence_watch = SilenceWatch()      # somebody else is current now
+        for t in range(0, 20):
+            assert webapp._silence_tick(eng, w2, float(t)) is None, "published for a stale watch"
+        assert webapp.STATE.silence_nudge is None and calls == []
+    finally:
+        restore_notify()
+        _restore_state(saved)
+    print("  OK  a mute (or a replaced watch) between the trip and the publish suppresses both")
+
+
+def test_watch_state_transitions_are_locked():
+    # A plain smoke test for the lock: the request thread answers the banner (snooze, then mute)
+    # while the watcher thread is mid sample loop. Nothing may raise, and the per-session cap
+    # must still hold - a torn read of _nudges/_outstanding is exactly how it would not.
+    w = SilenceWatch(threshold_s=1.0, arm_s=0.0, max_nudges=2)
+    assert isinstance(w._lock, type(threading.Lock())), "SilenceWatch must own a lock"
+    trips = []
+    errors = []
+    stop = threading.Event()
+
+    def answerer():
+        try:
+            while not stop.is_set():
+                w.snooze()
+                w.state()
+                w.mute()
+        except Exception as exc:                      # noqa: BLE001 - reported, not swallowed
+            errors.append(exc)
+
+    th = threading.Thread(target=answerer, daemon=True)
+    th.start()
+    try:
+        for i in range(4000):
+            if w.sample(float(i) * 0.5, {"MIC": -70.0, "SYS": -70.0}):
+                trips.append(i)
+    except Exception as exc:                          # noqa: BLE001
+        errors.append(exc)
+    finally:
+        stop.set()
+        th.join(2.0)
+    assert not errors, f"a concurrent snooze/mute raised: {errors}"
+    assert len(trips) <= w.max_nudges, f"the session cap was torn by the race: {trips}"
+    assert w.state()["nudges"] == len(trips), (w.state(), trips)
+    print("  OK  snooze/mute from another thread during a sample loop: no error, cap intact")
 
 
 # --- 3. the loop, the endpoints and the gating ----------------------------
@@ -394,6 +475,7 @@ def test_no_watcher_when_off_or_for_file_transcription():
         assert webapp.STATE.silence_watch is None
         os.environ.pop(webapp.SILENCE_ENV, None)
         # No session clock (no capture._t0): nothing to query honestly, so no watcher.
+        webapp.STATE.engine = FakeEngine(FakeRing([-70.0]))
         assert webapp._silence_start(FakeCapture(t0=None)) is None
         assert webapp.STATE.silence_watch is None
         # On: a daemon thread called "silence-watch" plus a watch on STATE, and _silence_signal
@@ -425,6 +507,50 @@ def test_no_watcher_when_off_or_for_file_transcription():
             os.environ[webapp.SILENCE_ENV] = saved_env
         _restore_state(saved)
     print("  OK  no watcher when switched off, killed by env, clockless, or transcribing a file")
+
+
+def test_no_watcher_for_a_record_only_session():
+    """Record-only (STATE.engine is None) has no energy rings - they live on the engine - so the
+    levels dict would be empty on every tick. sample() treats that as absence of evidence, so the
+    watcher could never trip while /api/status reported it armed: a feature that looks like it is
+    covering a session it cannot see. It stays out, and says so once."""
+    saved = _save_state()
+    saved_load = config.load
+    saved_env = os.environ.get(webapp.SILENCE_ENV)
+    try:
+        os.environ.pop(webapp.SILENCE_ENV, None)
+        config.load = lambda: {"silence_nudge": True}
+        webapp.STATE.running = True
+        webapp.STATE.stopping = False
+        webapp.STATE.source_kind = "live"
+        webapp.STATE.engine = None
+        webapp.STATE.silence_watch = None
+        before = [t.name for t in threading.enumerate()].count("silence-watch")
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            assert webapp._silence_start(FakeCapture(t0=time.monotonic())) is None
+        assert webapp.STATE.silence_watch is None, "a record-only session armed a watcher"
+        assert webapp.STATE.silence_stop is None
+        assert [t.name for t in threading.enumerate()].count("silence-watch") == before, \
+            "a record-only session started a watcher thread"
+        assert "[silence] watcher not started (record-only session has no energy rings)" \
+            in log.getvalue(), log.getvalue()
+        # With an engine (the transcribing case) the same call arms it, so the guard is the
+        # engine and nothing else.
+        webapp.STATE.engine = FakeEngine(FakeRing([-70.0]))
+        th = webapp._silence_start(FakeCapture(t0=time.monotonic()))
+        assert th is not None and isinstance(webapp.STATE.silence_watch, SilenceWatch)
+        webapp._silence_signal()
+        th.join(2.5)
+        assert not th.is_alive()
+    finally:
+        config.load = saved_load
+        if saved_env is None:
+            os.environ.pop(webapp.SILENCE_ENV, None)
+        else:
+            os.environ[webapp.SILENCE_ENV] = saved_env
+        _restore_state(saved)
+    print("  OK  a record-only session starts no watcher and logs why")
 
 
 def test_endpoint_requires_a_live_session_and_the_csrf_token():
@@ -505,9 +631,12 @@ if __name__ == "__main__":
              test_tick_reads_the_rings_on_the_session_clock,
              test_tick_publishes_one_nudge_and_one_toast,
              test_tick_never_fires_while_stopping,
+             test_tick_does_not_publish_a_nudge_the_user_just_muted,
+             test_watch_state_transitions_are_locked,
              test_loop_samples_on_the_session_clock_and_exits_on_signal,
              test_settings_and_env_gating,
              test_no_watcher_when_off_or_for_file_transcription,
+             test_no_watcher_for_a_record_only_session,
              test_endpoint_requires_a_live_session_and_the_csrf_token,
              test_endpoint_snoozes_and_mutes_and_status_carries_the_nudge,
              test_settings_keys_exist_and_are_patchable)

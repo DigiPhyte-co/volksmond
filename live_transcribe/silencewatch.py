@@ -23,6 +23,7 @@ Both channels must be silent, never just the mic. Sitting quietly while the far 
 is ordinary meeting behaviour and must never be nudged; nothing arriving on either side is
 what a broken capture looks like.
 """
+import threading
 
 
 class SilenceWatch:
@@ -38,8 +39,13 @@ class SilenceWatch:
     max_nudges:  hard cap per session, so a genuinely silent recording (someone left it
                  running) costs two interruptions, not sixty.
 
-    Not thread-safe by design: one watcher thread owns the instance, and the two user
-    actions (snooze/mute) are single attribute writes from the request thread.
+    Thread-safe: one internal lock guards every state transition. Two threads really do touch
+    this - the 1 Hz watcher calls sample(), the request thread answering the banner calls
+    snooze()/mute() - and none of the three is a single attribute write. sample() in particular
+    reads _muted/_outstanding/_nudges and then writes all three, so a mute landing mid-decision
+    could be overwritten and a nudge published for a banner the user had just closed. The lock is
+    held only over arithmetic (no I/O, no callbacks), so it can never be the thing that blocks a
+    request. Lock order where it matters: web/app.py always takes STATE.lock first, then this one.
     """
 
     def __init__(self, threshold_s=300.0, floor_db=-50.0, arm_s=30.0, max_nudges=2):
@@ -53,6 +59,7 @@ class SilenceWatch:
         self._nudges = 0            # nudges fired this session
         self._outstanding = False   # a nudge is on screen; do not fire another until it is answered
         self._muted = False         # the user closed it: silent for the rest of the session
+        self._lock = threading.Lock()   # guards every transition above (see the class note)
 
     # -- the tick ----------------------------------------------------------
 
@@ -71,31 +78,32 @@ class SilenceWatch:
         if not levels:
             return False
         now = float(now)
-        if self._first is None:
-            self._first = now
-        self._last = now
-        if now - self._first < self.arm_s:
-            # Not armed yet. Also keep the silence clock clear, so the grace period can
-            # never be counted as part of a silent run.
-            self._silent_since = None
-            return False
-        # A channel with no frames in the window counts as silent (dead device); a channel
-        # above the floor on THIS tick clears the run for everyone.
-        for db in levels.values():
-            if db is not None and float(db) > self.floor_db:
+        with self._lock:
+            if self._first is None:
+                self._first = now
+            self._last = now
+            if now - self._first < self.arm_s:
+                # Not armed yet. Also keep the silence clock clear, so the grace period can
+                # never be counted as part of a silent run.
                 self._silent_since = None
                 return False
-        if self._silent_since is None:
-            self._silent_since = now
-            return False
-        if self._muted or self._outstanding or self._nudges >= self.max_nudges:
-            return False
-        if now - self._silent_since < self.threshold_s:
-            return False
-        self._nudges += 1
-        self._outstanding = True
-        self._silent_since = None    # the next threshold is measured from here, not from the start
-        return True
+            # A channel with no frames in the window counts as silent (dead device); a channel
+            # above the floor on THIS tick clears the run for everyone.
+            for db in levels.values():
+                if db is not None and float(db) > self.floor_db:
+                    self._silent_since = None
+                    return False
+            if self._silent_since is None:
+                self._silent_since = now
+                return False
+            if self._muted or self._outstanding or self._nudges >= self.max_nudges:
+                return False
+            if now - self._silent_since < self.threshold_s:
+                return False
+            self._nudges += 1
+            self._outstanding = True
+            self._silent_since = None  # the next threshold is measured from here, not the start
+            return True
 
     # -- the two user answers ---------------------------------------------
 
@@ -106,36 +114,42 @@ class SilenceWatch:
         `now` defaults to the last sampled clock value, so the request thread does not
         have to reconstruct the session clock to answer a banner.
         """
-        if now is None:
-            now = self._last
-        self._outstanding = False
-        self._silent_since = None if now is None else float(now)
+        with self._lock:
+            if now is None:
+                now = self._last
+            self._outstanding = False
+            self._silent_since = None if now is None else float(now)
 
     def mute(self):
         """"Not now, and stop asking": no further nudges for the rest of the session."""
-        self._muted = True
-        self._outstanding = False
-        self._silent_since = None
+        with self._lock:
+            self._muted = True
+            self._outstanding = False
+            self._silent_since = None
 
     # -- introspection ----------------------------------------------------
 
     def state(self):
-        """A plain dict for /api/status, the banner copy and the tests."""
-        silent_s = 0.0
-        if self._silent_since is not None and self._last is not None:
-            silent_s = max(0.0, self._last - self._silent_since)
-        armed = (self._first is not None and self._last is not None
-                 and (self._last - self._first) >= self.arm_s)
-        return {
-            "armed": armed,
-            "silent_s": silent_s,
-            "nudges": self._nudges,
-            "muted": self._muted,
-            "outstanding": self._outstanding,
-            "threshold_s": self.threshold_s,
-            "minutes": minutes_of(self.threshold_s),
-            "exhausted": self._nudges >= self.max_nudges,
-        }
+        """A plain dict for /api/status, the banner copy and the tests.
+
+        Snapshotted under the lock, so a caller deciding on it (notably _silence_tick's
+        re-check before publishing) never sees a half-applied mute."""
+        with self._lock:
+            silent_s = 0.0
+            if self._silent_since is not None and self._last is not None:
+                silent_s = max(0.0, self._last - self._silent_since)
+            armed = (self._first is not None and self._last is not None
+                     and (self._last - self._first) >= self.arm_s)
+            return {
+                "armed": armed,
+                "silent_s": silent_s,
+                "nudges": self._nudges,
+                "muted": self._muted,
+                "outstanding": self._outstanding,
+                "threshold_s": self.threshold_s,
+                "minutes": minutes_of(self.threshold_s),
+                "exhausted": self._nudges >= self.max_nudges,
+            }
 
 
 def minutes_of(threshold_s):

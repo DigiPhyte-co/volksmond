@@ -1447,19 +1447,22 @@ async function reminderTick() {
   // in toast-only mode: there is no card to block on, and the poll would fire a notification every
   // minute for a quarter of an hour.
   reminderHandled[key] = true;
-  if (toastOn) notifyMeetingToast(r.subject || "");
+  if (toastOn) notifyMeetingToast(r.subject || "", r.start || "");
   if (bannerOn) {
     S.reminder = { subject: r.subject, attendees: r.attendees || [], start: r.start, key: key };
     render();
   }
 }
-function notifyMeetingToast(subject) {
+function notifyMeetingToast(subject, start) {
   // Fire and forget. The server hands the text to the Windows shell; a failure (no licence, no
   // pywin32, notifications switched off, offline edition with no such route) is not worth a word to
   // the user and must never disturb the reminder card. Clicking the notification only brings the
   // window forward, where the card is already waiting: there is deliberately no action channel
   // from a toast back into the app.
-  api.post("/api/notify-meeting", { subject: subject }).catch(function () {});
+  // The start time goes with it because the server folds it into the notification's coalescing
+  // tag: two occurrences of a recurring meeting share a subject, and without the start the second
+  // one would be swallowed as a duplicate of the first.
+  api.post("/api/notify-meeting", { subject: subject, start: start || "" }).catch(function () {});
 }
 function acceptReminder() {
   var r = S.reminder; if (!r) return;
