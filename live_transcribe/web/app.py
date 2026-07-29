@@ -1551,6 +1551,7 @@ class SettingsPatch(BaseModel):
     business_nudge_seen: Optional[bool] = None
     summary_footer: Optional[bool] = None
     calendar_reminders: Optional[bool] = None
+    os_toasts: Optional[bool] = None        # Windows desktop notifications (toasts); shared by every notifying feature
     live_notes_width: Optional[int] = None  # live-screen notes column width (px); 0 = default
     # summary_model is intentionally NOT settable here: only the verified downloader
     # (modeldl.py) sets it, to a pinned catalogue filename, so an arbitrary or
@@ -2094,6 +2095,29 @@ if not buildflags.OFFLINE_ONLY:
                 starts_in_min = None
         return {"available": True, "found": True, "subject": meeting["subject"],
                 "attendees": meeting["attendees"], "start": start, "starts_in_min": starts_in_min}
+
+    class NotifyMeetingRequest(BaseModel):
+        subject: Optional[str] = None
+
+    @app.post("/api/notify-meeting")
+    def notify_meeting(req: NotifyMeetingRequest):
+        """Show a Windows notification for a meeting that is starting.
+
+        Fired by the UI's own calendar poll (app.js reminderTick), not by a second server-side
+        loop: the poll is client-driven either way, and the UI already owns the once-per-meeting
+        bookkeeping, so a server-side watcher would mean another thread, another COM init and a
+        duplicate dedup table for nothing.
+
+        Sits with the calendar routes, inside the OFFLINE_ONLY guard and behind the same Business
+        entitlement, because this notification IS the calendar reminder wearing a different coat.
+        The generic notification machinery (notify.py) is not gated and not compiled out; only this
+        calendar-shaped use of it is. Never starts anything: clicking the toast just brings the
+        window forward, where the reminder card is already waiting."""
+        if not licensing.current().has("calendar"):
+            raise HTTPException(status_code=402, detail="Calendar reminders need a business licence.")
+        from .. import notify
+        shown = notify.show("A meeting is starting", (req.subject or "").strip(), tag="meeting")
+        return {"shown": bool(shown)}
 
 
 class SummariseRequest(BaseModel):

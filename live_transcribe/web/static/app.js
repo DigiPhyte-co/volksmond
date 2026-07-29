@@ -117,6 +117,7 @@ var IP = {
   heart: '<path d="M12 20s-7-4.6-7-9.6A3.9 3.9 0 0 1 12 7a3.9 3.9 0 0 1 7 2.8C19 15.4 12 20 12 20z"/>',
   pencil: '<path d="M4 20l1.2-4.2L16 5a2 2 0 0 1 3 3L8.2 18.8z"/><path d="M14 7l3 3"/>',
   calendar: '<rect x="4" y="5" width="16" height="16" rx="2"/><path d="M4 9.5h16M8 3v4M16 3v4"/>',
+  bell: '<path d="M6.5 10.5a5.5 5.5 0 0 1 11 0c0 4 1.5 5.5 1.5 5.5H5s1.5-1.5 1.5-5.5z"/><path d="M10 19a2 2 0 0 0 4 0"/>',
 };
 function icon(name, size) {
   size = size || 16;
@@ -1410,9 +1411,16 @@ function startReminderPoll() {
   reminderTick();
 }
 async function reminderTick() {
-  // Guard cheaply BEFORE any request: only Business licences with the setting on, and never while a
+  // ONE poll, TWO independent outputs (WP-10): the in-app reminder card, gated on
+  // calendar_reminders, and the Windows notification, gated on os_toasts. They are separately
+  // switchable because they answer different situations: the card is for when you are looking at
+  // Volksmond, the notification is for when you are not. So poll while EITHER is on, and gate each
+  // output on its own switch. Guard cheaply BEFORE any request: Business only, and never while a
   // session is already running or being set up.
-  if (!isPro() || !(S.settings && S.settings.calendar_reminders !== false)) return;
+  if (!isPro()) return;
+  var bannerOn = !(S.settings && S.settings.calendar_reminders === false);   // default on
+  var toastOn = !(S.settings && S.settings.os_toasts === false);             // default on
+  if (!bannerOn && !toastOn) return;
   if (S.reminder || (S.live && S.live.running)) return;
   if (["live", "recordonly", "importing", "starting", "setup"].indexOf(S.route) >= 0) return;
   var r;
@@ -1423,8 +1431,24 @@ async function reminderTick() {
   if (r.starts_in_min > 2 || r.starts_in_min < -15) return;
   var key = reminderKey(r);
   if (reminderHandled[key]) return;
-  S.reminder = { subject: r.subject, attendees: r.attendees || [], start: r.start, key: key };
-  render();
+  // Marked before either output fires, so a meeting is nudged at most once per session whichever
+  // output is on. The card used to rely on S.reminder blocking re-entry for this, which is no help
+  // in toast-only mode: there is no card to block on, and the poll would fire a notification every
+  // minute for a quarter of an hour.
+  reminderHandled[key] = true;
+  if (toastOn) notifyMeetingToast(r.subject || "");
+  if (bannerOn) {
+    S.reminder = { subject: r.subject, attendees: r.attendees || [], start: r.start, key: key };
+    render();
+  }
+}
+function notifyMeetingToast(subject) {
+  // Fire and forget. The server hands the text to the Windows shell; a failure (no licence, no
+  // pywin32, notifications switched off, offline edition with no such route) is not worth a word to
+  // the user and must never disturb the reminder card. Clicking the notification only brings the
+  // window forward, where the card is already waiting: there is deliberately no action channel
+  // from a toast back into the app.
+  api.post("/api/notify-meeting", { subject: subject }).catch(function () {});
 }
 function acceptReminder() {
   var r = S.reminder; if (!r) return;
@@ -2384,6 +2408,10 @@ function licenceCard() {
   var until = lic.valid_until;  // ISO date, or null for an undated key
   var seatText = seats > 1 ? (seats + " seats") : "1 seat";
   var remindersOn = !(S.settings && S.settings.calendar_reminders === false);  // default on
+  var toastsOn = !(S.settings && S.settings.os_toasts === false);              // default on
+  // Shell_NotifyIcon balloons are a Windows mechanism, so the row is hidden elsewhere rather
+  // than offering a switch that does nothing (platform is platform.platform(), e.g. "Windows-11-...").
+  var winPlatform = /^windows/i.test((S.appInfo && S.appInfo.platform) || "");
   return el("div", { class: "card settings-card" }, [
     el("div", { class: "set-row" }, [
       el("div", { class: "tone-tile accent", style: { width: "36px", height: "36px", flex: "0 0 auto" } }, icon("crown", 18)),
@@ -2400,13 +2428,27 @@ function licenceCard() {
         ? el("button", { class: "btn ghost", onclick: deactivateLicence }, "Deactivate")
         : el("button", { class: "btn ghost", onclick: function () { go("upgrade"); } }, "Business licensing"),
     ]),
+    // Everyone: the shared switch for Windows desktop notifications. Not a Business feature,
+    // because the things it is used for (a meeting starting, a long silence during a recording)
+    // include plain data-integrity warnings that every user should get. Purely local: it hands a
+    // short message to the Windows shell on this computer and makes no network call.
+    winPlatform ? el("div", { class: "set-row" }, [
+      el("div", { class: "ic" }, icon("bell", 18)),
+      el("div", { class: "body" }, [
+        el("div", { class: "t", text: "Windows notifications" }),
+        el("div", { class: "s", text: "Let Volksmond send a Windows notification when it needs to tell you something while its window is hidden behind your meeting. Nothing is sent anywhere; the message appears on this computer only." }),
+      ]),
+      el("div", { class: "ctl" }, toggleEl(toastsOn, function () { saveSettings({ os_toasts: !toastsOn }); })),
+    ]) : null,
     // Business only: the calendar reminder toggle. Reads the local Outlook calendar while the app is
     // open and offers to start transcribing when a meeting begins. Local only, never auto-starts.
+    // The copy names the CARD specifically, because since WP-10 the same calendar poll also drives a
+    // Windows notification, switched by the row above; this row governs only the in-app card.
     pro ? el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("calendar", 18)),
       el("div", { class: "body" }, [
-        el("div", { class: "t", text: "Remind me when a meeting starts" }),
-        el("div", { class: "s", text: "While Volksmond is open, it checks your Outlook calendar on this computer and offers to start transcribing when a meeting begins. Nothing is sent anywhere, and it never starts on its own." }),
+        el("div", { class: "t", text: "Show a reminder card when a meeting starts" }),
+        el("div", { class: "s", text: "While Volksmond is open, it checks your Outlook calendar on this computer and shows a reminder card, inside the app, offering to start transcribing when a meeting begins. Windows notifications are switched separately, above. Nothing is sent anywhere, and it never starts on its own." }),
       ]),
       el("div", { class: "ctl" }, toggleEl(remindersOn, function () { saveSettings({ calendar_reminders: !remindersOn }); })),
     ]) : null,
