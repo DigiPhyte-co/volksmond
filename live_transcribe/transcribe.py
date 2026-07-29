@@ -381,8 +381,24 @@ def xchan_gate_mic(mic, sysc, sr=16000, frame_ms=300, gate_db=10.0, sys_floor_db
     return out, silenced, total
 
 
+def raw_mic_ring_on():
+    """Kill switch for the raw-mic energy ring (WP-4): SA_LIVE_RAW_MIC_RING=0 leaves Engine.mic_env
+    unset, so the echo veto and the silence gate fall back to chunk samples - exactly the pre-WP-4
+    behaviour. Read at call time so a test (or a support session) can flip it without a reimport."""
+    return os.environ.get("SA_LIVE_RAW_MIC_RING", "1") != "0"
+
+
 class SysEnergyRing:
-    """Rolling per-frame RMS (dBFS) of the SYS (far-end) channel, keyed by session-relative time.
+    """Rolling per-frame RMS (dBFS) of one channel, keyed by session-relative time.
+
+    Named for its first consumer (the SYS reference for the MIC echo veto) and kept under that name
+    because it is public API; `EnergyRing` is the neutral alias new call sites use. There is now one
+    of these per channel: the MIC ring is fed from the RAW pre-APM mic so every level test stays on
+    its calibrated absolute basis under AGC (see capture_core.attach_mic_ring).
+
+    `raw` records whether the feed is pre-processing device audio (live capture) or already-processed
+    audio (an uploaded/auto-boosted recording, which has no absolute basis). Only the silence floor
+    reads it; see _silence_floor_db.
 
     Written in real time by the capture callback (live) or filled in one pass from the aligned SYS
     channel (re-transcribe); read by the transcription worker to veto MIC echo segments. The live
@@ -392,10 +408,11 @@ class SysEnergyRing:
     ghost is judged. Retained for minutes because a MIC chunk can be transcribed well after capture
     under CPU backlog. Thread-safe: the audio thread writes, the transcribe worker reads.
     """
-    def __init__(self, retain_s=600.0):
+    def __init__(self, retain_s=600.0, raw=True):
         self._t = deque()
         self._db = deque()
         self._retain = retain_s
+        self.raw = raw
         self._lock = threading.Lock()
 
     def add(self, t, db):
@@ -414,15 +431,77 @@ class SysEnergyRing:
         self.add(t, 20.0 * np.log10(rms + 1e-9))
 
     def frames_in(self, t_lo, t_hi):
-        """The SYS frame dB values whose timestamps fall in [t_lo, t_hi]. Copies under the lock;
+        """The frame dB values whose timestamps fall in [t_lo, t_hi]. Copies under the lock;
         the caller does the heavier percentile maths outside it."""
         with self._lock:
             return [d for t, d in zip(self._t, self._db) if t_lo <= t <= t_hi]
 
+    def max_db(self, t_lo, t_hi):
+        """The LOUDEST frame in the window, or None when the window holds no frames.
+
+        The silence gate's statistic: any real utterance, however quiet, leaves one loud frame,
+        so gating on the max keeps it (the same principle as _is_silence, on raw energy)."""
+        f = self.frames_in(t_lo, t_hi)
+        return max(f) if f else None
+
+    def coverage(self, t_lo, t_hi, floor_db):
+        """Fraction of frames in the window above `floor_db` (0.0 when the window is empty).
+
+        Continuity, not loudness: measured on the incident recording, ghost/bleed lines cover
+        ~39% of their window while real speech covers ~74%."""
+        f = self.frames_in(t_lo, t_hi)
+        if not f:
+            return 0.0
+        return sum(1 for d in f if d > floor_db) / len(f)
+
+    def speech_level(self, t_hi, window_s=120.0):
+        """p90 of the trailing window's frames above -70 dBFS: this channel's level WHEN SPEAKING.
+
+        Returns None until there is anything to measure. Used to derive a relative floor for feeds
+        with no absolute basis (an uploaded, possibly auto-boosted recording)."""
+        import numpy as np
+        f = [d for d in self.frames_in(t_hi - window_s, t_hi) if d > -70.0]
+        if not f:
+            return None
+        return float(np.percentile(f, 90))
+
+    def noise_floor(self, t_hi, window_s=120.0):
+        """p10 of the trailing window's frames: this room's tone. None when there are no frames.
+
+        The hardware-independent reference a continuity test needs (a whisper sits above room tone
+        even when it sits far below any absolute speech floor)."""
+        import numpy as np
+        f = self.frames_in(t_hi - window_s, t_hi)
+        if not f:
+            return None
+        return float(np.percentile(f, 10))
+
+
+# Neutral alias: there is one ring per channel now, not just a SYS one. The old name stays
+# because app.py, capture_core's docstrings and two test files use it.
+EnergyRing = SysEnergyRing
+
+
+def _silence_floor_db(ring, t_hi, static_db=-45.0):
+    """The dBFS floor a ring-fed silence gate should use at time `t_hi`.
+
+    A RAW ring is device audio, which is what the static -45 dBFS floor was calibrated on, so it
+    is used unchanged. A PROCESSED ring (the file/upload path: already AGC'd, possibly
+    auto-boosted) has no absolute basis, so the floor is derived from the channel's own speech
+    level, 30 dB down, clamped to [-55, -35]. Measured basis for the 30: real speech lands
+    -8..-20 dBFS while bleed/room tone lands -33..-57, the same gap the absolute -45 encodes for
+    a -15 dBFS mic. Falls back to the static floor until there is a speech estimate at all."""
+    if getattr(ring, "raw", True):
+        return static_db
+    lvl = ring.speech_level(t_hi)
+    if lvl is None:
+        return static_db
+    return min(-35.0, max(-55.0, lvl - 30.0))
+
 
 def sys_echo_veto(mic_audio, sys_ring, abs_start, abs_end, word_count, sr=16000,
                   frame_ms=100, tol=0.3, active_floor=-50.0, min_coverage=0.60,
-                  margin_db=10.0, mic_ceiling=-28.0):
+                  margin_db=10.0, mic_ceiling=-28.0, *, mic_ring=None):
     """Decide whether a MIC segment is far-end bleed (echo) that should be dropped.
 
     Conservative by construction so it (almost) never eats real speech: it fires only when the far
@@ -431,6 +510,12 @@ def sys_echo_veto(mic_audio, sys_ring, abs_start, abs_end, word_count, sr=16000,
     missing SYS reference fails safe (keep). Post-ASR, so it cannot un-blend a mixed segment - hence
     the coverage floor: it only drops segments that are overwhelmingly far-end. Returns
     (drop: bool, reason: str). Thresholds are the tuned starting points from the design review.
+
+    mic_ring (keyword-only): a raw-mic EnergyRing. When supplied, the mic's loud-frame level comes
+    from its RAW pre-APM frames instead of the chunk samples, which is what makes this relative
+    test honest under live AGC - the chunk is gain-boosted while the SYS reference never is, so a
+    boosted-but-silent mic used to clear the -28 dBFS ceiling and dodge the veto. Omitted (or with
+    no frames for the window) it behaves exactly as before.
     """
     import numpy as np
     dur = abs_end - abs_start
@@ -440,19 +525,27 @@ def sys_echo_veto(mic_audio, sys_ring, abs_start, abs_end, word_count, sr=16000,
     # stays because its mic energy is above the ceiling (A/B-verified on real recordings, v1.8.2).
     if dur < 0.5:
         return False, "short"
-    mic = np.asarray(mic_audio, dtype=np.float32)
-    if mic.size < sr * frame_ms / 1000.0:
-        return False, "tiny"
-    fr = max(1, int(sr * frame_ms / 1000.0))
-    mdb = []
-    for i in range(0, len(mic), fr):
-        w = mic[i:i + fr]
-        if len(w) < fr // 2:
-            break
-        mdb.append(20.0 * np.log10(float(np.sqrt(np.mean(w * w))) + 1e-9))
-    if not mdb:
-        return False, "nomic"
-    mic_p90 = float(np.percentile(mdb, 90))       # the mic's loud frames; low => never really spoke
+    mic_p90 = None                                # the mic's loud frames; low => never really spoke
+    micsrc = ""
+    if mic_ring is not None:
+        _mf = mic_ring.frames_in(abs_start - tol, abs_end + tol)
+        if _mf:
+            mic_p90 = float(np.percentile(_mf, 90))
+            micsrc = " micsrc=ring"
+    if mic_p90 is None:
+        mic = np.asarray(mic_audio, dtype=np.float32)
+        if mic.size < sr * frame_ms / 1000.0:
+            return False, "tiny"
+        fr = max(1, int(sr * frame_ms / 1000.0))
+        mdb = []
+        for i in range(0, len(mic), fr):
+            w = mic[i:i + fr]
+            if len(w) < fr // 2:
+                break
+            mdb.append(20.0 * np.log10(float(np.sqrt(np.mean(w * w))) + 1e-9))
+        if not mdb:
+            return False, "nomic"
+        mic_p90 = float(np.percentile(mdb, 90))
     sys = sys_ring.frames_in(abs_start - tol, abs_end + tol)
     if not sys:
         return False, "nosys"                     # no reference -> keep (fail safe)
@@ -462,7 +555,7 @@ def sys_echo_veto(mic_audio, sys_ring, abs_start, abs_end, word_count, sr=16000,
         return False, f"cov={coverage:.2f}"
     sys_p70 = float(np.percentile(active, 70))
     drop = (sys_p70 - mic_p90) >= margin_db and mic_p90 < mic_ceiling
-    return drop, f"cov={coverage:.2f} sysP70={sys_p70:.0f} micP90={mic_p90:.0f}"
+    return drop, f"cov={coverage:.2f} sysP70={sys_p70:.0f} micP90={mic_p90:.0f}{micsrc}"
 
 
 def _is_silence(audio, sr=16000, frame_ms=100, floor_db=-45.0):
@@ -883,7 +976,10 @@ class Engine:
         self._rtf = deque(maxlen=DOWNGRADE_WINDOW)  # recent real-time factors (CPU downgrade)
         self.subscribers = []
         self._pending_mic = []                # [(release_monotonic, Segment)] held by MIC_PUBLISH_DELAY
-        self.sys_env = None                   # optional SysEnergyRing -> enables the MIC echo veto
+        self.sys_env = None                   # optional EnergyRing (far end) -> enables the MIC echo veto
+        self.mic_env = None                   # optional EnergyRing (RAW near end) -> gain-invariant
+                                              # mic levels for the silence gate + the echo veto
+        self._raw_mic_ring = raw_mic_ring_on()
         self._xchan_veto = os.environ.get("SA_LIVE_XCHAN_VETO", "1") != "0"
         self._silence_gate = os.environ.get("SA_LIVE_SILENCE_GATE", "1") != "0"
         self._prompt_leak_on = os.environ.get("SA_LIVE_PROMPT_LEAK_GUARD", "1") != "0"
@@ -905,6 +1001,54 @@ class Engine:
         the prompt from anchor+names down to names alone (exactly the incident scenario)."""
         self._prompt_leak = PromptLeakMatcher(
             user_prompt, AF_ANCHOR_PROMPT if language == "af" else None)
+
+    def _ring_for(self, source):
+        """This source's energy ring, or None when it has none (or the kill switch is off).
+
+        MIC honours SA_LIVE_RAW_MIC_RING; SYS's ring predates it and is unaffected."""
+        if source == "MIC":
+            return self.mic_env if self._raw_mic_ring else None
+        return self.sys_env if source == "SYS" else None
+
+    def _chunk_is_silence(self, source, audio, t_start, dead_margin_db=8.0, dead_ceiling_db=-35.0):
+        """Is this whole chunk room tone / near-silence (so Whisper must not see it)?
+
+        With an energy ring for the source, decide on the loudest RAW 100 ms frame in the chunk's
+        window, on two tests:
+
+        1. Absolute: the loudest frame never reached the speech floor (see _silence_floor_db).
+           That is the point of WP-4 - live AGC lifts a silent room's chunk energy over the
+           -45 dBFS floor, so the chunk-fed gate was effectively dead on a quiet mic, the exact
+           condition Whisper fabricates on.
+        2. Dead channel (relative): the loudest frame sits <= `dead_margin_db` above this
+           channel's OWN measured room tone (ring p10), i.e. nothing here rose meaningfully above
+           the background. Measured on the incident recording, fabrication-bearing windows sit at
+           <= 6 dB above floor while the nearest real line sits 25.8 dB above it, so 8 dB leaves
+           ~18 dB of headroom. Guarded by an absolute cap: a window louder than
+           `dead_ceiling_db` is never skipped on the relative test alone, so a never-quiet
+           channel (HVAC, music, a constant-tone feed) whose p10 is poisoned upward cannot be
+           eaten - a loud-but-flat channel keeps every chunk.
+
+        Without a ring (uploads, ring-less paths) it falls back to `_is_silence(audio)` verbatim,
+        which keeps its four pinned tests untouched. A ring with no frames covering the window also
+        falls back: never gate on missing evidence. Both tests share SA_LIVE_SILENCE_GATE=0.
+        """
+        ring = self._ring_for(source)
+        if ring is None:
+            return _is_silence(audio)
+        try:
+            dur = len(audio) / 16000.0
+        except TypeError:
+            return _is_silence(audio)          # not real audio (a test stub): same posture as _is_silence
+        t_hi = t_start + dur
+        peak = ring.max_db(t_start, t_hi)
+        if peak is None:
+            return _is_silence(audio)
+        if peak < _silence_floor_db(ring, t_hi):
+            return True
+        floor = ring.noise_floor(t_hi)
+        return (floor is not None and peak <= dead_ceiling_db
+                and (peak - floor) <= dead_margin_db)
 
     def subscribe(self, fn):
         self.subscribers.append(fn)
@@ -1164,7 +1308,9 @@ class Engine:
                 # If no frame in the chunk reaches the speech floor there is nothing to transcribe,
                 # so skip it. Complements the echo veto (which needs a loud far end as reference);
                 # this is the no-far-end pure-silence case. Toggle SA_LIVE_SILENCE_GATE=0.
-                if self._silence_gate and _is_silence(audio):
+                # Reads the source's raw energy ring when there is one, so an AGC boost cannot
+                # hide a silent room from the gate (SA_LIVE_RAW_MIC_RING=0 restores chunk energy).
+                if self._silence_gate and self._chunk_is_silence(source, audio, t_start):
                     continue
                 t0 = time.monotonic()
                 segs, _info = self.model.transcribe(
@@ -1208,10 +1354,14 @@ class Engine:
                     # Cross-channel echo veto: drop a MIC segment that is far-end bleed (quiet copy
                     # of a concurrently-active SYS). Post-ASR + conservative, so it never touches the
                     # audio (no word-nudging / fragmentation) and keeps real speech. Live and file
-                    # both feed self.sys_env; when it is absent the veto is inert.
+                    # both feed self.sys_env; when it is absent the veto is inert. The mic side of
+                    # the comparison comes from self.mic_env (RAW, pre-AGC) when that ring exists,
+                    # so the calibrated 10 dB margin and -28 dBFS ceiling mean what they were
+                    # measured to mean; without it the chunk samples are used, as before.
                     if source == "MIC" and self._xchan_veto and self.sys_env is not None:
                         _mic = audio[int(float(seg.start) * 16000):int(float(seg.end) * 16000)]
-                        _drop, _why = sys_echo_veto(_mic, self.sys_env, out.t_start, out.t_end, len(text.split()))
+                        _drop, _why = sys_echo_veto(_mic, self.sys_env, out.t_start, out.t_end, len(text.split()),
+                                                    mic_ring=self._ring_for("MIC"))
                         if _drop:
                             print(f"[engine] echo-veto dropped MIC @ {out.t_start:.1f}s [{_why}] {text[:40]!r}", flush=True)
                             continue
