@@ -339,6 +339,22 @@ def test_live_notes_width_roundtrip():
     print("  OK  live_notes_width round-trips through /api/settings")
 
 
+def test_os_toasts_roundtrip():
+    # WP-9a: the shared Windows-notifications switch. It defaults ON (the whole point of a
+    # toast is to be seen when the window is not) and must be settable through the API, or the
+    # Settings toggle silently does nothing.
+    from live_transcribe import config
+    assert config.DEFAULTS["os_toasts"] is True, "os_toasts no longer defaults on"
+    orig = config.load().get("os_toasts", True)
+    try:
+        assert client.post("/api/settings", json={"os_toasts": False}).json()["os_toasts"] is False
+        assert client.get("/api/settings").json()["os_toasts"] is False
+        assert client.post("/api/settings", json={"os_toasts": True}).json()["os_toasts"] is True
+    finally:
+        config.update({"os_toasts": orig})
+    print("  OK  os_toasts defaults on and round-trips through /api/settings")
+
+
 def test_default_language_roundtrip():
     # Settings must accept EVERY pre-meeting language mode as the default: the classics
     # ("af"/"en"), the Swivuriso group ("sa"), a specific South African language, a world
@@ -1065,6 +1081,7 @@ if __name__ == "__main__":
                test_license_pubkey_precedence,
                test_summary_device_and_capability,
                test_live_notes_width_roundtrip,
+               test_os_toasts_roundtrip,
                test_default_language_roundtrip,
                test_language_mode_tokens,
                test_settings_migration_old_default_language,

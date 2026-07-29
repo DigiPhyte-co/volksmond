@@ -1522,6 +1522,7 @@ class SettingsPatch(BaseModel):
     business_nudge_seen: Optional[bool] = None
     summary_footer: Optional[bool] = None
     calendar_reminders: Optional[bool] = None
+    os_toasts: Optional[bool] = None        # Windows desktop notifications (toasts); shared by every notifying feature
     live_notes_width: Optional[int] = None  # live-screen notes column width (px); 0 = default
     # summary_model is intentionally NOT settable here: only the verified downloader
     # (modeldl.py) sets it, to a pinned catalogue filename, so an arbitrary or

@@ -59,6 +59,7 @@ DEFAULTS = {
     "summary_footer": True,           # append a small "Made with Volksmond" line to the summary file. Never the raw transcript, never any export of it.
     "calendar_reminders": True,       # while the app is open, poll the LOCAL Outlook calendar and nudge "start transcribing?" when a meeting begins. Business feature; inert without a licence + Outlook + pywin32. Local only, no network call.
     "live_notes_width": 0,            # width (px) of the live-screen notes column; 0 = default. Disk mirror of localStorage vm_live_split, which the WebView can wipe between launches.
+    "os_toasts": True,                # show Windows desktop notifications (toasts) when Volksmond has something to say while its window is behind a call. ON by default: the whole point is to be seen when the window is not. One shared switch for every notification the app sends; each feature keeps its own on/off. Hard kill: SA_LIVE_TOASTS=0. Local only, no network path (Shell_NotifyIcon is a shell call).
 }
 
 

@@ -117,6 +117,7 @@ var IP = {
   heart: '<path d="M12 20s-7-4.6-7-9.6A3.9 3.9 0 0 1 12 7a3.9 3.9 0 0 1 7 2.8C19 15.4 12 20 12 20z"/>',
   pencil: '<path d="M4 20l1.2-4.2L16 5a2 2 0 0 1 3 3L8.2 18.8z"/><path d="M14 7l3 3"/>',
   calendar: '<rect x="4" y="5" width="16" height="16" rx="2"/><path d="M4 9.5h16M8 3v4M16 3v4"/>',
+  bell: '<path d="M6.5 10.5a5.5 5.5 0 0 1 11 0c0 4 1.5 5.5 1.5 5.5H5s1.5-1.5 1.5-5.5z"/><path d="M10 19a2 2 0 0 0 4 0"/>',
 };
 function icon(name, size) {
   size = size || 16;
@@ -2384,6 +2385,10 @@ function licenceCard() {
   var until = lic.valid_until;  // ISO date, or null for an undated key
   var seatText = seats > 1 ? (seats + " seats") : "1 seat";
   var remindersOn = !(S.settings && S.settings.calendar_reminders === false);  // default on
+  var toastsOn = !(S.settings && S.settings.os_toasts === false);              // default on
+  // Shell_NotifyIcon balloons are a Windows mechanism, so the row is hidden elsewhere rather
+  // than offering a switch that does nothing (platform is platform.platform(), e.g. "Windows-11-...").
+  var winPlatform = /^windows/i.test((S.appInfo && S.appInfo.platform) || "");
   return el("div", { class: "card settings-card" }, [
     el("div", { class: "set-row" }, [
       el("div", { class: "tone-tile accent", style: { width: "36px", height: "36px", flex: "0 0 auto" } }, icon("crown", 18)),
@@ -2400,6 +2405,18 @@ function licenceCard() {
         ? el("button", { class: "btn ghost", onclick: deactivateLicence }, "Deactivate")
         : el("button", { class: "btn ghost", onclick: function () { go("upgrade"); } }, "Business licensing"),
     ]),
+    // Everyone: the shared switch for Windows desktop notifications. Not a Business feature,
+    // because the things it is used for (a meeting starting, a long silence during a recording)
+    // include plain data-integrity warnings that every user should get. Purely local: it hands a
+    // short message to the Windows shell on this computer and makes no network call.
+    winPlatform ? el("div", { class: "set-row" }, [
+      el("div", { class: "ic" }, icon("bell", 18)),
+      el("div", { class: "body" }, [
+        el("div", { class: "t", text: "Windows notifications" }),
+        el("div", { class: "s", text: "Let Volksmond send a Windows notification when it needs to tell you something while its window is hidden behind your meeting. Nothing is sent anywhere; the message appears on this computer only." }),
+      ]),
+      el("div", { class: "ctl" }, toggleEl(toastsOn, function () { saveSettings({ os_toasts: !toastsOn }); })),
+    ]) : null,
     // Business only: the calendar reminder toggle. Reads the local Outlook calendar while the app is
     // open and offers to start transcribing when a meeting begins. Local only, never auto-starts.
     pro ? el("div", { class: "set-row" }, [

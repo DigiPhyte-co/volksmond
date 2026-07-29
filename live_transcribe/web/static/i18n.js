@@ -675,6 +675,9 @@ window.VM_I18N = {
     "Start transcribing": "Begin transkribeer",
     "Not now": "Nie nou nie",
     "Dismiss": "Maak toe",
+    "Windows notifications": "Windows-kennisgewings",
+    "Let Volksmond send a Windows notification when it needs to tell you something while its window is hidden behind your meeting. Nothing is sent anywhere; the message appears on this computer only.":
+      "Laat Volksmond 'n Windows-kennisgewing stuur wanneer dit vir jou iets moet sê terwyl sy venster agter jou vergadering weggesteek is. Niks word enige plek heen gestuur nie; die boodskap verskyn net op hierdie rekenaar.",
     "Remind me when a meeting starts": "Herinner my wanneer 'n vergadering begin",
     "While Volksmond is open, it checks your Outlook calendar on this computer and offers to start transcribing when a meeting begins. Nothing is sent anywhere, and it never starts on its own.":
       "Terwyl Volksmond oop is, kyk dit na jou Outlook-kalender op hierdie rekenaar en bied aan om te begin transkribeer wanneer 'n vergadering begin. Niks word enige plek heen gestuur nie, en dit begin nooit vanself nie.",
