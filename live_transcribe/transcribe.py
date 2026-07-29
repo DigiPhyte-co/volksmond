@@ -695,6 +695,80 @@ class PromptLeakMatcher:
         return len(content) >= _LEAK_MIN_CONTENT or matched_len > 1
 
 
+# ---------------------------------------------------------------------------
+# Cross-segment repetition guard (WP-2)
+#
+# Every existing loop guard (_collapse_repetition, _is_phrase_loop) is SEGMENT
+# scoped: it only sees one seg.text. The incident's worst runs are spread ACROSS
+# segments and chunks and are therefore invisible to all of them - "Bye." x22 one
+# per second, and an "and" / "Danica Freimond" alternation running 22 pairs at two
+# per second. This is the missing cross-segment view.
+#
+# Shape is driven entirely by backchannel safety: a genuine "ja. ja. ja." must
+# never lose anything, and a reader must still see evidence of whatever got
+# suppressed. Hence: the first 4 cycles ALWAYS publish, only short lines qualify,
+# the run must be dense, and MIC/SYS histories are never shared (a listener's "ja"
+# must not be cancelled by a speaker's "ja").
+_LOOP_MAX_PERIOD = 3          # covers the observed p=1 and p=2 with headroom
+_LOOP_MIN_CYCLES = 4          # cycles that always publish before suppression starts
+_LOOP_MAX_TOKENS = 4          # per element; a 5+ word line repeating is likelier a real refrain
+_LOOP_MAX_S_PER_CYCLE = 3.0   # observed loops 0.5-1.0 s; backchannel spacing is 5-20 s
+_LOOP_HISTORY = 16            # 4 cycles at p=3 plus slack; bounded memory
+
+
+class RecentEmissions:
+    """Per-source rolling history of recent segments, used to spot a repeating cycle.
+
+    Suppression is SILENT (stdout log only, no transcript marker): a suppressed loop lost
+    nothing real, and the first _LOOP_MIN_CYCLES cycles stay in the transcript as evidence.
+
+    Notices and backpressure markers go straight to _fanout and never reach _route, so they
+    can never enter this history.
+    """
+
+    def __init__(self, maxlen=_LOOP_HISTORY):
+        self._maxlen = maxlen
+        self._hist = {}   # source -> deque[(norm_text, n_content_tokens, t_start)]
+
+    def clear(self):
+        """Forget everything. Called on engine start and on a live model/language change,
+        which legitimately changes output style and must not false-trigger the guard."""
+        self._hist.clear()
+
+    def observe(self, source, text, t_start):
+        """Record a candidate and return the cycle period that suppresses it (0 = publish).
+
+        Suppressed candidates are recorded too. They are part of the run, and dropping them
+        from the history would break the phase of an alternating (p>=2) loop and would stall
+        the density measurement on the tail of a run, so only the first few cycles past the
+        threshold would be caught. Genuinely different speech still enters the history and
+        breaks the cycle, which is what disarms the guard.
+        """
+        toks = _norm_tokens(text)
+        cand = (" ".join(toks), len(_content_tokens(toks)), float(t_start))
+        hist = self._hist.setdefault(source, deque(maxlen=self._maxlen))
+        p = self._period(hist, cand)
+        hist.append(cand)
+        return p
+
+    def _period(self, hist, cand):
+        if not cand[0] or cand[1] > _LOOP_MAX_TOKENS:
+            return 0
+        for p in range(1, _LOOP_MAX_PERIOD + 1):
+            need = p * _LOOP_MIN_CYCLES
+            if len(hist) < need:
+                continue
+            run = list(hist)[-need:] + [cand]          # _LOOP_MIN_CYCLES complete cycles
+            if any(e[1] > _LOOP_MAX_TOKENS for e in run):
+                continue
+            if any(run[i][0] != run[i + p][0] for i in range(len(run) - p)):
+                continue
+            if (cand[2] - run[0][2]) / _LOOP_MIN_CYCLES > _LOOP_MAX_S_PER_CYCLE:
+                continue                               # too slow to be a decoder loop
+            return p
+        return 0
+
+
 @dataclass
 class Segment:
     source: str       # "MIC" or "SYS"
@@ -747,6 +821,8 @@ class Engine:
         self._xchan_veto = os.environ.get("SA_LIVE_XCHAN_VETO", "1") != "0"
         self._silence_gate = os.environ.get("SA_LIVE_SILENCE_GATE", "1") != "0"
         self._prompt_leak_on = os.environ.get("SA_LIVE_PROMPT_LEAK_GUARD", "1") != "0"
+        self._loop_guard_on = os.environ.get("SA_LIVE_LOOP_GUARD", "1") != "0"
+        self._recent = RecentEmissions()   # cross-segment loop history, per source
         self._queue = queue.Queue(maxsize=32)
         self._stop = threading.Event()    # shutting down: stop accepting new audio
         self._abort = threading.Event()   # hard abort: discard the backlog instead of draining
@@ -767,6 +843,7 @@ class Engine:
         self.subscribers.append(fn)
 
     def start(self):
+        self._recent.clear()
         self._worker.start()
 
     def stop(self, drain=True, timeout=None):
@@ -863,6 +940,7 @@ class Engine:
             self.is_fluister = ch["family"] == "fluister"
         self.initial_prompt = _compose_prompt(self.language, self._user_prompt)
         self._rebuild_prompt_leak(self._user_prompt, self.language)
+        self._recent.clear()  # a model/language flip legitimately changes output style
         self._rtf.clear()   # judge the (possibly new) model fresh; never downgrade on the old RTF
         lang_name = {"af": "Afrikaans", "en": "English"}.get(self.language, self.language or "auto-detect")
         self._emit_notice(t_start, f"[engine: now {self.family} {self.size}, language {lang_name}]")
@@ -1047,6 +1125,17 @@ class Engine:
                         _drop, _why = sys_echo_veto(_mic, self.sys_env, out.t_start, out.t_end, len(text.split()))
                         if _drop:
                             print(f"[engine] echo-veto dropped MIC @ {out.t_start:.1f}s [{_why}] {text[:40]!r}", flush=True)
+                            continue
+                    # Cross-segment loop: this line is the 5th+ cycle of a short, fast
+                    # repeat on this source. Silent drop, stdout log only - the first four
+                    # cycles are already in the transcript as evidence. Toggle
+                    # SA_LIVE_LOOP_GUARD=0. Recorded only for segments that reach publish,
+                    # so a vetoed or dropped segment never seeds the history.
+                    if self._loop_guard_on:
+                        _p = self._recent.observe(source, text, out.t_start)
+                        if _p:
+                            print(f"[engine] loop-guard suppressed {source} @ {out.t_start:.1f}s "
+                                  f"p={_p} {text[:40]!r}", flush=True)
                             continue
                     self._route(out)
 
