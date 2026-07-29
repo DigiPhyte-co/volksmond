@@ -158,6 +158,9 @@ function freshLive() {
     // Live AEC toggle: rendered from the ENGINE'S confirmed state (/api/status, /api/aec-live),
     // never from stored settings, so it can never show a value the engine does not have.
     aecAvailable: false, aecActive: false, aecBusy: false, noticeShown: "",
+    // Outstanding long-silence warning from the server ({minutes, count, at}), or null.
+    // Server-owned: the watcher lives there, so this is only ever a copy of /api/status.
+    silenceNudge: null,
   };
 }
 var S = {
@@ -182,6 +185,7 @@ var S = {
 // transient refs + timers (not part of render state)
 var liveDocEl = null, liveBodyEl = null, elapsedEl = null, recTimerEl = null, returnPillTimeEl = null;
 var pollTimer = null, elapsedTimer = null, toastTimer = null, levelTimer = null, warmTimer = null, histTimer = null, reminderTimer = null;
+var silenceTimer = null;
 var startingTimer = null, startingElapsedEl = null;
 
 /* ── api ──────────────────────────────────────────────────── */
@@ -296,6 +300,7 @@ function stopHistoryPoll() { if (histTimer) { clearInterval(histTimer); histTime
 function teardownLive() {
   closeStream();
   stopLevels();
+  stopSilencePoll();
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
   if (startingTimer) { clearInterval(startingTimer); startingTimer = null; }
@@ -564,7 +569,7 @@ async function startLive() {
     S.live.engine = S.form.engine;
     S.live.title = S.form.title || "Live meeting";
     S.live.micDevice = S.form.mic; S.live.loopbackDevice = S.form.loopback;
-    go("live"); openStream(); startElapsed(); startLevels(); refreshLiveAec();
+    go("live"); openStream(); startElapsed(); startLevels(); refreshLiveAec(); startSilencePoll();
   } catch (e) {
     // Surface the failure on the Starting screen (with Back), not just a toast that
     // vanishes; the model-load error ("Could not load model ...") needs to be readable.
@@ -1076,6 +1081,12 @@ function render() {
   if (S.reminder && ["setup", "starting", "live", "recordonly", "importing"].indexOf(S.route) < 0) {
     APP.appendChild(reminderBanner());
   }
+  // The long-silence warning belongs on the live screen: it is about THIS session's audio,
+  // and its answers (stop and save / keep recording) only make sense there. Elsewhere the
+  // Windows notification is what reaches the user, and the return pill leads back here.
+  if (S.live.silenceNudge && S.route === "live") {
+    APP.appendChild(silenceBanner());
+  }
   if (S.toast) {
     APP.appendChild(el("div", { class: "toast-wrap" }, el("div", { class: "toast" + (S.toast.err ? " err" : ""), text: S.toast.msg })));
   }
@@ -1479,6 +1490,70 @@ function reminderBanner() {
         ]),
       ]),
       el("button", { class: "btn ghost sm", style: { flex: "0 0 auto", padding: "6px" }, onclick: dismissReminder, title: "Dismiss" }, icon("x", 14)),
+    ]));
+}
+
+/* ── long silence during a live session (WP-9b) ───────────────── */
+// The server watches the raw energy of both channels and, when NOTHING has been heard for
+// the chosen number of minutes, publishes a nudge on /api/status (and sends a Windows
+// notification if those are on). The page only has to notice it and offer the three honest
+// answers: stop and save, keep recording, or stop asking.
+//
+// Why a poll of its own: during a live session the page runs the SSE stream, the elapsed
+// timer and the level meter, but nothing that re-reads /api/status - deliberately, so a
+// quiet meeting does not re-render. Ten seconds is plenty of resolution for a warning that
+// is minutes old by the time it fires, and it costs one tiny GET.
+var SILENCE_POLL_MS = 10000;
+function startSilencePoll() {
+  if (silenceTimer) return;
+  silenceTimer = setInterval(refreshSilence, SILENCE_POLL_MS);
+}
+function stopSilencePoll() { if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; } }
+function silenceSig(n) { return n ? (String(n.at || "") + "|" + String(n.count || 0)) : ""; }
+function refreshSilence() {
+  if (!S.live.running || S.live.sourceKind === "file") return;
+  api.get("/api/status").then(function (st) {
+    if (!st || !st.running) return;
+    var n = st.silence_nudge || null;
+    if (silenceSig(n) === silenceSig(S.live.silenceNudge)) return;   // no change: no re-render
+    S.live.silenceNudge = n;
+    render();
+  }).catch(function () {});
+}
+// Clicking the Windows notification brings this window forward; the banner must already be
+// there when it arrives, not up to ten seconds later. So a focus event forces the poll.
+// Cheap and harmless when nothing is running (refreshSilence guards on that itself).
+try { window.addEventListener("focus", function () { refreshSilence(); }); } catch (e) {}
+async function answerSilence(action) {
+  // Optimistic: the banner goes now. The server call only records the choice for the
+  // watcher, so a failure means at worst one more warning later, never a stuck banner.
+  S.live.silenceNudge = null;
+  render();
+  try { await api.post("/api/silence-nudge", { action: action }); } catch (e) {}
+  toast(action === "mute" ? "No more silence warnings this session."
+                          : "Still recording. We will tell you again if it stays silent.");
+}
+// A floating card, same shape as the calendar reminder, injected in render() so it sits
+// above the live screen without disturbing its layout.
+function silenceBanner() {
+  var n = S.live.silenceNudge || {};
+  var mins = n.minutes || 5;
+  return el("div", { style: { position: "fixed", top: "16px", left: "50%", transform: "translateX(-50%)", zIndex: "60", maxWidth: "460px", width: "calc(100% - 32px)" } },
+    el("div", { class: "card", style: { padding: "14px 16px", display: "flex", gap: "12px", alignItems: "flex-start", borderColor: "var(--warn)", boxShadow: "0 10px 34px rgba(0,0,0,0.20)" } }, [
+      el("div", { class: "tone-tile warn", style: { width: "34px", height: "34px", flex: "0 0 auto" } }, icon("alert", 17)),
+      el("div", { class: "grow" }, [
+        el("div", { style: { fontWeight: "600", fontSize: "13.5px" } },
+          [raw(tr("Nothing heard for") + " " + mins + " " + tr("minutes"))]),
+        el("p", { class: "ink-3", style: { fontSize: "11.5px", margin: "4px 0 0" }, text: "Volksmond is still recording, but both the microphone and the system audio have been silent. Check your device, or stop and save." }),
+        el("div", { class: "row gap-8", style: { marginTop: "10px", flexWrap: "wrap" } }, [
+          // Exactly what the Stop button does (doStop -> POST /api/stop?what=all), so there is
+          // one stop path in the app and this one cannot drift from it. The server signals the
+          // watcher as part of that stop, so no separate answer is needed here.
+          el("button", { class: "btn sm primary", onclick: function () { S.live.silenceNudge = null; doStop("all"); } }, [icon("stop", 12), "Stop and save"]),
+          el("button", { class: "btn sm ghost", onclick: function () { answerSilence("snooze"); } }, "Keep recording"),
+        ]),
+      ]),
+      el("button", { class: "btn ghost sm", style: { flex: "0 0 auto", padding: "6px" }, onclick: function () { answerSilence("mute"); }, title: "Stop warning me this session" }, icon("x", 14)),
     ]));
 }
 
@@ -2409,6 +2484,8 @@ function licenceCard() {
   var seatText = seats > 1 ? (seats + " seats") : "1 seat";
   var remindersOn = !(S.settings && S.settings.calendar_reminders === false);  // default on
   var toastsOn = !(S.settings && S.settings.os_toasts === false);              // default on
+  var silenceOn = !(S.settings && S.settings.silence_nudge === false);         // default on
+  var silenceMins = (S.settings && S.settings.silence_nudge_minutes) || 5;     // 3 / 5 / 10 / 15
   // Shell_NotifyIcon balloons are a Windows mechanism, so the row is hidden elsewhere rather
   // than offering a switch that does nothing (platform is platform.platform(), e.g. "Windows-11-...").
   var winPlatform = /^windows/i.test((S.appInfo && S.appInfo.platform) || "");
@@ -2440,6 +2517,21 @@ function licenceCard() {
       ]),
       el("div", { class: "ctl" }, toggleEl(toastsOn, function () { saveSettings({ os_toasts: !toastsOn }); })),
     ]) : null,
+    // Everyone: warn when a live session hears nothing at all for a long stretch. Not a Business
+    // feature and not platform-gated: the in-app banner works everywhere, and the Windows
+    // notification is a bonus governed by the row above. This is data integrity, not a nicety.
+    el("div", { class: "set-row" }, [
+      el("div", { class: "ic" }, icon("alert", 18)),
+      el("div", { class: "body" }, [
+        el("div", { class: "t", text: "Warn me about long silences" }),
+        el("div", { class: "s", text: "If nothing at all reaches Volksmond during a meeting, neither your microphone nor the system audio, it warns you instead of quietly recording an hour of nothing. Useful when Windows moves your microphone to another device." }),
+      ]),
+      el("div", { class: "ctl row gap-8" }, [
+        silenceOn ? selectEl([["3", "After 3 minutes"], ["5", "After 5 minutes"], ["10", "After 10 minutes"], ["15", "After 15 minutes"]],
+          String(silenceMins), function (v) { saveSettings({ silence_nudge_minutes: parseInt(v, 10) || 5 }); }) : null,
+        toggleEl(silenceOn, function () { saveSettings({ silence_nudge: !silenceOn }); }),
+      ]),
+    ]),
     // Business only: the calendar reminder toggle. Reads the local Outlook calendar while the app is
     // open and offers to start transcribing when a meeting begins. Local only, never auto-starts.
     // The copy names the CARD specifically, because since WP-10 the same calendar poll also drives a
@@ -3592,7 +3684,8 @@ function adoptRunning(status) {
   openStream(); startElapsed();
   seedFromTranscript();
   seedNotes();
-  if (status.source_kind !== "file") startLevels();
+  S.live.silenceNudge = status.silence_nudge || null;   // a nudge that fired before this reload
+  if (status.source_kind !== "file") { startLevels(); startSilencePoll(); }
   if (status.source_kind === "file") {
     S.route = "importing";
     // Mirror startImport: surface the sticky server notice (e.g. "stereo requested but the file
