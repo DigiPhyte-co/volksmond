@@ -769,6 +769,169 @@ def test_model_update_endpoints():
     print("  OK  model updates: voice-models carries fluister catalogue; /api/model-updates + update CSRF + session-gated; bad size 400")
 
 
+def _sandbox_settings():
+    """Context manager pointing config at a throwaway settings.json, so the session-count
+    tests below can read and write it without touching the real one."""
+    import contextlib
+    import tempfile
+    from pathlib import Path
+    from live_transcribe import config as C
+
+    @contextlib.contextmanager
+    def _cm():
+        orig_dir, orig_path = C._DIR, C._SETTINGS_PATH
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                C._DIR = Path(td)
+                C._SETTINGS_PATH = C._DIR / "settings.json"
+                yield C
+        finally:
+            C._DIR, C._SETTINGS_PATH = orig_dir, orig_path
+    return _cm()
+
+
+def _wait_idle(st, timeout=10.0):
+    """Wait for the background drain thread to finish the session."""
+    import time as _time
+    deadline = _time.time() + timeout
+    while st.running and _time.time() < deadline:
+        _time.sleep(0.02)
+    return not st.running
+
+
+def test_session_count_bumped_on_full_stop():
+    # WP-6: a normal "Stop and save" counts exactly one completed session. This is the path
+    # that already worked; it is pinned because the once-per-session guard added for the other
+    # paths must not break it. Sandboxed settings: the real settings.json is never touched.
+    st = webapp.STATE
+    saved = (st.running, st.stopping, st.source_kind, st.transcribing, st.recording,
+             st.session_counted, st.sink_error)
+    try:
+        with _sandbox_settings() as C:
+            st.running, st.stopping, st.source_kind = True, False, "live"
+            st.transcribing = st.recording = False
+            st.session_counted = False
+            r = client.post("/api/stop?what=all")
+            assert r.status_code == 200, r.text
+            assert C.load()["session_count"] == 1, C.load()
+            assert _wait_idle(st), "stop drain never finished"
+            # Stopping again finds nothing running (409) and cannot count a second time.
+            assert client.post("/api/stop?what=all").status_code == 409
+            assert C.load()["session_count"] == 1, C.load()
+    finally:
+        (st.running, st.stopping, st.source_kind, st.transcribing, st.recording,
+         st.session_counted, st.sink_error) = saved
+    print("  OK  /api/stop?what=all counts exactly one completed session")
+
+
+def test_session_count_bumped_on_transcription_branch_finalise():
+    # WP-6, the bug: "stop transcription" (recording continues) and then "stop recording"
+    # finalises the session inside _drain_transcription's `cap_to_stop is not None` branch,
+    # which never called _bump_session_count. That is how session_count sat at 1 for 50+
+    # meetings. No audio and no model: a fake engine gates the drain so the two stops
+    # interleave exactly as they do in the app.
+    import threading as _th
+    gate = _th.Event()
+    stopped = {"capture": False}
+
+    class _GatedEngine:
+        def pending(self):
+            return 0
+
+        def stop(self, drain=False):
+            gate.wait(10)      # hold the drain open until the test stops the recorder
+
+    class _FakeCapture:
+        def stop(self):
+            stopped["capture"] = True
+
+    st = webapp.STATE
+    saved = (st.running, st.stopping, st.source_kind, st.transcribing, st.recording,
+             st.engine, st.capture, st.md_sink, st.recorder, st.session_counted, st.sink_error)
+    try:
+        with _sandbox_settings() as C:
+            st.running, st.stopping, st.source_kind = True, False, "live"
+            st.transcribing, st.recording = True, True
+            st.engine, st.capture = _GatedEngine(), _FakeCapture()
+            st.md_sink = st.recorder = None
+            st.session_counted = False
+
+            r1 = client.post("/api/stop?what=transcription")
+            assert r1.status_code == 200 and r1.json()["stopped"] == "transcription", r1.text
+            r2 = client.post("/api/stop?what=recording")          # user stops recording mid-drain
+            assert r2.status_code == 200, r2.text
+            assert C.load()["session_count"] == 0, "counted before the session actually finalised"
+            gate.set()                                            # let the drain complete
+            assert _wait_idle(st), "transcription drain never finalised the session"
+            assert stopped["capture"], "the drain did not stop the capture"
+            assert C.load()["session_count"] == 1, \
+                f"partial-stop finalise did not count the session: {C.load()}"
+    finally:
+        gate.set()
+        (st.running, st.stopping, st.source_kind, st.transcribing, st.recording,
+         st.engine, st.capture, st.md_sink, st.recorder, st.session_counted, st.sink_error) = saved
+    print("  OK  the stop-transcription-then-recording finalise counts the session (WP-6 bug)")
+
+
+def test_session_count_never_double_bumps():
+    # WP-6: the finalisation paths can overlap (a window close while a UI stop is in flight),
+    # so the count is guarded by an explicit session-scoped flag, not by call-site discipline.
+    import threading as _th
+    st = webapp.STATE
+    saved = st.session_counted
+    try:
+        with _sandbox_settings() as C:
+            st.session_counted = False
+            webapp._bump_session_count()      # e.g. the what="all" stop
+            webapp._bump_session_count()      # e.g. the drain finalising the same session
+            assert C.load()["session_count"] == 1, C.load()
+            # Concurrent finalisers still count once.
+            st.session_counted = False
+            threads = [_th.Thread(target=webapp._bump_session_count) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+            assert C.load()["session_count"] == 2, f"double-counted under a race: {C.load()}"
+            # A new session clears the flag, so the NEXT session still counts.
+            st.session_counted = False
+            webapp._bump_session_count()
+            assert C.load()["session_count"] == 3, C.load()
+    finally:
+        st.session_counted = saved
+    # reset() (end of session) clears the flag, which is what re-arms the counter.
+    fresh = webapp._State()
+    fresh.session_counted = True
+    fresh.reset()
+    assert fresh.session_counted is False, "STATE.reset() must clear session_counted"
+    print("  OK  session count is bumped once per session (overlapping/concurrent finalisers, reset re-arms)")
+
+
+def test_session_count_failure_is_logged_not_raised():
+    # WP-6: the bump used to swallow every failure with `except Exception: pass`, so a
+    # settings.json that could not be written left the counter silently stuck. It must still
+    # never raise (finalisation must not break) but it must say so in the log.
+    import contextlib
+    import io
+    from live_transcribe import config as C
+    st = webapp.STATE
+    saved, orig_update = st.session_counted, C.update
+    try:
+        def _boom(d):
+            raise OSError("disk full")
+        C.update = _boom
+        st.session_counted = False
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            webapp._bump_session_count()      # must not raise
+        out = buf.getvalue()
+        assert "disk full" in out, f"bump failure was swallowed silently: {out!r}"
+    finally:
+        C.update = orig_update
+        st.session_counted = saved
+    print("  OK  a failed session count logs the reason and never raises")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_app_info,
@@ -805,7 +968,11 @@ if __name__ == "__main__":
                test_warm_up,
                test_summarise_accepts_instruction,
                test_model_update_status_logic,
-               test_model_update_endpoints):
+               test_model_update_endpoints,
+               test_session_count_bumped_on_full_stop,
+               test_session_count_bumped_on_transcription_branch_finalise,
+               test_session_count_never_double_bumps,
+               test_session_count_failure_is_logged_not_raised):
         try:
             fn()
         except AssertionError as e:

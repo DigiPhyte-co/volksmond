@@ -139,6 +139,10 @@ class _State:
         self.transcribing: bool = False
         self.source_kind: Optional[str] = None   # "live" | "file"
         self.stopping: bool = False  # True while draining the backlog after Stop
+        # True once this session has been counted (see _bump_session_count). More than one
+        # finalisation path can complete a session, so the "count it once" rule is an explicit
+        # session-scoped flag rather than an assumption that the call sites never overlap.
+        self.session_counted: bool = False
         # Sticky transcript/recording write error, surfaced via /api/status. Set
         # during finalisation and kept across reset() so the UI can show it after
         # the session ends; cleared when the next session starts.
@@ -169,6 +173,7 @@ class _State:
         self.transcribing = False
         self.source_kind = None
         self.stopping = False
+        self.session_counted = False
 
 
 STATE = _State()
@@ -696,6 +701,7 @@ def start(req: StartRequest):
         STATE.language = (language or "auto") if transcribe_on else None
         STATE.source_kind = "live"
         STATE.running = True
+        STATE.session_counted = False   # a fresh session is uncounted until it finalises
         STATE.mic_device = req.mic_device
         STATE.loopback_device = req.loopback_device
         STATE.chunk_seconds = chunk_seconds
@@ -896,6 +902,7 @@ def transcribe_file(req: TranscribeFileRequest):
         STATE.recorder = None
         STATE.source_kind = "file"
         STATE.running = True
+        STATE.session_counted = False   # a fresh session is uncounted until it finalises
 
     def _run():
         try:
@@ -1109,11 +1116,14 @@ def transcribe_file(req: TranscribeFileRequest):
             except Exception:
                 pass
             err = md_sink.last_error if md_sink else None
+            if not aborted:
+                # One completed file transcription (not a user cancel). Before reset(),
+                # like every other finalise path, so the count belongs to THIS session's
+                # counted-once flag and not to whatever starts next.
+                _bump_session_count()
             with STATE.lock:
                 STATE.reset()
                 STATE.sink_error = err
-            if not aborted:
-                _bump_session_count()  # one completed file transcription (not a user cancel)
 
     threading.Thread(target=_run, daemon=True, name="file-transcribe").start()
     return {
@@ -1127,14 +1137,27 @@ def transcribe_file(req: TranscribeFileRequest):
 
 
 def _bump_session_count():
-    """Count one completed session. Local only: it drives the one-time business-use
-    nudge in the UI and never leaves this machine (the model is honour-system, not
-    enforcement). A record-only session that is later re-transcribed can count twice;
-    that is fine for a soft nudge and simpler than tracking session identity."""
+    """Count one completed session, at most ONCE per session. Local only: it drives the
+    one-time business-use nudge in the UI and never leaves this machine (the model is
+    honour-system, not enforcement). A record-only session that is later re-transcribed
+    can count twice; that is fine for a soft nudge and simpler than tracking session
+    identity.
+
+    Three different paths can finalise one session (the what="all" stop, the partial-stop
+    drain that turns into a full finalise, and the window-close handler that may fire while
+    a UI stop is already in flight), so "once per session" is enforced here by an explicit
+    STATE flag cleared at session start and in STATE.reset(), not by hoping the call sites
+    never overlap. Never raises - a failed count must not break finalisation - but the
+    failure is printed (stdout is captured in volksmond.log) instead of vanishing, because
+    a silently stuck counter is exactly how session_count sat at 1 for 50+ sessions."""
+    with STATE.lock:
+        if STATE.session_counted:
+            return
+        STATE.session_counted = True
     try:
         config.update({"session_count": int(config.load().get("session_count", 0)) + 1})
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[session-count] could not record completed session: {e}", flush=True)
 
 
 @app.post("/api/stop")
@@ -1221,6 +1244,11 @@ def stop(what: str = "all"):
                         cap_to_stop.stop()
                     except Exception:
                         pass
+                    # This branch IS the end of the session (transcription was stopped
+                    # first, recording stopped while we drained), so it must count like
+                    # any other finalise. Outside STATE.lock: _bump_session_count takes
+                    # it itself. Idempotent, so a racing what="all" cannot double-count.
+                    _bump_session_count()
                     with STATE.lock:
                         saved_err = STATE.sink_error
                         STATE.reset()

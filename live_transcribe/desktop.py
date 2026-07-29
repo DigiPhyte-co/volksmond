@@ -20,6 +20,12 @@ HOST = "127.0.0.1"
 PREFERRED_PORT = 8765
 WINDOW_TITLE = "Volksmond"
 
+# How long the close is allowed to wait for a running session to finalise. Long enough for
+# a normal stop (capture stop + a short ASR backlog + closing the files), short enough that
+# a wedged drain never turns into an unclosable window. Past this we let the window go and
+# rely on the sinks' atexit handlers to flush what is left.
+CLOSE_FINALISE_TIMEOUT = 5.0
+
 
 def free_port(preferred=PREFERRED_PORT):
     """Return `preferred` if it's free, otherwise an OS-assigned free port."""
@@ -72,6 +78,91 @@ def _keep_alive(server, url, open_browser):
     except KeyboardInterrupt:
         pass
     server.should_exit = True
+
+
+def finalise_open_session(timeout=CLOSE_FINALISE_TIMEOUT, poll=0.05, lock_timeout=0.5):
+    """Finalise a running session the way the UI's "Stop and save" does, so closing the
+    window is a real end-of-session and not a silent one.
+
+    Before this existed, closing the window went straight to `server.should_exit = True`:
+    the transcript and recording were only saved because MarkdownSink/AudioRecorder register
+    atexit handlers, and the app's own stop path (which counts the session and lets the UI
+    finish it) never ran. Result: session_count stuck at 1 across 50+ real meetings.
+
+    Approach: call the `/api/stop?what=all` handler IN-PROCESS rather than doing an HTTP
+    self-call. The window-close handler runs on the GUI thread; an HTTP call would make
+    closing the window depend on the uvicorn thread being healthy and on a socket round
+    trip, for no gain (the handler is a plain function - FastAPI's decorator returns it
+    unchanged).
+
+    Deadlock analysis (this runs on the GUI thread, which must always get to return):
+      * The stop call is made on a throwaway daemon thread, so even a stop that blocks
+        forever cannot hold the window open.
+      * This function never holds STATE.lock while waiting, and every acquisition is
+        bounded (`lock_timeout`); if the lock is busy we give up and let atexit do it.
+        So no lock held by a request thread can wedge the close.
+      * The wait for the drain is a bounded poll (`timeout`), never a join on the drain
+        thread, and `/api/stop` itself only holds STATE.lock briefly before handing off
+        to its own daemon thread.
+      * The bump happens synchronously inside the stop handler, so the session is counted
+        even when the drain outlives the timeout.
+    Worst case the GUI thread blocks for about `timeout` and the window then closes.
+
+    Returns a short status string: "idle" (nothing was running), "finalised", "timeout"
+    (still draining; atexit is the backstop) or "unavailable".
+    """
+    try:
+        from .web import app as webapp
+    except Exception as exc:                       # pragma: no cover - import can't realistically fail here
+        print(f"[desktop] close: session state unavailable ({exc})", flush=True)
+        return "unavailable"
+    state = webapp.STATE
+
+    def _flags():
+        """(running, stopping) or None if the lock did not come free in time."""
+        if not state.lock.acquire(timeout=lock_timeout):
+            return None
+        try:
+            return bool(state.running), bool(state.stopping)
+        finally:
+            state.lock.release()
+
+    flags = _flags()
+    if flags is None:
+        print("[desktop] close: session lock busy, leaving finalisation to atexit", flush=True)
+        return "unavailable"
+    running, stopping = flags
+    if not running:
+        return "idle"          # the common case: nothing running, close immediately
+
+    if not stopping:           # a stop already in flight finalises on its own; don't start a second one
+        def _stop():
+            try:
+                webapp.stop(what="all")
+            except Exception as exc:   # 409 if the UI's own stop won the race - harmless
+                print(f"[desktop] close: stop reported {exc!r}", flush=True)
+        threading.Thread(target=_stop, daemon=True, name="close-stop").start()
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(poll)
+        flags = _flags()
+        if flags is not None and not flags[0]:
+            print("[desktop] close: session finalised", flush=True)
+            return "finalised"
+    print(f"[desktop] close: session still finalising after {timeout:.1f}s; closing anyway "
+          "(the transcript and recording are flushed by their atexit handlers)", flush=True)
+    return "timeout"
+
+
+def _on_closing():
+    """pywebview `closing` handler. It runs synchronously on the GUI thread and can VETO
+    the close by returning False, so this must never return False and never raise."""
+    try:
+        finalise_open_session()
+    except Exception as exc:
+        print(f"[desktop] close: finalisation failed ({exc})", flush=True)
+    return True
 
 
 class DesktopApi:
@@ -157,6 +248,10 @@ def main(argv=None):
             js_api=api,
         )
         api._window = window     # MUST stay underscored (see DesktopApi docstring)
+        # Closing the window must finalise a running session first (see
+        # finalise_open_session): `closing` is the only event that still runs while the
+        # server and the session threads are alive.
+        window.events.closing += _on_closing
         webview.start()          # blocks until the window is closed
         server.should_exit = True
     else:
