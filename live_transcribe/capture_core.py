@@ -21,6 +21,7 @@ from scipy.signal import resample_poly
 
 TARGET_RATE = 16000          # faster-whisper input rate
 BLOCK_SECONDS = 0.5          # audio callback granularity
+RING_FRAME_SECONDS = 0.1     # energy-ring resolution (see _ring_frames)
 
 # Silence-aware chunking: when the buffer reaches `chunk_seconds`, we try to
 # cut at a natural silence boundary in the last ~2s so sentences end cleanly.
@@ -116,6 +117,35 @@ def iter_silence_chunks(audio: np.ndarray, sample_rate: int = TARGET_RATE,
         pos += cut
 
 
+def _ring_frames(t_start, arr, rate, frame_s=RING_FRAME_SECONDS):
+    """Sub-frame one raw block into ~frame_s energy samples: yields (t, dBFS) pairs.
+
+    `t_start` is the session-clock time of the block's FIRST sample (block START, not arrival),
+    so each yielded timestamp is the true time of the audio it describes. The RMS is taken over
+    all channels, exactly like the block-level `_rms` in `_ingest_block`, and converted with the
+    same `20*log10(x + 1e-9)`, so MIC and SYS ring samples stay directly comparable.
+
+    100 ms rather than one sample per 0.5 s block: coverage tests (echo veto, speech evidence)
+    need frame-level resolution - a 1 s segment used to give 2 samples, which cannot express a
+    fraction. Costs 5 tiny RMS calls per block instead of 1 and ~6000 floats per ring.
+    A block shorter than one frame yields a single sample; a trailing remainder shorter than
+    half a frame is folded away (energy statistics, not audio - nothing is lost downstream).
+    """
+    fr = max(1, int(rate * frame_s))
+    n = arr.shape[0]
+    if n < fr:
+        yield t_start, 20.0 * float(np.log10(float(np.sqrt(np.mean(arr * arr))) + 1e-9))
+        return
+    i = 0
+    while i + fr <= n:
+        w = arr[i:i + fr]
+        yield t_start + i / rate, 20.0 * float(np.log10(float(np.sqrt(np.mean(w * w))) + 1e-9))
+        i += fr
+    if n - i >= fr // 2:
+        w = arr[i:]
+        yield t_start + i / rate, 20.0 * float(np.log10(float(np.sqrt(np.mean(w * w))) + 1e-9))
+
+
 class CaptureBase:
     """Shared capture state + logic. Backends implement `_open_sources()`
     (open devices, register each via `_register_source`, raise if nothing
@@ -158,13 +188,16 @@ class CaptureBase:
         self._t0_init = t0
         self._workers = []
         self._levels = {}         # source -> (peak, rms), latest input level for a live meter
-        self._sys_ring = None     # optional transcribe.SysEnergyRing, fed SYS block RMS for the echo veto
+        self._sys_ring = None     # optional transcribe.EnergyRing, fed raw SYS energy for the echo veto
+        self._mic_ring = None     # optional transcribe.EnergyRing, fed RAW (pre-APM) MIC energy
 
         # Per-source state, keyed by "MIC" / "SYS"
         self._buffers = {}        # source -> list[np.ndarray]
         self._buffer_counts = {}  # source -> int (frames)
         self._buffer_locks = {}   # source -> threading.Lock
         self._rates = {}          # source -> int (native rate)
+        self._native_rates = {}   # source -> int (the rate as OPENED; _rates["MIC"] is rewritten to
+                                  # 16k when the APM engages, but the callback's blocks stay native)
         self._channels = {}       # source -> int
 
     # ---- backend seam -------------------------------------------------
@@ -189,6 +222,11 @@ class CaptureBase:
         self._buffer_counts[source] = 0
         self._buffer_locks[source] = threading.Lock()
         self._rates[source] = rate
+        # The rate this device was OPENED at, never rewritten. start() sets _rates["MIC"] (and
+        # SYS) to TARGET_RATE once the APM worker engages, because the CHUNK BUFFER then holds
+        # 16k audio - but the blocks arriving at _ingest_block are still native, so the energy
+        # ring's block-start timestamps must divide by this rate, not _rates.
+        self._native_rates[source] = rate
         self._channels[source] = channels
 
     def _worker_takes(self, la, source):
@@ -209,24 +247,33 @@ class CaptureBase:
 
     def _ingest_block(self, source, arr):
         """Take one float32 block, shaped (frames, channels), from a backend's
-        audio thread: level calc, SYS-ring feed, AEC routing, and the
-        under-lock re-check before appending to the chunk buffer."""
+        audio thread: level calc, energy-ring feed (MIC + SYS), AEC routing, and
+        the under-lock re-check before appending to the chunk buffer."""
         # Cheap per-block level for the live meter (peak + RMS, 0..1). A single
         # dict assignment, so the reader (levels()) never sees a torn value.
         # When the APM worker takes this source the meter is fed from _append_16k
         # instead, so it shows what the engine actually hears (AGC-boosted /
-        # echo-cancelled), not the raw device level; the SYS ring below ALWAYS reads
-        # the raw block (the echo veto keys off the true far-end level, which the
-        # worker passes through unchanged anyway).
+        # echo-cancelled), not the raw device level; the energy rings below ALWAYS read
+        # the raw block (the guards key off true device levels, and the far end passes
+        # through the worker unchanged anyway).
         if arr.size:
             _rms = float(np.sqrt(np.mean(arr * arr)))
             if not self._worker_takes(self._live_aec, source):
                 self._levels[source] = (float(np.max(np.abs(arr))), _rms)
-            # Feed the SYS energy ring (engine echo veto): one RMS sample per block,
-            # timestamped on the session clock (same _t0 as chunk t_start). SYS only.
-            _ring = self._sys_ring
-            if _ring is not None and source == "SYS" and self._t0 is not None:
-                _ring.add(time.monotonic() - self._t0, 20.0 * np.log10(_rms + 1e-9))
+            # Feed this source's energy ring: 100 ms RMS samples from the RAW (pre-APM) block,
+            # timestamped on the session clock (same _t0 as chunk t_start) at block START.
+            # This is the tap that makes the MIC feed gain-invariant: the engine's silence gate
+            # and echo veto used to read the AGC-boosted CHUNK for the mic while reading the raw
+            # block for SYS, so a relative test compared a gain-controlled signal against a raw
+            # one. Both sides now come from here, same seam, same RMS definition, same clock.
+            _ring = self._sys_ring if source == "SYS" else (self._mic_ring if source == "MIC" else None)
+            if _ring is not None and self._t0 is not None:
+                # Native rate, NOT self._rates: start() rewrites _rates["MIC"] to 16k when the
+                # APM engages while these blocks stay at the device rate.
+                _nr = self._native_rates.get(source) or self._rates.get(source) or TARGET_RATE
+                _tb = time.monotonic() - self._t0 - arr.shape[0] / _nr
+                for _t, _db in _ring_frames(_tb, arr, _nr):
+                    _ring.add(_t, _db)
         # Live echo cancellation (when engaged): hand the mono block to the APM worker
         # instead of the native chunk buffer; the worker resamples + cancels and feeds
         # the (now 16k) chunk buffer itself. A SYS block a mic-only (AGC-only) worker
@@ -430,10 +477,20 @@ class CaptureBase:
         return out
 
     def attach_sys_ring(self, ring):
-        """Attach a transcribe.SysEnergyRing. The audio callback then feeds it one SYS RMS sample
-        per ~0.5 s block in real time, so the engine's echo veto has a current far-end reference
-        even during a monologue (when SYS chunks emit late)."""
+        """Attach a transcribe.EnergyRing for the far end. The audio callback then feeds it 100 ms
+        RMS samples from every raw SYS block in real time, so the engine's echo veto has a current
+        far-end reference even during a monologue (when SYS chunks emit late)."""
         self._sys_ring = ring
+
+    def attach_mic_ring(self, ring):
+        """Attach a transcribe.EnergyRing for the near end, fed from the RAW (pre-APM) mic blocks.
+
+        The mic the engine transcribes is AGC-boosted, so chunk energy says nothing about how loud
+        the room actually was: the silence gate and the echo veto's mic side need this raw feed to
+        stay on their calibrated absolute basis (-45 dBFS floor, -28 dBFS ceiling, 10 dB margin).
+        Separate method rather than a `source` argument on attach_sys_ring: several test stubs
+        implement `attach_sys_ring` by name."""
+        self._mic_ring = ring
 
     def _chunker(self, source):
         rate = self._rates[source]

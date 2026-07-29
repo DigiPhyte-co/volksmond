@@ -18,6 +18,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
@@ -28,7 +29,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .. import audioboost, buildflags, capture, config, licensing, paths, sinks, transcribe
+from .. import audioboost, buildflags, capture, config, licensing, paths, silencewatch, sinks, transcribe
 from ..__main__ import default_chunk_seconds, pick_tier, resolve_tier
 
 app = FastAPI(title="SA-Live-Transcribe")
@@ -151,6 +152,14 @@ class _State:
         # /api/status the same sticky way (e.g. "stereo interview requested but the file
         # is mono"). Cleared when the next session starts.
         self.notice: Optional[str] = None
+        # Long-silence nudge (WP-9b). silence_nudge is the outstanding warning the UI
+        # renders as a banner ({"minutes", "count", "at"}) or None; silence_watch is the
+        # SilenceWatch the 1 Hz watcher thread ticks and the endpoint answers; silence_stop
+        # is that thread's exit signal. All three are session-scoped, so reset() clears
+        # them (and sets the event, so a watcher can never outlive its session).
+        self.silence_nudge: Optional[dict] = None
+        self.silence_watch = None
+        self.silence_stop: Optional[threading.Event] = None
 
     def reset(self):
         self.engine = None
@@ -174,6 +183,13 @@ class _State:
         self.source_kind = None
         self.stopping = False
         self.session_counted = False
+        # Signal BEFORE dropping the reference: reset() is the one call every finalisation
+        # path makes, so this is what guarantees no silence watcher survives its session.
+        if self.silence_stop is not None:
+            self.silence_stop.set()
+        self.silence_stop = None
+        self.silence_watch = None
+        self.silence_nudge = None
 
 
 STATE = _State()
@@ -224,6 +240,206 @@ def _feed(source, audio, t_start):
         rec.on_chunk(source, audio, t_start)
     if eng is not None:
         eng.on_chunk(source, audio, t_start)
+
+
+# --- long-silence nudge (WP-9b) ------------------------------------------------
+# A live session that hears NOTHING for minutes is almost always broken rather than quiet:
+# Windows moved the default mic to a headset in a drawer, the meeting app took the device
+# exclusively, or the mic is muted in the OS mixer. The app looks busy the whole time, so
+# the user finds out an hour later. This watcher says it once, in the app and (on Windows)
+# as a desktop notification, and offers to stop and save.
+#
+# Signal: the WP-4 raw energy rings on the ENGINE (mic_env / sys_env), which are fed per
+# 100 ms frame from the RAW pre-APM capture blocks. Deliberately NOT capture.levels() /
+# /api/levels: the mic side of those is POST-AGC, and live AGC lifts an empty room toward
+# -25 dBFS, so a silence test there would never fire. Reading the rings also means zero
+# change to capture_core.py.
+SILENCE_ENV = "SA_LIVE_SILENCE_NUDGE"
+SILENCE_TICK_S = 1.0        # watcher cadence
+SILENCE_LOOKBACK_S = 2.0    # ring window each tick: wider than the tick so a late 0.5 s
+                            # block, or a tick that drifts under load, cannot read as silence
+
+
+def _silence_env_on() -> bool:
+    """False when SA_LIVE_SILENCE_NUDGE is set to 0/false/no/off: the hard kill switch,
+    checked before anything else so a support session can turn the whole feature off."""
+    return (os.environ.get(SILENCE_ENV, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _silence_settings():
+    """(on, threshold_s) for this session, from the env kill switch plus settings.
+
+    The minutes value is clamped rather than restricted to the picker's 3/5/10/15, so a
+    hand-edited settings file gets what it asked for as long as it is sane."""
+    if not _silence_env_on():
+        return False, 0.0
+    try:
+        cfg = config.load()
+    except Exception:
+        return True, 300.0
+    on = cfg.get("silence_nudge", True) is not False
+    try:
+        mins = int(cfg.get("silence_nudge_minutes", 5) or 5)
+    except (TypeError, ValueError):
+        mins = 5
+    mins = max(1, min(120, mins))
+    return on, float(mins * 60)
+
+
+def _silence_tick(engine, watch, now):
+    """One watcher tick: read the rings, feed the watch, and on a trip publish the nudge.
+
+    Split out of the loop and given its arguments explicitly so the whole decision path is
+    driveable from a test with a fake engine and a hand-wound clock, no threads involved.
+    Returns the published nudge dict, or None.
+
+    `now` MUST be on the SESSION clock (time.monotonic() - capture._t0), because that is
+    the clock the rings are timestamped on (capture_core._ingest_block). Mixing in a wall
+    clock would query a window the rings never had frames in, and every tick would read as
+    silence.
+    """
+    if engine is None or watch is None or now is None:
+        return None
+    levels = {}
+    for name, attr in (("MIC", "mic_env"), ("SYS", "sys_env")):
+        ring = getattr(engine, attr, None)
+        if ring is None:
+            continue          # this channel has no ring: not measurable, so not a source
+        try:
+            levels[name] = ring.max_db(now - SILENCE_LOOKBACK_S, now)
+        except Exception:
+            levels[name] = None
+    try:
+        tripped = watch.sample(now, levels)
+    except Exception:
+        return None
+    if not tripped:
+        return None
+    st = watch.state()
+    minutes = st.get("minutes") or silencewatch.minutes_of(watch.threshold_s)
+    nudge = {"minutes": minutes, "count": st.get("nudges", 1),
+             "at": datetime.now().isoformat(timespec="seconds")}
+    with STATE.lock:
+        # A session that is already finishing must never be nudged: the audio has stopped
+        # on purpose, and the user is watching the drain.
+        if STATE.stopping:
+            return None
+        # Re-check the watch itself, under the lock, immediately before publishing. sample()
+        # decided to trip a few microseconds ago on the watcher thread; in that gap the request
+        # thread can have answered the banner (mute) or the session can have been replaced by a
+        # device switch or a new start. Publishing then puts a nudge on screen the user has
+        # already dismissed, or attributes one session's silence to another. SilenceWatch's own
+        # lock makes each transition atomic; this is the second half of the same problem, and it
+        # has to be settled here because only STATE knows which watch is current.
+        if STATE.silence_watch is not watch:
+            return None
+        if watch.state().get("muted"):
+            return None
+        STATE.silence_nudge = nudge
+    # Best-effort desktop notification: notify.show() is a no-op when os_toasts is off, on
+    # a non-Windows machine or without pywin32, and never raises. Clicking it brings the
+    # window forward, where the banner is already waiting.
+    from .. import notify
+    notify.show(f"Nothing heard for {minutes} minutes",
+                "Volksmond is still recording, but the microphone and the system audio have "
+                "both been silent. Check your device, or stop and save.",
+                tag="silence", on_click=notify.focus_app)
+    return nudge
+
+
+def _silence_loop(stop, t0):
+    """The 1 Hz watcher thread. Exits within one tick of the session ending.
+
+    Everything except the session's t0 is re-read from STATE each tick (the same posture as
+    _feed), so a device switch, a mid-meeting /api/reconfigure or a mute/snooze needs no
+    rebinding here: whatever rings the engine currently holds are the ones read. t0 is the
+    exception because it is fixed for the session, and is threaded through a device switch
+    on purpose (see switch_device) - so the clock survives even a switch that ends with no
+    capture at all, which is exactly the dead-capture case this watcher must still catch.
+    """
+    while not stop.wait(SILENCE_TICK_S):
+        with STATE.lock:
+            if not STATE.running or STATE.stopping or STATE.source_kind != "live":
+                return
+            engine = STATE.engine
+            watch = STATE.silence_watch
+        if watch is None:
+            return
+        try:
+            _silence_tick(engine, watch, time.monotonic() - t0)
+        except Exception:
+            pass          # a watchdog must never take the session down with it
+
+
+def _silence_start(cap):
+    """Arm the watcher for a live session. Returns the thread, or None when it is off.
+
+    Called at the very end of /api/start's LIVE branch (with STATE.lock held) and nowhere
+    else: file transcription never gets a watcher, because a file that goes quiet is just a
+    quiet file.
+    """
+    on, threshold_s = _silence_settings()
+    if not on:
+        return None
+    # Record-only (no engine) has no energy rings, because the rings live on the engine and are
+    # fed by the capture callback for it. A watcher started here would read an empty levels dict
+    # every tick, which sample() correctly treats as absence of evidence rather than silence: it
+    # could never trip, but /api/status would report an armed watch and the feature would look
+    # like it was covering a session it cannot see. Say so once and stay out. Giving record-only
+    # real coverage means moving the rings off the engine (or feeding a second pair from
+    # capture_core); that is future work, deliberately not smuggled in behind a nudge.
+    if STATE.engine is None:
+        print("[silence] watcher not started (record-only session has no energy rings)", flush=True)
+        return None
+    t0 = getattr(cap, "_t0", None)
+    if t0 is None:
+        return None       # no session clock, so no honest ring query: stay quiet
+    watch = silencewatch.SilenceWatch(threshold_s=threshold_s)
+    stop = threading.Event()
+    STATE.silence_watch = watch
+    STATE.silence_stop = stop
+    STATE.silence_nudge = None
+    th = threading.Thread(target=_silence_loop, args=(stop, t0), daemon=True, name="silence-watch")
+    th.start()
+    return th
+
+
+def _silence_after_switch():
+    """Restart the silence clock after a live device switch. Caller holds STATE.lock.
+
+    Two reasons, both real: a switch tears the capture down for about a second (a gap the
+    rings genuinely have no frames for), and changing the mic IS the fix the nudge asks
+    for, so an outstanding warning should clear rather than sit there contradicting the
+    user's action. The nudge COUNT is untouched, so the per-session cap still holds.
+
+    Note what is deliberately NOT here: rebinding the watcher to the engine's rings.
+    _silence_loop re-reads STATE.engine every tick, so it already follows whatever rings
+    the engine holds (the switch re-attaches the SAME ring objects anyway), and the session
+    clock it uses is the t0 threaded through the rebuild.
+    """
+    watch = STATE.silence_watch
+    STATE.silence_nudge = None
+    if watch is None:
+        return
+    t0 = getattr(STATE.capture, "_t0", None)
+    try:
+        # No usable t0 (a failed switch can leave no capture at all): snooze() with no
+        # argument restarts from the last SAMPLED clock value, which is always honest.
+        watch.snooze(None if t0 is None else time.monotonic() - t0)
+    except Exception:
+        pass
+
+
+def _silence_signal():
+    """Tell the watcher to exit now and forget it. Caller holds STATE.lock.
+
+    reset() does this too, but reset happens after the drain, which can take a while; a
+    stop should not leave a watcher ticking over a session that is finishing."""
+    ev, STATE.silence_stop = STATE.silence_stop, None
+    STATE.silence_watch = None
+    STATE.silence_nudge = None
+    if ev is not None:
+        ev.set()
 
 
 class StartRequest(BaseModel):
@@ -346,6 +562,9 @@ def status():
             "notice": STATE.notice,
             "mic_device": STATE.mic_device,
             "loopback_device": STATE.loopback_device,
+            # The outstanding long-silence warning ({"minutes","count","at"}) or None. The UI
+            # polls this while a live session runs and floats a banner when it appears.
+            "silence_nudge": STATE.silence_nudge,
         }
         # Live AEC truth for the in-meeting toggle: the ENGINE'S actual state, never the stored
         # setting (a long-running instance can drift from disk; the toggle must not lie).
@@ -413,8 +632,13 @@ def switch_device(req: SwitchDeviceRequest):
                                      on_chunk=_feed, t0=old_cap._t0, aec=old_cap.aec,
                                      agc=old_cap.agc, record_raw_mic=old_cap.record_raw_mic)
             eng = STATE.engine
+            # Re-attach BOTH energy rings, or the guards' level reference dies at the first
+            # mid-meeting device change (the rings survive on the engine; the new capture has to
+            # be told about them). Same rings, same session clock, so history stays continuous.
             if eng is not None and getattr(eng, "sys_env", None) is not None:
                 c.attach_sys_ring(eng.sys_env)   # keep the echo-veto reference fed across the switch
+            if eng is not None and getattr(eng, "mic_env", None) is not None:
+                c.attach_mic_ring(eng.mic_env)   # keep the raw-mic (gain-invariant) feed alive
             return c
 
         def _reset_loop_history():
@@ -453,6 +677,7 @@ def switch_device(req: SwitchDeviceRequest):
                 revert.start()
                 STATE.capture = revert
                 _reset_loop_history()   # the revert is a device change too (capture gap included)
+                _silence_after_switch()
             except Exception:
                 if revert is not None:
                     try:
@@ -465,7 +690,40 @@ def switch_device(req: SwitchDeviceRequest):
         STATE.record_raw_mic = new_cap.has_raw_mic()   # AEC may re-engage (or not) on the new device
         STATE.mic_device, STATE.loopback_device = mic, loop
         _reset_loop_history()
+        _silence_after_switch()
         return {"which": req.which, "device": req.device, "mic_device": mic, "loopback_device": loop}
+
+
+class SilenceNudgeRequest(BaseModel):
+    action: Literal["snooze", "mute"]
+
+
+@app.post("/api/silence-nudge")
+def silence_nudge_action(req: SilenceNudgeRequest):
+    """Answer an outstanding long-silence warning, from the banner's own buttons.
+
+    "snooze" ("Keep recording") clears it and restarts the silence clock, so a session that
+    stays silent is warned once more (the watcher caps the session at two); "mute" (the X)
+    stops it asking for the rest of the session. Neither touches the audio, and neither is
+    persisted: both are answers about THIS meeting, not settings.
+
+    409 when there is no live session to answer for, which is also what the UI gets if the
+    session ended between the banner appearing and the click landing."""
+    with STATE.lock:
+        if not STATE.running or STATE.source_kind != "live":
+            raise HTTPException(status_code=409, detail="No live session is running.")
+        watch = STATE.silence_watch
+        STATE.silence_nudge = None
+        if watch is not None:
+            # No clock argument: the watch restarts from the last value the watcher sampled,
+            # so the request thread never has to reconstruct the session clock.
+            if req.action == "mute":
+                watch.mute()
+            else:
+                watch.snooze()
+        st = watch.state() if watch is not None else {}
+        return {"action": req.action, "silence_nudge": None,
+                "muted": bool(st.get("muted")), "nudges": st.get("nudges", 0)}
 
 
 class AecLiveRequest(BaseModel):
@@ -738,11 +996,18 @@ def start(req: StartRequest):
             record_raw_mic=False,   # record the AEC-cleaned mic into the single stereo file, not a raw stem
         )
         # Feed a SYS energy ring from live capture so the engine vetoes MIC echo segments in real
-        # time. Fed per-block from the callback (not from late SYS chunks); see SysEnergyRing.
+        # time. Fed per-block from the callback (not from late SYS chunks); see EnergyRing.
+        # The MIC ring is the same feed for the near end, tapped RAW (pre-APM), so the silence gate
+        # and the veto's mic side stay gain-invariant under live AGC. Both are attached BEFORE
+        # cap.start() so no early block is missed. SA_LIVE_RAW_MIC_RING=0 skips the mic ring.
         if engine is not None:
-            _sys_ring = transcribe.SysEnergyRing()
+            _sys_ring = transcribe.EnergyRing()
             engine.sys_env = _sys_ring
             cap.attach_sys_ring(_sys_ring)
+            if transcribe.raw_mic_ring_on():
+                _mic_ring = transcribe.EnergyRing()
+                engine.mic_env = _mic_ring
+                cap.attach_mic_ring(_mic_ring)
         try:
             cap.start()
         except Exception as e:
@@ -758,6 +1023,9 @@ def start(req: StartRequest):
         # True only if live AEC actually engaged (the raw side channel exists). If AEC could not
         # start, this stays False and the recorder takes the normal MIC, which is already raw.
         STATE.record_raw_mic = cap.has_raw_mic()
+        # Long-silence watcher: LIVE sessions only, and only when the setting and the env kill
+        # switch both allow it. Started last, once the capture is up, so it reads a real t0.
+        _silence_start(cap)
 
         return {
             "tier": tier if transcribe_on else None,
@@ -978,20 +1246,37 @@ def transcribe_file(req: TranscribeFileRequest):
                     # the kept frames, and gate-zeroed bleed stays zero at any gain. Boosting
                     # BOTH channels jointly when either qualifies was rejected: it still shifts
                     # the relative levels (each channel needs a different gain to reach -20)
-                    # and needlessly rewrites a healthy channel. The ring below is built from
+                    # and needlessly rewrites a healthy channel. The SYS ring below is built from
                     # the boosted SYS so the engine's echo veto sees the same signal it
-                    # transcribes; the veto's relative margin loosens by the gain difference
-                    # for MIC segments, which is safe because the gate has already zeroed the
-                    # bleed the veto exists to catch, and a boosted MIC clears the veto's
-                    # -28 dBFS absolute ceiling, so quiet REAL speech can no longer be vetoed.
+                    # transcribes. (Before WP-4 the veto read the MIC from the BOOSTED chunk, which
+                    # loosened its relative margin by the gain difference and pushed a boosted MIC
+                    # over the -28 dBFS ceiling - safe-by-accident, since it could then veto almost
+                    # nothing. The mic ring below restores the calibrated basis on this path too,
+                    # so the veto is live again here: bleed the cross-channel gate missed can now
+                    # be dropped, and the -28 ceiling means what it was measured to mean.)
+                    # The MIC energy ring is built from the UNBOOSTED channel, for the same reason
+                    # the cross-channel gate runs before the boost: the mic level tests (silence
+                    # gate, echo veto ceiling) are calibrated on unboosted audio, and a per-channel
+                    # boost would shift the MIC/SYS relationship by the gain difference. This is the
+                    # file path's stand-in for the live raw tap - the recording is already
+                    # AGC-processed, so the ring is marked non-raw and the silence gate derives its
+                    # floor from the channel's own speech level instead of the absolute -45.
+                    _mic_unboosted = mic_ch
                     mic_ch = _boost("MIC", mic_ch)
                     sys_ch = _boost("SYS", sys_ch)
                     # Build the SYS energy ring from the aligned far-end channel so the engine's echo
                     # veto has a reference for every MIC segment (the same mechanism it uses live).
-                    _ring = transcribe.SysEnergyRing(retain_s=len(sys_ch) / 16000.0 + 60.0)
-                    for _i in range(0, len(sys_ch), 8000):
-                        _ring.add_block(_i / 16000.0, sys_ch[_i:_i + 8000])
+                    # 100 ms frames on both, matching the live rings' resolution.
+                    _retain = len(sys_ch) / 16000.0 + 60.0
+                    _ring = transcribe.EnergyRing(retain_s=_retain, raw=False)
+                    for _i in range(0, len(sys_ch), 1600):
+                        _ring.add_block(_i / 16000.0, sys_ch[_i:_i + 1600])
                     engine.sys_env = _ring
+                    if transcribe.raw_mic_ring_on():
+                        _mring = transcribe.EnergyRing(retain_s=_retain, raw=False)
+                        for _i in range(0, len(_mic_unboosted), 1600):
+                            _mring.add_block(_i / 16000.0, _mic_unboosted[_i:_i + 1600])
+                        engine.mic_env = _mring
                     for src, chan in (("MIC", mic_ch), ("SYS", sys_ch)):
                         for i, chunk in iter_silence_chunks(chan, 16000, chunk_seconds):
                             chunk = _np.ascontiguousarray(chunk)
@@ -1224,6 +1509,9 @@ def stop(what: str = "all"):
                 return {"stopped": "transcription", "stopping": True, "pending": pending, "output_path": out}
             STATE.stopping = True
             STATE.transcribing = False
+            # Transcription is what owns the energy rings, so once it goes there is nothing
+            # left to measure silence with: stop the watcher rather than leave it blind.
+            _silence_signal()
             engine = STATE.engine
             md_sink = STATE.md_sink
             pending = engine.pending() if engine else 0
@@ -1286,6 +1574,7 @@ def stop(what: str = "all"):
             pending = STATE.engine.pending() if STATE.engine else 0
             return {"stopping": True, "pending": pending, "output_path": out}
         STATE.stopping = True
+        _silence_signal()   # the session is over; the watcher must not outlive the drain
         engine = STATE.engine
         cap = STATE.capture
         md_sink = STATE.md_sink
@@ -1522,6 +1811,9 @@ class SettingsPatch(BaseModel):
     business_nudge_seen: Optional[bool] = None
     summary_footer: Optional[bool] = None
     calendar_reminders: Optional[bool] = None
+    os_toasts: Optional[bool] = None        # Windows desktop notifications (toasts); shared by every notifying feature
+    silence_nudge: Optional[bool] = None    # warn when nothing has been heard for a long stretch of a live session
+    silence_nudge_minutes: Optional[int] = None   # how long that stretch is (picker: 3/5/10/15)
     live_notes_width: Optional[int] = None  # live-screen notes column width (px); 0 = default
     # summary_model is intentionally NOT settable here: only the verified downloader
     # (modeldl.py) sets it, to a pinned catalogue filename, so an arbitrary or
@@ -2051,7 +2343,10 @@ if not buildflags.OFFLINE_ONLY:
             raise HTTPException(status_code=402, detail="Calendar reminders need a business licence.")
         from .. import outlook_local
         try:
-            meeting = outlook_local.current_or_next_meeting()
+            # 1 hour, not the 8-hour default: this poll only needs the reminder window (+2/-15 min),
+            # and the lookahead is what drives Outlook's recurrence expansion, now paid once per
+            # account. /api/calendar-seed keeps 8 hours, since that one is user-initiated.
+            meeting = outlook_local.current_or_next_meeting(look_ahead_hours=1)
         except outlook_local.OutlookUnavailable:
             return {"available": False, "found": False}
         if not meeting:
@@ -2065,6 +2360,38 @@ if not buildflags.OFFLINE_ONLY:
                 starts_in_min = None
         return {"available": True, "found": True, "subject": meeting["subject"],
                 "attendees": meeting["attendees"], "start": start, "starts_in_min": starts_in_min}
+
+    class NotifyMeetingRequest(BaseModel):
+        subject: Optional[str] = None
+        # The meeting's start time, as the UI already has it (app.js reminderTick). Only used to
+        # make the coalescing tag unique per OCCURRENCE: a weekly "Standup" is the same subject
+        # every week, and a tag of just "meeting" would swallow every one after the first.
+        start: Optional[str] = None
+
+    @app.post("/api/notify-meeting")
+    def notify_meeting(req: NotifyMeetingRequest):
+        """Show a Windows notification for a meeting that is starting.
+
+        Fired by the UI's own calendar poll (app.js reminderTick), not by a second server-side
+        loop: the poll is client-driven either way, and the UI already owns the once-per-meeting
+        bookkeeping, so a server-side watcher would mean another thread, another COM init and a
+        duplicate dedup table for nothing.
+
+        Sits with the calendar routes, inside the OFFLINE_ONLY guard and behind the same Business
+        entitlement, because this notification IS the calendar reminder wearing a different coat.
+        The generic notification machinery (notify.py) is not gated and not compiled out; only this
+        calendar-shaped use of it is. Never starts anything: clicking the toast just brings the
+        window forward, where the reminder card is already waiting."""
+        if not licensing.current().has("calendar"):
+            raise HTTPException(status_code=402, detail="Calendar reminders need a business licence.")
+        from .. import notify
+        # Tag per occurrence, not per feature: notify.show swallows an identical same-tag toast
+        # while its balloon is outstanding, which is right for a 1 Hz watchdog and wrong for a
+        # recurring meeting whose subject never changes. The start time is what makes two
+        # occurrences of "Standup" two different notifications.
+        shown = notify.show("A meeting is starting", (req.subject or "").strip(),
+                            tag=f"meeting:{(req.start or '').strip()}")
+        return {"shown": bool(shown)}
 
 
 class SummariseRequest(BaseModel):

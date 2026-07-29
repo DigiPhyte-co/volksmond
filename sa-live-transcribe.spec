@@ -46,12 +46,22 @@ for pkg in ("google.protobuf", "aiofiles", "soxr"):
 hiddenimports += collect_submodules("live_transcribe")
 hiddenimports += ["scipy.signal", "anyio", "h11", "sniffio", "clr",
                   "livekit.rtc.apm", "google._upb._message"]
-# pywin32, imported lazily by live_transcribe/outlook_local.py for the local Outlook calendar
-# read. PyInstaller's built-in pywin32 hooks bundle the pythoncom/pywintypes DLLs; these names
-# just ensure the modules are pulled in despite the lazy import. The offline edition drops the
-# calendar feature, so it needs no pywin32 at all.
+# pywin32, imported lazily in two places. PyInstaller's built-in pywin32 hooks bundle the
+# supporting DLLs; these names just ensure the modules are pulled in despite the lazy imports.
+#
+# The GUI half (win32gui/win32api/win32con/pywintypes) is needed by live_transcribe/notify.py
+# for Shell_NotifyIcon desktop notifications, and is bundled in BOTH editions. That is a
+# deliberate call about the offline edition's trust claim: the claim is "no network paths",
+# verifiable by the absence of the online modules, and Shell_NotifyIcon is a purely local
+# shell call that talks to explorer.exe on this machine. The COM half stays out (below), so
+# nothing in the offline bundle can reach Outlook, Graph or any other remote-capable surface.
+# If that trade is ever refused, notify.py's shell calls can be reimplemented in ctypes with
+# no pywin32 at all (roughly 120 lines) and this line reverted.
+hiddenimports += ["win32gui", "win32api", "win32con", "pywintypes"]
+# The COM half, for live_transcribe/outlook_local.py's local Outlook calendar read. The
+# offline edition drops the calendar feature entirely, so it needs none of this.
 if not OFFLINE:
-    hiddenimports += ["win32com", "win32com.client", "win32timezone", "pythoncom", "pywintypes"]
+    hiddenimports += ["win32com", "win32com.client", "win32timezone", "pythoncom"]
 
 # collect_submodules("live_transcribe") above pulls in EVERY submodule, including the online-only
 # ones. For the offline edition, drop them from the hidden imports so the excludes below have
@@ -62,6 +72,11 @@ if OFFLINE:
 # The web UI's static asset(s).
 datas += [(os.path.join("live_transcribe", "web", "static"),
            os.path.join("live_transcribe", "web", "static"))]
+# The app icon as a DATA file as well as the EXE icon: live_transcribe/notify.py loads it at
+# runtime (LoadImage from disk) for the notification tray icon, and an icon compiled into the
+# EXE's resources is not reachable that way. Without this the notifications wear the generic
+# Windows application icon instead of the Volksmond mark.
+datas += [("volksmond.ico", ".")]
 
 # CPU-only: drop the CUDA GPU libraries ctranslate2 bundles (cuBLAS/cuDNN/cudart/
 # cuFFT/nvrtc). Keeps libctranslate2 + the CPU oneDNN libs, roughly 1 GB smaller.

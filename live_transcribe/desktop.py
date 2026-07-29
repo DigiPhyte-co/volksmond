@@ -276,6 +276,14 @@ def main(argv=None):
             js_api=api,
         )
         api._window = window     # MUST stay underscored (see DesktopApi docstring)
+        # Let notify.py bring this window forward when the user clicks a desktop notification.
+        # It is handed over as a CLOSURE, not as an attribute on `api`, for the same reason
+        # `_window` is underscored: any public attribute on the js_api object gets walked
+        # recursively by pywebview's exposer and a Window leads it into .NET statics that
+        # recurse to the limit on every paint (see the DesktopApi docstring). notify.py holds
+        # the window in a module global, well outside that walker's reach.
+        from . import notify
+        notify.set_window_hook(lambda: window)
         # Closing the window must finalise a running session first (see
         # finalise_open_session): `closing` is the only event that still runs while the
         # server and the session threads are alive.

@@ -675,9 +675,28 @@ window.VM_I18N = {
     "Start transcribing": "Begin transkribeer",
     "Not now": "Nie nou nie",
     "Dismiss": "Maak toe",
-    "Remind me when a meeting starts": "Herinner my wanneer 'n vergadering begin",
-    "While Volksmond is open, it checks your Outlook calendar on this computer and offers to start transcribing when a meeting begins. Nothing is sent anywhere, and it never starts on its own.":
-      "Terwyl Volksmond oop is, kyk dit na jou Outlook-kalender op hierdie rekenaar en bied aan om te begin transkribeer wanneer 'n vergadering begin. Niks word enige plek heen gestuur nie, en dit begin nooit vanself nie.",
+    "Windows notifications": "Windows-kennisgewings",
+    "Let Volksmond send a Windows notification when it needs to tell you something while its window is hidden behind your meeting. Nothing is sent anywhere; the message appears on this computer only.":
+      "Laat Volksmond 'n Windows-kennisgewing stuur wanneer dit vir jou iets moet sê terwyl sy venster agter jou vergadering weggesteek is. Niks word enige plek heen gestuur nie; die boodskap verskyn net op hierdie rekenaar.",
+    // Long-silence warning during a live session (the banner, its buttons, the setting)
+    "Nothing heard for": "Niks gehoor vir",
+    "minutes": "minute",
+    "Volksmond is still recording, but both the microphone and the system audio have been silent. Check your device, or stop and save.":
+      "Volksmond neem steeds op, maar sowel die mikrofoon as die stelselklank was stil. Kyk na jou toestel, of stop en stoor.",
+    "Keep recording": "Hou aan opneem",
+    "Stop warning me this session": "Moenie my weer in hierdie sessie waarsku nie",
+    "No more silence warnings this session.": "Geen stilte-waarskuwings meer in hierdie sessie nie.",
+    "Still recording. We will tell you again if it stays silent.": "Neem steeds op. Ons sê weer as dit stil bly.",
+    "Warn me about long silences": "Waarsku my oor lang stiltes",
+    "If nothing at all reaches Volksmond during a meeting, neither your microphone nor the system audio, it warns you instead of quietly recording an hour of nothing. Useful when Windows moves your microphone to another device.":
+      "As niks hoegenaamd Volksmond bereik tydens 'n vergadering nie, nie jou mikrofoon of die stelselklank nie, waarsku dit jou eerder as om stil-stil 'n uur van niks op te neem. Handig wanneer Windows jou mikrofoon na 'n ander toestel skuif.",
+    "After 3 minutes": "Na 3 minute",
+    "After 5 minutes": "Na 5 minute",
+    "After 10 minutes": "Na 10 minute",
+    "After 15 minutes": "Na 15 minute",
+    "Show a reminder card when a meeting starts": "Wys 'n herinneringskaart wanneer 'n vergadering begin",
+    "While Volksmond is open, it checks your Outlook calendar on this computer and shows a reminder card, inside the app, offering to start transcribing when a meeting begins. Windows notifications are switched separately, above. Nothing is sent anywhere, and it never starts on its own.":
+      "Terwyl Volksmond oop is, kyk dit na jou Outlook-kalender op hierdie rekenaar en wys 'n herinneringskaart, binne die program, wat aanbied om te begin transkribeer wanneer 'n vergadering begin. Windows-kennisgewings word afsonderlik aan- en afgeskakel, hierbo. Niks word enige plek heen gestuur nie, en dit begin nooit vanself nie.",
     "Pull attendee names from your Outlook calendar": "Trek bywoners se name uit jou Outlook-kalender",
     "Priority email support": "Voorkeur-e-posondersteuning",
     "Coming soon": "Binnekort",
