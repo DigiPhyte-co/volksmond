@@ -435,6 +435,9 @@ def test_start_request_agc_live_overrides_settings():
         def attach_sys_ring(self, ring):
             pass
 
+        def attach_mic_ring(self, ring):
+            pass          # stub only: /api/start attaches the raw-mic energy ring too (WP-4)
+
         def aec_state(self):
             return (False, False)
 

@@ -413,8 +413,13 @@ def switch_device(req: SwitchDeviceRequest):
                                      on_chunk=_feed, t0=old_cap._t0, aec=old_cap.aec,
                                      agc=old_cap.agc, record_raw_mic=old_cap.record_raw_mic)
             eng = STATE.engine
+            # Re-attach BOTH energy rings, or the guards' level reference dies at the first
+            # mid-meeting device change (the rings survive on the engine; the new capture has to
+            # be told about them). Same rings, same session clock, so history stays continuous.
             if eng is not None and getattr(eng, "sys_env", None) is not None:
                 c.attach_sys_ring(eng.sys_env)   # keep the echo-veto reference fed across the switch
+            if eng is not None and getattr(eng, "mic_env", None) is not None:
+                c.attach_mic_ring(eng.mic_env)   # keep the raw-mic (gain-invariant) feed alive
             return c
 
         def _reset_loop_history():
@@ -738,11 +743,18 @@ def start(req: StartRequest):
             record_raw_mic=False,   # record the AEC-cleaned mic into the single stereo file, not a raw stem
         )
         # Feed a SYS energy ring from live capture so the engine vetoes MIC echo segments in real
-        # time. Fed per-block from the callback (not from late SYS chunks); see SysEnergyRing.
+        # time. Fed per-block from the callback (not from late SYS chunks); see EnergyRing.
+        # The MIC ring is the same feed for the near end, tapped RAW (pre-APM), so the silence gate
+        # and the veto's mic side stay gain-invariant under live AGC. Both are attached BEFORE
+        # cap.start() so no early block is missed. SA_LIVE_RAW_MIC_RING=0 skips the mic ring.
         if engine is not None:
-            _sys_ring = transcribe.SysEnergyRing()
+            _sys_ring = transcribe.EnergyRing()
             engine.sys_env = _sys_ring
             cap.attach_sys_ring(_sys_ring)
+            if transcribe.raw_mic_ring_on():
+                _mic_ring = transcribe.EnergyRing()
+                engine.mic_env = _mic_ring
+                cap.attach_mic_ring(_mic_ring)
         try:
             cap.start()
         except Exception as e:
@@ -978,20 +990,37 @@ def transcribe_file(req: TranscribeFileRequest):
                     # the kept frames, and gate-zeroed bleed stays zero at any gain. Boosting
                     # BOTH channels jointly when either qualifies was rejected: it still shifts
                     # the relative levels (each channel needs a different gain to reach -20)
-                    # and needlessly rewrites a healthy channel. The ring below is built from
+                    # and needlessly rewrites a healthy channel. The SYS ring below is built from
                     # the boosted SYS so the engine's echo veto sees the same signal it
-                    # transcribes; the veto's relative margin loosens by the gain difference
-                    # for MIC segments, which is safe because the gate has already zeroed the
-                    # bleed the veto exists to catch, and a boosted MIC clears the veto's
-                    # -28 dBFS absolute ceiling, so quiet REAL speech can no longer be vetoed.
+                    # transcribes. (Before WP-4 the veto read the MIC from the BOOSTED chunk, which
+                    # loosened its relative margin by the gain difference and pushed a boosted MIC
+                    # over the -28 dBFS ceiling - safe-by-accident, since it could then veto almost
+                    # nothing. The mic ring below restores the calibrated basis on this path too,
+                    # so the veto is live again here: bleed the cross-channel gate missed can now
+                    # be dropped, and the -28 ceiling means what it was measured to mean.)
+                    # The MIC energy ring is built from the UNBOOSTED channel, for the same reason
+                    # the cross-channel gate runs before the boost: the mic level tests (silence
+                    # gate, echo veto ceiling) are calibrated on unboosted audio, and a per-channel
+                    # boost would shift the MIC/SYS relationship by the gain difference. This is the
+                    # file path's stand-in for the live raw tap - the recording is already
+                    # AGC-processed, so the ring is marked non-raw and the silence gate derives its
+                    # floor from the channel's own speech level instead of the absolute -45.
+                    _mic_unboosted = mic_ch
                     mic_ch = _boost("MIC", mic_ch)
                     sys_ch = _boost("SYS", sys_ch)
                     # Build the SYS energy ring from the aligned far-end channel so the engine's echo
                     # veto has a reference for every MIC segment (the same mechanism it uses live).
-                    _ring = transcribe.SysEnergyRing(retain_s=len(sys_ch) / 16000.0 + 60.0)
-                    for _i in range(0, len(sys_ch), 8000):
-                        _ring.add_block(_i / 16000.0, sys_ch[_i:_i + 8000])
+                    # 100 ms frames on both, matching the live rings' resolution.
+                    _retain = len(sys_ch) / 16000.0 + 60.0
+                    _ring = transcribe.EnergyRing(retain_s=_retain, raw=False)
+                    for _i in range(0, len(sys_ch), 1600):
+                        _ring.add_block(_i / 16000.0, sys_ch[_i:_i + 1600])
                     engine.sys_env = _ring
+                    if transcribe.raw_mic_ring_on():
+                        _mring = transcribe.EnergyRing(retain_s=_retain, raw=False)
+                        for _i in range(0, len(_mic_unboosted), 1600):
+                            _mring.add_block(_i / 16000.0, _mic_unboosted[_i:_i + 1600])
+                        engine.mic_env = _mring
                     for src, chan in (("MIC", mic_ch), ("SYS", sys_ch)):
                         for i, chunk in iter_silence_chunks(chan, 16000, chunk_seconds):
                             chunk = _np.ascontiguousarray(chunk)

@@ -464,6 +464,9 @@ def test_switch_device_preserves_recording_clock():
         def attach_sys_ring(self, ring):
             pass
 
+        def attach_mic_ring(self, ring):
+            pass          # stub only: switch_device re-attaches BOTH energy rings (WP-4)
+
         def has_raw_mic(self):
             return self.record_raw_mic
 
