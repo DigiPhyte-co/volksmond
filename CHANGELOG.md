@@ -1,5 +1,20 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-07-31, v1.12.0: hallucinated lines cut by two thirds, and the app taps you on the shoulder
+
+`licensing.APP_VERSION` 1.11.2 -> 1.12.0.
+
+Built from a forensic investigation of two real meetings that hallucinated badly, with every guard validated against those same recordings before shipping. Measured on real meetings: junk lines cut from ~22% of the transcript to ~6%, with zero real speech lost (verified line by line).
+
+- **Names you type before a meeting no longer come back as hallucinated lines.** The attendee/context field could be regurgitated verbatim by the engine during quiet moments (one real meeting collected 90 lines of just the attendees' names). A new guard recognises and drops any line that is substantially a copy of your typed prompt, in any language, without touching genuine mentions of the same names in real speech. (`transcribe.py`.)
+- **Repeating hallucination loops are cut off at four.** A fabricated line repeating once a second ("Bye." twenty-two times in a real meeting) is now suppressed from the fifth repetition; the first four stay as evidence. Genuine repeated backchannels ("ja... ja... ja" across a conversation) are unaffected, and real rapid repetition never loses more than the tail. (`transcribe.py`.)
+- **The silence and echo guards now see your real microphone level, not the auto-gain boosted one.** v1.11.2's auto-gain fixed quiet mics but quietly blinded the silence gate (a boosted empty room no longer looked silent, which is where fabricated lines are born). Both channels now feed raw pre-processing energy meters at 100 ms resolution, restoring every guard's calibration: in testing, the silence gate went from catching 0% of boosted-quiet audio to 100%, and the echo veto stopped occasionally eating quiet real speech. A second echo guard drops lines that are garbled copies of what the other side was saying at that exact moment. (`capture_core.py`, `transcribe.py`, `web/app.py`.)
+- **Windows notifications.** A toast when a calendar meeting starts (Business, independently switchable from the in-app banner), and a "Nothing heard for N minutes" nudge with one-click Stop and save when both audio channels go silent mid-session, so a forgotten session no longer records an empty room for an hour. Both default on, both off-switchable in Settings, nothing ever auto-starts or auto-stops. (`notify.py` new, `silencewatch.py` new, `web/app.py`, `web/static/app.js`, `desktop.py`.)
+- **All your Outlook accounts' calendars are read, not just the default one.** The meeting reminder previously saw only the default account's calendar; it now reads every account and de-duplicates meetings that appear in more than one. (`outlook_local.py`.)
+- **Closing the window now finishes the session properly.** Closing with X mid-session previously skipped the finalisation path (files were still saved by a backstop); it now stops and finalises exactly like the Stop button, bounded so a close can never hang. (`desktop.py`, `web/app.py`.)
+
+Verified: 380-test suite green (script-run and pytest), two independent adversarial reviews (13 findings triaged, 12 fixed, 1 consciously deferred with its follow-up designed), and seeded before/after replays of three real meeting recordings with line-by-line classification of every changed line (zero real-speech loss on all three; junk 21.7% -> 5.6% on the worst meeting; Afrikaans regression clean). A field meeting on the release candidate measured 6.3% junk against the 21.7% baseline with zero guard misfires in 97 logged suppressions.
+
 ## 2026-07-23, v1.11.2: a quiet microphone no longer starves the engine
 
 `licensing.APP_VERSION` 1.11.1 -> 1.11.2.
