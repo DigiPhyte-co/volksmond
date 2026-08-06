@@ -1309,10 +1309,11 @@ function setupView() {
       ]),
     ]);
   } else if (stage === "save_location") {
-    // The default location is per-user app data on this computer. Many users want
-    // their transcripts in Documents or a synced folder instead, so we ask before
-    // they start a session rather than hiding it in Settings. Picking nothing is
-    // fine -- "Continue" just keeps the default.
+    // The default location is a per-user Volksmond folder on this computer (the
+    // server supplies the exact path). Many users want their transcripts in
+    // Documents or a synced folder instead, so we ask before they start a
+    // session rather than hiding it in Settings. Picking nothing is fine --
+    // "Continue" just keeps the default.
     var savedLoc = (S.settings && S.settings.save_location) || "";
     var defaultLoc = (S.appInfo && S.appInfo.save_dir) || "default folder";
     var currentLoc = savedLoc || defaultLoc;

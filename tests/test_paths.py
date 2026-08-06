@@ -48,6 +48,32 @@ def test_data_dir_follows_sys_platform():
     print("  OK  data_dir() dispatches on sys.platform")
 
 
+def test_default_sessions_dir_windows():
+    # Frozen Windows saves to a visible per-user folder, NOT app data (buried,
+    # wiped on uninstall, virtualised under MSIX) and NOT Documents (commonly
+    # OneDrive-redirected, which would undermine the local-only posture).
+    expect = Path.home() / "Volksmond"
+    assert paths.default_sessions_dir_for("win32") == expect, \
+        paths.default_sessions_dir_for("win32")
+    print("  OK  win32 default sessions dir is ~/Volksmond (USERPROFILE)")
+
+
+def test_default_sessions_dir_darwin_and_linux_unchanged():
+    # macOS and Linux deliberately keep sessions under the data dir (~/Volksmond
+    # is unidiomatic on macOS and violates the XDG posture on Linux).
+    for plat in ("darwin", "linux", "linux2"):
+        expect = paths.data_dir_for(plat) / "sessions"
+        assert paths.default_sessions_dir_for(plat) == expect, \
+            (plat, paths.default_sessions_dir_for(plat))
+    print("  OK  darwin/linux default sessions dir stays under the data dir")
+
+
+def test_default_sessions_dir_follows_sys_platform():
+    assert paths.default_sessions_dir() == paths.default_sessions_dir_for(sys.platform), \
+        (paths.default_sessions_dir(), sys.platform)
+    print("  OK  default_sessions_dir() dispatches on sys.platform")
+
+
 def test_callers_share_the_data_dir():
     # The five migrated call sites must all hang off the same folder. config._DIR and
     # licensing._LICENSE_PATH are module-level singletons frozen at import time, and an
@@ -128,6 +154,9 @@ if __name__ == "__main__":
                test_data_dir_darwin,
                test_data_dir_other,
                test_data_dir_follows_sys_platform,
+               test_default_sessions_dir_windows,
+               test_default_sessions_dir_darwin_and_linux_unchanged,
+               test_default_sessions_dir_follows_sys_platform,
                test_callers_share_the_data_dir,
                test_cudadl_gate_on_this_platform,
                test_cudadl_gate_non_windows,
