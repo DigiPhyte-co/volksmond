@@ -21,7 +21,8 @@ Website and download: **[volksmond.com](https://volksmond.com/)**
 - **Local AI summaries** and editable meeting notes, saved as Markdown next to the
   transcript.
 - **Optional Outlook calendar integration** (Business licences): pre-seed attendees from
-  the classic Outlook desktop app, fully offline over COM.
+  the classic Outlook desktop app, fully offline over COM, or, if you use new Outlook or
+  Outlook on the web, via an optional Microsoft 365 sign-in (Microsoft Graph).
 - **A provable offline edition** that compiles out every network code path.
 
 ## Privacy and POPIA
