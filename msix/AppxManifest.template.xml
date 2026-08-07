@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Volksmond Microsoft Store (MSIX) manifest TEMPLATE.
+
+  Stamped by msix\build-msix.ps1: every {{TOKEN}} below is replaced before packing.
+  The identity values (IdentityName, Publisher, PublisherDisplayName) come from
+  msix\identity.json, which holds the Partner Center "Product identity" values and
+  is gitignored because this repo is public. {{VERSION}} is the app version from
+  live_transcribe\licensing.py with a ".0" revision appended (the Store requires a
+  4-part version with revision 0). {{EXECUTABLE}} is the package-relative path to
+  the PyInstaller exe in the layout build-msix.ps1 assembles.
+
+  Shape constraints (do not reorder): the appx schema requires Package children in
+  the sequence Identity, Properties, Dependencies, Resources, Applications,
+  Capabilities. EntryPoint="Windows.FullTrustApplication" + the rescap runFullTrust
+  capability mark a full-trust Win32 desktop app, which a PyInstaller onedir build
+  is. TargetDeviceFamily Windows.Desktop MinVersion 10.0.17763.0 is the MSIX
+  full-trust baseline (Windows 10 1809). The microphone DeviceCapability covers the
+  mic path; WASAPI loopback (system audio) needs no declared capability and passed
+  the packaged-context gate empirically. The package is NOT signed here: the Store
+  signs on ingestion, which is also why Publisher must exactly match Partner
+  Center's "Package/Identity/Publisher" value.
+-->
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+    IgnorableNamespaces="uap rescap">
+
+  <Identity
+      Name="{{IDENTITY_NAME}}"
+      Publisher="{{PUBLISHER}}"
+      Version="{{VERSION}}"
+      ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Volksmond</DisplayName>
+    <PublisherDisplayName>{{PUBLISHER_DISPLAY_NAME}}</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="Volksmond" Executable="{{EXECUTABLE}}" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+          DisplayName="Volksmond"
+          Description="Live meeting transcription for South African Afrikaans and mixed Afrikaans and English, entirely on this machine. No audio leaves your computer."
+          BackgroundColor="#36587b"
+          Square150x150Logo="Assets\Square150x150Logo.png"
+          Square44x44Logo="Assets\Square44x44Logo.png" />
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <DeviceCapability Name="microphone" />
+  </Capabilities>
+
+</Package>

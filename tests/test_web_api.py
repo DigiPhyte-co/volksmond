@@ -37,7 +37,11 @@ def test_app_info():
     j = r.json()
     for k in ("name", "version", "platform", "save_dir"):
         assert k in j and j[k], f"app-info missing {k}: {j}"
-    print("  OK  /api/app-info returns name/version/platform/save_dir")
+    # The edition flags are always present and, in a dev run (no edition env var), both False:
+    # the UI's offlineBuild()/storeBuild() predicates read exactly these.
+    for k in ("offline", "store"):
+        assert j.get(k) is False, f"app-info {k} should be False in a dev run: {j}"
+    print("  OK  /api/app-info returns name/version/platform/save_dir + edition flags")
 
 
 def test_summaries_are_free():
@@ -1284,18 +1288,56 @@ def test_offline_build_registers_no_calendar_routes():
             "from live_transcribe import buildflags\n"
             "from live_transcribe.web.app import app\n"
             "assert buildflags.OFFLINE_ONLY is True\n"
+            "assert buildflags.STORE_BUILD is False\n"
             "print('ROUTES=' + json.dumps(sorted({r.path for r in app.routes})))\n")
-    env = dict(os.environ, SA_LIVE_OFFLINE="1")
+    # Strip BOTH edition vars before setting the one under test, so a stray flag in the parent
+    # environment can never turn this into an accidental mixed-edition run.
+    env = {k: v for k, v in os.environ.items() if k not in ("SA_LIVE_OFFLINE", "SA_LIVE_STORE")}
+    env["SA_LIVE_OFFLINE"] = "1"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          cwd=root, env=env, timeout=300)
     assert out.returncode == 0, f"the offline app failed to import:\n{out.stdout}\n{out.stderr}"
     line = [ln for ln in out.stdout.splitlines() if ln.startswith("ROUTES=")]
     assert line, f"no route list from the offline import:\n{out.stdout}\n{out.stderr}"
     paths = json.loads(line[-1][len("ROUTES="):])
-    for gone in ("/api/notify-meeting", "/api/calendar-upcoming", "/api/calendar-seed"):
+    # Both update checks are pinned absent alongside the calendar: the offline edition strips
+    # EVERY outbound route, and the store edition (tested below) must strip strictly fewer.
+    for gone in ("/api/notify-meeting", "/api/calendar-upcoming", "/api/calendar-seed",
+                 "/api/check-updates", "/api/model-updates"):
         assert gone not in paths, f"the offline build still registers {gone}"
     assert "/api/settings" in paths, f"the offline build lost its ordinary routes: {paths}"
-    print("  OK  the offline build registers no calendar routes, meeting notifications included")
+    print("  OK  the offline build registers no calendar or update-check routes")
+
+
+def test_store_build_registers_no_app_update_check():
+    # The store (MSIX) edition strips ONLY the app update check (the Store owns updates): the
+    # model-update check and the calendar must survive, or the gate was widened by accident (the
+    # locked decision is that the licensing UI and every other connected feature stay). Same
+    # SUBPROCESS pattern as the offline test above, and for the same CSRF/session reasons.
+    import json
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = ("import json\n"
+            "from live_transcribe import buildflags\n"
+            "from live_transcribe.web.app import app\n"
+            "assert buildflags.STORE_BUILD is True\n"
+            "assert buildflags.OFFLINE_ONLY is False\n"
+            "print('ROUTES=' + json.dumps(sorted({r.path for r in app.routes})))\n")
+    # Strip BOTH edition vars before setting the one under test (same isolation as the offline
+    # test above).
+    env = {k: v for k, v in os.environ.items() if k not in ("SA_LIVE_OFFLINE", "SA_LIVE_STORE")}
+    env["SA_LIVE_STORE"] = "1"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         cwd=root, env=env, timeout=300)
+    assert out.returncode == 0, f"the store app failed to import:\n{out.stdout}\n{out.stderr}"
+    line = [ln for ln in out.stdout.splitlines() if ln.startswith("ROUTES=")]
+    assert line, f"no route list from the store import:\n{out.stdout}\n{out.stderr}"
+    paths = json.loads(line[-1][len("ROUTES="):])
+    assert "/api/check-updates" not in paths, "the store build still registers /api/check-updates"
+    for kept in ("/api/model-updates", "/api/calendar-seed", "/api/calendar-upcoming",
+                 "/api/notify-meeting", "/api/settings"):
+        assert kept in paths, f"the store build lost {kept}, which only the offline edition strips"
+    print("  OK  the store build strips only /api/check-updates; model updates and calendar stay")
 
 
 if __name__ == "__main__":
@@ -1347,7 +1389,8 @@ if __name__ == "__main__":
                test_session_count_failure_is_logged_not_raised,
                test_notify_meeting_needs_a_business_licence,
                test_notify_meeting_shows_one_toast_with_the_subject,
-               test_offline_build_registers_no_calendar_routes):
+               test_offline_build_registers_no_calendar_routes,
+               test_store_build_registers_no_app_update_check):
         try:
             fn()
         except AssertionError as e:

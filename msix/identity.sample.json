@@ -1,0 +1,6 @@
+{
+  "_comment": "SAMPLE ONLY. Copy this file to msix\\identity.json and fill it with the real values from Partner Center (your app > Product management > Product identity): IdentityName is 'Package/Identity/Name', Publisher is 'Package/Identity/Publisher' (a CN=... GUID string that must match exactly or the Store rejects the package), PublisherDisplayName is 'Package/Properties/PublisherDisplayName'. The real identity.json is GITIGNORED (this repo is public); it never gets committed.",
+  "IdentityName": "PLACEHOLDER.Volksmond",
+  "Publisher": "CN=00000000-0000-0000-0000-000000000000",
+  "PublisherDisplayName": "PLACEHOLDER Publisher"
+}

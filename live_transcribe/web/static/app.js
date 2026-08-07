@@ -996,6 +996,7 @@ function summaryInstalled() { return S.models && S.models.summary_installed; }
 function inDesktop() { return !!(window.pywebview && window.pywebview.api); }
 function connected() { return !!(S.appInfo && S.appInfo.connected); }  // online (paid) edition; the offline build hides online-feature UI
 function offlineBuild() { return !!(S.appInfo && S.appInfo.offline); }  // the airtight offline-only edition: even the model-update check and calendar are compiled out
+function storeBuild() { return !!(S.appInfo && S.appInfo.store); }  // the Microsoft Store (MSIX) edition: ONLY the app-update check is compiled out (the Store owns updates); model updates and calendar stay
 function openExternal(url) {
   // Native shell: hand it to the OS (system browser / mail client).
   if (inDesktop() && window.pywebview.api.open_external) { window.pywebview.api.open_external(url); return; }
@@ -1133,12 +1134,14 @@ function sidebar(active) {
     el("div", { class: "spacer" }),
     el("div", { class: "local-pill" }, [icon("lock", 14), el("span", { text: "Local only, no internet" })]),
     // The manual "Check for updates" is a user-initiated convenience (one outbound call, only on
-    // click), so every build shows it EXCEPT the airtight offline-only edition, where the route is
-    // compiled out. Same gating as the model-update check. It never runs on its own, so it does not
-    // touch the "Local only" promise (which is about audio, telemetry, and background calls).
-    !offlineBuild() ? el("button", { class: "nav-item", style: { fontSize: "12px" }, disabled: updateState.state === "checking", onclick: function () { checkUpdates(); } },
+    // click), so every build shows it EXCEPT the airtight offline-only edition and the Store
+    // edition, where the route is compiled out (offline strips every network path; the Store owns
+    // updates). NOT the same gate as the model-update check, which the Store edition keeps. It
+    // never runs on its own, so it does not touch the "Local only" promise (which is about audio,
+    // telemetry, and background calls).
+    !(offlineBuild() || storeBuild()) ? el("button", { class: "nav-item", style: { fontSize: "12px" }, disabled: updateState.state === "checking", onclick: function () { checkUpdates(); } },
       [icon("download", 16), el("span", { text: updateState.state === "checking" ? "Checking for updates" : "Check for updates" })]) : null,
-    !offlineBuild() ? sideUpdateResult() : null,
+    !(offlineBuild() || storeBuild()) ? sideUpdateResult() : null,
     el("button", { class: "nav-item", style: { fontSize: "12px" }, onclick: reportBug },
       [icon("bug", 16), el("span", { text: "Report a bug or idea" })]),
   ]);
@@ -2454,9 +2457,9 @@ function sideUpdateResult() {
 function aboutCard() {
   var version = (S.appInfo && S.appInfo.version) || "?";
   var u = updateState;
-  // The update check is present in every build except the airtight offline edition, so hide this
-  // status line only there.
-  var updateLine = offlineBuild() ? null :
+  // The update check is present in every build except the airtight offline edition and the Store
+  // edition (the Store owns updates), so hide this status line in both.
+  var updateLine = (offlineBuild() || storeBuild()) ? null :
     u.state === "checking" ? el("div", { class: "s", style: { marginTop: "4px", display: "flex", gap: "6px", alignItems: "center" } }, [el("span", { class: "spinner" }), el("span", { text: "Checking for updates" })]) :
     u.state === "error" ? el("div", { class: "s", style: { marginTop: "4px", color: "var(--warn)" }, text: "Could not check for updates." }) :
     (u.state === "done" && u.info && u.info.update_available) ? el("div", { class: "s", style: { marginTop: "4px" } }, [el("span", { text: "Update available" }), raw(": v" + u.info.latest + "  "), el("span", { class: "link", onclick: function () { openUpdateLink(u.info.url); } }, "Download")]) :
@@ -2474,7 +2477,7 @@ function aboutCard() {
         updateLine,
       ]),
       el("div", { class: "ctl", style: { display: "flex", flexDirection: "column", gap: "6px", alignItems: "stretch" } }, [
-        !offlineBuild() ? el("button", { class: "btn ghost", disabled: u.state === "checking", onclick: function () { checkUpdates(); } }, "Check for updates") : null,
+        !(offlineBuild() || storeBuild()) ? el("button", { class: "btn ghost", disabled: u.state === "checking", onclick: function () { checkUpdates(); } }, "Check for updates") : null,
         el("button", { class: "btn ghost", onclick: function () { openExternal("https://digiphyte.com"); } }, "digiphyte.com"),
       ]),
     ]),
