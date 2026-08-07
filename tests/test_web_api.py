@@ -1288,8 +1288,12 @@ def test_offline_build_registers_no_calendar_routes():
             "from live_transcribe import buildflags\n"
             "from live_transcribe.web.app import app\n"
             "assert buildflags.OFFLINE_ONLY is True\n"
+            "assert buildflags.STORE_BUILD is False\n"
             "print('ROUTES=' + json.dumps(sorted({r.path for r in app.routes})))\n")
-    env = dict(os.environ, SA_LIVE_OFFLINE="1")
+    # Strip BOTH edition vars before setting the one under test, so a stray flag in the parent
+    # environment can never turn this into an accidental mixed-edition run.
+    env = {k: v for k, v in os.environ.items() if k not in ("SA_LIVE_OFFLINE", "SA_LIVE_STORE")}
+    env["SA_LIVE_OFFLINE"] = "1"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          cwd=root, env=env, timeout=300)
     assert out.returncode == 0, f"the offline app failed to import:\n{out.stdout}\n{out.stderr}"
@@ -1319,8 +1323,10 @@ def test_store_build_registers_no_app_update_check():
             "assert buildflags.STORE_BUILD is True\n"
             "assert buildflags.OFFLINE_ONLY is False\n"
             "print('ROUTES=' + json.dumps(sorted({r.path for r in app.routes})))\n")
-    env = dict(os.environ, SA_LIVE_STORE="1")
-    env.pop("SA_LIVE_OFFLINE", None)
+    # Strip BOTH edition vars before setting the one under test (same isolation as the offline
+    # test above).
+    env = {k: v for k, v in os.environ.items() if k not in ("SA_LIVE_OFFLINE", "SA_LIVE_STORE")}
+    env["SA_LIVE_STORE"] = "1"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          cwd=root, env=env, timeout=300)
     assert out.returncode == 0, f"the store app failed to import:\n{out.stdout}\n{out.stderr}"

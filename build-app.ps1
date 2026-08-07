@@ -99,6 +99,13 @@ foreach ($edition in $Editions) {
 
     $dist = Join-Path $edDistRoot $appName
 
+    # Mark a successful STORE build with its version, at the dist-store ROOT (a sibling of the
+    # app folder, so it is never zipped and never copied into the MSIX layout). build-msix.ps1
+    # refuses to pack a dist without a matching marker: a connected onedir looks identical from
+    # the outside but still carries the in-app update check, so packing one by mistake would
+    # ship a Store app that phones our update manifest.
+    if ($store) { Set-Content -Path (Join-Path $edDistRoot "store-edition.marker") -Value $ver -Encoding Ascii }
+
     # Bundle the Quick Start guides next to the exe so testers get them inside the zip.
     $pdfs = @("Volksmond - Quick Start Guide.pdf", "Volksmond - Snelgids (Afrikaans).pdf")
     foreach ($pdf in $pdfs) {

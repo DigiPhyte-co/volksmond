@@ -18,12 +18,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _flags(extra_env):
-    """(OFFLINE_ONLY, STORE_BUILD) as a fresh interpreter with `extra_env` sees them."""
+def _flags(extra_env, hook=None):
+    """(OFFLINE_ONLY, STORE_BUILD) as a fresh interpreter with `extra_env` sees them.
+
+    `hook` names a PyInstaller runtime-hook file at the repo root to execute BEFORE buildflags
+    is imported, which is exactly the frozen-app ordering (runtime hooks run before any app
+    code), so the hooks' env clearing is exercised for real rather than reimplemented here.
+    """
     env = {k: v for k, v in os.environ.items() if k not in ("SA_LIVE_OFFLINE", "SA_LIVE_STORE")}
     env.update(extra_env)
-    code = ("from live_transcribe import buildflags\n"
-            "print(buildflags.OFFLINE_ONLY, buildflags.STORE_BUILD)\n")
+    code = ""
+    if hook:
+        code += f"import runpy\nrunpy.run_path({hook!r})\n"
+    code += ("from live_transcribe import buildflags\n"
+             "print(buildflags.OFFLINE_ONLY, buildflags.STORE_BUILD)\n")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          cwd=ROOT, env=env, timeout=300)
     assert out.returncode == 0, f"buildflags failed to import:\n{out.stdout}\n{out.stderr}"
@@ -53,12 +61,26 @@ def test_flags_require_exactly_1():
     print("  OK  only the literal '1' flips a flag")
 
 
+def test_runtime_hooks_enforce_mutual_exclusion():
+    # The hook-inheritance case: a frozen edition launched from a shell that happens to export
+    # the OTHER edition's env var. Each runtime hook clears its sibling flag before force-setting
+    # its own, so even with BOTH vars in the environment exactly one edition is active. The real
+    # hook files run first (runpy, mirroring PyInstaller's runtime-hook-before-app ordering).
+    both = {"SA_LIVE_OFFLINE": "1", "SA_LIVE_STORE": "1"}
+    assert _flags(both, hook="pyi_rth_store.py") == (False, True), \
+        "the store hook must clear an inherited SA_LIVE_OFFLINE"
+    assert _flags(both, hook="pyi_rth_offline.py") == (True, False), \
+        "the offline hook must clear an inherited SA_LIVE_STORE"
+    print("  OK  each runtime hook clears the sibling edition's flag (mutual exclusion holds)")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_default_is_neither_edition,
                test_offline_env_sets_only_offline,
                test_store_env_sets_only_store,
-               test_flags_require_exactly_1):
+               test_flags_require_exactly_1,
+               test_runtime_hooks_enforce_mutual_exclusion):
         try:
             fn()
         except AssertionError as e:

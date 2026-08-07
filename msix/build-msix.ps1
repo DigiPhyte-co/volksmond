@@ -36,6 +36,20 @@ if (-not (Test-Path (Join-Path $Dist "Volksmond.exe"))) {
     Write-Host "  Build it first:  .\build-app.ps1 -Editions store" -ForegroundColor Red
     exit 1
 }
+
+# Only a verified STORE dist may be packed. build-app.ps1's store pass writes this marker
+# (containing the app version) at the dist-store root, a SIBLING of the app folder, so it never
+# enters the layout below. Its absence means the dist is a connected/offline build or a stray
+# copy, and a connected onedir packed here would ship a Store app that still phones our update
+# manifest; the version check catches a stale store dist left over from an older release.
+$marker = Join-Path (Split-Path $Dist -Parent) "store-edition.marker"
+if (-not (Test-Path $marker)) {
+    Write-Host "  $Dist is not a verified STORE build (no store-edition.marker beside it)." -ForegroundColor Red
+    Write-Host "  Build the store edition first:  .\build-app.ps1 -Editions store" -ForegroundColor Red
+    exit 1
+}
+$markerVer = (Get-Content $marker -TotalCount 1).Trim()
+
 if (-not (Test-Path $pyexe)) {
     Write-Host "  venv not found at $pyexe - run 'First-time setup.bat' first." -ForegroundColor Red
     exit 1
@@ -66,6 +80,19 @@ foreach ($k in @("IdentityName", "Publisher", "PublisherDisplayName")) {
         Write-Host "  msix\identity.json is missing '$k' (see identity.sample.json)." -ForegroundColor Red
         exit 1
     }
+    # Sample values must never reach a package: a .msix stamped with them sails through
+    # makeappx and only bounces at Partner Center, or worse, gets handed around looking real.
+    # (-match is case-insensitive in PowerShell.)
+    if ($identity.$k -match "PLACEHOLDER") {
+        Write-Host "  msix\identity.json '$k' still carries a PLACEHOLDER value ('$($identity.$k)')." -ForegroundColor Red
+        Write-Host "  Fill in the real values from Partner Center (your app > Product management > Product identity)." -ForegroundColor Red
+        exit 1
+    }
+}
+if ($identity.Publisher -eq "CN=00000000-0000-0000-0000-000000000000") {
+    Write-Host "  msix\identity.json 'Publisher' is the sample's all-zero GUID, not a real identity." -ForegroundColor Red
+    Write-Host "  Use the exact 'Package/Identity/Publisher' value from Partner Center (Product identity)." -ForegroundColor Red
+    exit 1
 }
 
 # App version from licensing.py (the single version source), as the Store's required 4-part
@@ -76,6 +103,11 @@ $verLine = Get-Content $licPy | Where-Object { $_ -match 'APP_VERSION\s*=' } | S
 if ($verLine -match '"([0-9]+\.[0-9]+\.[0-9]+)"') { $ver = $Matches[1] }
 if (-not $ver) {
     Write-Host "  Could not read APP_VERSION from $licPy" -ForegroundColor Red
+    exit 1
+}
+if ($markerVer -ne $ver) {
+    Write-Host "  The store dist is v$markerVer but the source is v$ver (a stale dist-store)." -ForegroundColor Red
+    Write-Host "  Rebuild it:  .\build-app.ps1 -Editions store" -ForegroundColor Red
     exit 1
 }
 $msixVer = "$ver.0"
