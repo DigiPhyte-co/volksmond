@@ -9,18 +9,32 @@
 import os
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
-# Two build profiles from one spec (docs/distribution-and-landing-plan.md section 3). Set
+# Three build profiles from one spec (docs/distribution-and-landing-plan.md section 3). Set
 # VOLKSMOND_OFFLINE=1 to build the OFFLINE-ONLY edition: the online-only modules (the app update
 # check, the Outlook calendar and its Graph sibling, the cloud auth lib) are compiled OUT, and a
-# runtime hook hard-forces SA_LIVE_OFFLINE=1 so the frozen app provably cannot phone home. Unset
-# (the default) builds the CONNECTED edition, which keeps them.
+# runtime hook hard-forces SA_LIVE_OFFLINE=1 so the frozen app provably cannot phone home. Set
+# VOLKSMOND_STORE=1 to build the STORE (Microsoft Store MSIX) edition: the connected build minus
+# the in-app update check (the Store owns updates), so ONLY updatecheck is compiled out and a hook
+# forces SA_LIVE_STORE=1. Unset (the default) builds the CONNECTED edition, which keeps everything.
 OFFLINE = os.environ.get("VOLKSMOND_OFFLINE") == "1"
+STORE = os.environ.get("VOLKSMOND_STORE") == "1"
+if OFFLINE and STORE:
+    raise SystemExit("VOLKSMOND_OFFLINE and VOLKSMOND_STORE are mutually exclusive; set one.")
+# The store edition keeps the display name "Volksmond" (it IS the normal app, packaged for the
+# Store); build-app.ps1 keeps its output apart by building it into a separate dist root
+# (dist-store) and naming its zip volksmond-store_<ver>.zip, so the folder name here can stay
+# what the exe, the shortcuts and the MSIX manifest all expect.
 APP_NAME = "Volksmond-Offline" if OFFLINE else "Volksmond"
 # Excluded from the offline bundle so these paths are not merely disabled but physically absent: a
 # source-available verifier can confirm the update-manifest fetch (updatecheck), the calendar
 # (outlook/outlook_local), and the Graph/cloud auth lib (msal) are gone.
 ONLINE_ONLY_MODULES = ["live_transcribe.outlook", "live_transcribe.outlook_local",
                        "live_transcribe.updatecheck", "msal"]
+# The store edition strips ONLY the update-manifest fetch: the calendar and its COM/auth support
+# stay in, exactly as in the connected build. One list per edition, resolved once, so every
+# exclusion site below treats the editions uniformly.
+STORE_ONLY_EXCLUDES = ["live_transcribe.updatecheck"]
+EDITION_EXCLUDES = ONLINE_ONLY_MODULES if OFFLINE else (STORE_ONLY_EXCLUDES if STORE else [])
 
 datas, binaries, hiddenimports = [], [], []
 # collect_all pulls each package's code, data, and native libs. webview + clr_loader
@@ -64,10 +78,11 @@ if not OFFLINE:
     hiddenimports += ["win32com", "win32com.client", "win32timezone", "pythoncom"]
 
 # collect_submodules("live_transcribe") above pulls in EVERY submodule, including the online-only
-# ones. For the offline edition, drop them from the hidden imports so the excludes below have
-# nothing to fight, and the modules are genuinely absent from the bundle.
-if OFFLINE:
-    hiddenimports = [h for h in hiddenimports if h not in ONLINE_ONLY_MODULES]
+# ones. For the offline and store editions, drop that edition's excluded modules from the hidden
+# imports so the excludes below have nothing to fight, and the modules are genuinely absent from
+# the bundle.
+if EDITION_EXCLUDES:
+    hiddenimports = [h for h in hiddenimports if h not in EDITION_EXCLUDES]
 
 # The web UI's static asset(s).
 datas += [(os.path.join("live_transcribe", "web", "static"),
@@ -92,13 +107,16 @@ a = Analysis(
     hiddenimports=hiddenimports,
     # Heavy/irrelevant stacks (retranscribe runs in a separate env). tkinter isn't
     # needed: the native window uses pywebview's own file dialog. The offline edition also
-    # excludes the online-only modules, so its update-check and calendar code is not in the bundle.
+    # excludes the online-only modules, so its update-check and calendar code is not in the
+    # bundle; the store edition excludes only updatecheck (the Store owns updates).
     excludes=["torch", "torchaudio", "torchvision", "whisperx", "pyannote",
               "pyannote.audio", "matplotlib", "tkinter", "IPython"]
-             + (ONLINE_ONLY_MODULES if OFFLINE else []),
+             + EDITION_EXCLUDES,
     # The offline edition installs a runtime hook that hard-forces SA_LIVE_OFFLINE=1 before any app
     # code runs, so the frozen app takes the offline path (no update check, no calendar, no cloud).
-    runtime_hooks=(["pyi_rth_offline.py"] if OFFLINE else []),
+    # The store edition's hook hard-forces SA_LIVE_STORE=1 the same way (no in-app update check).
+    runtime_hooks=(["pyi_rth_offline.py"] if OFFLINE
+                   else (["pyi_rth_store.py"] if STORE else [])),
     noarchive=False,
 )
 pyz = PYZ(a.pure)

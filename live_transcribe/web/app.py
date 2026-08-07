@@ -2202,17 +2202,19 @@ def _connected():
 
 
 # The app update check is the single outbound call the app makes on its own behalf, and only when
-# the user clicks it. Every build has it EXCEPT the airtight offline-only edition, which compiles it
-# out entirely: buildflags.OFFLINE_ONLY skips the route registration below, and the updatecheck
-# module that performs the fetch is excluded from that bundle (sa-live-transcribe.spec), so the
-# manifest URL is not even present. This gates exactly like the model-update check above.
-if not buildflags.OFFLINE_ONLY:
+# the user clicks it. Every build has it EXCEPT the airtight offline-only edition and the Store
+# (MSIX) edition, both of which compile it out entirely: the guard skips the route registration
+# below, and the updatecheck module that performs the fetch is excluded from those bundles
+# (sa-live-transcribe.spec), so the manifest URL is not even present. Offline strips it because it
+# strips every network path; the Store edition strips ONLY this, because the Store owns updates
+# (its siblings, the model-update check and the calendar, gate on OFFLINE_ONLY alone and stay in).
+if not (buildflags.OFFLINE_ONLY or buildflags.STORE_BUILD):
     @app.post("/api/check-updates")
     def check_updates():
         """Manual, user-initiated app update check. Present in every build except the airtight
-        offline edition (the OFFLINE_ONLY guard skips this route, and updatecheck is excluded from
-        that bundle). Delegates the one outbound HTTPS GET to updatecheck.check. No user data is
-        sent, it runs only on click, and it is CSRF-protected like every other POST."""
+        offline edition and the Store edition (the guard skips this route, and updatecheck is
+        excluded from those bundles). Delegates the one outbound HTTPS GET to updatecheck.check. No
+        user data is sent, it runs only on click, and it is CSRF-protected like every other POST."""
         from .. import updatecheck
         try:
             return updatecheck.check(licensing.APP_VERSION)
@@ -2243,6 +2245,9 @@ def app_info():
         # SA_LIVE_CONNECTED=1 turns on; it does NOT gate the user-initiated update check.
         "connected": _connected(),
         "offline": buildflags.OFFLINE_ONLY,
+        # "store" is the Microsoft Store (MSIX) edition: the connected build minus the in-app
+        # update check, which the UI hides because the Store owns updates. Nothing else differs.
+        "store": buildflags.STORE_BUILD,
     }
 
 
