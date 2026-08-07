@@ -417,6 +417,158 @@ def test_settings_migration_old_default_language():
     print("  OK  old settings files ('af'/'en') load unchanged; new mode values persist (sandboxed)")
 
 
+def test_save_location_upgrade_pin():
+    # The frozen Windows default moved from <data dir>\sessions to %USERPROFILE%\Volksmond.
+    # An upgraded install (sessions in the old default, save_location unset) must get the old
+    # folder pinned as an explicit save_location; a fresh install (old folder exists but is
+    # EMPTY, because the old _sessions_dir mkdir'd eagerly on every call) and a user with an
+    # explicit choice must be left alone. Every evaluation sets the save_location_migrated
+    # sentinel so the pin runs once ever; each scenario here resets the settings file to
+    # simulate a separate install. Sandboxed: config AND paths.data_dir point at temp
+    # dirs, and sys.frozen is restored in finally (a stray True flips later tests).
+    if sys.platform != "win32":
+        print("  SKIP  (win32-only)")
+        return
+    import json as _json
+    import tempfile
+    from pathlib import Path
+    from live_transcribe import config as C
+    from live_transcribe import paths as P
+    orig_dir, orig_path = C._DIR, C._SETTINGS_PATH
+    orig_data_dir = P.data_dir
+    had_frozen = hasattr(sys, "frozen")
+    orig_frozen = getattr(sys, "frozen", None)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            C._DIR = Path(td)
+            C._SETTINGS_PATH = C._DIR / "settings.json"
+            fake_data = Path(td) / "data"
+            old_default = fake_data / "sessions"
+            old_default.mkdir(parents=True)
+            P.data_dir = lambda: fake_data     # webapp reads paths.data_dir at call time
+            sys.frozen = True
+            # (iii) old default empty (the fresh-install eager-mkdir case) -> no pin,
+            # but the sentinel is still written (one settings write on first launch)
+            webapp._pin_save_location_on_upgrade()
+            assert C.load()["save_location"] == "", C.load()
+            assert C.load()["save_location_migrated"] is True, C.load()
+            # (i) old default holds a session -> pinned, so History keeps listing it
+            C._SETTINGS_PATH.write_text("{}", encoding="utf-8")   # fresh install state
+            (old_default / "2026-01-01-120000-meeting.md").write_text("x", encoding="utf-8")
+            webapp._pin_save_location_on_upgrade()
+            assert C.load()["save_location"] == str(old_default), C.load()
+            assert C.load()["save_location_migrated"] is True, C.load()
+            # ...and a second launch changes nothing (idempotent behind the sentinel)
+            webapp._pin_save_location_on_upgrade()
+            assert C.load()["save_location"] == str(old_default), C.load()
+            # (ii) an explicit user choice is never overwritten
+            C._SETTINGS_PATH.write_text(_json.dumps({"save_location": r"D:\MyMeetings"}),
+                                        encoding="utf-8")
+            webapp._pin_save_location_on_upgrade()
+            assert C.load()["save_location"] == r"D:\MyMeetings", C.load()
+            assert C.load()["save_location_migrated"] is True, C.load()
+    finally:
+        C._DIR, C._SETTINGS_PATH = orig_dir, orig_path
+        P.data_dir = orig_data_dir
+        if had_frozen:
+            sys.frozen = orig_frozen
+        elif hasattr(sys, "frozen"):
+            del sys.frozen
+    print("  OK  upgrade pin: old sessions pinned; empty old default and explicit choice untouched; sentinel set")
+
+
+def test_save_location_pin_respects_a_later_clear():
+    # A user who clears save_location AFTER the one-time pin (adopting the new
+    # %USERPROFILE%\Volksmond default) must not be re-pinned to the old folder on the
+    # next launch: the save_location_migrated sentinel makes the pin run once ever,
+    # not once per launch. Sandboxed exactly like test_save_location_upgrade_pin,
+    # plus USERPROFILE redirected so the resolved default never touches the real home.
+    if sys.platform != "win32":
+        print("  SKIP  (win32-only)")
+        return
+    import tempfile
+    from pathlib import Path
+    from live_transcribe import config as C
+    from live_transcribe import paths as P
+    orig_dir, orig_path = C._DIR, C._SETTINGS_PATH
+    orig_data_dir = P.data_dir
+    orig_profile = os.environ.get("USERPROFILE")
+    had_frozen = hasattr(sys, "frozen")
+    orig_frozen = getattr(sys, "frozen", None)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            C._DIR = Path(td)
+            C._SETTINGS_PATH = C._DIR / "settings.json"
+            fake_data = Path(td) / "data"
+            old_default = fake_data / "sessions"
+            old_default.mkdir(parents=True)
+            (old_default / "2026-01-01-120000-meeting.md").write_text("x", encoding="utf-8")
+            P.data_dir = lambda: fake_data
+            os.environ["USERPROFILE"] = td
+            sys.frozen = True
+            # First launch after the upgrade: the old folder gets pinned.
+            webapp._pin_save_location_on_upgrade()
+            assert C.load()["save_location"] == str(old_default), C.load()
+            assert C.load()["save_location_migrated"] is True, C.load()
+            # The user clears the pin to adopt the new default; a relaunch must respect that.
+            C.update({"save_location": ""})
+            webapp._pin_save_location_on_upgrade()
+            assert C.load()["save_location"] == "", C.load()
+            # And the resolved sessions folder is the NEW default, not the old one.
+            assert webapp._sessions_dir() == Path(td) / "Volksmond", webapp._sessions_dir()
+    finally:
+        C._DIR, C._SETTINGS_PATH = orig_dir, orig_path
+        P.data_dir = orig_data_dir
+        if orig_profile is None:
+            os.environ.pop("USERPROFILE", None)
+        else:
+            os.environ["USERPROFILE"] = orig_profile
+        if had_frozen:
+            sys.frozen = orig_frozen
+        elif hasattr(sys, "frozen"):
+            del sys.frozen
+    print("  OK  cleared save_location stays cleared on relaunch; new default applies (sentinel holds)")
+
+
+def test_frozen_sessions_dir_default_is_home_volksmond():
+    # With save_location unset, a frozen Windows build must resolve to %USERPROFILE%\Volksmond
+    # (visible, survives uninstall, not cloud-synced by default), not per-user app data.
+    # USERPROFILE points at a temp dir so the eager mkdir never touches the real home folder
+    # (Path.home() reads USERPROFILE first on Windows); sys.frozen is restored in finally.
+    if sys.platform != "win32":
+        print("  SKIP  (win32-only)")
+        return
+    import tempfile
+    from pathlib import Path
+    from live_transcribe import config as C
+    orig_dir, orig_path = C._DIR, C._SETTINGS_PATH
+    orig_profile = os.environ.get("USERPROFILE")
+    had_frozen = hasattr(sys, "frozen")
+    orig_frozen = getattr(sys, "frozen", None)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            C._DIR = Path(td)
+            C._SETTINGS_PATH = C._DIR / "settings.json"   # save_location unset
+            os.environ["USERPROFILE"] = td
+            sys.frozen = True
+            got = webapp._sessions_dir()
+            assert got == Path(td) / "Volksmond", got
+            # The eager mkdir stands: /api/sessions and /api/open-folder need the
+            # folder to exist on a fresh install.
+            assert got.is_dir(), "default folder not created eagerly"
+    finally:
+        C._DIR, C._SETTINGS_PATH = orig_dir, orig_path
+        if orig_profile is None:
+            os.environ.pop("USERPROFILE", None)
+        else:
+            os.environ["USERPROFILE"] = orig_profile
+        if had_frozen:
+            sys.frozen = orig_frozen
+        elif hasattr(sys, "frozen"):
+            del sys.frozen
+    print("  OK  frozen _sessions_dir defaults to %USERPROFILE%\\Volksmond when unset (win32)")
+
+
 def test_fits_on_gpu_logic():
     # The GPU fit check: full offload only when the model file plus a working-memory
     # headroom fits in VRAM. A tiny real file fits a big card; nothing fits an unknown
@@ -1171,6 +1323,9 @@ if __name__ == "__main__":
                test_default_language_roundtrip,
                test_language_mode_tokens,
                test_settings_migration_old_default_language,
+               test_save_location_upgrade_pin,
+               test_save_location_pin_respects_a_later_clear,
+               test_frozen_sessions_dir_default_is_home_volksmond,
                test_fits_on_gpu_logic,
                test_levels_and_switch_device,
                test_switch_device_preserves_recording_clock,

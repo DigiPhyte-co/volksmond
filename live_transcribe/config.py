@@ -39,7 +39,8 @@ DEFAULTS = {
     "transcription_language": "af",   # default spoken language mode: "af" | "en" | "sa" (SA group) | a code like "zu"/"de"; "" == auto-detect
     "transcribe_languages": ["af", "en"],  # languages the user transcribes; drives the per-session language picker and (later) which model families to provision. The chosen language picks the model FAMILY (Afrikaans -> Fluister), the hardware picks the size.
     "tier": "auto",                   # default hardware tier
-    "save_location": "",              # "" == default folder (project sessions/ in dev, per-user app-data when frozen)
+    "save_location": "",              # "" == default folder (project sessions/ in dev; frozen: %USERPROFILE%\Volksmond on Windows, data-dir sessions/ elsewhere)
+    "save_location_migrated": False,  # the one-time save-location upgrade pin has run; never re-pin (a user may clear save_location later to adopt the new default)
     "default_context": "",            # standing names/jargon seeded every session
     "ai_backend": "local",            # "local" | "cloud" (cloud is a paid add-on)
     "ai_instructions": [],            # [{"id","name","prompt"}] saved system prompts

@@ -6,7 +6,8 @@ the session and stream segments to the browser via Server-Sent Events.
 
 A session can transcribe live, record live (off by default, POPIA), do both, or
 transcribe an existing file. Transcripts and recordings save to the user's chosen
-save_location (validated; falls back to the project sessions/ folder).
+save_location (validated; falls back to a per-platform default folder, see
+_sessions_dir).
 """
 import asyncio
 import json
@@ -490,8 +491,9 @@ def _sessions_dir() -> Path:
     """Where transcripts and recordings are saved.
 
     User-configurable via the save_location setting. Falls back when unset or
-    invalid to the project sessions/ folder in dev, or a per-user app-data folder
-    when frozen (see below). Validates the configured path is a real,
+    invalid to the project sessions/ folder in dev, or the per-platform default
+    when frozen (%USERPROFILE%\\Volksmond on Windows, the data dir elsewhere; see
+    paths.default_sessions_dir_for). Validates the configured path is a real,
     writable directory before trusting it (defence against a typo'd or read-only
     location silently losing a meeting's transcript).
     """
@@ -505,15 +507,57 @@ def _sessions_dir() -> Path:
         except Exception:
             pass  # fall through to the default
     # Default save location: the project sessions/ folder in dev. When frozen,
-    # PROJECT_ROOT points INSIDE the PyInstaller bundle, so use a persistent,
-    # non-synced user folder (same base as settings/models) instead - otherwise
+    # PROJECT_ROOT points INSIDE the PyInstaller bundle, so use a persistent
+    # user folder (on Windows a visible one the user can find, that survives
+    # uninstall and is not cloud-synced by default) instead - otherwise
     # transcripts bury inside the app and vanish on reinstall.
     if getattr(sys, "frozen", False):
-        p = paths.data_dir() / "sessions"
+        p = paths.default_sessions_dir()
     else:
         p = PROJECT_ROOT / "sessions"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def _pin_save_location_on_upgrade() -> None:
+    """One-time pin so the moved Windows default never hides existing transcripts.
+
+    The frozen Windows default moved from %LOCALAPPDATA%\\sa-live-transcribe\\sessions
+    to %USERPROFILE%\\Volksmond (new installs only). An upgraded install with
+    transcripts in the old default and save_location unset would suddenly list an
+    empty History, so pin the old folder as an explicit save_location once. Reads
+    the raw setting, never the resolved _sessions_dir (which cannot express
+    "unset"). Only the old folder's CONTENTS decide: _sessions_dir has always
+    mkdir'd eagerly, so the folder itself exists on every install, empty or not.
+    Any entry counts, not just files: transcripts, recordings and notes sidecars
+    all live flat in that folder, and a subfolder there is user-created and worth
+    keeping visible too. Gated to frozen Windows because the default moved
+    nowhere else; a failure must never stop the app.
+
+    Runs once EVER, not once per launch: the save_location_migrated sentinel is
+    written on the first evaluation, so a user who later clears save_location to
+    adopt the new default is never re-pinned to the old folder. The pin and the
+    sentinel land in one config.update() call, one atomic write.
+    """
+    if not (getattr(sys, "frozen", False) and sys.platform == "win32"):
+        return
+    try:
+        s = config.load()
+        if s.get("save_location_migrated"):
+            return  # already decided once; respect whatever the user did since
+        patch = {"save_location_migrated": True}
+        if not (s.get("save_location") or "").strip():
+            old = paths.data_dir() / "sessions"
+            if old.is_dir() and any(old.iterdir()):
+                patch["save_location"] = str(old)
+        config.update(patch)
+    except Exception as e:
+        print(f"[sessions] save-location upgrade pin skipped: {e}", flush=True)
+
+
+# Module scope: runs once per process and covers every entrypoint (desktop
+# window, --browser, --server-only, python -m live_transcribe.web).
+_pin_save_location_on_upgrade()
 
 
 def _build_output_path(topic: str) -> Path:

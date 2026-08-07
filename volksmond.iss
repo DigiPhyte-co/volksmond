@@ -20,8 +20,9 @@
 #endif
 
 [Setup]
-; A stable AppId keeps upgrades in place: a new version replaces the old one, the user's settings
-; and downloaded models (which live under %LOCALAPPDATA%\sa-live-transcribe, not here) are untouched.
+; A stable AppId keeps upgrades in place: a new version replaces the old one. Settings, downloaded
+; models and every transcript location live outside {app}, so install, upgrade and uninstall all
+; leave them untouched.
 AppId={{7C8E2A14-3B5D-4E9F-A1C2-9D4F6B0E8A37}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
