@@ -533,15 +533,24 @@ def _pin_save_location_on_upgrade() -> None:
     all live flat in that folder, and a subfolder there is user-created and worth
     keeping visible too. Gated to frozen Windows because the default moved
     nowhere else; a failure must never stop the app.
+
+    Runs once EVER, not once per launch: the save_location_migrated sentinel is
+    written on the first evaluation, so a user who later clears save_location to
+    adopt the new default is never re-pinned to the old folder. The pin and the
+    sentinel land in one config.update() call, one atomic write.
     """
     if not (getattr(sys, "frozen", False) and sys.platform == "win32"):
         return
     try:
-        if (config.load().get("save_location") or "").strip():
-            return  # the user already chose a folder; respect it
-        old = paths.data_dir() / "sessions"
-        if old.is_dir() and any(old.iterdir()):
-            config.update({"save_location": str(old)})
+        s = config.load()
+        if s.get("save_location_migrated"):
+            return  # already decided once; respect whatever the user did since
+        patch = {"save_location_migrated": True}
+        if not (s.get("save_location") or "").strip():
+            old = paths.data_dir() / "sessions"
+            if old.is_dir() and any(old.iterdir()):
+                patch["save_location"] = str(old)
+        config.update(patch)
     except Exception as e:
         print(f"[sessions] save-location upgrade pin skipped: {e}", flush=True)
 

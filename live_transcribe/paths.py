@@ -36,8 +36,9 @@ def default_sessions_dir_for(platform: str) -> Path:
 
     Windows gets a visible per-user folder: transcripts are the user's documents,
     not app data, and burying them under %LOCALAPPDATA% means they are hard to
-    find and vanish on uninstall (fatal under MSIX, which virtualises AppData
-    writes and deletes them with the package). Deliberately NOT Documents, which
+    find (the Inno uninstaller leaves them, but the upcoming MSIX edition
+    virtualises AppData writes and deletes them with the package). Deliberately
+    NOT Documents, which
     is commonly OneDrive-redirected: transcripts silently syncing to the cloud
     would undermine the local-only posture. Path.home() honours USERPROFILE on
     Windows, same fallback style as data_dir_for above.

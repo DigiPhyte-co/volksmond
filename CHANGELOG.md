@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **New installs on Windows now save transcripts and recordings to `%USERPROFILE%\Volksmond`.** The old default buried them in per-user app data (`%LOCALAPPDATA%\sa-live-transcribe\sessions`): easy to find and open beats hidden, the new folder survives an uninstall, and it is not cloud-synced by default (deliberately not Documents, which OneDrive commonly redirects). Existing installs keep their current folder automatically: on first launch after updating, a default folder that already holds sessions is pinned as the explicit save location, so nothing moves and History stays intact. macOS and Linux defaults are unchanged. (`paths.py`, `web/app.py`, `config.py`, `volksmond.iss`.)
+- **New installs on Windows now save transcripts and recordings to `%USERPROFILE%\Volksmond`.** The old default buried them in per-user app data (`%LOCALAPPDATA%\sa-live-transcribe\sessions`): easy to find and open beats hidden, the new folder stays safe in the upcoming Microsoft Store (MSIX) edition, where app-data writes are removed on uninstall, and it is not cloud-synced by default (deliberately not Documents, which OneDrive commonly redirects). Existing installs keep their current folder automatically: on first launch after updating, a default folder that already holds sessions is pinned as the explicit save location, so nothing moves and History stays intact. macOS and Linux defaults are unchanged. (`paths.py`, `web/app.py`, `config.py`, `volksmond.iss`.)
 
 ## 2026-07-31, v1.12.0: hallucinated lines cut by two thirds, and the app taps you on the shoulder
 
