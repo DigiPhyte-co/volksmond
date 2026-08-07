@@ -50,8 +50,9 @@ def test_data_dir_follows_sys_platform():
 
 def test_default_sessions_dir_windows():
     # Frozen Windows saves to a visible per-user folder, NOT app data (buried,
-    # wiped on uninstall, virtualised under MSIX) and NOT Documents (commonly
-    # OneDrive-redirected, which would undermine the local-only posture).
+    # and removed on uninstall under the MSIX edition, which virtualises AppData
+    # writes) and NOT Documents (commonly OneDrive-redirected, which would
+    # undermine the local-only posture).
     expect = Path.home() / "Volksmond"
     assert paths.default_sessions_dir_for("win32") == expect, \
         paths.default_sessions_dir_for("win32")
