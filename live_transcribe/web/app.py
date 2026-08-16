@@ -136,6 +136,11 @@ class _State:
         self.chunk_seconds: Optional[int] = None
         self.running: bool = False
         self.recording: bool = False
+        # Latch: has recording EVER been active this session (a start-time recording OR a mid-session
+        # record-from-here)? Stays True after a what="recording" stop, so a second record-from-here
+        # cannot reuse the session stem and TRUNCATE the first <stem>.wav on its close. Surfaced as
+        # /api/status "recording_started"; cleared only by reset() for a fresh session.
+        self.recording_started: bool = False
         self.record_raw_mic: bool = False   # live AEC + recording: recorder takes the raw MIC_RAW,
                                              # engine takes the cleaned MIC, so the recording stays raw
         self.transcribing: bool = False
@@ -187,6 +192,7 @@ class _State:
         self.chunk_seconds = None
         self.running = False
         self.recording = False
+        self.recording_started = False
         self.record_raw_mic = False
         self.transcribing = False
         self.source_kind = None
@@ -703,6 +709,10 @@ def status():
             # "recording"}) or None, set when a live CPU session auto-downgrades. Same poll, a
             # parallel banner. `recording` is the session's recording state when it was raised.
             "struggle_nudge": STATE.struggle_nudge,
+            # True iff recording is, or has ever been, active this session (start-time or a
+            # mid-session record-from-here). The live screen and finish handoff key off it, and once
+            # true /api/record-from-here refuses (re-recording the same stem would truncate the WAV).
+            "recording_started": STATE.recording_started,
         }
         # Live AEC truth for the in-meeting toggle: the ENGINE'S actual state, never the stored
         # setting (a long-running instance can drift from disk; the toggle must not lie).
@@ -869,13 +879,17 @@ def record_from_here():
     """Start recording audio partway through a running live transcription ("I forgot to record", or
     the struggle nudge's offer). Captures IDENTICALLY to a start-time recording: the AEC-cleaned MIC
     + SYS folded to one L/R stereo <stem>.wav, reusing the session stem so it lands as a normal
-    History row and re-transcribes unchanged. The recorder rebases to zero on its first chunk, so it
-    does not zero-fill the elapsed session lead with (up to hours of) silence.
+    History row and re-transcribes unchanged.
 
-    Already-elapsed audio is unrecoverable: nothing was buffered before this call, so recording
-    truly starts from here. 409 when there is no running live transcription session to attach to, or
-    when the session is already recording (idempotent: a double-click must never orphan an open WAV
-    handle by replacing STATE.recorder)."""
+    Records strictly from the click on: the recorder is given the session-clock time of THIS call as
+    a shared anchor, so buffered pre-click audio (up to a chunk of it) is dropped/sliced and never
+    written, and MIC/SYS stay aligned to that one moment. Earlier audio is not recoverable and is not
+    saved (nothing was buffered before this call).
+
+    409 when there is no running live transcription session to attach to, when the session has ALREADY
+    recorded this session (a start-time recording or an earlier record-from-here: recording once per
+    session, since a re-record would reuse the stem and truncate the first WAV), or when there is no
+    live capture to record from (a failed device switch can leave a running session with none)."""
     with STATE.lock:
         if not (STATE.running and not STATE.stopping and STATE.source_kind == "live"
                 and STATE.transcribing and STATE.engine is not None):
@@ -883,16 +897,31 @@ def record_from_here():
                                 detail="Recording can only be started during a live transcription session.")
         if STATE.recording:
             raise HTTPException(status_code=409, detail="This session is already recording.")
+        if STATE.recording_started:
+            # Recorded earlier this session and stopped: a new recorder on the same stem would
+            # truncate the finalised <stem>.wav on close, losing the first take. Record once.
+            raise HTTPException(status_code=409, detail="This session has already recorded audio.")
+        cap = STATE.capture
+        t0 = getattr(cap, "_t0", None)
+        if cap is None or t0 is None:
+            # A failed live device switch can leave a running session with STATE.capture=None; a
+            # recorder attached now would get no audio, and there is no session clock to anchor to.
+            raise HTTPException(status_code=409, detail="There is no live audio capture to record from.")
         if STATE.output_path is None:
             raise HTTPException(status_code=409, detail="No active session to record.")
+        # The click moment on the session clock (the same clock every chunk's t_start uses). The
+        # recorder drops/slices anything before it, so nothing captured before the click is written
+        # and both channels start at 0 aligned to this shared anchor.
+        anchor = time.monotonic() - t0
         stem = STATE.output_path.with_suffix("")
-        rec = sinks.AudioRecorder(stem, rebase=True)
+        rec = sinks.AudioRecorder(stem, anchor=anchor)
         # Attach order matters: _feed reads STATE.recorder / STATE.recording LOCK-FREE every chunk,
         # so publish the recorder BEFORE the flag; the next captured chunk of each source then
         # begins writing. Never the reverse (recording=True with recorder=None). Stop closes this
         # recorder generically (the existing what="all"/"recording" paths), so do NOT close it here.
         STATE.recorder = rec
         STATE.recording = True
+        STATE.recording_started = True   # latch: this session has now recorded; refuse a re-record
         # Taking the offered action answers the banner: clear it so it cannot linger contradicting
         # the fact that we are now recording (the frontend also drops it optimistically).
         STATE.struggle_nudge = None
@@ -1174,6 +1203,7 @@ def start(req: StartRequest):
         STATE.browser_sink = browser_sink
         STATE.recorder = recorder
         STATE.recording = record_on
+        STATE.recording_started = record_on   # latch: a start-time recording counts as "has recorded"
         STATE.transcribing = transcribe_on
         STATE.started_at = datetime.now()
         STATE.tier = tier if transcribe_on else None

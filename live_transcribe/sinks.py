@@ -164,7 +164,7 @@ class AudioRecorder:
     GAP_TOLERANCE_S = 2.0
     _FILL_BLOCK = TARGET_RATE * 10   # write gap silence in 10 s blocks to bound memory
 
-    def __init__(self, path_stem, *, rebase=False):
+    def __init__(self, path_stem, *, anchor=None):
         self.stem = Path(path_stem)
         self.stem.parent.mkdir(parents=True, exist_ok=True)
         self._writers = {}     # source -> wave.Wave_write
@@ -172,13 +172,14 @@ class AudioRecorder:
         self._gap_warned = set()     # sources already warned about a backwards t_start
         self._lock = threading.Lock()
         self._closed = False
-        # Mid-session ("record from here") recorder: zero the timeline on the FIRST chunk of ANY
-        # source instead of zero-filling the elapsed session lead (up to hours) with silence. One
-        # SHARED offset across sources keeps MIC/SYS relatively aligned in the stereo fold, so the
-        # file plays from 0. Default False: a start-time recorder keeps today's wall-clock placement
-        # byte-for-byte (a session that begins recording at t=0 has nothing to rebase anyway).
-        self._rebase = rebase
-        self._t_offset = None    # set once, under the lock, by the first chunk seen
+        # Mid-session ("record from here") recorder: `anchor` is the session-clock time of the click,
+        # captured at the endpoint and SHARED across sources. Audio before it is never written - a
+        # chunk that ends at or before the anchor is dropped whole, and the chunk straddling it is
+        # sliced at the anchor - and the SAME anchor is then subtracted from every source, so the file
+        # starts at 0 with MIC/SYS still aligned to the one shared moment (never a per-source
+        # first-chunk offset, which would place the two channels at different zeros). None (default) =
+        # a start-time recorder, which keeps today's wall-clock placement byte-for-byte.
+        self._anchor = anchor
         self.last_error = None      # human-readable write/close failure, surfaced in the UI
         atexit.register(self.close)
 
@@ -186,13 +187,26 @@ class AudioRecorder:
         if self._closed:
             return
         with self._lock:
-            if self._rebase:
-                # First chunk (any source) anchors the shared zero; every later chunk of either
-                # source subtracts the SAME offset, so the wall-clock placement below still keeps
-                # the two channels aligned relative to each other, just shifted to start at 0.
-                if self._t_offset is None:
-                    self._t_offset = t_start
-                t_start = max(0.0, t_start - self._t_offset)
+            # Re-check under the lock. close() flips _closed and finalises (folds + deletes the
+            # per-source files) under this SAME lock, so a stop landing between the check above and
+            # here must not create a new writer AFTER finalisation: that would be an orphaned,
+            # never-finalised WAV handle atexit cannot fold. Same discipline as MarkdownSink.
+            if self._closed:
+                return
+            if self._anchor is not None:
+                # Never write anything captured before the click. A chunk ending at or before the
+                # anchor is dropped whole; the chunk straddling it is sliced at the anchor. Then the
+                # ONE shared anchor is subtracted from every source, so both channels start at 0 and
+                # stay aligned to the same moment - nothing before the click reaches disk.
+                n = len(audio)
+                t_end = t_start + n / self.TARGET_RATE
+                if t_end <= self._anchor:
+                    return
+                if t_start < self._anchor:
+                    skip = min(int((self._anchor - t_start) * self.TARGET_RATE), n)
+                    audio = audio[skip:]
+                    t_start = self._anchor
+                t_start = t_start - self._anchor
             w = self._writers.get(source)
             if w is None:
                 path = self.stem.with_name(f"{self.stem.name}-{source}.wav")
