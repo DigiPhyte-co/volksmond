@@ -63,6 +63,7 @@ DEFAULTS = {
     "os_toasts": True,                # show Windows desktop notifications (toasts) when Volksmond has something to say while its window is behind a call. ON by default: the whole point is to be seen when the window is not. One shared switch for every notification the app sends; each feature keeps its own on/off. Hard kill: SA_LIVE_TOASTS=0. Local only, no network path (Shell_NotifyIcon is a shell call).
     "silence_nudge": True,            # warn (banner + Windows notification) when NOTHING has been heard on either the mic or the system audio for a long stretch of a live session: the "recording an hour of nothing because Windows switched the mic" failure. Not a Business feature; it is data integrity, not a nicety. Hard kill: SA_LIVE_SILENCE_NUDGE=0.
     "silence_nudge_minutes": 5,       # how long everything must stay silent before that warning. Picker offers 3/5/10/15; a hand-edited value is clamped to 1..120.
+    "struggle_nudge": True,           # surface (banner + Windows notification) the CPU auto-downgrade that fires when the machine cannot transcribe in real time. The downgrade ALWAYS happens regardless; this only gates the SURFACING, so a user who knowingly runs a weak CPU can silence it. Not a Business feature; data integrity, like silence_nudge. Hard kill: SA_LIVE_STRUGGLE_NUDGE=0.
 }
 
 

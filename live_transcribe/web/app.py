@@ -161,6 +161,14 @@ class _State:
         self.silence_nudge: Optional[dict] = None
         self.silence_watch = None
         self.silence_stop: Optional[threading.Event] = None
+        # "Model struggling to keep up" nudge. struggle_nudge is the outstanding warning the UI
+        # renders as a banner ({"old_size", "new_size", "recording"}) or None; it is set by the
+        # engine's on_downgrade callback when a live CPU session auto-downgrades. struggle_notified
+        # is the once-per-session latch: the Windows toast fires only on the first downgrade, and a
+        # banner the user has dismissed is not re-raised by a later rung. Both session-scoped, so
+        # reset() clears them.
+        self.struggle_nudge: Optional[dict] = None
+        self.struggle_notified: bool = False
 
     def reset(self):
         self.engine = None
@@ -191,6 +199,8 @@ class _State:
         self.silence_stop = None
         self.silence_watch = None
         self.silence_nudge = None
+        self.struggle_nudge = None
+        self.struggle_notified = False
 
 
 STATE = _State()
@@ -443,6 +453,83 @@ def _silence_signal():
         ev.set()
 
 
+# --- "model struggling to keep up" nudge --------------------------------------
+# When a live CPU session auto-downgrades (transcribe.Engine._maybe_downgrade, ladder
+# medium->small->base->tiny) because it cannot hold real time, the transcription silently gets
+# rougher. Surface it: a one-time banner (STATE.struggle_nudge, polled via /api/status) plus a
+# single Windows toast, with the offer to start recording so the meeting can be re-transcribed at
+# full accuracy afterwards. The downgrade ITSELF always happens; this only makes it visible, and
+# only for a CPU + adaptive(live) + transcribing session (a GPU tier never downgrades, Swivuriso is
+# a single fixed model, a record-only session has no engine). Data integrity, not a Business
+# nicety, so the toast fires ungated like the silence one, never through /api/notify-meeting.
+STRUGGLE_ENV = "SA_LIVE_STRUGGLE_NUDGE"
+
+
+def _struggle_env_on() -> bool:
+    """False when SA_LIVE_STRUGGLE_NUDGE is set to 0/false/no/off: the hard kill switch, checked
+    before the setting so a support session can turn the whole surfacing off in one place."""
+    return (os.environ.get(STRUGGLE_ENV, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _struggle_nudge_on() -> bool:
+    """True when the struggle-nudge SURFACING (banner + toast) is enabled: the env kill switch plus
+    the struggle_nudge setting (default on). The auto-downgrade is unaffected either way."""
+    if not _struggle_env_on():
+        return False
+    try:
+        return config.load().get("struggle_nudge", True) is not False
+    except Exception:
+        return True
+
+
+def _on_downgrade(engine, old_size, new_size):
+    """Engine.on_downgrade callback: surface a CPU auto-downgrade. Runs on the TRANSCRIPTION
+    WORKER thread (transcribe.Engine._maybe_downgrade), so it takes STATE.lock and guards the
+    session's identity exactly like _silence_tick before touching STATE, then fires the toast
+    outside the lock (best-effort, never raises). Returns the published nudge dict, or None.
+
+    Once per session: the FIRST downgrade sets the banner and fires the toast; a later rung UPDATES
+    the banner's new_size in place (keeping the original old_size, the full-quality model the
+    session began degrading from) but never re-fires the toast, and a banner the user has already
+    dismissed is not re-raised. `recording` is captured at emit time (STATE.recording), so the
+    frontend can drop the record offer when the session is already recording."""
+    if not _struggle_nudge_on():
+        return None
+    published = None
+    fire_toast = False
+    with STATE.lock:
+        # A session that is finishing must never be nudged (its audio has stopped on purpose), and
+        # a callback from an engine that is no longer the session's (a stop/switch mid-drain, or a
+        # new session) must not publish onto the current one.
+        if STATE.stopping or STATE.engine is not engine:
+            return None
+        # Already surfaced once this session and the user dismissed it: do not nag again. A banner
+        # still on screen falls through and is updated in place below.
+        if STATE.struggle_notified and STATE.struggle_nudge is None:
+            return None
+        prior = STATE.struggle_nudge
+        STATE.struggle_nudge = {
+            "old_size": prior["old_size"] if prior else old_size,
+            "new_size": new_size,
+            "recording": STATE.recording,
+        }
+        published = STATE.struggle_nudge
+        fire_toast = not STATE.struggle_notified
+        STATE.struggle_notified = True
+    if fire_toast:
+        # Best-effort desktop toast: a no-op when os_toasts is off, on a non-Windows machine or
+        # without pywin32, and never raises. Clicking it brings the window forward, where the
+        # banner (with the actions) is already waiting. NOT routed through /api/notify-meeting,
+        # which is Business-gated; this mirrors the silence watcher, called directly and ungated.
+        from .. import notify
+        notify.show("Volksmond switched to a faster model",
+                    "Your computer can't transcribe this meeting at full quality in real time, so "
+                    "Volksmond stepped down to a faster model to keep up. It is still running. Open "
+                    "Volksmond to record the audio and re-transcribe at full accuracy later.",
+                    tag="struggle", on_click=notify.focus_app)
+    return published
+
+
 class StartRequest(BaseModel):
     topic: str = ""
     tier: str = "auto"            # "auto" | "gpu" | "cpu-strong" | "cpu-mid"
@@ -612,6 +699,10 @@ def status():
             # The outstanding long-silence warning ({"minutes","count","at"}) or None. The UI
             # polls this while a live session runs and floats a banner when it appears.
             "silence_nudge": STATE.silence_nudge,
+            # The outstanding "model struggling to keep up" warning ({"old_size","new_size",
+            # "recording"}) or None, set when a live CPU session auto-downgrades. Same poll, a
+            # parallel banner. `recording` is the session's recording state when it was raised.
+            "struggle_nudge": STATE.struggle_nudge,
         }
         # Live AEC truth for the in-meeting toggle: the ENGINE'S actual state, never the stored
         # setting (a long-running instance can drift from disk; the toggle must not lie).
@@ -771,6 +862,70 @@ def silence_nudge_action(req: SilenceNudgeRequest):
         st = watch.state() if watch is not None else {}
         return {"action": req.action, "silence_nudge": None,
                 "muted": bool(st.get("muted")), "nudges": st.get("nudges", 0)}
+
+
+@app.post("/api/record-from-here")
+def record_from_here():
+    """Start recording audio partway through a running live transcription ("I forgot to record", or
+    the struggle nudge's offer). Captures IDENTICALLY to a start-time recording: the AEC-cleaned MIC
+    + SYS folded to one L/R stereo <stem>.wav, reusing the session stem so it lands as a normal
+    History row and re-transcribes unchanged. The recorder rebases to zero on its first chunk, so it
+    does not zero-fill the elapsed session lead with (up to hours of) silence.
+
+    Already-elapsed audio is unrecoverable: nothing was buffered before this call, so recording
+    truly starts from here. 409 when there is no running live transcription session to attach to, or
+    when the session is already recording (idempotent: a double-click must never orphan an open WAV
+    handle by replacing STATE.recorder)."""
+    with STATE.lock:
+        if not (STATE.running and not STATE.stopping and STATE.source_kind == "live"
+                and STATE.transcribing and STATE.engine is not None):
+            raise HTTPException(status_code=409,
+                                detail="Recording can only be started during a live transcription session.")
+        if STATE.recording:
+            raise HTTPException(status_code=409, detail="This session is already recording.")
+        if STATE.output_path is None:
+            raise HTTPException(status_code=409, detail="No active session to record.")
+        stem = STATE.output_path.with_suffix("")
+        rec = sinks.AudioRecorder(stem, rebase=True)
+        # Attach order matters: _feed reads STATE.recorder / STATE.recording LOCK-FREE every chunk,
+        # so publish the recorder BEFORE the flag; the next captured chunk of each source then
+        # begins writing. Never the reverse (recording=True with recorder=None). Stop closes this
+        # recorder generically (the existing what="all"/"recording" paths), so do NOT close it here.
+        STATE.recorder = rec
+        STATE.recording = True
+        # Taking the offered action answers the banner: clear it so it cannot linger contradicting
+        # the fact that we are now recording (the frontend also drops it optimistically).
+        STATE.struggle_nudge = None
+        audio_stem = str(stem)
+    # audio_stem must reach the client: the finish-screen re-transcribe handoff keys off it.
+    return {"recording": True, "audio_stem": audio_stem}
+
+
+class StruggleNudgeRequest(BaseModel):
+    action: Literal["dismiss", "mute"]
+
+
+@app.post("/api/struggle-nudge")
+def struggle_nudge_action(req: StruggleNudgeRequest):
+    """Answer an outstanding "model struggling to keep up" banner, from its own buttons.
+
+    "dismiss" ("Keep going" / the X) clears it for this session; the auto-downgrade carries on, and
+    the once-per-session latch means a later rung will not re-raise a dismissed banner. "mute"
+    clears it AND persists struggle_nudge=false, so this machine stops surfacing the downgrade
+    entirely (for a user who knowingly runs a weak CPU). Neither touches the transcription or the
+    downgrade itself. 409 when there is no live session to answer for."""
+    with STATE.lock:
+        if not STATE.running or STATE.source_kind != "live":
+            raise HTTPException(status_code=409, detail="No live session is running.")
+        STATE.struggle_nudge = None
+    if req.action == "mute":
+        # Persist outside the state lock (config.update does disk I/O). The session-level clear
+        # already took effect, so a failed write must not fail the request; log it and carry on.
+        try:
+            config.update({"struggle_nudge": False})
+        except Exception as e:
+            print(f"[struggle] muted for the session but the setting could not be saved: {e}", flush=True)
+    return {"struggle_nudge": None}
 
 
 class AecLiveRequest(BaseModel):
@@ -1055,6 +1210,11 @@ def start(req: StartRequest):
         # and the veto's mic side stay gain-invariant under live AGC. Both are attached BEFORE
         # cap.start() so no early block is missed. SA_LIVE_RAW_MIC_RING=0 skips the mic ring.
         if engine is not None:
+            # Surface a live CPU auto-downgrade (banner + one-time toast). Bind THIS engine into
+            # the callback so the handler can confirm it is still the session's before publishing
+            # (the downgrade fires on the worker thread; a stop/switch can be mid-flight). A GPU or
+            # Swivuriso session simply never downgrades, so this is inert there.
+            engine.on_downgrade = lambda old, new, _e=engine: _on_downgrade(_e, old, new)
             _sys_ring = transcribe.EnergyRing()
             engine.sys_env = _sys_ring
             cap.attach_sys_ring(_sys_ring)
@@ -1869,6 +2029,7 @@ class SettingsPatch(BaseModel):
     os_toasts: Optional[bool] = None        # Windows desktop notifications (toasts); shared by every notifying feature
     silence_nudge: Optional[bool] = None    # warn when nothing has been heard for a long stretch of a live session
     silence_nudge_minutes: Optional[int] = None   # how long that stretch is (picker: 3/5/10/15)
+    struggle_nudge: Optional[bool] = None   # surface the live CPU auto-downgrade (banner + toast)
     live_notes_width: Optional[int] = None  # live-screen notes column width (px); 0 = default
     # summary_model is intentionally NOT settable here: only the verified downloader
     # (modeldl.py) sets it, to a pinned catalogue filename, so an arbitrary or
