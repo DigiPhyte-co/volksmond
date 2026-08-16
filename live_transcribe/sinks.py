@@ -203,11 +203,14 @@ class AudioRecorder:
                 if t_end <= self._anchor:
                     return
                 if t_start < self._anchor:
-                    skip = min(int((self._anchor - t_start) * self.TARGET_RATE), n)
+                    # Cut with ceil, not int(): with a non-integer-second anchor an int() floor keeps
+                    # the sample straddling the anchor, leaking one pre-click sample onto disk.
+                    skip = min(int(np.ceil((self._anchor - t_start) * self.TARGET_RATE)), n)
                     audio = audio[skip:]
                     t_start = self._anchor
                 t_start = t_start - self._anchor
             w = self._writers.get(source)
+            first = w is None      # this source's first retained chunk (drives the anchor placement)
             if w is None:
                 path = self.stem.with_name(f"{self.stem.name}-{source}.wav")
                 w = wave.open(str(path), "wb")
@@ -225,12 +228,26 @@ class AudioRecorder:
             # index is recomputed from t_start each chunk (absolute, not accumulated), so
             # rounding never drifts.
             written = self._samples_written[source]
-            expected = int(t_start * self.TARGET_RATE)
+            # Under a shared anchor, round so identical real times map to identical sample indices on
+            # every source (the stereo alignment invariant); the wall-clock path keeps int().
+            expected = (round(t_start * self.TARGET_RATE) if self._anchor is not None
+                        else int(t_start * self.TARGET_RATE))
             gap = expected - written
-            if gap > int(self.GAP_TOLERANCE_S * self.TARGET_RATE):
+            tol = int(self.GAP_TOLERANCE_S * self.TARGET_RATE)
+            if self._anchor is not None and first:
+                # A source's FIRST retained chunk after the anchor must land at its EXACT offset from
+                # the shared origin, zero-filling the lead. The jitter-tolerance collapse below is
+                # only safe between CONSECUTIVE chunks of the SAME source; applying it to a first
+                # chunk that begins up to GAP_TOLERANCE_S after the anchor would snap it to sample 0
+                # and skew this channel against the other (broken stereo/speaker separation).
+                gap = max(0, gap)
+                if gap:
+                    print(f"[recorder] {source}: first audio {gap / self.TARGET_RATE:.2f}s after the "
+                          f"record point; zero-filling the lead to keep the channels aligned", flush=True)
+            elif gap > tol:
                 print(f"[recorder] {source}: no audio for {gap / self.TARGET_RATE:.1f}s "
                       f"(source idle), filling with silence to stay time-aligned", flush=True)
-            elif gap < -int(self.GAP_TOLERANCE_S * self.TARGET_RATE):
+            elif gap < -tol:
                 # Overlap: chunk starts before what we already wrote (should not happen;
                 # chunks arrive in order per source). Append as-is rather than corrupt
                 # what is on disk; warn once per source.

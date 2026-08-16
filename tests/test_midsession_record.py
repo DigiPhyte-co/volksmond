@@ -52,6 +52,17 @@ def pcm16(float_audio):
     return (np.clip(float_audio, -1.0, 1.0) * 32767.0).astype("<i2")
 
 
+def block(secs, val=0.25):
+    """A constant-level block: EVERY sample is non-zero, so a channel's leading-zero count is
+    exactly its zero-filled lead (a sine would start at 0 and blur the count by a sample)."""
+    return np.full(int(secs * RATE), val, dtype=np.float32)
+
+
+def leading_zeros(ch):
+    nz = np.nonzero(ch)[0]
+    return int(nz[0]) if len(nz) else len(ch)
+
+
 def read_wav(path):
     with wave.open(str(path), "rb") as r:
         nch = r.getnchannels()
@@ -168,33 +179,80 @@ def test_default_recorder_uses_wall_clock_placement():
     print("  OK  default anchor=None keeps today's wall-clock placement (30s lead preserved)")
 
 
-def test_closed_recheck_under_lock_prevents_orphan_handle():
-    # Force the exact interleaving the pre-lock _closed check leaves open: close() lands AFTER
-    # on_chunk's pre-lock check passed but BEFORE it holds the lock. A lock whose acquire flips
-    # _closed True (as close() would, under this same lock) stands in for that race. Without the
-    # re-check under the lock, on_chunk would create a WAV writer AFTER finalisation -> an orphaned,
-    # never-finalised handle.
+def test_anchor_first_chunk_offsets_stay_aligned_across_channels():
+    # The channel-skew bug: both sources' FIRST retained chunks begin AFTER the anchor at DIFFERENT
+    # sub-2s offsets (0.5s and 1.2s, both below GAP_TOLERANCE_S). Each must be zero-filled to its
+    # EXACT offset from the shared anchor, NOT collapsed to sample 0, so a given real time maps to
+    # the same sample index on both channels. The old jitter-collapse snapped both to 0 (skew).
+    d = Path(tempfile.mkdtemp())
+    anchor = 100.0
+    rec = sinks.AudioRecorder(d / "align", anchor=anchor)
+    rec.on_chunk("MIC", block(10.0), 100.5)    # first MIC audio 0.5s after the record point
+    rec.on_chunk("SYS", block(10.0), 101.2)    # first SYS audio 1.2s after the record point
+    rec.close()
+    micc, sysc = read_wav(d / "align.wav")
+    assert sysc is not None, "both channels present -> stereo fold expected"
+    mic_off, sys_off = leading_zeros(micc), leading_zeros(sysc)
+    assert mic_off == round((100.5 - anchor) * RATE) == 8000, f"MIC lead {mic_off}, expected 8000"
+    assert sys_off == round((101.2 - anchor) * RATE) == 19200, f"SYS lead {sys_off}, expected 19200"
+    # Invariant: the real-time gap between the two onsets is preserved sample-for-sample (a
+    # collapse-to-0 would zero both leads and lose the 0.7s separation).
+    assert sys_off - mic_off == round((101.2 - 100.5) * RATE) == 11200, "cross-channel skew introduced"
+    print("  OK  first post-anchor chunks land at their exact offsets; channels stay aligned")
+
+
+def test_anchor_noninteger_uses_ceil_slice_no_preanchor_leak():
+    # A non-integer-second anchor makes the straddle pre-roll a fractional sample count. An int()
+    # floor would keep the boundary sample (real time just before the anchor); ceil drops it.
+    t_start, anchor = 95.0, 100.1
+    raw = (anchor - t_start) * RATE
+    floor_cut, ceil_cut = int(raw), int(np.ceil(raw))
+    assert ceil_cut == floor_cut + 1, "choose an anchor whose pre-roll is a fractional sample count"
+    d = Path(tempfile.mkdtemp())
+    n = int(10.0 * RATE)
+    rec = sinks.AudioRecorder(d / "frac", anchor=anchor)
+    rec.on_chunk("SYS", block(10.0), t_start)   # 95..105 straddles the click at 100.1
+    rec.close()
+    data, _ = read_wav(d / "frac.wav")
+    cut = n - len(data)                          # samples removed from the straddling chunk
+    assert cut == ceil_cut, f"slice removed {cut} samples; expected the ceil cut {ceil_cut} (int floor leaks one)"
+    assert cut != floor_cut, "the slice used int() floor and kept a pre-anchor sample"
+    print("  OK  non-integer anchor slices with ceil: the boundary pre-anchor sample is dropped")
+
+
+def test_closed_recheck_runs_a_real_close_between_snapshot_and_write():
+    # The real TOCTOU: _feed snapshots the recorder, /api/stop closes+finalises it, THEN the
+    # snapshotted on_chunk lands. Force exactly that by running a REAL close() (which folds the MIC
+    # channel to <stem>.wav and deletes the per-source file) inside the lock acquire, i.e. after
+    # on_chunk's pre-lock _closed check passed but before it holds the lock. Without the re-check
+    # under the lock, on_chunk would create a NEW writer/file AFTER finalisation (an orphan handle).
     d = Path(tempfile.mkdtemp())
     rec = sinks.AudioRecorder(d / "toctou")
+    rec.on_chunk("MIC", tone(1.0, 220), 0.0)          # a real open per-source writer + file
+    assert (d / "toctou-MIC.wav").exists(), "the first chunk should have opened a per-source WAV"
     real_lock = rec._lock
     fired = {"n": 0}
 
-    class _CloseOnAcquire:
+    class _CloseInAcquire:
         def __enter__(self):
-            real_lock.acquire()
-            if fired["n"] == 0:            # simulate close() winning the race exactly once
+            if fired["n"] == 0:            # the stop wins the race exactly once
                 fired["n"] = 1
-                rec._closed = True
+                rec._lock = real_lock      # close() must use the real lock, not this shim (no re-entry)
+                rec.close()                # REAL close + finalise, landing in the TOCTOU window
+            real_lock.acquire()
             return self
 
         def __exit__(self, *a):
             real_lock.release()
 
-    rec._lock = _CloseOnAcquire()
-    rec.on_chunk("MIC", tone(1.0, 220), 0.0)
-    assert rec._writers == {}, "on_chunk created a writer after close: the _closed re-check is missing"
-    assert not (d / "toctou-MIC.wav").exists(), "an orphaned per-source WAV was created after close()"
-    print("  OK  on_chunk re-checks _closed under the lock: no writer/handle created after close")
+    rec._lock = _CloseInAcquire()
+    rec.on_chunk("SYS", tone(1.0, 660), 0.0)          # arrives after finalisation: must be a no-op
+
+    assert rec._closed is True, "the real close() must have run in the interleaving"
+    assert "SYS" not in rec._writers, "a writer was created AFTER finalisation (missing _closed re-check)"
+    assert not (d / "toctou-SYS.wav").exists(), "an orphaned per-source WAV was created after close()"
+    assert (d / "toctou.wav").exists(), "close() should have finalised the MIC channel to <stem>.wav"
+    print("  OK  a real close()+finalise between snapshot and on_chunk creates no new writer/handle/file")
 
 
 # --- 2. POST /api/record-from-here (web/app.py) ----------------------------
@@ -327,7 +385,9 @@ if __name__ == "__main__":
     tests = (test_anchor_drops_and_slices_preclick_audio,
              test_anchor_keeps_channels_aligned_to_one_shared_moment,
              test_default_recorder_uses_wall_clock_placement,
-             test_closed_recheck_under_lock_prevents_orphan_handle,
+             test_anchor_first_chunk_offsets_stay_aligned_across_channels,
+             test_anchor_noninteger_uses_ceil_slice_no_preanchor_leak,
+             test_closed_recheck_runs_a_real_close_between_snapshot_and_write,
              test_record_from_here_requires_a_live_transcription_session_and_csrf,
              test_record_from_here_rejects_record_only_stopping_no_engine_and_no_capture,
              test_record_from_here_attaches_an_anchored_recorder_and_returns_the_stem,
