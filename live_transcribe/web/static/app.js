@@ -168,6 +168,10 @@ function freshLive() {
     // ({old_size, new_size, recording}), or null. Server-owned, like silenceNudge: set when a
     // CPU session auto-downgrades to a lighter model to stay live.
     struggleNudge: null,
+    // Server-owned latched flag: true once recording is, or has ever been, active this session.
+    // Latched (never clears on stop) so the record affordances stay hidden after a stop, which
+    // prevents a stop-then-restart that would clobber the session WAV.
+    recordingStarted: false,
   };
 }
 var S = {
@@ -1584,12 +1588,15 @@ function refreshSilence() {
   if (!S.live.running || S.live.sourceKind === "file") return;
   api.get("/api/status").then(function (st) {
     if (!st || !st.running) return;
-    // One poll, both server-owned live nudges: re-render if EITHER changed, and only then.
+    // One poll, both server-owned live nudges plus the latched recording flag: re-render if
+    // ANY changed, and only then.
     var changed = false;
     var n = st.silence_nudge || null;
     if (silenceSig(n) !== silenceSig(S.live.silenceNudge)) { S.live.silenceNudge = n; changed = true; }
     var g = st.struggle_nudge || null;
     if (struggleSig(g) !== struggleSig(S.live.struggleNudge)) { S.live.struggleNudge = g; changed = true; }
+    var rs = !!st.recording_started;
+    if (rs !== S.live.recordingStarted) { S.live.recordingStarted = rs; changed = true; }
     if (changed) render();
   }).catch(function () {});
 }
@@ -1639,8 +1646,9 @@ function silenceBanner() {
 async function recordFromHere() {
   // Optimistic + double-click guard: flipping recording now hides BOTH triggers (this action's
   // banner button and the live-footer button), so a fast second click short-circuits here and
-  // cannot open a second recorder. Clearing the nudge drops the banner at once (server clears it too).
-  if (S.live.recording) return;
+  // cannot open a second recorder. recordingStarted (latched) also blocks a restart after a stop.
+  // Clearing the nudge drops the banner at once (the server clears it too on success).
+  if (S.live.recording || S.live.recordingStarted) return;
   S.live.recording = true;
   S.live.struggleNudge = null;
   render();
@@ -1649,35 +1657,57 @@ async function recordFromHere() {
     // The stem must reach the client or the finish screen's re-transcribe handoff has nothing to
     // point at (S.finish.recordingStem is derived from S.live.audioStem).
     if (resp && resp.audio_stem) S.live.audioStem = resp.audio_stem;
+    S.live.recordingStarted = true;
     toast("Recording from here. Earlier audio is not saved.");
   } catch (e) {
-    // Roll the optimistic flip back so the trigger returns and the user can retry; the next
-    // status poll re-syncs the banner from the server if the downgrade is still outstanding.
-    S.live.recording = false;
+    // The optimistic flip may no longer match reality: the backend could have committed while the
+    // response was lost, or 409'd because a recording had already started. Do NOT blindly force
+    // recording off - ask the server and adopt the authoritative recording state.
+    try {
+      var st = await api.get("/api/status");
+      if (st && st.running) {
+        S.live.recording = !!st.recording;
+        S.live.recordingStarted = !!st.recording_started;
+        // If a recording really is running, recover its stem (status has no dedicated field; it
+        // derives from the transcript path, output_path minus ".md") for the re-transcribe handoff.
+        if (S.live.recording && !S.live.audioStem) {
+          var stem = st.audio_stem || (st.output_path ? st.output_path.replace(/\.md$/, "") : null);
+          if (stem) S.live.audioStem = stem;
+        }
+      } else {
+        S.live.recording = false;
+      }
+    } catch (e2) {
+      S.live.recording = false;   // status unreachable too: fall back to the safe "not recording"
+    }
     render();
-    toast((e && e.message) || "Could not start recording.", true);
+    // Recording ended up on (the call had committed) -> confirm it; otherwise surface the failure.
+    if (S.live.recording) toast("Recording from here. Earlier audio is not saved.");
+    else toast((e && e.message) || "Could not start recording.", true);
   }
 }
 async function dismissStruggle(action) {
   // Optimistic, exactly like answerSilence: the banner goes now; the POST only records the choice
-  // server-side (dismiss clears it; mute also silences further downgrades this session), so a
-  // failure means at worst one more nudge later, never a stuck banner.
+  // server-side (dismiss clears it for this session; mute persists struggle_nudge=false so it is
+  // off until re-enabled in Settings), so a failure means at worst one more nudge, never a stuck banner.
   S.live.struggleNudge = null;
   render();
   try { await api.post("/api/struggle-nudge", { action: action }); } catch (e) {}
-  if (action === "mute") toast("Won't warn again this session.");
+  if (action === "mute") toast("Won't warn again");
 }
 // A floating card, same shape and inject point as silenceBanner().
 function struggleBanner() {
-  var n = S.live.struggleNudge || {};
-  var recording = !!n.recording;
-  var body = recording
+  // Use the latched client state, not the nudge's snapshot: if a recording is running OR has run
+  // this session, there is already audio to re-transcribe, so drop the record affordance and switch
+  // the copy. (Same condition that hides the standalone footer button.)
+  var hasRec = !!(S.live.recording || S.live.recordingStarted);
+  var body = hasRec
     ? "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Your recording can be re-transcribed at full accuracy afterward."
     : "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Record now and re-transcribe at full accuracy afterward.";
   var actions = [];
-  // Record button only when not already recording; once recording, the audio is already being
-  // kept for a re-transcribe, so the primary action falls away (matches the body copy).
-  if (!recording) actions.push(el("button", { class: "btn sm record", onclick: function () { recordFromHere(); } }, [icon("dot", 12), "Record from here"]));
+  // Record button only when nothing has recorded yet; once it has, the audio is already kept for a
+  // re-transcribe, so the primary action falls away (matches the body copy).
+  if (!hasRec) actions.push(el("button", { class: "btn sm record", onclick: function () { recordFromHere(); } }, [icon("dot", 12), "Record from here"]));
   actions.push(el("button", { class: "btn sm ghost", onclick: function () { dismissStruggle("dismiss"); } }, "Keep going"));
   actions.push(el("button", { class: "btn ghost sm ink-3", onclick: function () { dismissStruggle("mute"); } }, "Don't warn again"));
   return el("div", { style: { position: "fixed", top: "16px", left: "50%", transform: "translateX(-50%)", zIndex: "60", maxWidth: "460px", width: "calc(100% - 32px)" } },
@@ -2090,12 +2120,13 @@ function liveView() {
     stopBtn = el("button", { class: "btn primary", onclick: function () { doStop("all"); } }, [icon("stop", 14), "Stop and save"]);
   }
 
-  // Recording indicator once recording is on; before that, on a transcribing session, a
-  // standalone "Record from here" button (for "I forgot to record") that starts recording
-  // mid-session. Independent of the struggle banner; both call recordFromHere().
+  // Recording indicator once recording is on; before that, on a transcribing session that has
+  // never recorded, a standalone "Record from here" button (for "I forgot to record") that starts
+  // recording mid-session. recordingStarted is latched, so once a session has recorded the button
+  // stays gone (a restart would clobber the WAV). Independent of the banner; both call recordFromHere().
   var recSlot;
   if (S.live.recording) recSlot = el("span", { class: "rec-ind" }, [el("i"), "Recording audio"]);
-  else if (S.live.transcribing) recSlot = el("button", { class: "btn sm record", onclick: function () { recordFromHere(); } }, [icon("dot", 12), "Record from here"]);
+  else if (S.live.transcribing && !S.live.recordingStarted) recSlot = el("button", { class: "btn sm record", onclick: function () { recordFromHere(); } }, [icon("dot", 12), "Record from here"]);
   else recSlot = null;
 
   var footer = el("div", { class: "live-footer" }, [
@@ -2643,6 +2674,7 @@ function licenceCard() {
   var toastsOn = !(S.settings && S.settings.os_toasts === false);              // default on
   var silenceOn = !(S.settings && S.settings.silence_nudge === false);         // default on
   var silenceMins = (S.settings && S.settings.silence_nudge_minutes) || 5;     // 3 / 5 / 10 / 15
+  var struggleOn = !(S.settings && S.settings.struggle_nudge === false);       // default on
   // Shell_NotifyIcon balloons are a Windows mechanism, so the row is hidden elsewhere rather
   // than offering a switch that does nothing (platform is platform.platform(), e.g. "Windows-11-...").
   var winPlatform = /^windows/i.test((S.appInfo && S.appInfo.platform) || "");
@@ -2688,6 +2720,18 @@ function licenceCard() {
           String(silenceMins), function (v) { saveSettings({ silence_nudge_minutes: parseInt(v, 10) || 5 }); }) : null,
         toggleEl(silenceOn, function () { saveSettings({ silence_nudge: !silenceOn }); }),
       ]),
+    ]),
+    // Everyone: warn when the computer cannot keep up and Volksmond drops to a lighter model.
+    // Same class as the silence warning: data integrity, not a nicety. The in-app banner works
+    // everywhere; the Windows notification is the bonus governed by the notifications row above.
+    // Turning this off persists struggle_nudge=false, which is how "Don't warn again" mutes it too.
+    el("div", { class: "set-row" }, [
+      el("div", { class: "ic" }, icon("alert", 18)),
+      el("div", { class: "body" }, [
+        el("div", { class: "t", text: "Warn me when the model can't keep up" }),
+        el("div", { class: "s", text: "On a slower computer, Volksmond drops to a lighter, faster model to stay live. When it does, it tells you so you can record and re-transcribe at full accuracy afterward." }),
+      ]),
+      el("div", { class: "ctl" }, toggleEl(struggleOn, function () { saveSettings({ struggle_nudge: !struggleOn }); })),
     ]),
     // Business only: the calendar reminder toggle. Reads the local Outlook calendar while the app is
     // open and offers to start transcribing when a meeting begins. Local only, never auto-starts.
@@ -3843,6 +3887,7 @@ function adoptRunning(status) {
   seedNotes();
   S.live.silenceNudge = status.silence_nudge || null;   // a nudge that fired before this reload
   S.live.struggleNudge = status.struggle_nudge || null; // same, for a downgrade that fired before this reload
+  S.live.recordingStarted = !!status.recording_started; // latched: recording is or was active this session
   if (status.source_kind !== "file") { startLevels(); startSilencePoll(); }
   if (status.source_kind === "file") {
     S.route = "importing";
