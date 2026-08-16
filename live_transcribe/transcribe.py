@@ -1173,6 +1173,11 @@ class Engine:
         self._cpu_threads = cpu_threads
         self._rtf = deque(maxlen=DOWNGRADE_WINDOW)  # recent real-time factors (CPU downgrade)
         self.subscribers = []
+        self.on_downgrade = None               # optional callback(old_size, new_size), fired on the
+                                               # worker thread after a successful CPU auto-downgrade.
+                                               # Decoupled like subscribe(): the web layer sets it to
+                                               # surface the downgrade (banner + one-time toast); the
+                                               # engine stays ignorant of app.py/notify/STATE.
         self._pending_mic = []                # [(release_monotonic, Segment)] held by MIC_PUBLISH_DELAY
         self.sys_env = None                   # optional EnergyRing (far end) -> enables the MIC echo veto
         self.mic_env = None                   # optional EnergyRing (RAW near end) -> gain-invariant
@@ -1483,6 +1488,7 @@ class Engine:
         except Exception as e:
             print(f"[engine] downgrade load failed ({new_size}): {e}", flush=True)
             return
+        old_size = self.size   # capture BEFORE the swap: the callback reports the size we left
         self.model = new
         self.size = new_size
         self.model_name = new_model
@@ -1490,6 +1496,17 @@ class Engine:
         self.is_fluister = new_family == "fluister"
         self._rtf.clear()
         self._emit_notice(t_start, f"[engine: switched to '{new_size}' model to keep up with the audio]")
+        # Surface the downgrade to whoever is listening (the web layer floats a banner + fires a
+        # one-time toast). Best-effort and fully decoupled, exactly like the segment subscribers:
+        # this runs on the worker thread, so the callback body does its own thread-safe hand-off.
+        # A None callback (CLI, file import, tests) is a no-op; a raising callback must never take
+        # the transcription worker down with it.
+        cb = self.on_downgrade
+        if cb is not None:
+            try:
+                cb(old_size, new_size)
+            except Exception as e:
+                print(f"[engine] on_downgrade callback error: {e}", flush=True)
 
     def _run(self):
         # Loop until the sentinel, or (during shutdown) until the queue empties.

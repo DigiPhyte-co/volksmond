@@ -164,7 +164,7 @@ class AudioRecorder:
     GAP_TOLERANCE_S = 2.0
     _FILL_BLOCK = TARGET_RATE * 10   # write gap silence in 10 s blocks to bound memory
 
-    def __init__(self, path_stem):
+    def __init__(self, path_stem, *, rebase=False):
         self.stem = Path(path_stem)
         self.stem.parent.mkdir(parents=True, exist_ok=True)
         self._writers = {}     # source -> wave.Wave_write
@@ -172,6 +172,13 @@ class AudioRecorder:
         self._gap_warned = set()     # sources already warned about a backwards t_start
         self._lock = threading.Lock()
         self._closed = False
+        # Mid-session ("record from here") recorder: zero the timeline on the FIRST chunk of ANY
+        # source instead of zero-filling the elapsed session lead (up to hours) with silence. One
+        # SHARED offset across sources keeps MIC/SYS relatively aligned in the stereo fold, so the
+        # file plays from 0. Default False: a start-time recorder keeps today's wall-clock placement
+        # byte-for-byte (a session that begins recording at t=0 has nothing to rebase anyway).
+        self._rebase = rebase
+        self._t_offset = None    # set once, under the lock, by the first chunk seen
         self.last_error = None      # human-readable write/close failure, surfaced in the UI
         atexit.register(self.close)
 
@@ -179,6 +186,13 @@ class AudioRecorder:
         if self._closed:
             return
         with self._lock:
+            if self._rebase:
+                # First chunk (any source) anchors the shared zero; every later chunk of either
+                # source subtracts the SAME offset, so the wall-clock placement below still keeps
+                # the two channels aligned relative to each other, just shifted to start at 0.
+                if self._t_offset is None:
+                    self._t_offset = t_start
+                t_start = max(0.0, t_start - self._t_offset)
             w = self._writers.get(source)
             if w is None:
                 path = self.stem.with_name(f"{self.stem.name}-{source}.wav")
