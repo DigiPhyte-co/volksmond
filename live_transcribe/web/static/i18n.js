@@ -696,6 +696,18 @@ window.VM_I18N = {
     "Stop warning me this session": "Moenie my weer in hierdie sessie waarsku nie",
     "No more silence warnings this session.": "Geen stilte-waarskuwings meer in hierdie sessie nie.",
     "Still recording. We will tell you again if it stays silent.": "Neem steeds op. Ons sê weer as dit stil bly.",
+    // "Model struggling to keep up" nudge + mid-session "Record from here"
+    "Struggling to keep up": "Sukkel om by te hou",
+    "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Record now and re-transcribe at full accuracy afterward.":
+      "Volksmond het na 'n ligter, vinniger model oorgeskakel om lewendig te bly, so hierdie deel is dalk minder akkuraat. Neem nou op en hertranskribeer daarna teen volle akkuraatheid.",
+    "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Your recording can be re-transcribed at full accuracy afterward.":
+      "Volksmond het na 'n ligter, vinniger model oorgeskakel om lewendig te bly, so hierdie deel is dalk minder akkuraat. Jou opname kan daarna teen volle akkuraatheid hertranskribeer word.",
+    "Record from here": "Neem van hier af op",
+    "Keep going": "Gaan voort",
+    "Don't warn again": "Moenie weer waarsku nie",
+    "Recording from here. Earlier audio is not saved.": "Neem van hier af op. Vroeëre klank word nie gestoor nie.",
+    "Could not start recording.": "Kon nie opname begin nie.",
+    "Won't warn again this session.": "Sal nie weer in hierdie sessie waarsku nie.",
     "Warn me about long silences": "Waarsku my oor lang stiltes",
     "If nothing at all reaches Volksmond during a meeting, neither your microphone nor the system audio, it warns you instead of quietly recording an hour of nothing. Useful when Windows moves your microphone to another device.":
       "As niks hoegenaamd Volksmond bereik tydens 'n vergadering nie, nie jou mikrofoon of die stelselklank nie, waarsku dit jou eerder as om stil-stil 'n uur van niks op te neem. Handig wanneer Windows jou mikrofoon na 'n ander toestel skuif.",
