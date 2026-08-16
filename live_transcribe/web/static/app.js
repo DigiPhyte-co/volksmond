@@ -164,6 +164,10 @@ function freshLive() {
     // Outstanding long-silence warning from the server ({minutes, count, at}), or null.
     // Server-owned: the watcher lives there, so this is only ever a copy of /api/status.
     silenceNudge: null,
+    // Outstanding "model struggling to keep up" nudge from the server
+    // ({old_size, new_size, recording}), or null. Server-owned, like silenceNudge: set when a
+    // CPU session auto-downgrades to a lighter model to stay live.
+    struggleNudge: null,
   };
 }
 var S = {
@@ -1139,6 +1143,11 @@ function render() {
   if (S.live.silenceNudge && S.route === "live") {
     APP.appendChild(silenceBanner());
   }
+  // The "model struggling to keep up" nudge lives on the same live screen for the same reason:
+  // its answers (record from here / keep going) only make sense there. Mirrors the silence inject.
+  if (S.live.struggleNudge && S.route === "live") {
+    APP.appendChild(struggleBanner());
+  }
   if (S.toast) {
     APP.appendChild(el("div", { class: "toast-wrap" }, el("div", { class: "toast" + (S.toast.err ? " err" : ""), text: S.toast.msg })));
   }
@@ -1567,14 +1576,21 @@ function startSilencePoll() {
 }
 function stopSilencePoll() { if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; } }
 function silenceSig(n) { return n ? (String(n.at || "") + "|" + String(n.count || 0)) : ""; }
+// The struggle nudge carries no timestamp; its identity is the model step plus whether
+// recording has since started, so any of those changing re-renders (a second downgrade, or
+// recording turning on so the banner switches to its "already recording" wording).
+function struggleSig(n) { return n ? (String(n.old_size || "") + "|" + String(n.new_size || "") + "|" + (n.recording ? "1" : "0")) : ""; }
 function refreshSilence() {
   if (!S.live.running || S.live.sourceKind === "file") return;
   api.get("/api/status").then(function (st) {
     if (!st || !st.running) return;
+    // One poll, both server-owned live nudges: re-render if EITHER changed, and only then.
+    var changed = false;
     var n = st.silence_nudge || null;
-    if (silenceSig(n) === silenceSig(S.live.silenceNudge)) return;   // no change: no re-render
-    S.live.silenceNudge = n;
-    render();
+    if (silenceSig(n) !== silenceSig(S.live.silenceNudge)) { S.live.silenceNudge = n; changed = true; }
+    var g = st.struggle_nudge || null;
+    if (struggleSig(g) !== struggleSig(S.live.struggleNudge)) { S.live.struggleNudge = g; changed = true; }
+    if (changed) render();
   }).catch(function () {});
 }
 // Clicking the Windows notification brings this window forward; the banner must already be
@@ -1611,6 +1627,69 @@ function silenceBanner() {
         ]),
       ]),
       el("button", { class: "btn ghost sm", style: { flex: "0 0 auto", padding: "6px" }, onclick: function () { answerSilence("mute"); }, title: "Stop warning me this session" }, icon("x", 14)),
+    ]));
+}
+
+/* ── model struggling to keep up during a live session ─────────── */
+// Parallel to the silence nudge: the server steps a CPU session down to a lighter, faster model
+// when it cannot hold real time, and publishes struggle_nudge on /api/status
+// ({old_size, new_size, recording}). The page notices it on the SAME poll (refreshSilence) and
+// offers the honest answers: start recording so the audio can be re-transcribed at full accuracy
+// afterward, or keep going. Recording can also be started from the standalone live-footer button.
+async function recordFromHere() {
+  // Optimistic + double-click guard: flipping recording now hides BOTH triggers (this action's
+  // banner button and the live-footer button), so a fast second click short-circuits here and
+  // cannot open a second recorder. Clearing the nudge drops the banner at once (server clears it too).
+  if (S.live.recording) return;
+  S.live.recording = true;
+  S.live.struggleNudge = null;
+  render();
+  try {
+    var resp = await api.post("/api/record-from-here");
+    // The stem must reach the client or the finish screen's re-transcribe handoff has nothing to
+    // point at (S.finish.recordingStem is derived from S.live.audioStem).
+    if (resp && resp.audio_stem) S.live.audioStem = resp.audio_stem;
+    toast("Recording from here. Earlier audio is not saved.");
+  } catch (e) {
+    // Roll the optimistic flip back so the trigger returns and the user can retry; the next
+    // status poll re-syncs the banner from the server if the downgrade is still outstanding.
+    S.live.recording = false;
+    render();
+    toast((e && e.message) || "Could not start recording.", true);
+  }
+}
+async function dismissStruggle(action) {
+  // Optimistic, exactly like answerSilence: the banner goes now; the POST only records the choice
+  // server-side (dismiss clears it; mute also silences further downgrades this session), so a
+  // failure means at worst one more nudge later, never a stuck banner.
+  S.live.struggleNudge = null;
+  render();
+  try { await api.post("/api/struggle-nudge", { action: action }); } catch (e) {}
+  if (action === "mute") toast("Won't warn again this session.");
+}
+// A floating card, same shape and inject point as silenceBanner().
+function struggleBanner() {
+  var n = S.live.struggleNudge || {};
+  var recording = !!n.recording;
+  var body = recording
+    ? "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Your recording can be re-transcribed at full accuracy afterward."
+    : "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Record now and re-transcribe at full accuracy afterward.";
+  var actions = [];
+  // Record button only when not already recording; once recording, the audio is already being
+  // kept for a re-transcribe, so the primary action falls away (matches the body copy).
+  if (!recording) actions.push(el("button", { class: "btn sm record", onclick: function () { recordFromHere(); } }, [icon("dot", 12), "Record from here"]));
+  actions.push(el("button", { class: "btn sm ghost", onclick: function () { dismissStruggle("dismiss"); } }, "Keep going"));
+  actions.push(el("button", { class: "btn ghost sm ink-3", onclick: function () { dismissStruggle("mute"); } }, "Don't warn again"));
+  return el("div", { style: { position: "fixed", top: "16px", left: "50%", transform: "translateX(-50%)", zIndex: "60", maxWidth: "460px", width: "calc(100% - 32px)" } },
+    el("div", { class: "card", style: { padding: "14px 16px", display: "flex", gap: "12px", alignItems: "flex-start", borderColor: "var(--warn)", boxShadow: "0 10px 34px rgba(0,0,0,0.20)" } }, [
+      el("div", { class: "tone-tile warn", style: { width: "34px", height: "34px", flex: "0 0 auto" } }, icon("alert", 17)),
+      el("div", { class: "grow" }, [
+        el("div", { style: { fontWeight: "600", fontSize: "13.5px" }, text: "Struggling to keep up" }),
+        el("p", { class: "ink-3", style: { fontSize: "11.5px", margin: "4px 0 0" }, text: body }),
+        el("div", { class: "row gap-8", style: { marginTop: "10px", flexWrap: "wrap" } }, actions),
+      ]),
+      // The corner X is the same as Keep going: dismiss this session's banner without muting.
+      el("button", { class: "btn ghost sm", style: { flex: "0 0 auto", padding: "6px" }, onclick: function () { dismissStruggle("dismiss"); }, title: "Dismiss" }, icon("x", 14)),
     ]));
 }
 
@@ -2011,9 +2090,17 @@ function liveView() {
     stopBtn = el("button", { class: "btn primary", onclick: function () { doStop("all"); } }, [icon("stop", 14), "Stop and save"]);
   }
 
+  // Recording indicator once recording is on; before that, on a transcribing session, a
+  // standalone "Record from here" button (for "I forgot to record") that starts recording
+  // mid-session. Independent of the struggle banner; both call recordFromHere().
+  var recSlot;
+  if (S.live.recording) recSlot = el("span", { class: "rec-ind" }, [el("i"), "Recording audio"]);
+  else if (S.live.transcribing) recSlot = el("button", { class: "btn sm record", onclick: function () { recordFromHere(); } }, [icon("dot", 12), "Record from here"]);
+  else recSlot = null;
+
   var footer = el("div", { class: "live-footer" }, [
     stopBtn,
-    S.live.recording ? el("span", { class: "rec-ind" }, [el("i"), "Recording audio"]) : null,
+    recSlot,
     el("span", { class: "grow" }),
     S.live.outputPath ? el("span", { class: "saving" }, ["Saving to ", el("span", { class: "mono", text: baseName(S.live.outputPath) })]) : null,
   ]);
@@ -3755,6 +3842,7 @@ function adoptRunning(status) {
   seedFromTranscript();
   seedNotes();
   S.live.silenceNudge = status.silence_nudge || null;   // a nudge that fired before this reload
+  S.live.struggleNudge = status.struggle_nudge || null; // same, for a downgrade that fired before this reload
   if (status.source_kind !== "file") { startLevels(); startSilencePoll(); }
   if (status.source_kind === "file") {
     S.route = "importing";
