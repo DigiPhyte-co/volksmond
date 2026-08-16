@@ -707,7 +707,10 @@ window.VM_I18N = {
     "Don't warn again": "Moenie weer waarsku nie",
     "Recording from here. Earlier audio is not saved.": "Neem van hier af op. Vroeëre klank word nie gestoor nie.",
     "Could not start recording.": "Kon nie opname begin nie.",
-    "Won't warn again this session.": "Sal nie weer in hierdie sessie waarsku nie.",
+    "Won't warn again": "Sal nie weer waarsku nie",
+    "Warn me when the model can't keep up": "Waarsku my wanneer die model nie kan byhou nie",
+    "On a slower computer, Volksmond drops to a lighter, faster model to stay live. When it does, it tells you so you can record and re-transcribe at full accuracy afterward.":
+      "Op 'n stadiger rekenaar val Volksmond terug na 'n ligter, vinniger model om lewendig te bly. Wanneer dit gebeur, sê dit vir jou sodat jy kan opneem en daarna teen volle akkuraatheid kan hertranskribeer.",
     "Warn me about long silences": "Waarsku my oor lang stiltes",
     "If nothing at all reaches Volksmond during a meeting, neither your microphone nor the system audio, it warns you instead of quietly recording an hour of nothing. Useful when Windows moves your microphone to another device.":
       "As niks hoegenaamd Volksmond bereik tydens 'n vergadering nie, nie jou mikrofoon of die stelselklank nie, waarsku dit jou eerder as om stil-stil 'n uur van niks op te neem. Handig wanneer Windows jou mikrofoon na 'n ander toestel skuif.",
