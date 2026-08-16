@@ -155,6 +155,71 @@ def test_quality_resolution():
     print("  OK  quality resolution: explicit honoured (CPU+GPU), auto = best per language")
 
 
+def test_auto_prefers_downloaded_size():
+    # "Auto" quality prefers the LARGEST size ALREADY DOWNLOADED for the family, within the existing
+    # hardware ceiling, so starting a meeting rewards an existing download instead of triggering a
+    # surprise multi-minute one. Deterministic: cuda_ready, the on-disk check (_downloaded_sizes) and
+    # the CPU core-count pick (_cpu_auto_tier) are all stubbed, so no real GPU or disk is touched.
+    from live_transcribe import __main__ as M
+    from live_transcribe.transcribe import TIER_CONFIG
+    from live_transcribe import cudadl as _cudadl
+
+    def model(tier):
+        return TIER_CONFIG[tier]["model"]
+
+    orig_cuda, orig_dl, orig_cpu = _cudadl.cuda_ready, M._downloaded_sizes, M._cpu_auto_tier
+    try:
+        # ---- GPU ready ----
+        _cudadl.cuda_ready = lambda: True
+        # (4) HEADLINE: fluister with only a SMALLER size (medium) downloaded -> that size's GPU tier
+        # (gpu-medium), NOT the biggest (turbo).
+        M._downloaded_sizes = lambda fam: {"medium"} if fam == "fluister" else set()
+        assert model(M.resolve_tier("auto", "auto", "af")) == "medium", "fluister medium-only -> gpu-medium"
+        # (3) fluister with the biggest (turbo) downloaded -> turbo, exactly as today.
+        M._downloaded_sizes = lambda fam: {"small", "medium", "large-v3", "large-v3-turbo"}
+        assert model(M.resolve_tier("auto", "auto", "af")) == "large-v3-turbo", "fluister turbo present -> turbo"
+        # (5) whisper (English) with only medium downloaded -> gpu-medium, not large-v3.
+        M._downloaded_sizes = lambda fam: {"medium"} if fam == "whisper" else set()
+        assert model(M.resolve_tier("auto", "auto", "en")) == "medium", "whisper medium-only -> gpu-medium"
+        # (6) NOTHING downloaded -> today's biggest-size fallback (turbo for af, large-v3 for en).
+        M._downloaded_sizes = lambda fam: set()
+        assert model(M.resolve_tier("auto", "auto", "af")) == "large-v3-turbo", "af nothing -> turbo fallback"
+        assert model(M.resolve_tier("auto", "auto", "en")) == "large-v3", "en nothing -> large-v3 fallback"
+        # (2) swivuriso is unchanged: one model at a nominal size, downloads never consulted (a smaller
+        # downloaded set would change the answer if it were, so the unchanged "gpu" proves it is not).
+        M._downloaded_sizes = lambda fam: {"small"}
+        assert M.resolve_tier("auto", "auto", "zu") == "gpu", "swivuriso auto GPU unchanged"
+        # (1) EXPLICIT quality is honoured unchanged on the GPU regardless of what is downloaded.
+        assert model(M.resolve_tier("medium", "auto", "af")) == "medium", "explicit medium honoured on GPU"
+        assert model(M.resolve_tier("large-v3", "auto", "en")) == "large-v3", "explicit large-v3 honoured on GPU"
+
+        # ---- CPU (no usable GPU) ----
+        _cudadl.cuda_ready = lambda: False
+        M._cpu_auto_tier = lambda: "cpu-mid"          # simulate a >=8-core box (ceiling = medium)
+        # (7) largest downloaded <= ceiling: medium present -> cpu-mid.
+        M._downloaded_sizes = lambda fam: {"medium"}
+        assert M.resolve_tier("auto", "cpu", "af") == "cpu-mid", "cpu medium present -> cpu-mid"
+        # (7) reward the smaller download: only small present -> cpu (avoids a surprise medium download).
+        M._downloaded_sizes = lambda fam: {"small"}
+        assert M.resolve_tier("auto", "cpu", "af") == "cpu", "cpu small present -> cpu"
+        # (7) NEVER exceed the ceiling: turbo/large-v3 downloaded but medium/small absent -> ceiling.
+        M._downloaded_sizes = lambda fam: {"large-v3", "large-v3-turbo"}
+        assert M.resolve_tier("auto", "cpu", "af") == "cpu-mid", "cpu above-ceiling ignored -> ceiling"
+        # (7) nothing downloaded -> today's _cpu_auto_tier() result (no regression).
+        M._downloaded_sizes = lambda fam: set()
+        assert M.resolve_tier("auto", "cpu", "af") == "cpu-mid", "cpu nothing -> _cpu_auto_tier()"
+        # (7) weak CPU (ceiling = small): a downloaded medium sits ABOVE the ceiling -> falls back to cpu.
+        M._cpu_auto_tier = lambda: "cpu"
+        M._downloaded_sizes = lambda fam: {"medium"}
+        assert M.resolve_tier("auto", "cpu", "af") == "cpu", "weak-cpu medium above small ceiling -> cpu"
+        # (1) explicit CPU pick unchanged.
+        M._downloaded_sizes = lambda fam: {"small"}
+        assert model(M.resolve_tier("large-v3", "cpu", "en")) == "large-v3", "explicit large-v3 on cpu honoured"
+    finally:
+        _cudadl.cuda_ready, M._downloaded_sizes, M._cpu_auto_tier = orig_cuda, orig_dl, orig_cpu
+    print("  OK  auto prefers largest downloaded size within the hardware ceiling; explicit + swivuriso unchanged")
+
+
 def test_context_override():
     # The saved default_context is prepended to a meeting's prompt. A per-meeting context_override,
     # when supplied, REPLACES the saved default for that one run (an empty string suppresses it) and
@@ -1385,6 +1450,7 @@ if __name__ == "__main__":
                test_voice_model_download_api,
                test_cuda_api,
                test_quality_resolution,
+               test_auto_prefers_downloaded_size,
                test_context_override,
                test_family_resolution,
                test_model_delete_api,
