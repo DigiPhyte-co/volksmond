@@ -1588,13 +1588,18 @@ function refreshSilence() {
   if (!S.live.running || S.live.sourceKind === "file") return;
   api.get("/api/status").then(function (st) {
     if (!st || !st.running) return;
-    // One poll, both server-owned live nudges plus the latched recording flag: re-render if
-    // ANY changed, and only then.
+    // One poll, both server-owned live nudges PLUS the authoritative recording state: re-render
+    // if ANY changed, and only then. The server is the source of truth for recording, so adopt
+    // st.recording / st.recording_started every tick (not just on the record path); this self-heals
+    // any desync within one poll if both the record POST and its recovery fetch were lost. The
+    // optimistic flip in recordFromHere still gives an instant response; this only reconciles.
     var changed = false;
     var n = st.silence_nudge || null;
     if (silenceSig(n) !== silenceSig(S.live.silenceNudge)) { S.live.silenceNudge = n; changed = true; }
     var g = st.struggle_nudge || null;
     if (struggleSig(g) !== struggleSig(S.live.struggleNudge)) { S.live.struggleNudge = g; changed = true; }
+    var rec = !!st.recording;
+    if (rec !== S.live.recording) { S.live.recording = rec; changed = true; }
     var rs = !!st.recording_started;
     if (rs !== S.live.recordingStarted) { S.live.recordingStarted = rs; changed = true; }
     if (changed) render();
@@ -1657,6 +1662,9 @@ async function recordFromHere() {
     // The stem must reach the client or the finish screen's re-transcribe handoff has nothing to
     // point at (S.finish.recordingStem is derived from S.live.audioStem).
     if (resp && resp.audio_stem) S.live.audioStem = resp.audio_stem;
+    // Re-assert on confirmed success: a status poll landing in the in-flight window could have
+    // reconciled recording back to false before the server committed. The 2xx means it is on.
+    S.live.recording = true;
     S.live.recordingStarted = true;
     toast("Recording from here. Earlier audio is not saved.");
   } catch (e) {
