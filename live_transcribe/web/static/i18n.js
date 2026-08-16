@@ -129,6 +129,12 @@ window.VM_I18N = {
     "Always applied (from Settings)": "Altyd toegepas (van Instellings)",
     "Tip: save company names and jargon in Settings and they apply to every transcription automatically.":
       "Wenk: stoor maatskappyname en vakterme in Instellings en hulle word outomaties op elke transkripsie toegepas.",
+    "Context for this meeting": "Konteks vir hierdie vergadering",
+    " edit for this meeting": " wysig vir hierdie vergadering",
+    "Starts from your saved default. Edits here apply to this meeting only; your saved default in Settings is unchanged.":
+      "Begin by jou gestoorde verstek. Wysigings hier geld net vir hierdie vergadering; jou gestoorde verstek in Instellings bly onveranderd.",
+    "Applies to this meeting only. To reuse it every time, save it in Settings.":
+      "Geld net vir hierdie vergadering. Om dit elke keer te gebruik, stoor dit in Instellings.",
     "Up to several hours. The file stays on this computer. It is never uploaded.":
       "Tot etlike ure. Die lêer bly op hierdie rekenaar. Dit word nooit opgelaai nie.",
     "Browse": "Blaai",
@@ -437,10 +443,13 @@ window.VM_I18N = {
     "by DigiPhyte": "deur DigiPhyte",
     "About": "Oor",
     "Check for updates": "Kyk vir opdaterings",
+    "Check for updates in Microsoft Store": "Kyk vir opdaterings in Microsoft Store",
     "Checking for updates": "Soek tans vir opdaterings",
     "Could not check for updates.": "Kon nie vir opdaterings soek nie.",
     "Update available": "Opdatering beskikbaar",
     "You are up to date.": "Jy is op datum.",
+    "Microsoft Store normally updates Volksmond automatically. Use the button to check now.":
+      "Microsoft Store werk Volksmond gewoonlik outomaties by. Gebruik die knoppie om nou te kyk.",
     "Said Fawlks-mawnt. Afrikaans for the way people actually speak.":
       "Uitgespreek Fawlks-mawnt. Afrikaans vir hoe mense werklik praat.",
 

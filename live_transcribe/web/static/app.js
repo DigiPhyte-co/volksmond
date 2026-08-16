@@ -15,6 +15,9 @@ var FEEDBACK_EMAIL = "volksmond@digiphyte.com";
 // The business / licensing page: current pricing and what a Business licence covers.
 // Personal use is free, so this is only ever a "learn or buy" link, opened in the browser.
 var BUSINESS_PAGE_URL = "https://volksmond.digiphyte.com/business";
+// Public Microsoft Store identity for the stable channel. Opening this URI is a
+// user-initiated hand-off to the Store app; Volksmond itself makes no update request.
+var STORE_PRODUCT_URI = "ms-windows-store://pdp/?ProductId=9P7BD97WTZ3W";
 // Completed sessions before the one-time, dismissable business-use nudge. Local only; the
 // count lives in settings.json on this machine and is never sent anywhere.
 var SESSION_NUDGE_THRESHOLD = 10;
@@ -169,7 +172,7 @@ var S = {
   sessions: [], sessionsFolder: "", sessionsActive: null, sessionsSummarising: [],
   live: freshLive(),
   starting: { active: false, kind: null, title: "", error: null, startedAt: null },
-  form: { title: "", language: "af", moreLang: null, tier: "auto", device: "auto", engine: "auto", participants: [], terms: [], record: false, aec: false, agcLive: true, stereoSplit: false, mic: null, loopback: null, advancedOpen: false },
+  form: { title: "", language: "af", moreLang: null, tier: "auto", device: "auto", engine: "auto", participants: [], terms: [], context: null, record: false, aec: false, agcLive: true, stereoSplit: false, mic: null, loopback: null, advancedOpen: false },
   setup: { stage: "welcome", choice: "transcribe" },
   finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null },
   reader: { name: "", title: "", text: "", summarising: false, summary: null },
@@ -520,12 +523,24 @@ function liveTuneStrip() {
 // Loading the model the first time after launch can stall for minutes (network revalidation
 // of an already-downloaded model, plus CUDA/AV cold start). We pre-load it in the background
 // the moment the user reaches a pre-meeting screen, so Begin reuses a warm model.
+// The pre-meeting screen reflects warm status ONLY through warmChip(), which reads S.warm.state.
+// So re-render that screen ONLY when the state actually changes, never on every 1.5s poll tick.
+// An unconditional tick re-render tore the whole DOM down (clear(APP) in render) every 1.5s while
+// warming, recreating the title / name / jargon inputs under the user's cursor and dropping them
+// mid-word. Same "only render when something moved" guard the History list uses for its search box.
+var _warmSig = null;
+function warmRender(st) {
+  var sig = st ? st.state : null;
+  if (sig === _warmSig) return;
+  _warmSig = sig;
+  if (S.route === "pre" || S.route === "importpre") render();
+}
 function warmUp() {
   api.post("/api/warm-up", { tier: S.form.tier || "auto", device: S.form.device || "auto", language: S.form.language || "", engine: S.form.engine || "auto" })
     .then(function (st) {
       S.warm = st;
       if (st && st.state === "warming") pollWarm();
-      if (S.route === "pre" || S.route === "importpre") render();
+      warmRender(st);
     }).catch(function () {});
 }
 function pollWarm() {
@@ -534,7 +549,7 @@ function pollWarm() {
     api.get("/api/warm-up").then(function (st) {
       S.warm = st;
       if (!st || st.state !== "warming") { clearInterval(warmTimer); warmTimer = null; }
-      if (S.route === "pre" || S.route === "importpre") render();
+      warmRender(st);
     }).catch(function () { clearInterval(warmTimer); warmTimer = null; });
   }, 1500);
 }
@@ -552,6 +567,7 @@ async function startLive() {
     topic: S.form.title || "",
     tier: S.form.tier, device: S.form.device, language: S.form.language, engine: S.form.engine,
     prompt: S.form.participants.concat(S.form.terms).join(", "),
+    context_override: S.form.context,   // null -> server uses the saved default; a string overrides it for this run
     record: !!S.form.record, transcribe: true,
     mic_device: S.form.mic, loopback_device: S.form.loopback,
     aec_live: !!S.form.aecLive,
@@ -561,6 +577,7 @@ async function startLive() {
   try {
     var resp = await api.post("/api/start", body);
     endStarting();
+    S.form.context = null;   // the override applied to this run; the next meeting starts from the saved default again
     S.live = freshLive();
     S.live.running = true; S.live.transcribing = true; S.live.recording = !!resp.recording;
     S.live.sourceKind = "live"; S.live.startedAt = new Date().toISOString();
@@ -617,13 +634,14 @@ function recordPreView() {
   ]));
 }
 async function startImport(arg) {
-  var body = { topic: arg.topic || "", tier: S.form.tier, device: S.form.device, language: S.form.language, engine: S.form.engine, aec: !!S.form.aec, prompt: (S.form.participants || []).concat(S.form.terms || []).join(", ") };
+  var body = { topic: arg.topic || "", tier: S.form.tier, device: S.form.device, language: S.form.language, engine: S.form.engine, aec: !!S.form.aec, prompt: (S.form.participants || []).concat(S.form.terms || []).join(", "), context_override: S.form.context };
   if (arg.path) { body.paths = [arg.path]; body.stereo_split = !!S.form.stereoSplit; }
   if (arg.stem) body.stem = arg.stem;
   beginStarting("file", arg.topic || S.importName || "Recording");
   try {
     var resp = await api.post("/api/transcribe-file", body);
     endStarting();
+    S.form.context = null;   // per-run override consumed; the next import starts from the saved default again
     S.live = freshLive();
     S.live.running = true; S.live.transcribing = true; S.live.sourceKind = "file";
     S.live.startedAt = new Date().toISOString();
@@ -743,7 +761,7 @@ async function importFromPicker() {
   // Go through the context screen first (title, language, names and jargon),
   // then transcribe - same as a live meeting gets its pre-meeting setup.
   S.importPath = p; S.importStem = null; S.importName = baseName(p);
-  S.form.title = ""; S.form.participants = []; S.form.terms = [];
+  S.form.title = ""; S.form.participants = []; S.form.terms = []; S.form.context = null;
   S.form.stereoSplit = false;   // per-file choice, never carried from a previous upload
   go("importpre");
 }
@@ -1005,6 +1023,7 @@ function openExternal(url) {
   if (url.slice(0, 7) === "mailto:") { window.location.href = url; }
   else { window.open(url, "_blank", "noopener"); }
 }
+function openStoreListing() { openExternal(STORE_PRODUCT_URI); }
 function reportBug() {
   // No phone-home: the app never sends anything. It either hands a prefilled draft to
   // the user's default mail app (mailto), or copies a report to the clipboard for them
@@ -1047,10 +1066,42 @@ function reportBug() {
  * RENDER
  * ═══════════════════════════════════════════════════════════ */
 var _renderedRoute = null;
+// Keyboard focus + caret survive a re-render. render() rebuilds the entire DOM (clear(APP)
+// below), so any re-render that lands while the user is typing — a background poll, a toast, a
+// calendar reminder — would otherwise recreate the focused <input>/<textarea> as a new, unfocused
+// element and drop the user mid-word. Record which field held focus (by its index path in the
+// tree) and its caret range, then restore both onto the freshly built field of the same shape.
+// A structural mismatch (different tag or placeholder at that path) just skips restoration, so we
+// never focus the wrong box. Only same-route re-renders restore; a route change resets focus.
+function captureFocus() {
+  var a = document.activeElement;
+  if (!a || (a.tagName !== "INPUT" && a.tagName !== "TEXTAREA") || !APP.contains(a)) return null;
+  var path = [];
+  for (var node = a; node && node !== APP; node = node.parentNode) {
+    var p = node.parentNode;
+    if (!p) return null;
+    path.push(Array.prototype.indexOf.call(p.childNodes, node));
+  }
+  var range = null;
+  try { range = { start: a.selectionStart, end: a.selectionEnd }; } catch (e) {}
+  return { path: path, tag: a.tagName, ph: a.getAttribute("placeholder") || "", range: range };
+}
+function restoreFocus(f) {
+  if (!f) return;
+  var node = APP;
+  for (var i = f.path.length - 1; i >= 0 && node; i--) node = node.childNodes[f.path[i]];
+  if (!node || node.tagName !== f.tag || (node.getAttribute("placeholder") || "") !== f.ph) return;
+  try {
+    node.focus({ preventScroll: true });
+    if (f.range && node.setSelectionRange) node.setSelectionRange(f.range.start, f.range.end);
+  } catch (e) {}
+}
 function render() {
   // Preserve scroll across a same-route re-render (e.g. the 1s download poll on
   // Settings) so the page does not snap to the top. A route change still resets.
   var keepScroll = (S.route === _renderedRoute);
+  // Same-route re-renders also preserve which text box had focus and the caret in it.
+  var focusState = keepScroll ? captureFocus() : null;
   var prevScroller = keepScroll ? APP.querySelector(".screen, .solo, .live-body") : null;
   var prevScrollTop = prevScroller ? prevScroller.scrollTop : 0;
   liveDocEl = liveBodyEl = elapsedEl = recTimerEl = returnPillTimeEl = null;
@@ -1096,6 +1147,7 @@ function render() {
     var ns = APP.querySelector(".screen, .solo, .live-body");
     if (ns) ns.scrollTop = prevScrollTop;
   }
+  restoreFocus(focusState);
 }
 
 /* ── shell (sidebar + main) ───────────────────────────────── */
@@ -1133,14 +1185,11 @@ function sidebar(active) {
     returnPill(),
     el("div", { class: "spacer" }),
     el("div", { class: "local-pill" }, [icon("lock", 14), el("span", { text: "Local only, no internet" })]),
-    // The manual "Check for updates" is a user-initiated convenience (one outbound call, only on
-    // click), so every build shows it EXCEPT the airtight offline-only edition and the Store
-    // edition, where the route is compiled out (offline strips every network path; the Store owns
-    // updates). NOT the same gate as the model-update check, which the Store edition keeps. It
-    // never runs on its own, so it does not touch the "Local only" promise (which is about audio,
-    // telemetry, and background calls).
-    !(offlineBuild() || storeBuild()) ? el("button", { class: "nav-item", style: { fontSize: "12px" }, disabled: updateState.state === "checking", onclick: function () { checkUpdates(); } },
-      [icon("download", 16), el("span", { text: updateState.state === "checking" ? "Checking for updates" : "Check for updates" })]) : null,
+    // The direct edition checks DigiPhyte's manifest only when clicked. The Store edition instead
+    // hands the user to its Store listing, where Microsoft owns the update decision. The airtight
+    // offline edition has no update control at all.
+    !offlineBuild() ? el("button", { class: "nav-item", style: { fontSize: "12px" }, disabled: !storeBuild() && updateState.state === "checking", onclick: function () { storeBuild() ? openStoreListing() : checkUpdates(); } },
+      [icon("download", 16), el("span", { text: storeBuild() ? "Check for updates in Microsoft Store" : (updateState.state === "checking" ? "Checking for updates" : "Check for updates") })]) : null,
     !(offlineBuild() || storeBuild()) ? sideUpdateResult() : null,
     el("button", { class: "nav-item", style: { fontSize: "12px" }, onclick: reportBug },
       [icon("bug", 16), el("span", { text: "Report a bug or idea" })]),
@@ -1588,7 +1637,7 @@ function homeView() {
     el("div", { class: "entry-grid" }, [
       entry({ primary: true, ic: "mic", title: "Start a live meeting", cta: "Begin",
         body: "Transcribe what you and others are saying right now, on this computer. Optionally record the audio too.",
-        onclick: function () { S.form.title = ""; go("pre"); } }),
+        onclick: function () { S.form.title = ""; S.form.context = null; go("pre"); } }),
       entry({ ic: "upload", title: "Upload a recording to transcribe", cta: "Choose a file",
         body: "Pick an audio or video file you already have. Volksmond transcribes it locally, just like a live meeting.",
         formats: [".mp3", ".m4a", ".wav", ".mp4", ".mov", ".ogg"],
@@ -1680,15 +1729,27 @@ function termsBox(list, placeholder) {
   return box;
 }
 function defaultContextNote() {
-  // Show the saved default context so it's visible on the setup screen, not hidden
-  // behind "applied automatically". It's edited in Settings, read-only here.
-  var dc = ((S.settings && S.settings.default_context) || "").trim();
-  if (!dc) {
-    return el("p", { class: "hint", style: { marginTop: "-4px", marginBottom: "16px" }, text: "Tip: save company names and jargon in Settings and they apply to every transcription automatically." });
-  }
+  // The standing context saved in Settings, shown here EDITABLE so it can be tuned for just this
+  // meeting. S.form.context stays null while the box merely mirrors the saved default; the moment
+  // the user types it holds a per-meeting override that rides to the server as context_override and
+  // is never written back to Settings. It resets to the saved default when the next meeting starts
+  // (see startLive / startImport / the "Start a live meeting" entry).
+  var saved = ((S.settings && S.settings.default_context) || "");
+  var value = (S.form.context != null) ? S.form.context : saved;
+  var hasSaved = !!saved.trim();
   return el("div", { class: "card", style: { padding: "10px 12px", marginBottom: "16px" } }, [
-    el("div", { class: "section-label", style: { marginBottom: "4px" }, text: "Always applied (from Settings)" }),
-    el("div", { class: "ink-2", style: { fontSize: "12px" } }, raw(dc)),
+    el("div", { class: "row gap-6", style: { alignItems: "baseline", marginBottom: "6px" } }, [
+      el("div", { class: "section-label", text: hasSaved ? "Always applied (from Settings)" : "Context for this meeting" }),
+      el("span", { class: "label-muted", style: { fontSize: "11px" }, text: hasSaved ? " edit for this meeting" : " (optional)" }),
+    ]),
+    el("textarea", { class: "field", rows: "2", style: { fontSize: "12px", minHeight: "42px", resize: "vertical" },
+      placeholder: "e.g. Thabo, Acme Corp, EBITDA. Or a sentence guiding the recogniser.",
+      value: value,
+      oninput: function (e) { S.form.context = e.target.value; } }),
+    el("p", { class: "hint", style: { margin: "6px 0 0", fontSize: "11px" },
+      text: hasSaved
+        ? "Starts from your saved default. Edits here apply to this meeting only; your saved default in Settings is unchanged."
+        : "Applies to this meeting only. To reuse it every time, save it in Settings." }),
   ]);
 }
 
@@ -2457,9 +2518,10 @@ function sideUpdateResult() {
 function aboutCard() {
   var version = (S.appInfo && S.appInfo.version) || "?";
   var u = updateState;
-  // The update check is present in every build except the airtight offline edition and the Store
-  // edition (the Store owns updates), so hide this status line in both.
-  var updateLine = (offlineBuild() || storeBuild()) ? null :
+  // Direct builds show the result of their manual manifest check. Store builds show static guidance
+  // because Microsoft Store owns their automatic updates; the button only opens the Store listing.
+  var updateLine = offlineBuild() ? null : storeBuild() ?
+    el("div", { class: "s", style: { marginTop: "4px" }, text: "Microsoft Store normally updates Volksmond automatically. Use the button to check now." }) :
     u.state === "checking" ? el("div", { class: "s", style: { marginTop: "4px", display: "flex", gap: "6px", alignItems: "center" } }, [el("span", { class: "spinner" }), el("span", { text: "Checking for updates" })]) :
     u.state === "error" ? el("div", { class: "s", style: { marginTop: "4px", color: "var(--warn)" }, text: "Could not check for updates." }) :
     (u.state === "done" && u.info && u.info.update_available) ? el("div", { class: "s", style: { marginTop: "4px" } }, [el("span", { text: "Update available" }), raw(": v" + u.info.latest + "  "), el("span", { class: "link", onclick: function () { openUpdateLink(u.info.url); } }, "Download")]) :
@@ -2477,7 +2539,7 @@ function aboutCard() {
         updateLine,
       ]),
       el("div", { class: "ctl", style: { display: "flex", flexDirection: "column", gap: "6px", alignItems: "stretch" } }, [
-        !(offlineBuild() || storeBuild()) ? el("button", { class: "btn ghost", disabled: u.state === "checking", onclick: function () { checkUpdates(); } }, "Check for updates") : null,
+        !offlineBuild() ? el("button", { class: "btn ghost", disabled: !storeBuild() && u.state === "checking", onclick: function () { storeBuild() ? openStoreListing() : checkUpdates(); } }, storeBuild() ? "Check for updates in Microsoft Store" : "Check for updates") : null,
         el("button", { class: "btn ghost", onclick: function () { openExternal("https://digiphyte.com"); } }, "digiphyte.com"),
       ]),
     ]),

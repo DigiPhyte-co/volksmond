@@ -155,6 +155,37 @@ def test_quality_resolution():
     print("  OK  quality resolution: explicit honoured (CPU+GPU), auto = best per language")
 
 
+def test_context_override():
+    # The saved default_context is prepended to a meeting's prompt. A per-meeting context_override,
+    # when supplied, REPLACES the saved default for that one run (an empty string suppresses it) and
+    # is never written back to settings. File-import shares the same resolver, so it honours the
+    # override too; a request object lacking the field falls back to the saved default via getattr
+    # rather than raising.
+    import types
+    from live_transcribe.web import app as A
+    from live_transcribe import config as C
+    orig_load, orig_resolve = C.load, A.resolve_tier
+    C.load = lambda: {"default_context": "CompanyCtx", "tier": "auto", "device": "auto", "engine": "auto"}
+    A.resolve_tier = lambda *a, **k: "cpu-mid"          # isolate the prompt merge from tier/CUDA
+    try:
+        prompt = lambda req: A._resolve_tier_lang_prompt(req)[2]
+        # No override: saved default prepended (behaviour unchanged).
+        assert prompt(A.StartRequest(prompt="Alice, Bob")) == "CompanyCtx, Alice, Bob"
+        # String override: replaces the saved default for this run only.
+        assert prompt(A.StartRequest(prompt="Alice, Bob", context_override="Override")) == "Override, Alice, Bob"
+        # Empty override: suppresses the default for this run.
+        assert prompt(A.StartRequest(prompt="Alice, Bob", context_override="")) == "Alice, Bob"
+        # Empty override + empty prompt: nothing to bias with -> None.
+        assert prompt(A.StartRequest(prompt="", context_override="")) is None
+        # File import honours the override through the same helper.
+        assert prompt(A.TranscribeFileRequest(prompt="X", context_override="Y")) == "Y, X"
+        # A request without the field (defensive getattr) still resolves to the saved default.
+        assert prompt(types.SimpleNamespace(tier="auto", device="auto", language="af", prompt="Z", engine="auto")) == "CompanyCtx, Z"
+    finally:
+        C.load, A.resolve_tier = orig_load, orig_resolve
+    print("  OK  context override: per-meeting replaces default, empty suppresses, import honours it")
+
+
 def test_family_resolution():
     # Language picks the model FAMILY: Afrikaans AND auto-detect -> Fluister; explicit English/other
     # -> stock Whisper. A manual engine override forces either family. The tier holds a stock SIZE;
@@ -229,8 +260,13 @@ def test_settings_never_leak_secret():
 
 def test_static_assets_served():
     assert client.get("/").status_code == 200, "index did not serve"
-    assert client.get("/assets/app.js").status_code == 200, "app.js did not serve"
+    app_js = client.get("/assets/app.js")
+    assert app_js.status_code == 200, "app.js did not serve"
     assert client.get("/assets/styles.css").status_code == 200, "styles.css did not serve"
+    assert "ms-windows-store://pdp/?ProductId=9P7BD97WTZ3W" in app_js.text, \
+        "Store candidate is missing Volksmond's product link"
+    assert "storeBuild() ? openStoreListing() : checkUpdates()" in app_js.text, \
+        "Store and direct editions no longer have distinct update actions"
     print("  OK  index + /assets/app.js + /assets/styles.css all serve")
 
 

@@ -450,6 +450,9 @@ class StartRequest(BaseModel):
     language: str = "af"          # "af" | "en" | "sa" (SA group) | a code like "zu"/"de" | "" (empty == auto-detect)
     engine: str = "auto"          # model family: "auto" (by language) | "fluister" | "whisper"
     prompt: str = ""
+    # Per-meeting override of the saved default_context. None -> use settings.default_context;
+    # a string (including "") -> use it verbatim for THIS run only, never persisted to settings.
+    context_override: Optional[str] = None
     mic_device: Optional[str] = None
     loopback_device: Optional[str] = None
     record: bool = False          # also save the audio (POPIA: needs consent)
@@ -949,7 +952,13 @@ def _resolve_tier_lang_prompt(req):
               f"installed={cudadl.installed()} cuda_ready={cudadl.cuda_ready()} -> {tier}", flush=True)
     except Exception:
         pass
-    parts = [p for p in (settings.get("default_context", "").strip(), req.prompt.strip()) if p]
+    # default_context is prepended to the per-meeting prompt (participants + terms). A per-run
+    # context_override, when supplied, replaces the saved default for THIS run only; file-import
+    # shares this helper and has no such field, so read it defensively. None means "use settings".
+    ctx = getattr(req, "context_override", None)
+    if ctx is None:
+        ctx = settings.get("default_context", "")
+    parts = [p for p in (ctx.strip(), req.prompt.strip()) if p]
     prompt = ", ".join(parts) or None
     return tier, language, prompt, engine_pref
 
@@ -1126,6 +1135,7 @@ class TranscribeFileRequest(BaseModel):
     language: str = "af"
     prompt: str = ""
     engine: str = "auto"           # model family override, mirrors StartRequest
+    context_override: Optional[str] = None  # per-run replacement for settings.default_context (None -> use setting)
     aec: Optional[bool] = None     # echo cancellation on a re-transcribe (None -> settings default)
     stereo_split: bool = False     # upload option: a 2-channel file is an interview, one speaker
                                    # per channel (e.g. Samsung Interview mode); transcribe L and R
