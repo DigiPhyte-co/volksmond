@@ -136,27 +136,123 @@ def _best_size_for(language, engine="auto"):
     return "large-v3-turbo" if fam == "fluister" else "large-v3"
 
 
+# Per-family size preference, WORST -> BEST accuracy. "Auto" walks this best-first and takes the
+# largest size actually DOWNLOADED for the family, so a meeting starts on a model already on disk
+# instead of triggering a surprise multi-minute download at Begin. The BEST (last) entry equals
+# _best_size_for's answer for the family: Fluister's tuned large-v3-turbo beats its large-v3 (our v2
+# tune), while stock Whisper peaks at large-v3. Entries are the downloadable sizes (voicedl _OFFER /
+# FLUISTER_REPOS); base/tiny are internal live-downgrade rungs only, never an auto START size.
+_FAMILY_SIZE_ORDER = {
+    "fluister": ["small", "medium", "large-v3", "large-v3-turbo"],
+    "whisper":  ["small", "medium", "large-v3-turbo", "large-v3"],
+}
+# Sizes CPU 'auto' may START at (cheapest -> costliest). The live ceiling is _cpu_auto_tier()'s size
+# (medium on >=8 cores, else small); turbo/large-v3 are deliberately absent (too slow to hold real-
+# time on CPU), so the downloaded-size pick can never exceed the ceiling and stall a live meeting.
+_CPU_AUTO_ORDER = ["small", "medium"]
+
+
+def _downloaded_sizes(family):
+    """The set of model SIZES actually cached on disk for `family`, via voicedl's REAL per-size
+    on-disk check (voicedl._present), never the always-true fluister_available()/swivuriso_available()
+    flags. Whisper checks the stock size name; Fluister checks its HuggingFace repo id.
+
+    Defensive by contract: any failure (voicedl import, a raising probe, an unknown family) yields an
+    EMPTY set, so resolve_tier falls back to today's biggest-size behaviour and never crashes on the
+    model-picking path."""
+    order = _FAMILY_SIZE_ORDER.get(family)
+    if not order:
+        return set()
+    try:
+        from . import voicedl, transcribe
+        out = set()
+        for size in order:
+            target = transcribe.FLUISTER_REPOS.get(size) if family == "fluister" else size
+            if target and voicedl._present(target):
+                out.add(size)
+        return out
+    except Exception:
+        return set()
+
+
+def _best_downloaded_size(family):
+    """Highest-accuracy size actually downloaded for `family` (per-family order above), or None when
+    none are downloaded so the caller uses today's biggest-size fallback."""
+    order = _FAMILY_SIZE_ORDER.get(family)
+    if not order:
+        return None
+    downloaded = _downloaded_sizes(family)
+    for size in reversed(order):          # best first
+        if size in downloaded:
+            return size
+    return None
+
+
+def _cpu_auto_downloaded_tier(family):
+    """CPU 'auto': the largest DOWNLOADED size within today's CPU-auto ceiling (_cpu_auto_tier()'s
+    size - medium on >=8 cores, else small), mapped to its CPU tier. Rewards an existing download so a
+    live meeting starts on a cached model instead of triggering one; falls back to today's ambitious
+    _cpu_auto_tier() when nothing suitable is downloaded (which then downloads on demand and self-
+    downgrades). NEVER exceeds the ceiling: turbo/large-v3 are too slow to hold real-time on CPU."""
+    ceiling_tier = _cpu_auto_tier()
+    from . import transcribe
+    ceiling_size = transcribe.TIER_CONFIG.get(ceiling_tier, {}).get("model", "medium")
+    order = _CPU_AUTO_ORDER
+    candidates = order[:order.index(ceiling_size) + 1] if ceiling_size in order else list(order)
+    downloaded = _downloaded_sizes(family)
+    for size in reversed(candidates):     # largest size at or below the ceiling first
+        if size in downloaded:
+            return _QUALITY_TO_CPU_TIER.get(size, ceiling_tier)
+    return ceiling_tier
+
+
 def resolve_tier(quality, device="auto", language=None, engine="auto"):
     """Resolve a UI quality choice + device + language to a concrete TIER_CONFIG tier.
 
     device: "cpu" forces the CPU even when a GPU is present; "auto"/"gpu" use the GPU when ready.
     An EXPLICIT quality (a size like "medium"/"large-v3") is honoured as-is, on GPU or CPU, so the
-    user always gets the model they asked for. "auto" picks the highest-quality model for the
-    chosen language's family (Afrikaans -> turbo, English -> large-v3). On the CPU the engine still
+    user always gets the model they asked for. "auto" prefers the LARGEST size already DOWNLOADED for
+    the chosen language's family, within the hardware ceiling (GPU: up to the family best; CPU: up to
+    _cpu_auto_tier()'s medium/small live ceiling) - rewarding an existing download and avoiding a
+    surprise multi-minute download at Begin. When nothing suitable is downloaded it falls back to
+    today's biggest-size pick (Afrikaans -> turbo, English -> large-v3), which then downloads on
+    demand. Swivuriso is one model at a nominal size, so it is unaffected. On the CPU the engine still
     downgrades along CPU_LADDER if the chosen model cannot keep up live."""
     explicit = bool(quality) and quality != "auto"
+    # For "auto", resolve the model FAMILY once so the size pick can prefer what is already on disk.
+    # Swivuriso never participates (one model, nominal size); any failure leaves fam None, i.e.
+    # today's biggest-size behaviour.
+    fam = None
+    if not explicit:
+        try:
+            from . import transcribe
+            eng = (engine or "auto").lower()
+            fam = eng if eng in ("fluister", "whisper", "swivuriso") else transcribe.family_for_language(language)
+        except Exception:
+            fam = None
     if device != "cpu":
         try:
             from . import cudadl
             if cudadl.cuda_ready():
                 # Do NOT route through pick_tier() here: it honours the SA_LIVE_TIER env override
                 # (a CLI-only feature), which could force a CPU tier even though the GPU is ready.
-                size = quality if explicit else _best_size_for(language, engine)
+                if explicit:
+                    size = quality
+                elif fam in ("fluister", "whisper"):
+                    # Prefer the largest DOWNLOADED size; only when none is on disk fall back to
+                    # today's family best (which downloads on demand).
+                    size = _best_downloaded_size(fam) or _best_size_for(language, engine)
+                else:
+                    size = _best_size_for(language, engine)
                 return _QUALITY_TO_GPU_TIER.get(size, "gpu")
         except Exception:
             pass
     # CPU path (forced, or no usable GPU): honour the picked quality, never a GPU tier.
     if not explicit:
+        # Prefer the largest downloaded size within the CPU live ceiling; swivuriso and any
+        # family-detection failure keep today's ambitious core-count pick.
+        if fam in ("fluister", "whisper"):
+            return _cpu_auto_downloaded_tier(fam)
         return _cpu_auto_tier()
     if quality in TIER_CHOICES:
         t = pick_tier(quality)
