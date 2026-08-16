@@ -1523,6 +1523,7 @@ function acceptReminder() {
   S.reminder = null;
   S.form.title = r.subject || "";
   S.form.participants = (r.attendees || []).slice();
+  S.form.context = null;   // a calendar-started meeting begins from the saved default, never a stale per-meeting override
   go("pre");   // drop on the pre-meeting screen, pre-seeded; the user presses Begin (never auto-start)
 }
 function dismissReminder() {
@@ -2316,7 +2317,7 @@ function reTranscribe(stem, topic, isRegen) {
       : tr("Transcribes both sides (you and the other person) as separate speakers. Pick the language and model for this pass below."),
     body: reTranscribeOptions(),
     confirmLabel: isRegen ? tr("Re-transcribe") : tr("Transcribe"),
-    onConfirm: function () { startImport({ stem: stem, topic: topic }); },
+    onConfirm: function () { S.form.context = null; startImport({ stem: stem, topic: topic }); },   // re-transcribe shows no context editor: use the saved default, never a stale override
   });
 }
 // Language + model pickers for the re-transcribe dialog. Native selects that mutate S.form

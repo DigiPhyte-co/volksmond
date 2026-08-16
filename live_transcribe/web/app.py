@@ -952,9 +952,10 @@ def _resolve_tier_lang_prompt(req):
               f"installed={cudadl.installed()} cuda_ready={cudadl.cuda_ready()} -> {tier}", flush=True)
     except Exception:
         pass
-    # default_context is prepended to the per-meeting prompt (participants + terms). A per-run
-    # context_override, when supplied, replaces the saved default for THIS run only; file-import
-    # shares this helper and has no such field, so read it defensively. None means "use settings".
+    # default_context is prepended to the per-meeting prompt (participants + terms). Both StartRequest
+    # and TranscribeFileRequest carry an optional context_override; getattr keeps the resolver safe for
+    # any other caller too. None -> use the saved default; a string (incl. "") replaces it for THIS run
+    # only, never persisted.
     ctx = getattr(req, "context_override", None)
     if ctx is None:
         ctx = settings.get("default_context", "")

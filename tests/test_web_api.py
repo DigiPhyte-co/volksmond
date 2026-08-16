@@ -1385,6 +1385,7 @@ if __name__ == "__main__":
                test_voice_model_download_api,
                test_cuda_api,
                test_quality_resolution,
+               test_context_override,
                test_family_resolution,
                test_model_delete_api,
                test_summary_language_validated,
