@@ -172,6 +172,11 @@ function freshLive() {
     // Latched (never clears on stop) so the record affordances stay hidden after a stop, which
     // prevents a stop-then-restart that would clobber the session WAV.
     recordingStarted: false,
+    // t0-capture: capture (and recording, if on) start the instant Begin is clicked, while the
+    // transcription model loads in the background. modelReady is false until the engine attaches;
+    // prepareError carries a model-load failure message (null while healthy). Both mirror
+    // /api/status, adopted by the readiness poll and the silence reconcile.
+    modelReady: false, prepareError: null,
   };
 }
 var S = {
@@ -197,6 +202,7 @@ var S = {
 var liveDocEl = null, liveBodyEl = null, elapsedEl = null, recTimerEl = null, returnPillTimeEl = null;
 var pollTimer = null, elapsedTimer = null, toastTimer = null, levelTimer = null, warmTimer = null, histTimer = null, reminderTimer = null;
 var silenceTimer = null;
+var readinessTimer = null;   // t0-capture: polls /api/status for model_ready while a session prepares
 var startingTimer = null, startingElapsedEl = null;
 
 /* ── api ──────────────────────────────────────────────────── */
@@ -312,6 +318,7 @@ function teardownLive() {
   closeStream();
   stopLevels();
   stopSilencePoll();
+  stopReadinessPoll();
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
   if (startingTimer) { clearInterval(startingTimer); startingTimer = null; }
@@ -594,7 +601,12 @@ async function startLive() {
     S.live.engine = S.form.engine;
     S.live.title = S.form.title || "Live meeting";
     S.live.micDevice = S.form.mic; S.live.loopbackDevice = S.form.loopback;
+    // t0-capture: /api/start now returns the instant capture is live; the model may still be loading.
+    // Go straight to the live screen (which shows a "preparing" chip until ready) instead of holding
+    // the user on a blocking spinner, and poll readiness until the transcript starts filling in.
+    S.live.modelReady = !!resp.model_ready;
     go("live"); openStream(); startElapsed(); startLevels(); refreshLiveAec(); startSilencePoll();
+    if (!S.live.modelReady) startReadinessPoll();
   } catch (e) {
     // Surface the failure on the Starting screen (with Back), not just a toast that
     // vanishes; the model-load error ("Could not load model ...") needs to be readable.
@@ -1579,6 +1591,33 @@ function startSilencePoll() {
   silenceTimer = setInterval(refreshSilence, SILENCE_POLL_MS);
 }
 function stopSilencePoll() { if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; } }
+// t0-capture readiness poll: while a live session is still loading its model, poll /api/status ~1.5s
+// (like pollWarm) and flip the "preparing" chip to live the instant model_ready turns true, then stop
+// itself. The slower 10s silence reconcile also adopts these fields as a self-healing backstop.
+var READINESS_POLL_MS = 1500;
+function startReadinessPoll() {
+  if (readinessTimer) return;
+  readinessTimer = setInterval(function () {
+    if (!S.live.running || S.live.sourceKind === "file" || S.live.modelReady) { stopReadinessPoll(); return; }
+    api.get("/api/status").then(function (st) {
+      if (!st || !st.running) return;
+      if (adoptReadiness(st)) render();
+      if (S.live.modelReady) stopReadinessPoll();
+    }).catch(function () {});
+  }, READINESS_POLL_MS);
+}
+function stopReadinessPoll() { if (readinessTimer) { clearInterval(readinessTimer); readinessTimer = null; } }
+// Adopt the server's transcription-readiness onto S.live; returns true if anything changed (so the
+// caller can re-render). Shared by the readiness poll and the silence reconcile, so a steady state
+// never forces a re-render and the two stay in step.
+function adoptReadiness(st) {
+  var changed = false;
+  var mr = !!st.model_ready;
+  if (mr !== S.live.modelReady) { S.live.modelReady = mr; changed = true; }
+  var pe = st.prepare_error || null;
+  if (pe !== S.live.prepareError) { S.live.prepareError = pe; changed = true; }
+  return changed;
+}
 function silenceSig(n) { return n ? (String(n.at || "") + "|" + String(n.count || 0)) : ""; }
 // The struggle nudge carries no timestamp; its identity is the model step plus whether
 // recording has since started, so any of those changing re-renders (a second downgrade, or
@@ -1602,6 +1641,9 @@ function refreshSilence() {
     if (rec !== S.live.recording) { S.live.recording = rec; changed = true; }
     var rs = !!st.recording_started;
     if (rs !== S.live.recordingStarted) { S.live.recordingStarted = rs; changed = true; }
+    // t0-capture: also adopt model readiness / load error here as a slower self-healing backstop to
+    // the 1.5s readiness poll (which stops once ready), so a lost poll cannot leave the chip stuck.
+    if (adoptReadiness(st)) changed = true;
     if (changed) render();
   }).catch(function () {});
 }
@@ -1963,12 +2005,22 @@ function startingView() {
       ]),
     ]);
   } else {
+    // File import still loads the model on this screen (synchronous), so it keeps the original copy.
+    // Live (t0-capture) returns the instant capture is up, so this screen is only a brief flash before
+    // the live view, where the model loads behind a "preparing" chip; give live its own honest copy.
+    var isFile = S.starting.kind === "file";
+    var lead = isFile
+      ? "Loading the transcription model on your computer. The first time you use a quality level can take a moment, and if that model still needs downloading it can take a few minutes."
+      : "Opening your microphone and system audio and starting to capture. This is quick.";
+    var sub = isFile
+      ? "You can keep this open. It switches to the transcript by itself."
+      : "The live screen opens by itself. Nothing is missed: the transcript fills in from the start once the model is ready.";
     inner = el("div", { class: "rec-stage" }, [
       el("span", { class: "spinner" }),
       el("h1", { style: { fontSize: "22px", marginTop: "8px" }, text: "Starting" }),
       startingElapsedEl,
-      el("p", { class: "ink-2", style: { maxWidth: "470px", textAlign: "center" }, text: "Loading the transcription model on your computer. The first time you use a quality level can take a moment, and if that model still needs downloading it can take a few minutes." }),
-      el("p", { class: "ink-3", style: { fontSize: "12px" }, text: "You can keep this open. It switches to the transcript by itself." }),
+      el("p", { class: "ink-2", style: { maxWidth: "470px", textAlign: "center" }, text: lead }),
+      el("p", { class: "ink-3", style: { fontSize: "12px" }, text: sub }),
     ]);
   }
   var header = el("div", { class: "live-header" }, [
@@ -2093,8 +2145,13 @@ function notesRail() {
 }
 
 function liveView() {
+  // t0-capture: while the model loads the screen is fully live (Stop, audio strip, elapsed all key
+  // off running/startedAt), only the status chip and the empty-transcript line say "preparing". A
+  // model-load failure shows a clear but non-alarming chip; capture/recording carry on regardless.
   var statusChip;
   if (S.live.stopping) statusChip = el("span", { class: "chip warn" }, [el("span", { class: "dot" }), el("span", { id: "live-status-text", text: "Finishing" })]);
+  else if (S.live.transcribing && S.live.prepareError) statusChip = el("span", { class: "chip warn" }, [icon("alert", 12), el("span", { text: "Transcription unavailable" })]);
+  else if (S.live.transcribing && !S.live.modelReady) statusChip = el("span", { class: "chip prep" }, [el("span", { class: "dot" }), el("span", { text: "Preparing transcription model" })]);
   else if (S.live.transcribing) statusChip = el("span", { class: "chip rec" }, [el("span", { class: "dot" }), el("span", { text: "Listening" })]);
   else statusChip = el("span", { class: "chip ok" }, [el("span", { class: "dot" }), el("span", { text: "Saved" })]);
 
@@ -2113,9 +2170,22 @@ function liveView() {
     ]),
   ]);
 
+  // t0-capture reassurance in the empty transcript area: say plainly that capture (and recording, if
+  // on) is already running and that the transcript fills in from the start once the model is ready.
+  var emptyMsg;
+  if (S.live.transcribing && S.live.prepareError) {
+    emptyMsg = S.live.recording
+      ? "The transcription model could not load on this computer, but your audio is still recording here. Stop when you are done and transcribe the recording later."
+      : "The transcription model could not load on this computer, and recording is off, so there is no live transcript. Stop, set up the model in Settings, then start again.";
+  } else if (S.live.transcribing && !S.live.modelReady) {
+    emptyMsg = (S.live.recording ? "Capturing and recording now on this computer." : "Capturing now on this computer.")
+      + " The transcription model is still loading. Nothing is missed: the transcript fills in from the very start the moment it is ready.";
+  } else {
+    emptyMsg = "Listening. The transcript appears here as people talk.";
+  }
   liveDocEl = el("div", { class: "doc" }, S.live.segments.length
     ? S.live.segments.map(segRow)
-    : el("div", { class: "empty", text: "Listening. The transcript appears here as people talk." }));
+    : el("div", { class: "empty", text: emptyMsg }));
   liveBodyEl = el("div", { class: "live-body" }, liveDocEl);
   setTimeout(function () { if (liveBodyEl) liveBodyEl.scrollTop = liveBodyEl.scrollHeight; }, 0);
 

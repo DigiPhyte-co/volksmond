@@ -247,6 +247,11 @@ html, body { margin: 0; padding: 0; height: 100%; }
 .vm .chip .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .vm .chip.rec { color: var(--record); background: var(--record-soft); border-color: transparent; }
 .vm .chip.rec .dot { background: var(--record); animation: vm-pulse 1.6s ease-in-out infinite; }
+/* t0-capture "preparing transcription model" chip: accent-coloured with a pulsing dot so it reads
+   as working (distinct from the record colour and, deliberately, NOT "chip live" - see the note
+   above). Capture/recording are already live behind it; this only says transcription is still loading. */
+.vm .chip.prep { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
+.vm .chip.prep .dot { background: var(--accent); animation: vm-pulse 1.6s ease-in-out infinite; }
 .vm .chip.ok { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
 .vm .chip.warn { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
 .vm .chip.accent { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
