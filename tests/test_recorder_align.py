@@ -225,6 +225,25 @@ def test_mono_single_source_gap():
     print("  OK  mono single-source recording also placed on the session clock")
 
 
+def test_start_time_recorder_writes_from_t0():
+    # t0-capture: the start-time recorder stays on anchor=None and simply receives chunks from t0 via
+    # _feed, doing absolute wall-clock placement on t_start. A first chunk whose t_start is 0.0 lands
+    # at sample 0 with no leading offset, so a record-on session captures from the instant Begin is
+    # clicked. This pins the LOCKED decision that the recorder is anchor=None (no first-chunk anchor
+    # slicing, which is what re-introduced the MIC/SYS channel skew before).
+    d = Path(tempfile.mkdtemp())
+    rec = AudioRecorder(d / "from-t0")   # anchor=None: a start-time recorder
+    rec.on_chunk("MIC", tone(2.0, 220), 0.0)   # first mic chunk at t0
+    rec.on_chunk("SYS", tone(2.0, 660), 0.0)   # first sys chunk at t0
+    rec.close()
+    micc, sysc = read_stereo(d / "from-t0.wav")
+    assert len(micc) == len(sysc) == int(2.0 * RATE), (len(micc), len(sysc))
+    # Byte-exact from sample 0: no leading zero-fill and no anchor offset -> the file starts at t0.
+    assert np.array_equal(micc, pcm16(tone(2.0, 220))), "MIC must start at sample 0 (t0), no offset"
+    assert np.array_equal(sysc, pcm16(tone(2.0, 660))), "SYS must start at sample 0 (t0), no offset"
+    print("  OK  start-time recorder (anchor=None) writes both channels from t0 (sample 0), no offset")
+
+
 # ---------------------------------------------------------------------------
 # LiveAEC pacing guard (stub APM, no LiveKit binding and no devices needed)
 # ---------------------------------------------------------------------------
@@ -333,6 +352,7 @@ if __name__ == "__main__":
                test_aligned_session_no_zero_fill,
                test_overlap_appends_as_is_with_warning,
                test_mono_single_source_gap,
+               test_start_time_recorder_writes_from_t0,
                test_live_aec_pacing_sample_conservation):
         try:
             fn()
