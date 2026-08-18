@@ -263,29 +263,132 @@ def test_build_failure_keeps_capturing():
     print("  OK  engine-build failure sets prepare_error and leaves the session capturing (running), no crash")
 
 
-def test_pending_buffer_bounds_and_drops_oldest():
-    # The bounded pending-audio buffer: chunks are held in order; over the sample cap the OLDEST is
-    # dropped (never the newest), so a never-loading model cannot OOM the app. close_and_drain returns
-    # what is left, in order, and seals the buffer so a later append is rejected (fed live instead).
+def test_pending_buffer_bounds_and_drop_take_finalise():
+    # The bounded pending-audio buffer's primitives:
+    #  - append holds chunks in order and, over the sample cap, drops the OLDEST (never the newest),
+    #    so a never-loading model cannot OOM the app;
+    #  - take_all returns what is held, in order, and LEAVES THE BUFFER OPEN (append still works), so
+    #    the drain loop can keep collecting live chunks behind the backlog;
+    #  - finalise_if_empty returns stragglers (and stays open) when NON-empty, and only when EMPTY
+    #    closes the buffer + runs on_close (publish) atomically, after which append returns False.
     pa = webapp._PendingAudio(max_samples=300)   # tiny cap: 300 float32 samples
     for i in range(5):
         assert pa.append("MIC", np.full(100, i, dtype=np.float32), float(i)) is True, i
-    items = pa.close_and_drain()
+    items = pa.take_all()
     ts = [t for (_s, _a, t) in items]
     # 5 x 100 = 500 samples > 300 cap: the two oldest (t=0,1) were dropped; 2..4 remain, in order.
     assert ts == [2.0, 3.0, 4.0], ts
     assert sum(len(a) for (_s, a, _t) in items) <= 300
-    # Sealed after the drain: a further append returns False so _feed feeds the live engine instead.
-    assert pa.append("MIC", np.zeros(100, dtype=np.float32), 9.0) is False
-    print("  OK  pending buffer keeps order, drops OLDEST over the cap, and seals on drain (no post-handoff loss)")
+    # take_all left the buffer OPEN: append still works (this is how live-during-drain chunks queue).
+    assert pa.append("MIC", np.zeros(100, dtype=np.float32), 9.0) is True
+    # finalise_if_empty on a NON-empty buffer returns the stragglers and does NOT publish or close.
+    published = []
+    res = pa.finalise_if_empty(lambda: published.append("published"))
+    assert [t for (_s, _a, t) in res] == [9.0], res
+    assert published == [], "must not publish while stragglers remain"
+    assert pa.append("MIC", np.zeros(10, dtype=np.float32), 10.0) is True, "buffer must still be open"
+    # Drain it, then finalise on an EMPTY buffer: closes + runs on_close atomically, returns None.
+    pa.take_all()
+    res2 = pa.finalise_if_empty(lambda: published.append("published"))
+    assert res2 is None and published == ["published"], (res2, published)
+    # Sealed: any later append returns False so _feed feeds the published engine directly.
+    assert pa.append("MIC", np.zeros(100, dtype=np.float32), 11.0) is False
+    print("  OK  pending buffer: drop-oldest, take_all leaves it OPEN, finalise_if_empty publishes+seals only when empty")
+
+
+def test_backlog_stays_ahead_of_live_during_replay():
+    # THE seam-ordering property: chunks that arrive live DURING the backlog replay must land AFTER the
+    # whole backlog and never be dropped. We buffer a backlog, then pause the engine inside the replay
+    # of the FIRST backlog chunk, inject live chunks while it is paused, release, and assert the engine
+    # received the entire backlog strictly BEFORE any live chunk, in order, with zero drops.
+    reset_state()
+    build_release = threading.Event()
+    replay_release = threading.Event()
+    first_chunk_seen = threading.Event()
+    received = []
+    rlock = threading.Lock()
+
+    class GatedEngine:
+        model_name = "fake-model"
+        family = "whisper"
+        engine = "auto"
+
+        def __init__(self, **kw):
+            if not build_release.wait(timeout=20.0):
+                raise RuntimeError("test never released the engine build")
+
+        def subscribe(self, fn):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def pending(self):
+            return 0
+
+        def on_chunk(self, source, audio, t_start, block=False, timeout=None):
+            with rlock:
+                received.append((source, t_start, block))
+                n = len(received)
+            if n == 1:
+                # Pause the drain INSIDE the replay of the first backlog chunk, so the test can inject
+                # live chunks while the engine is still unpublished and the backlog is mid-replay.
+                first_chunk_seen.set()
+                replay_release.wait(timeout=20.0)
+            return True
+
+    try:
+        with stubs(GatedEngine):
+            r = client.post("/api/start", json=START_BODY)
+            assert r.status_code == 200, r.text
+            # Buffer a backlog while the engine build is blocked.
+            backlog = []
+            for i in range(10):
+                src = "MIC" if i % 2 == 0 else "SYS"
+                webapp._feed(src, np.full(160, i, dtype=np.float32), float(i))
+                backlog.append((src, float(i)))
+            # Release the build; the drain begins and pauses inside the first backlog chunk's on_chunk.
+            build_release.set()
+            assert first_chunk_seen.wait(10.0), "drain never reached the first backlog chunk"
+            # Engine is not published yet: inject LIVE chunks WHILE the backlog replay is paused. They
+            # must be buffered behind the backlog (STATE.engine is still None during the drain).
+            assert webapp.STATE.engine is None, "engine must not be published mid-replay"
+            live = []
+            for i in range(5):
+                src = "MIC" if i % 2 == 0 else "SYS"
+                webapp._feed(src, np.full(160, 100 + i, dtype=np.float32), float(100 + i))
+                live.append((src, float(100 + i)))
+            # Let the drain finish: backlog tail, then the live chunks, then finalise.
+            replay_release.set()
+            assert wait_until(lambda: client.get("/api/status").json().get("model_ready") is True, 15.0), \
+                "session never finalised after the replay"
+            with rlock:
+                got = [(s, t) for (s, t, _b) in received]
+                blocks = [b for (_s, _t, b) in received]
+            # The whole backlog, in order, STRICTLY before every live chunk, in order. Zero drops.
+            assert got == backlog + live, f"seam order/drops wrong:\n got {got}\n exp {backlog + live}"
+            assert len(got) == 15, f"expected 15 chunks (no drops), got {len(got)}"
+            assert all(b is True for b in blocks), "replay must use block=True (never drops on a full queue)"
+            last_backlog_idx = max(got.index(c) for c in backlog)
+            first_live_idx = min(got.index(c) for c in live)
+            assert last_backlog_idx < first_live_idx, "a live chunk landed before the backlog finished"
+    finally:
+        build_release.set()
+        replay_release.set()
+        reset_state()
+    print("  OK  live chunks arriving DURING replay land strictly after the whole backlog, in order, zero drops")
 
 
 if __name__ == "__main__":
     failures = 0
     for fn in (test_start_returns_before_model_loads,
                test_buffer_and_replay_in_order_no_drops,
+               test_backlog_stays_ahead_of_live_during_replay,
                test_build_failure_keeps_capturing,
-               test_pending_buffer_bounds_and_drops_oldest):
+               test_pending_buffer_bounds_and_drop_take_finalise):
         try:
             fn()
         except AssertionError as e:

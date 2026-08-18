@@ -261,13 +261,19 @@ _PENDING_MAX_SAMPLES = 16000 * 60 * 20 * 2   # 20 min of both-source 16 kHz floa
 
 
 class _PendingAudio:
-    """Thread-safe, bounded, drop-oldest hold for transcription chunks captured before the engine
-    exists (t0-capture). _feed appends here from the capture/chunker threads while a live session is
-    still building its model; the builder thread (_build_engine_async) drains it exactly once, in
-    order, into the ready engine via engine.on_chunk(block=True) so the replay can never drop on the
-    engine's maxsize queue. Bounded by total float32 samples (see _PENDING_MAX_SAMPLES); see that
-    comment for the RAM tradeoff. Its own lock makes append (many producer threads) and the single
-    close_and_drain handoff atomic, so nothing is lost at the buffer->engine seam."""
+    """Thread-safe, bounded, drop-oldest hold for transcription chunks captured before the engine is
+    published (t0-capture). _feed appends here from the capture/chunker threads for as long as a live
+    session is still catching up; the builder thread (_build_engine_async) drains it, in order, into
+    the engine via engine.on_chunk(block=True) so the replay never drops on the engine's maxsize queue.
+
+    The buffer is the SOLE channel to the engine until the backlog is fully caught up: the builder
+    keeps STATE.engine None while it drains with take_all() (which leaves the buffer OPEN), so a
+    concurrent _feed keeps APPENDING live chunks behind the backlog instead of racing ahead of it into
+    the engine. Only when a drain pass finds the buffer empty does finalise_if_empty() close it and
+    publish the engine, both under this buffer's lock, so no _feed.append can slip through the seam.
+
+    Bounded by total float32 samples (see _PENDING_MAX_SAMPLES); see that comment for the RAM
+    tradeoff. Its own lock makes append (many producer threads) and the drain/finalise handoff atomic."""
 
     def __init__(self, max_samples):
         self._buf = collections.deque()
@@ -278,8 +284,8 @@ class _PendingAudio:
         self._warned = False
 
     def append(self, source, audio, t_start):
-        """Hold a chunk. Returns True if buffered, False if the buffer was already closed at handoff
-        (the caller then feeds the now-ready engine directly, so nothing slips through the seam)."""
+        """Hold a chunk. Returns True if buffered, False once the buffer has been closed at the final
+        handoff (the caller then feeds the now-published engine directly, so nothing slips the seam)."""
         try:
             n = len(audio)
         except TypeError:
@@ -301,16 +307,34 @@ class _PendingAudio:
                           "oldest held transcription chunk (recording, if on, is unaffected).", flush=True)
             return True
 
-    def close_and_drain(self):
-        """Close the buffer and return everything held, in order, atomically. After this, append()
-        returns False, so the drain->live handoff loses nothing and the replayed backlog stays
-        strictly ahead of any post-handoff live chunk."""
+    def take_all(self):
+        """Return everything currently held, in order, and clear it, LEAVING THE BUFFER OPEN so a
+        concurrent _feed keeps appending live chunks behind the backlog (never dropped, never
+        reordered). The drain loop replays each batch, then loops, until a batch comes back empty and
+        finalise_if_empty publishes the engine."""
         with self._lock:
-            self._closed = True
             items = list(self._buf)
             self._buf.clear()
             self._samples = 0
             return items
+
+    def finalise_if_empty(self, on_close):
+        """The atomic buffer->engine flip. Under the buffer's lock: if the buffer is EMPTY, close it
+        and run on_close() (which publishes the engine) BEFORE releasing the lock, then return None;
+        if it is NOT empty, return the current items (leaving the buffer OPEN) for the caller to replay
+        and loop. Because the close and the publish both happen under the same lock a _feed.append
+        takes, no chunk can slip in between 'closed' and 'engine published': a chunk lands either
+        before (replayed in the next take) or after (fed to the published engine directly, newest).
+        Returns None when finalised, or the straggler list (not finalised)."""
+        with self._lock:
+            if self._buf:
+                items = list(self._buf)
+                self._buf.clear()
+                self._samples = 0
+                return items
+            self._closed = True
+            on_close()
+            return None
 
 
 def _feed(source, audio, t_start):
@@ -1254,16 +1278,24 @@ def _resolve_tier_lang_prompt(req):
 
 def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_sink, browser_sink):
     """Build the transcription Engine off the request thread (t0-capture), then attach it to the
-    already-capturing session and replay everything held since Begin.
+    already-capturing session and replay everything held since Begin, IN ORDER and with zero drops.
 
-    The model load (Engine -> load_model) is the slow part and runs OUTSIDE STATE.lock, so
-    /api/status and /api/levels stay responsive throughout: a warm model is a fast cache hit, and a
-    first-time download can take minutes, which is fine because capture + recording are already
-    running and nothing is dropped. Before publishing we re-check under the lock that this is still
-    the current session (object identity of started_at, mirroring the record_from_here /
-    _on_downgrade TOCTOU guard); if a Stop/switch/new-start replaced it, the engine is discarded. On
-    build failure we surface prepare_error and leave capture + recording running, so a model problem
-    never loses the audio."""
+    The model load (Engine -> load_model) is the slow part and runs OUTSIDE STATE.lock, so /api/status
+    and /api/levels stay responsive throughout: a warm model is a fast cache hit, and a first-time
+    download can take minutes, which is fine because capture + recording are already running and
+    nothing is dropped.
+
+    The buffer->live handoff is the delicate part. STATE.engine is published only at the very END,
+    after the backlog is fully caught up. Until then STATE.engine stays None, so _feed keeps APPENDING
+    live chunks to the pending buffer (behind the backlog) instead of feeding the engine directly:
+    that is what keeps the replayed backlog strictly ahead of every live chunk AND stops any live
+    chunk being dropped on the full queue during a long replay. The drain runs OUTSIDE STATE.lock
+    (block=True with a short timeout so a Stop is honoured within ~0.5s and a full queue never drops);
+    the final flip (close the buffer, publish the engine) is done under STATE.lock AND the buffer's
+    own lock, so no _feed.append can interleave. Session identity (started_at object identity,
+    mirroring record_from_here / _on_downgrade) is re-checked at every step; a Stop/switch/new-start
+    discards the engine. On build failure we surface prepare_error and leave capture + recording
+    running, so a model problem never loses the audio."""
     try:
         engine = transcribe.Engine(tier=tier, language=language, initial_prompt=prompt, engine=engine_pref)
     except Exception as e:
@@ -1279,12 +1311,27 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
                 STATE.pending_audio = None
         return
 
-    backlog = []
+    def _still_ours():
+        # Cheap identity/liveness guard, used lock-free in the drain loop and re-checked under the
+        # lock at the flip. During the drain STATE.engine is still None, so the Stop path cannot stop
+        # THIS engine; STATE.stopping is our signal to abort and clean up.
+        return (STATE.running and not STATE.stopping and STATE.started_at is session_token
+                and STATE.preparing)
+
+    def _replay(items):
+        # Replay a batch into the engine in order. block=True with a short timeout so a healthy replay
+        # never drops on the maxsize=32 queue (it waits for space and retries), yet a Stop is honoured
+        # within one timeout. Returns False if the session ended mid-batch (caller aborts).
+        for (src, audio, t_start) in items:
+            while not engine.on_chunk(src, audio, t_start, block=True, timeout=0.5):
+                if not _still_ours():
+                    return False
+        return True
+
+    # --- phase 1: wire the engine up, but DO NOT publish it yet. STATE.engine stays None, preparing
+    # stays True and the buffer stays OPEN, so _feed keeps buffering live chunks behind the backlog.
     with STATE.lock:
-        # TOCTOU: only publish onto the session we started. If it was stopped, replaced by a new Begin,
-        # or is no longer preparing, discard this build rather than clobber the current session.
-        if not (STATE.running and not STATE.stopping and STATE.started_at is session_token
-                and STATE.preparing):
+        if not _still_ours():
             try:
                 engine.stop()
             except Exception:
@@ -1293,10 +1340,13 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
         engine.subscribe(md_sink)
         engine.subscribe(browser_sink)
         engine.start()
-        # Attach the energy rings now that the engine exists (they live on the engine, fed by the
-        # capture callback): the live CPU-downgrade nudge, the SYS echo-veto reference, and the
-        # gain-invariant raw-MIC feed. This is the work start() used to do inline before the engine
-        # moved off the request thread.
+        # Attach the energy rings NOW (they live on the engine, fed by the capture callback in real
+        # time): the live CPU-downgrade nudge, the SYS echo-veto reference, and the gain-invariant
+        # raw-MIC feed. Attaching here means every chunk captured from now on has ring history by the
+        # time it is replayed; the pre-engine backlog (captured during the model load) has none and
+        # falls back to sample-based tests. on_downgrade is inert until STATE.engine is published (the
+        # _on_downgrade guard drops callbacks whose engine is not STATE.engine), so no spurious
+        # "struggling" nudge fires during the expected catch-up.
         cap = STATE.capture
         engine.on_downgrade = lambda old, new, _e=engine: _on_downgrade(_e, old, new)
         _sys_ring = transcribe.EnergyRing()
@@ -1308,33 +1358,71 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
             engine.mic_env = _mic_ring
             if cap is not None:
                 cap.attach_mic_ring(_mic_ring)
-        # Go live: from here _feed feeds this engine. Re-affirm model/family from the built engine
-        # (set optimistically from resolve_model at Begin).
-        STATE.engine = engine
+        # Re-affirm model/family from the built engine (set optimistically from resolve_model at Begin).
         STATE.model = engine.model_name
         STATE.family = engine.family
-        STATE.preparing = False
-        # Close + drain the pending buffer under the SAME lock: close_and_drain() flips the buffer so
-        # every subsequent _feed.append returns False and feeds the live engine directly (in order,
-        # after this backlog), closing the buffer->engine seam with zero loss. The backlog itself is
-        # replayed OUTSIDE the lock (below), so a large first-download backlog cannot re-freeze
-        # /api/status by holding STATE.lock across the block=True drain.
         pb = STATE.pending_audio
-        STATE.pending_audio = None
-        backlog = pb.close_and_drain() if pb is not None else []
-        # Long-silence watcher: it reads the engine's rings, so it starts here (a record-only session
-        # armed its own in start()). Under the lock, as _silence_start expects, and with the engine
-        # already published so it does not early-return.
-        _silence_start(cap)
 
-    # Replay the backlog into the engine, in order, OUTSIDE STATE.lock. block=True so it NEVER drops
-    # on the engine's maxsize=32 queue; if a Stop lands mid-replay the engine's _stop is set and
-    # on_chunk returns False at once, so this loop can never wedge the shutdown.
-    for (src, audio, t_start) in backlog:
+    if pb is None:                       # defensive: a stop between publish and here cleared it
         try:
-            engine.on_chunk(src, audio, t_start, block=True)
+            engine.stop()
         except Exception:
             pass
+        return
+
+    # --- phase 2: drain the buffer into the engine, in order, OUTSIDE STATE.lock, until a pass comes
+    # back empty and the atomic flip publishes the engine. Because STATE.engine is still None, any
+    # _feed running now is still APPENDING to pb, so live-during-drain chunks queue behind the backlog
+    # rather than racing ahead of it.
+    while True:
+        if not _still_ours():
+            try:
+                engine.stop()
+            except Exception:
+                pass
+            return
+        items = pb.take_all()
+        if items:
+            if not _replay(items):       # session ended mid-replay
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+                return
+            continue                     # more live chunks may have queued behind; drain again
+        # The buffer looked empty: try to finalise. Under STATE.lock (re-check identity) AND the
+        # buffer's own lock (finalise_if_empty), the close + publish are atomic against _feed.append.
+        stragglers = None
+        with STATE.lock:
+            if not _still_ours():
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+                return
+
+            def _publish():
+                # Runs under the buffer lock (see finalise_if_empty): from here append() returns False,
+                # so _feed feeds the now-published engine directly, in order, after everything drained.
+                STATE.engine = engine
+                STATE.preparing = False
+                STATE.pending_audio = None
+
+            stragglers = pb.finalise_if_empty(_publish)
+            if stragglers is None:
+                # Published. Arm the long-silence watcher (it reads the engine + rings); a record-only
+                # session armed its own in start(). Under the lock, as _silence_start expects.
+                _silence_start(STATE.capture)
+        if stragglers is None:
+            break                        # finalised: the engine is live and _feed feeds it directly
+        # A straggler slipped in between take_all and the flip: replay it (outside the lock, buffer
+        # left OPEN) and loop. Converges because once caught up the engine consumes at >= real time.
+        if not _replay(stragglers):
+            try:
+                engine.stop()
+            except Exception:
+                pass
+            return
 
 
 @app.post("/api/start")
