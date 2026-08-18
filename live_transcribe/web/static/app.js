@@ -588,6 +588,7 @@ async function startLive() {
     S.form.context = null;   // the override applied to this run; the next meeting starts from the saved default again
     S.live = freshLive();
     S.live.running = true; S.live.transcribing = true; S.live.recording = !!resp.recording;
+    S.live.recordingStarted = !!resp.recording;   // latch: a session that starts already recording counts as having recorded
     S.live.sourceKind = "live"; S.live.startedAt = new Date().toISOString();
     S.live.outputPath = resp.output_path; S.live.audioStem = resp.audio_stem;
     S.live.tier = resp.tier; S.live.model = resp.model; S.live.family = resp.family; S.live.language = resp.language;
@@ -814,7 +815,7 @@ function gotoFinish(outputPath, sinkError) {
   teardownLive();
   S.finish.outputPath = outputPath || S.live.outputPath;
   S.finish.title = S.live.title || topicFromName(baseName(S.finish.outputPath));
-  S.finish.recordingStem = S.live.recording ? S.live.audioStem : null;
+  S.finish.recordingStem = S.live.recordingStarted ? S.live.audioStem : null;   // latch, not the live flag: a recording that was stopped mid-session still has a file to surface
   S.finish.summary = null; S.finish.savedAs = null; S.finish.summarising = false;
   S.finish.sinkError = sinkError || null;
   S.finish.notes = notesText; S.finish.hasNotes = !!notesText; S.finish.includeNotes = true;
@@ -3889,7 +3890,7 @@ function adoptRunning(status) {
   S.live.aecActive = !!status.aec_live_active;
   // /api/status does not carry the recording stem; the server derives it from the transcript
   // path (output_path minus ".md"), so reconstruct it for the record-only finish flow.
-  S.live.audioStem = (status.recording && status.output_path) ? status.output_path.replace(/\.md$/, "") : null;
+  S.live.audioStem = (status.recording_started && status.output_path) ? status.output_path.replace(/\.md$/, "") : null;
   openStream(); startElapsed();
   seedFromTranscript();
   seedNotes();
