@@ -10,6 +10,7 @@ save_location (validated; falls back to a per-platform default folder, see
 _sessions_dir).
 """
 import asyncio
+import collections
 import json
 import os
 import platform
@@ -174,6 +175,15 @@ class _State:
         # reset() clears them.
         self.struggle_nudge: Optional[dict] = None
         self.struggle_notified: bool = False
+        # t0-capture: capture (and recording, if on) start the instant Begin is clicked, while the
+        # transcription model loads on a background thread. `preparing` is True from Begin until that
+        # engine is ready (or errors); `prepare_error` carries a short model-load failure message for
+        # the UI (None while healthy). `pending_audio` is the bounded, thread-safe hold for the
+        # transcription copy of every chunk captured before the engine exists, drained into the
+        # engine (in order, no drops) once it is ready. See _PendingAudio and _build_engine_async.
+        self.preparing: bool = False
+        self.prepare_error: Optional[str] = None
+        self.pending_audio: Optional["_PendingAudio"] = None
 
     def reset(self):
         self.engine = None
@@ -207,6 +217,11 @@ class _State:
         self.silence_nudge = None
         self.struggle_nudge = None
         self.struggle_notified = False
+        # t0-capture: clear the preparing flag, any load error, and drop the pending-audio hold so a
+        # never-loaded model's buffer cannot outlive its session (and its RAM is freed at finalise).
+        self.preparing = False
+        self.prepare_error = None
+        self.pending_audio = None
 
 
 STATE = _State()
@@ -235,6 +250,69 @@ def _summary_running():
         return any(j.get("state") == "running" for j in _SUMMARY_JOBS.values())
 
 
+# t0-capture pending-audio buffer cap. Holds the TRANSCRIPTION copy of captured chunks while the
+# model loads, so nothing between Begin and engine-ready is dropped. float32 @ 16 kHz is ~64 KB/s
+# per source, ~128 KB/s for both -> ~115 MB per 15 minutes. We cap at 20 minutes of both-source
+# audio (~154 MB) and drop the OLDEST chunk on overflow. RAM tradeoff: with recording on the same
+# audio is already on disk from t0 (the recorder), so this buffer is only the transcription copy and
+# only has to cover a realistic model load/download; an unbounded buffer against a model that never
+# loads would OOM the app, so the cap is deliberate, not incidental.
+_PENDING_MAX_SAMPLES = 16000 * 60 * 20 * 2   # 20 min of both-source 16 kHz float32 samples
+
+
+class _PendingAudio:
+    """Thread-safe, bounded, drop-oldest hold for transcription chunks captured before the engine
+    exists (t0-capture). _feed appends here from the capture/chunker threads while a live session is
+    still building its model; the builder thread (_build_engine_async) drains it exactly once, in
+    order, into the ready engine via engine.on_chunk(block=True) so the replay can never drop on the
+    engine's maxsize queue. Bounded by total float32 samples (see _PENDING_MAX_SAMPLES); see that
+    comment for the RAM tradeoff. Its own lock makes append (many producer threads) and the single
+    close_and_drain handoff atomic, so nothing is lost at the buffer->engine seam."""
+
+    def __init__(self, max_samples):
+        self._buf = collections.deque()
+        self._samples = 0
+        self._max = max_samples
+        self._lock = threading.Lock()
+        self._closed = False
+        self._warned = False
+
+    def append(self, source, audio, t_start):
+        """Hold a chunk. Returns True if buffered, False if the buffer was already closed at handoff
+        (the caller then feeds the now-ready engine directly, so nothing slips through the seam)."""
+        try:
+            n = len(audio)
+        except TypeError:
+            n = 0   # a non-sized stub (only ever in tests): count it as weightless
+        with self._lock:
+            if self._closed:
+                return False
+            self._buf.append((source, audio, t_start))
+            self._samples += n
+            while self._samples > self._max and len(self._buf) > 1:
+                _s, old_audio, _t = self._buf.popleft()
+                try:
+                    self._samples -= len(old_audio)
+                except TypeError:
+                    pass
+                if not self._warned:
+                    self._warned = True
+                    print("[start] pending-audio buffer full while the model loads; dropping the "
+                          "oldest held transcription chunk (recording, if on, is unaffected).", flush=True)
+            return True
+
+    def close_and_drain(self):
+        """Close the buffer and return everything held, in order, atomically. After this, append()
+        returns False, so the drain->live handoff loses nothing and the replayed backlog stays
+        strictly ahead of any post-handoff live chunk."""
+        with self._lock:
+            self._closed = True
+            items = list(self._buf)
+            self._buf.clear()
+            self._samples = 0
+            return items
+
+
 def _feed(source, audio, t_start):
     """Route a captured chunk to the recorder and/or the engine, honouring the live flags.
 
@@ -245,7 +323,12 @@ def _feed(source, audio, t_start):
 
     Live AEC + recording (STATE.record_raw_mic): capture emits the RAW mic on a "MIC_RAW" source for
     the recorder (saved as the -MIC channel) and the cleaned mic on "MIC" for the engine, so the
-    recording stays raw while the live transcript still benefits from echo cancellation."""
+    recording stays raw while the live transcript still benefits from echo cancellation.
+
+    t0-capture: while a live transcription session is still loading its model (STATE.preparing, engine
+    not yet built), the engine-bound chunk is HELD in STATE.pending_audio instead of dropped, so
+    transcription can start from t0 once the model is ready. The recorder path above is unchanged, so
+    recording is already on disk from t0."""
     rec = STATE.recorder if (STATE.recording and STATE.recorder is not None) else None
     eng = STATE.engine if (STATE.transcribing and STATE.engine is not None) else None
     if source == "MIC_RAW":
@@ -257,6 +340,19 @@ def _feed(source, audio, t_start):
         rec.on_chunk(source, audio, t_start)
     if eng is not None:
         eng.on_chunk(source, audio, t_start)
+        return
+    # Engine not live at entry. A live transcription session still loading its model holds the chunk
+    # (t0-capture) so transcription starts from t0 once ready, instead of dropping it as before.
+    if not STATE.transcribing:
+        return   # record-only (or nothing to transcribe): nothing else to do
+    pb = STATE.pending_audio
+    if STATE.preparing and pb is not None and pb.append(source, audio, t_start):
+        return   # held in the buffer; the builder replays it in order once the engine is ready
+    # Not buffered (buffer closed at the handoff instant, or the engine came up between our reads):
+    # feed the engine directly if it is live now, so nothing slips through the preparing->ready seam.
+    eng2 = STATE.engine
+    if eng2 is not None:
+        eng2.on_chunk(source, audio, t_start)
 
 
 # --- long-silence nudge (WP-9b) ------------------------------------------------
@@ -713,6 +809,14 @@ def status():
             # mid-session record-from-here). The live screen and finish handoff key off it, and once
             # true /api/record-from-here refuses (re-recording the same stem would truncate the WAV).
             "recording_started": STATE.recording_started,
+            # t0-capture: transcription-model readiness. Capture (and recording, if on) are already
+            # live from Begin; while the model loads on the background thread the UI shows a
+            # "preparing" state and polls this. model_ready flips true once the engine is attached;
+            # prepare_error carries a short model-load failure message (None while healthy) so a
+            # failed load can be surfaced without hiding that capture/recording carried on.
+            "model_ready": STATE.engine is not None and not STATE.preparing,
+            "preparing": STATE.preparing,
+            "prepare_error": STATE.prepare_error,
         }
         # Live AEC truth for the in-meeting toggle: the ENGINE'S actual state, never the stored
         # setting (a long-running instance can drift from disk; the toggle must not lie).
@@ -1148,24 +1252,99 @@ def _resolve_tier_lang_prompt(req):
     return tier, language, prompt, engine_pref
 
 
+def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_sink, browser_sink):
+    """Build the transcription Engine off the request thread (t0-capture), then attach it to the
+    already-capturing session and replay everything held since Begin.
+
+    The model load (Engine -> load_model) is the slow part and runs OUTSIDE STATE.lock, so
+    /api/status and /api/levels stay responsive throughout: a warm model is a fast cache hit, and a
+    first-time download can take minutes, which is fine because capture + recording are already
+    running and nothing is dropped. Before publishing we re-check under the lock that this is still
+    the current session (object identity of started_at, mirroring the record_from_here /
+    _on_downgrade TOCTOU guard); if a Stop/switch/new-start replaced it, the engine is discarded. On
+    build failure we surface prepare_error and leave capture + recording running, so a model problem
+    never loses the audio."""
+    try:
+        engine = transcribe.Engine(tier=tier, language=language, initial_prompt=prompt, engine=engine_pref)
+    except Exception as e:
+        # Do NOT crash the app or the session: capture + recording carry on (audio safe on disk if
+        # recording). Stop waiting for a model that will not arrive, surface the error for the UI, and
+        # free the held transcription audio (no engine will ever consume it).
+        print(f"[start] engine build failed: {e}", flush=True)
+        with STATE.lock:
+            if (STATE.running and not STATE.stopping and STATE.started_at is session_token
+                    and STATE.preparing):
+                STATE.prepare_error = f"Could not load the transcription model: {e}"
+                STATE.preparing = False
+                STATE.pending_audio = None
+        return
+
+    backlog = []
+    with STATE.lock:
+        # TOCTOU: only publish onto the session we started. If it was stopped, replaced by a new Begin,
+        # or is no longer preparing, discard this build rather than clobber the current session.
+        if not (STATE.running and not STATE.stopping and STATE.started_at is session_token
+                and STATE.preparing):
+            try:
+                engine.stop()
+            except Exception:
+                pass
+            return
+        engine.subscribe(md_sink)
+        engine.subscribe(browser_sink)
+        engine.start()
+        # Attach the energy rings now that the engine exists (they live on the engine, fed by the
+        # capture callback): the live CPU-downgrade nudge, the SYS echo-veto reference, and the
+        # gain-invariant raw-MIC feed. This is the work start() used to do inline before the engine
+        # moved off the request thread.
+        cap = STATE.capture
+        engine.on_downgrade = lambda old, new, _e=engine: _on_downgrade(_e, old, new)
+        _sys_ring = transcribe.EnergyRing()
+        engine.sys_env = _sys_ring
+        if cap is not None:
+            cap.attach_sys_ring(_sys_ring)
+        if transcribe.raw_mic_ring_on():
+            _mic_ring = transcribe.EnergyRing()
+            engine.mic_env = _mic_ring
+            if cap is not None:
+                cap.attach_mic_ring(_mic_ring)
+        # Go live: from here _feed feeds this engine. Re-affirm model/family from the built engine
+        # (set optimistically from resolve_model at Begin).
+        STATE.engine = engine
+        STATE.model = engine.model_name
+        STATE.family = engine.family
+        STATE.preparing = False
+        # Close + drain the pending buffer under the SAME lock: close_and_drain() flips the buffer so
+        # every subsequent _feed.append returns False and feeds the live engine directly (in order,
+        # after this backlog), closing the buffer->engine seam with zero loss. The backlog itself is
+        # replayed OUTSIDE the lock (below), so a large first-download backlog cannot re-freeze
+        # /api/status by holding STATE.lock across the block=True drain.
+        pb = STATE.pending_audio
+        STATE.pending_audio = None
+        backlog = pb.close_and_drain() if pb is not None else []
+        # Long-silence watcher: it reads the engine's rings, so it starts here (a record-only session
+        # armed its own in start()). Under the lock, as _silence_start expects, and with the engine
+        # already published so it does not early-return.
+        _silence_start(cap)
+
+    # Replay the backlog into the engine, in order, OUTSIDE STATE.lock. block=True so it NEVER drops
+    # on the engine's maxsize=32 queue; if a Stop lands mid-replay the engine's _stop is set and
+    # on_chunk returns False at once, so this loop can never wedge the shutdown.
+    for (src, audio, t_start) in backlog:
+        try:
+            engine.on_chunk(src, audio, t_start, block=True)
+        except Exception:
+            pass
+
+
 @app.post("/api/start")
 def start(req: StartRequest):
     if _summary_running():
         raise HTTPException(status_code=409, detail="A summary is being generated. Wait for it to finish before starting a new session, so the two never compete for the machine.")
-    # Pre-warm the model OUTSIDE the state lock. A cold or first-time load takes seconds (longer on
-    # a network fallback), and doing it under STATE.lock (as the Engine build below does) freezes
-    # /api/status and /api/levels, which the UI polls ~1/s, so the app reads as hung. load_model
-    # caches by (model_name, device, compute_type), so the Engine build reuses this warm entry.
-    # Best-effort: if this resolution ever drifts from Engine's, the build just loads under the lock
-    # as before (slower, never wrong).
-    if bool(req.transcribe):
-        try:
-            _wt, _wlang, _wp, _weng = _resolve_tier_lang_prompt(req)
-            _wcfg = transcribe.TIER_CONFIG[_wt]
-            _wmodel, _wfam = transcribe.resolve_model(_wcfg["model"], _wlang, _weng)
-            transcribe.load_model(_wmodel, _wcfg["device"], _wcfg["compute_type"])
-        except Exception:
-            pass
+    # t0-capture: the transcription model is NOT loaded here. Capture (and recording, if on) start
+    # the instant Begin is clicked; the model builds on a background thread (_build_engine_async) and
+    # attaches once ready, replaying everything held since t0. So /api/start returns immediately and
+    # a slow first-time model download never blocks it or loses a moment of audio.
     with STATE.lock:
         if STATE.running:
             raise HTTPException(status_code=409, detail="Session already running")
@@ -1181,34 +1360,43 @@ def start(req: StartRequest):
         chunk_seconds = default_chunk_seconds(tier)
         output_path = _build_output_path(req.topic)
 
-        engine = None
-        md_sink = None
+        # Engine-bound sinks are created NOW (not with the engine) so the SSE stream binds to a stable
+        # browser sink from t0 and no replayed segment is missed by the live view, and so /api/status
+        # can read md_sink.last_error. They are subscribed to the engine once it is built. md_sink
+        # opens the transcript file immediately (header only); the engine fills it in once ready.
         browser_sink = BrowserSink()
+        md_sink = sinks.MarkdownSink(output_path) if transcribe_on else None
+        # Resolve the concrete model + family now (no load, no network) so /api/status and the client
+        # can label the session honestly while the real model builds in the background; the built
+        # engine re-affirms them.
+        model_name = family = None
         if transcribe_on:
-            # Load model (synchronous; takes a few seconds even when cached)
             try:
-                engine = transcribe.Engine(tier=tier, language=language, initial_prompt=prompt, engine=engine_pref)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Could not load model ({tier}): {e}")
-            md_sink = sinks.MarkdownSink(output_path)
-            engine.subscribe(md_sink)
-            engine.subscribe(browser_sink)
-            engine.start()
+                model_name, family = transcribe.resolve_model(transcribe.TIER_CONFIG[tier]["model"], language, engine_pref)
+            except Exception:
+                model_name = family = None
 
         recorder = sinks.AudioRecorder(output_path.with_suffix("")) if record_on else None
 
-        # Publish state BEFORE capture starts so the feed closure sees consistent flags.
-        STATE.engine = engine
+        # Publish state BEFORE capture starts so the feed sees consistent flags. For a transcription
+        # session the engine is still None here and `preparing` is True: that is the signal _feed uses
+        # to HOLD engine-bound chunks in pending_audio until the background build attaches the engine.
+        STATE.engine = None
         STATE.md_sink = md_sink
         STATE.browser_sink = browser_sink
         STATE.recorder = recorder
         STATE.recording = record_on
         STATE.recording_started = record_on   # latch: a start-time recording counts as "has recorded"
         STATE.transcribing = transcribe_on
+        STATE.preparing = transcribe_on       # only a transcription session waits on a model load
+        STATE.prepare_error = None
+        # The transcription copy of every pre-engine chunk (bounded, drop-oldest). Recording, if on,
+        # is already on disk from t0 via the recorder, so this only has to cover the model load.
+        STATE.pending_audio = _PendingAudio(_PENDING_MAX_SAMPLES) if transcribe_on else None
         STATE.started_at = datetime.now()
         STATE.tier = tier if transcribe_on else None
-        STATE.model = engine.model_name if engine else None
-        STATE.family = engine.family if engine else None
+        STATE.model = model_name if transcribe_on else None
+        STATE.family = family if transcribe_on else None
         STATE.output_path = output_path
         STATE.language = (language or "auto") if transcribe_on else None
         STATE.source_kind = "live"
@@ -1217,6 +1405,10 @@ def start(req: StartRequest):
         STATE.mic_device = req.mic_device
         STATE.loopback_device = req.loopback_device
         STATE.chunk_seconds = chunk_seconds
+        # Object-identity token: the background build re-checks this is still the current session
+        # before publishing its engine (a fast Stop/switch/new-start can race). datetime.now() makes a
+        # fresh object per session, and reset() sets started_at=None, so `is` never aliases.
+        session_token = STATE.started_at
 
         # Recorder is tapped BEFORE the engine (see _feed), so the recording stays complete
         # even when transcription drops chunks under load.
@@ -1234,29 +1426,12 @@ def start(req: StartRequest):
             agc=agc_live,
             record_raw_mic=False,   # record the AEC-cleaned mic into the single stereo file, not a raw stem
         )
-        # Feed a SYS energy ring from live capture so the engine vetoes MIC echo segments in real
-        # time. Fed per-block from the callback (not from late SYS chunks); see EnergyRing.
-        # The MIC ring is the same feed for the near end, tapped RAW (pre-APM), so the silence gate
-        # and the veto's mic side stay gain-invariant under live AGC. Both are attached BEFORE
-        # cap.start() so no early block is missed. SA_LIVE_RAW_MIC_RING=0 skips the mic ring.
-        if engine is not None:
-            # Surface a live CPU auto-downgrade (banner + one-time toast). Bind THIS engine into
-            # the callback so the handler can confirm it is still the session's before publishing
-            # (the downgrade fires on the worker thread; a stop/switch can be mid-flight). A GPU or
-            # Swivuriso session simply never downgrades, so this is inert there.
-            engine.on_downgrade = lambda old, new, _e=engine: _on_downgrade(_e, old, new)
-            _sys_ring = transcribe.EnergyRing()
-            engine.sys_env = _sys_ring
-            cap.attach_sys_ring(_sys_ring)
-            if transcribe.raw_mic_ring_on():
-                _mic_ring = transcribe.EnergyRing()
-                engine.mic_env = _mic_ring
-                cap.attach_mic_ring(_mic_ring)
+        # The engine's energy rings (SYS echo-veto reference, gain-invariant raw MIC) live on the
+        # engine and are attached by _build_engine_async once it exists, not here, because there is no
+        # engine yet. They only matter once transcription runs, which is after the model is ready.
         try:
             cap.start()
         except Exception as e:
-            if engine is not None:
-                engine.stop()
             if md_sink is not None:
                 md_sink.close()
             if recorder is not None:
@@ -1267,20 +1442,34 @@ def start(req: StartRequest):
         # True only if live AEC actually engaged (the raw side channel exists). If AEC could not
         # start, this stays False and the recorder takes the normal MIC, which is already raw.
         STATE.record_raw_mic = cap.has_raw_mic()
-        # Long-silence watcher: LIVE sessions only, and only when the setting and the env kill
-        # switch both allow it. Started last, once the capture is up, so it reads a real t0.
-        _silence_start(cap)
+        # Long-silence watcher: a record-only session has no engine (its rings live on the engine), so
+        # it arms here exactly as before. A transcription session arms its watcher from
+        # _build_engine_async, once the engine + rings exist.
+        if not transcribe_on:
+            _silence_start(cap)
+
+        # Kick off the background model load + engine attach. Capture and recording are already live;
+        # this only fills in transcription, replaying everything held since Begin once the model is up.
+        if transcribe_on:
+            threading.Thread(
+                target=_build_engine_async,
+                args=(session_token, tier, language, prompt, engine_pref, md_sink, browser_sink),
+                daemon=True, name="engine-build").start()
 
         return {
             "tier": tier if transcribe_on else None,
-            "model": engine.model_name if engine else None,
-            "family": engine.family if engine else None,
+            "model": model_name if transcribe_on else None,
+            "family": family if transcribe_on else None,
             "language": STATE.language,
             "output_path": str(output_path),
             "chunk_seconds": chunk_seconds,
             "recording": record_on,
             "transcribing": transcribe_on,
             "audio_stem": str(output_path.with_suffix("")) if record_on else None,
+            # t0-capture: capture is live now; transcription may still be loading its model. False here
+            # tells the UI to show "preparing" and poll /api/status until model_ready flips true. A
+            # record-only session has nothing to load, so it is ready immediately.
+            "model_ready": not transcribe_on,
         }
 
 
