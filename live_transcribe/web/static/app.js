@@ -624,14 +624,15 @@ async function startLive() {
   beginLive();
 }
 // Adopt a downloaded alternative from the pre-start modal into the form, so Begin uses a model
-// already on disk (no download). Engine follows the family for Fluister/Whisper; a Swivuriso
-// alternative is reached through the language (engine stays Auto), so only the size changes.
+// already on disk (no download). The engine is pinned to the alternative's ACTUAL family, never
+// "auto": leaving it Auto let Begin re-resolve by language and pick (and download) a different
+// family, so a "use the SA model already on disk" click could still trigger a download (P1-1).
 function applyModelAlternative(alt) {
   if (!alt) return;
   S.form.tier = alt.size;
   if (alt.family === "fluister") S.form.engine = "fluister";
   else if (alt.family === "whisper") S.form.engine = "whisper";
-  else if (alt.family === "swivuriso") S.form.engine = "auto";   // language routes to Swivuriso
+  else if (alt.family === "swivuriso") S.form.engine = "swivuriso";
 }
 async function beginLive() {
   _liveStarting = true; render();
@@ -703,7 +704,7 @@ function preStartModal(pf, onProceed, onUseAlt) {
         raw((pf.label || pf.model || "") + "  ·  " + familyDisplay(pf.family) + "  ·  "),
         el("span", { text: trFmt("About {size}, and usually a few minutes on a normal connection.", { size: fmtGB(pf.approx_bytes) }) }),
       ]),
-      el("p", { class: "ink-3", style: { margin: "0", fontSize: "12px" }, text: "Capture and recording begin immediately. Nothing is missed: the transcript fills in from the very start once the model is ready." }),
+      el("p", { class: "ink-3", style: { margin: "0", fontSize: "12px" }, text: "Capture and recording begin immediately. The transcript fills in from the start once the model is ready, and if you are recording, the audio is saved from the very beginning." }),
       altList,
       el("div", { class: "row gap-8", style: { justifyContent: "flex-end", marginTop: "18px" } }, [
         el("button", { class: "btn ghost", onclick: function () { modal.remove(); } }, "Cancel"),
@@ -2161,7 +2162,7 @@ function startingView() {
       : "Opening your microphone and system audio and starting to capture. This is quick.";
     var sub = isFile
       ? "You can keep this open. It switches to the transcript by itself."
-      : "The live screen opens by itself. Nothing is missed: the transcript fills in from the start once the model is ready.";
+      : "The live screen opens by itself. The transcript fills in from the start once the model is ready.";
     inner = el("div", { class: "rec-stage" }, [
       el("span", { class: "spinner" }),
       el("h1", { style: { fontSize: "22px", marginTop: "8px" }, text: "Starting" }),
@@ -2312,7 +2313,7 @@ function preparePanel(failMsg) {
   var p = L.prepare || {};
   var phase = p.phase || (L.preparing ? "loading" : "");
   var reassure = (L.recording ? tr("Capturing and recording now on this computer.") : tr("Capturing now on this computer."))
-    + " " + tr("The transcription model is still loading. Nothing is missed: the transcript fills in from the very start the moment it is ready.");
+    + " " + tr("The transcription model is still loading. The transcript fills in from the start the moment it is ready, and if you are recording, the audio is saved from the very beginning.");
   var progressBlock;
   if (phase === "downloading") {
     var total = p.total || 0, dl = p.downloaded || 0;

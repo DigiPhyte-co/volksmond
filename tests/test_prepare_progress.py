@@ -193,7 +193,7 @@ def test_download_progress_then_ready():
 
 def test_stall_becomes_a_retryable_error():
     # (b) No byte growth for the whole (shrunk) stall window -> a retryable prepare_error flagged
-    # stalled, capture still running, buffer freed. NOTE model_ready never flips.
+    # stalled, capture still running, the held backlog RETAINED for a retry (P1-2). model_ready never flips.
     reset_state()
 
     def progress():
@@ -213,7 +213,9 @@ def test_stall_becomes_a_retryable_error():
             assert st["preparing"] is False and st["model_ready"] is False, st
             assert "stall" in st["prepare_error"].lower(), st
             assert (st["prepare"] or {}).get("stalled") is True and st["prepare"]["phase"] == "error", st
-            assert webapp.STATE.pending_audio is None, "the held backlog was not freed after the failure"
+            # P1-2: the buffer is KEPT across a retryable failure (it goes on holding chunks, and a retry
+            # replays from t0), not freed. It is cleared only on stop / final abandonment / publication.
+            assert webapp.STATE.pending_audio is not None, "the held backlog must be retained for a retry (P1-2)"
     finally:
         reset_state()
     print("  OK  a stalled download -> retryable prepare_error (stalled) within the threshold; capture kept running")
@@ -281,6 +283,140 @@ def test_retry_recovers_without_restarting_capture():
     print("  OK  retry re-spawns the build and recovers without restarting capture; 409 when there is no error")
 
 
+def test_retry_replays_the_buffer_from_t0():
+    # P1-2: a retryable failure must KEEP the pending-audio buffer (it goes on holding chunks through the
+    # error state) and /api/prepare/retry must REUSE it, so a successful retry replays from Begin, not
+    # from the Retry click. Here the first build fails; chunks captured DURING the error state are then
+    # replayed to the engine on a successful retry, in order, with none dropped.
+    reset_state()
+    attempt = {"n": 0}
+    received = []
+    rlock = threading.Lock()
+
+    class RetryReplayEngine:
+        model_name = "fake-model"
+        family = "fluister"
+        engine = "auto"
+
+        def __init__(self, **kw):
+            attempt["n"] += 1
+            if attempt["n"] == 1:
+                raise RuntimeError("first build fails (retryable)")
+
+        def subscribe(self, fn):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self, drain=False, timeout=None):
+            pass
+
+        def pending(self):
+            return 0
+
+        def is_alive(self):
+            return True
+
+        def on_chunk(self, source, audio, t_start, block=False, timeout=None):
+            with rlock:
+                received.append((source, t_start))
+            return True
+
+    def progress():   # unused: present=True skips the download phase and goes straight to the load
+        return {"state": "done", "downloaded": 0, "total": 0}
+
+    try:
+        with stubs(progress, present_fn=lambda t: True, engine_cls=RetryReplayEngine):
+            r = client.post("/api/start", json=START_BODY)
+            assert r.status_code == 200, r.text
+            # First build fails -> a retryable error, and the buffer is RETAINED (P1-2).
+            assert wait_until(lambda: client.get("/api/status").json().get("prepare_error"), 5.0), st_err()
+            assert webapp.STATE.pending_audio is not None, "the buffer was freed on failure (P1-2 regression)"
+            # Capture chunks DURING the error state: they must be held (not dropped) for the retry.
+            backlog = []
+            for i in range(12):
+                src = "MIC" if i % 2 == 0 else "SYS"
+                webapp._feed(src, np.full(160, i, dtype=np.float32), float(i))
+                backlog.append((src, float(i)))
+            # Retry: reuse the SAME buffer, build succeeds, and everything held is replayed from t0.
+            rr = client.post("/api/prepare/retry")
+            assert rr.status_code == 200, rr.text
+            assert wait_until(lambda: client.get("/api/status").json().get("model_ready") is True, 5.0), \
+                "retry never reached model_ready"
+            assert wait_until(lambda: len(received) >= 12, 5.0), f"retry replayed only {len(received)}/12"
+            with rlock:
+                got = list(received)
+            assert got == backlog, f"retry did not replay the held buffer from t0:\n got {got}\n exp {backlog}"
+    finally:
+        reset_state()
+    print("  OK  a retryable failure keeps the buffer; retry replays it from t0, in order, zero drops (P1-2)")
+
+
+def test_foreign_download_in_slot_is_not_misread():
+    # P1-5: the single global download slot may be busy with a DIFFERENT model (a Settings download). Its
+    # bytes / 'done' / 'error' must NOT be read as ours: a foreign 'done' must not complete our prepare,
+    # and we must wait for the slot then rely on OUR model actually being on disk.
+    reset_state()
+    present = {"v": False}
+    foreign_done = {"v": False}
+
+    def progress():
+        st = "done" if foreign_done["v"] else "downloading"
+        return {"state": st, "repo": "someone/else-model", "downloaded": 500, "total": 500}
+
+    try:
+        with stubs(progress, present_fn=lambda t: present["v"], stall_s=0.3, poll_s=0.02):
+            r = client.post("/api/start", json=START_BODY)
+            assert r.status_code == 200, r.text
+            time.sleep(0.3)   # several poll cycles while the FOREIGN download holds the slot
+            # The foreign download completes: its 'done' must NOT complete our prepare, and we must not
+            # have failed ourselves as stalled while waiting for the slot.
+            foreign_done["v"] = True
+            time.sleep(0.3)
+            st = client.get("/api/status").json()
+            assert st["model_ready"] is False, "a foreign download's 'done' was misread as ours (P1-5)"
+            assert st["prepare_error"] is None, f"waiting for the slot was wrongly failed: {st}"
+            # Our model actually lands on disk -> prepare completes on the on-disk truth.
+            present["v"] = True
+            assert wait_until(lambda: client.get("/api/status").json().get("model_ready") is True, 5.0), \
+                "prepare never completed once our model was actually present"
+    finally:
+        reset_state()
+    print("  OK  a foreign model in the download slot is not misread; completion needs OUR model present (P1-5)")
+
+
+def test_verification_tail_is_not_a_false_stall():
+    # P2-2: bytes flat AT (or near) the total is the no-write verification tail (checksum / extraction /
+    # AV scan), which must get a longer grace than a genuine mid-download stall so a healthy download is
+    # not failed. Here bytes sit at the total: it must NOT trip the (short) download-stall window, and it
+    # completes when the files finish landing.
+    reset_state()
+    present = {"v": False}
+
+    def progress():   # flat AT total, no repo -> treated as ours; this is the verification tail
+        return {"state": "downloading", "downloaded": 1000, "total": 1000}
+
+    saved_grace = webapp.PREPARE_VERIFY_GRACE_SECONDS
+    try:
+        with stubs(progress, present_fn=lambda t: present["v"], stall_s=0.3, poll_s=0.02):
+            webapp.PREPARE_VERIFY_GRACE_SECONDS = 30   # far beyond the test window, unlike the 0.3s stall
+            r = client.post("/api/start", json=START_BODY)
+            assert r.status_code == 200, r.text
+            time.sleep(0.7)   # well past the 0.3s download-stall window
+            st = client.get("/api/status").json()
+            assert st["prepare_error"] is None, f"the verification tail was wrongly failed as stalled (P2-2): {st}"
+            assert st["model_ready"] is False, st
+            # Files finish landing -> present -> completes (no false stall along the way).
+            present["v"] = True
+            assert wait_until(lambda: client.get("/api/status").json().get("model_ready") is True, 5.0), \
+                "prepare never completed after the verification tail"
+    finally:
+        webapp.PREPARE_VERIFY_GRACE_SECONDS = saved_grace
+        reset_state()
+    print("  OK  a flat-at-total verification tail is not failed as a stall within the download window (P2-2)")
+
+
 def st_err():
     return f"prepare_error never set: {client.get('/api/status').json()}"
 
@@ -289,7 +425,10 @@ if __name__ == "__main__":
     tests = (test_download_progress_then_ready,
              test_stall_becomes_a_retryable_error,
              test_hard_error_surfaces,
-             test_retry_recovers_without_restarting_capture)
+             test_retry_recovers_without_restarting_capture,
+             test_retry_replays_the_buffer_from_t0,
+             test_foreign_download_in_slot_is_not_misread,
+             test_verification_tail_is_not_a_false_stall)
     failures = 0
     for fn in tests:
         try:

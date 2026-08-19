@@ -1492,6 +1492,35 @@ def test_preflight_model_api():
     print("  OK  /api/preflight-model: full schema, present true/false, cross-family engine_override, CSRF-protected")
 
 
+def test_downloaded_alternatives_swivuriso_only_when_present():
+    # P1-1: the pre-start modal's "start instantly" list may show Swivuriso ONLY when it is actually
+    # cached on disk. swivuriso_available() is ~always True (the model is hosted), so it must not gate
+    # the list, or the modal advertises a multi-GB download as an instant switch. Drive the presence
+    # probes directly so the assertion never depends on what happens to be cached on this machine.
+    from live_transcribe import voicedl as V, __main__ as M
+    orig_present, orig_local, orig_dsizes = V._present, webapp.transcribe.SWIVURISO_LOCAL, M._downloaded_sizes
+    try:
+        M._downloaded_sizes = lambda fam: set()                 # no fluister/whisper sizes on disk
+        webapp.transcribe.SWIVURISO_LOCAL = "Z:\\no\\such\\swivuriso\\dir"   # local build absent
+        # Case A: the Swivuriso repo is NOT cached -> it must NOT be offered as an instant alternative.
+        V._present = lambda t: False
+        outA = webapp._downloaded_alternatives(exclude_family="fluister", exclude_size="small")
+        assert not any(a["family"] == "swivuriso" for a in outA), \
+            f"Swivuriso listed as instant while not on disk (P1-1): {outA}"
+        # Case B: the Swivuriso repo IS cached -> it appears exactly once, at its nominal turbo size.
+        V._present = lambda t: (t == webapp.transcribe.SWIVURISO_REPO)
+        outB = webapp._downloaded_alternatives(exclude_family="fluister", exclude_size="small")
+        sv = [a for a in outB if a["family"] == "swivuriso"]
+        assert len(sv) == 1, f"expected exactly one Swivuriso alternative when present: {outB}"
+        assert sv[0]["size"] == "turbo" and sv[0]["model"] == webapp.transcribe.SWIVURISO_REPO, sv
+        # And it is excluded when Swivuriso is itself the primary pick.
+        outC = webapp._downloaded_alternatives(exclude_family="swivuriso", exclude_size="turbo")
+        assert not any(a["family"] == "swivuriso" for a in outC), outC
+    finally:
+        V._present, webapp.transcribe.SWIVURISO_LOCAL, M._downloaded_sizes = orig_present, orig_local, orig_dsizes
+    print("  OK  downloaded_alternatives lists Swivuriso only when it is actually cached on disk (P1-1)")
+
+
 def test_status_prepare_block_schema():
     # WP-1/WP-2: the /api/status running dict carries model_ready (authoritative), preparing,
     # prepare_error, and a prepare block present ONLY while preparing OR on error, with the pinned
@@ -1590,6 +1619,7 @@ if __name__ == "__main__":
                test_offline_build_registers_no_calendar_routes,
                test_store_build_registers_no_app_update_check,
                test_preflight_model_api,
+               test_downloaded_alternatives_swivuriso_only_when_present,
                test_status_prepare_block_schema):
         try:
             fn()

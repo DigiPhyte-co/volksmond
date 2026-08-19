@@ -233,8 +233,8 @@ window.VM_I18N = {
     "Capturing now on this computer.": "Vang nou op hierdie rekenaar op.",
     "Capturing and recording now on this computer.":
       "Vang op en neem nou op hierdie rekenaar op.",
-    "The transcription model is still loading. Nothing is missed: the transcript fills in from the very start the moment it is ready.":
-      "Die transkripsiemodel laai nog. Niks gaan verlore nie: die transkripsie vul van heel voor af in sodra dit gereed is.",
+    "The transcription model is still loading. The transcript fills in from the start the moment it is ready, and if you are recording, the audio is saved from the very beginning.":
+      "Die transkripsiemodel laai nog. Die transkripsie vul van voor af in sodra dit gereed is, en as jy opneem, word die klank van heel voor af gestoor.",
     "Could not load the transcription model on this computer.":
       "Kon nie die transkripsiemodel op hierdie rekenaar laai nie.",
     "The download stalled. Check your connection and try again.":
@@ -251,8 +251,8 @@ window.VM_I18N = {
     "Download the {label} model first?": "Laai eers die {label}-model af?",
     "About {size}, and usually a few minutes on a normal connection.":
       "Ongeveer {size}, en gewoonlik 'n paar minute op 'n normale verbinding.",
-    "Capture and recording begin immediately. Nothing is missed: the transcript fills in from the very start once the model is ready.":
-      "Opvang en opname begin dadelik. Niks gaan verlore nie: die transkripsie vul van heel voor af in sodra die model gereed is.",
+    "Capture and recording begin immediately. The transcript fills in from the start once the model is ready, and if you are recording, the audio is saved from the very beginning.":
+      "Opvang en opname begin dadelik. Die transkripsie vul van voor af in sodra die model gereed is, en as jy opneem, word die klank van heel voor af gestoor.",
     "Start instantly with a model you already have":
       "Begin dadelik met 'n model wat jy reeds het",
     "Use this": "Gebruik hierdie",
@@ -801,7 +801,7 @@ window.VM_I18N = {
     // brief starting screen is ever shown for a live session.
     "Opening your microphone and system audio and starting to capture. This is quick.":
       "Maak jou mikrofoon en stelselklank oop en begin opvang. Dit is vinnig.",
-    "The live screen opens by itself. Nothing is missed: the transcript fills in from the start once the model is ready.":
-      "Die lewendige skerm maak vanself oop. Niks gaan verlore nie: die transkripsie vul van voor af in sodra die model gereed is.",
+    "The live screen opens by itself. The transcript fills in from the start once the model is ready.":
+      "Die lewendige skerm maak vanself oop. Die transkripsie vul van voor af in sodra die model gereed is.",
   },
 };

@@ -260,7 +260,9 @@ def test_build_failure_keeps_capturing():
             assert st["preparing"] is False, st
             assert st["model_ready"] is False, st
             assert isinstance(st["prepare_error"], str) and st["prepare_error"], st
-            assert webapp.STATE.pending_audio is None, "buffer should be freed once the model can never load"
+            # P1-2: a retryable build failure KEEPS the buffer (retry replays from t0); it is not freed
+            # here. Only stop / final abandonment / a successful publication clears it.
+            assert webapp.STATE.pending_audio is not None, "buffer must be retained for a retry after a build failure (P1-2)"
             # The app did not crash: status still serves.
             assert client.get("/api/status").status_code == 200
     finally:
@@ -466,6 +468,154 @@ def test_asr_slower_than_realtime_forever_stays_ready():
     print("  OK  never-draining ASR: model_ready flips true and STAYS true, preparing clears, engine unpublished, zero drops")
 
 
+def test_stop_during_catchup_drains_backlog():
+    # P1-3: Stop clicked AFTER model_ready but BEFORE the engine is published (the slow-CPU catch-up
+    # window) must drain the held backlog into the transcript, not discard it. The engine exists only in
+    # STATE.preparing_engine here (STATE.engine is still None), so the stop path has to reach it, drain
+    # every buffered chunk into it (in order), and stop(drain=True) it. Before the fix the whole
+    # transcript was lost.
+    reset_state()
+    build_gate = threading.Event()
+    drain_gate = threading.Event()
+    first_seen = threading.Event()
+    received = []
+    rlock = threading.Lock()
+
+    class DrainGateEngine:
+        model_name = "fake-model"
+        family = "whisper"
+        engine = "auto"
+
+        def __init__(self, **kw):
+            self.stopped_drain = None
+            if not build_gate.wait(20.0):
+                raise RuntimeError("test never released the engine build")
+
+        def subscribe(self, fn):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self, drain=False, timeout=None):
+            self.stopped_drain = drain
+
+        def pending(self):
+            return 0
+
+        def is_alive(self):
+            return True
+
+        def on_chunk(self, source, audio, t_start, block=False, timeout=None):
+            with rlock:
+                received.append((source, t_start))
+                n = len(received)
+            if n == 1:
+                # Park inside the FIRST backlog chunk so the test can catch the session mid-catch-up
+                # (model_ready true, engine unpublished) and Stop it there.
+                first_seen.set()
+                drain_gate.wait(20.0)
+            return True
+
+    try:
+        with stubs(DrainGateEngine):
+            r = client.post("/api/start", json=START_BODY)
+            assert r.status_code == 200, r.text
+            # Buffer a backlog while the build is gated.
+            backlog = []
+            for i in range(20):
+                src = "MIC" if i % 2 == 0 else "SYS"
+                webapp._feed(src, np.full(160, i, dtype=np.float32), float(i))
+                backlog.append((src, float(i)))
+            # Release the build: model_ready flips true, the drain begins and parks in the first chunk.
+            build_gate.set()
+            assert first_seen.wait(10.0), "the drain never reached the first backlog chunk"
+            assert client.get("/api/status").json()["model_ready"] is True, "not ready at catch-up"
+            assert webapp.STATE.engine is None, "engine must not be published during catch-up"
+            assert webapp.STATE.preparing_engine is not None, "the private engine handle is missing (P1-3)"
+            eng = webapp.STATE.preparing_engine
+            # Stop everything mid-catch-up.
+            rs = client.post("/api/stop?what=all")
+            assert rs.status_code == 200, rs.text
+            # Let the parked drain finish so the builder hands the engine off to the stop path.
+            drain_gate.set()
+            assert wait_until(lambda: not webapp.STATE.running, 15.0), "stop never finalised the session"
+            with rlock:
+                got = list(received)
+            assert got == backlog, f"backlog not fully drained into the engine on Stop:\n got {got}\n exp {backlog}"
+            assert eng.stopped_drain is True, "the private engine was not stop(drain=True)'d on Stop"
+            assert webapp.STATE.preparing_engine is None, "the private engine handle survived the stop"
+            assert webapp.STATE.pending_audio is None, "the pending buffer survived the stop"
+    finally:
+        build_gate.set()
+        drain_gate.set()
+        reset_state()
+    print("  OK  Stop during model catch-up drains the whole backlog into the transcript, no loss (P1-3)")
+
+
+def test_partial_transcription_stop_makes_builder_bail():
+    # P1-4: stopping ONLY transcription (recording continues) while the model is still loading must make
+    # the in-flight builder bail out - it must NOT finish building, start an engine, and flip model_ready
+    # true after the user stopped transcribing. _still_ours() now checks STATE.transcribing, and the
+    # partial-stop clears preparation state and takes ownership, so a late build finds it is no longer ours.
+    reset_state()
+    build_gate = threading.Event()
+    started = {"v": False}
+
+    class BailEngine:
+        model_name = "fake-model"
+        family = "whisper"
+        engine = "auto"
+
+        def __init__(self, **kw):
+            if not build_gate.wait(20.0):
+                raise RuntimeError("test never released the engine build")
+
+        def subscribe(self, fn):
+            pass
+
+        def start(self):
+            started["v"] = True
+
+        def stop(self, drain=False, timeout=None):
+            pass
+
+        def pending(self):
+            return 0
+
+        def is_alive(self):
+            return True
+
+        def on_chunk(self, source, audio, t_start, block=False, timeout=None):
+            return True
+
+    try:
+        with stubs(BailEngine):
+            # transcribe + record, so "stop transcription" leaves the session running (recording).
+            r = client.post("/api/start", json={"transcribe": True, "record": True, "tier": "small",
+                                                "device": "cpu", "language": "en"})
+            assert r.status_code == 200, r.text
+            st = client.get("/api/status").json()
+            assert st["preparing"] is True and st["model_ready"] is False, st
+            # Stop ONLY transcription while the model is still (gated) loading.
+            rs = client.post("/api/stop?what=transcription")
+            assert rs.status_code == 200, rs.text
+            st2 = client.get("/api/status").json()
+            assert st2["transcribing"] is False and st2["running"] is True and st2["recording"] is True, st2
+            # Release the late build. It must NOT resurrect transcription.
+            build_gate.set()
+            time.sleep(0.6)   # give a would-be resurrection time to happen
+            st3 = client.get("/api/status").json()
+            assert st3["model_ready"] is False, "builder resurrected transcription after a partial stop (P1-4)"
+            assert webapp.STATE.engine is None, "an engine was published after transcription was stopped"
+            assert started["v"] is False, "the builder started an engine after transcription was stopped"
+            assert st3["prepare_error"] is None, st3
+    finally:
+        build_gate.set()
+        reset_state()
+    print("  OK  stopping only transcription mid-load makes the in-flight builder bail, no resurrection (P1-4)")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_start_returns_before_model_loads,
@@ -473,6 +623,8 @@ if __name__ == "__main__":
                test_backlog_stays_ahead_of_live_during_replay,
                test_asr_slower_than_realtime_forever_stays_ready,
                test_build_failure_keeps_capturing,
+               test_stop_during_catchup_drains_backlog,
+               test_partial_transcription_stop_makes_builder_bail,
                test_pending_buffer_bounds_and_drop_take_finalise):
         try:
             fn()
