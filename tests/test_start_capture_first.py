@@ -303,6 +303,27 @@ def test_pending_buffer_bounds_and_drop_take_finalise():
     print("  OK  pending buffer: drop-oldest, take_all leaves it OPEN, finalise_if_empty publishes+seals only when empty")
 
 
+def test_putback_front_enforces_cap_by_dropping_newest():
+    # P2-c: putback_front returns an OLDER unsubmitted tail to the front (the retry resume point). If the
+    # returned tail plus the later pending exceeds the cap it must evict the NEWEST (rightmost) chunks,
+    # never the just-returned tail - the opposite of append()'s drop-oldest. Without this, the next drop
+    # would delete the very tail putback is meant to preserve.
+    pa = webapp._PendingAudio(max_samples=300)   # 300 float32 samples (3 x 100)
+    # Later pending: t=100..104. append's own drop-oldest keeps the newest 3 (t=102,103,104).
+    for i in range(5):
+        pa.append("MIC", np.full(100, 0, dtype=np.float32), float(100 + i))
+    older = [("MIC", np.full(100, 9, dtype=np.float32), 0.0),
+             ("MIC", np.full(100, 9, dtype=np.float32), 1.0)]
+    pa.putback_front(older)   # 200 older samples returned to the front; total would be 500 > 300
+    items = pa.take_all()
+    ts = [t for (_s, _a, t) in items]
+    assert ts[0] == 0.0 and ts[1] == 1.0, f"the returned tail must stay at the front: {ts}"
+    assert 0.0 in ts and 1.0 in ts, f"the returned tail must never be evicted: {ts}"
+    assert 104.0 not in ts and 103.0 not in ts, f"the NEWEST later chunks must be the ones dropped: {ts}"
+    assert sum(len(a) for (_s, a, _t) in items) <= 300, f"cap not enforced: {ts}"
+    print("  OK  putback_front enforces the cap by dropping the NEWEST, preserving the returned tail (P2-c)")
+
+
 def test_backlog_stays_ahead_of_live_during_replay():
     # THE seam-ordering property: chunks that arrive live DURING the backlog replay must land AFTER the
     # whole backlog and never be dropped. We buffer a backlog, then pause the engine inside the replay
@@ -718,6 +739,103 @@ def test_stop_during_catchup_no_two_feeders():
     print("  OK  Stop mid-catch-up hands off cleanly: no reorder, no lost tail, single feeder at a time (P1-3)")
 
 
+def test_stop_during_large_accepted_backlog_hands_off_promptly():
+    # P1-3 (structural, the accept-path root cause): the OLD _replay checked ownership only AFTER a
+    # FULL-queue on_chunk() returned False, so a big backlog whose chunks are all ACCEPTED let the builder
+    # feed for seconds without noticing the Stop (up to the join's safety window). With the pre-enqueue
+    # check the builder hands off within ONE chunk. This engine ACCEPTS every chunk (small per-chunk
+    # cost, so feeding the whole backlog is not instantaneous); a big backlog is buffered, the build is
+    # released, and once the builder is mid-feed a Stop lands. Assert: the builder fed only a PREFIX (it
+    # handed off promptly, it did NOT feed all N), the stop path fed the rest, full order, no loss, never
+    # two feeders at once, and the private engine was stopped (no leaked worker).
+    reset_state()
+    build_gate = threading.Event()
+    fed_enough = threading.Event()
+    lock = threading.Lock()
+    received = []
+    inside = [0]
+    concurrent = [False]
+    N = 200
+    TRIGGER = 10
+
+    class AcceptingSlowEngine:
+        model_name = "fake-model"
+        family = "whisper"
+        engine = "auto"
+
+        def __init__(self, **kw):
+            self.stopped_drain = None
+            if not build_gate.wait(20.0):
+                raise RuntimeError("test never released the engine build")
+
+        def subscribe(self, fn):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self, drain=False, timeout=None):
+            self.stopped_drain = drain
+
+        def pending(self):
+            return 0
+
+        def is_alive(self):
+            return True
+
+        def on_chunk(self, source, audio, t_start, block=False, timeout=None):
+            tname = threading.current_thread().name
+            with lock:
+                inside[0] += 1
+                if inside[0] > 1:
+                    concurrent[0] = True
+            try:
+                time.sleep(0.01)   # per-chunk cost: the OLD post-only check would feed all N over ~2s
+                with lock:
+                    received.append((source, t_start, tname))
+                    if tname == "engine-build" and sum(1 for r in received if r[2] == "engine-build") >= TRIGGER:
+                        fed_enough.set()
+                return True
+            finally:
+                with lock:
+                    inside[0] -= 1
+
+    try:
+        with stubs(AcceptingSlowEngine):
+            r = client.post("/api/start", json=START_BODY)
+            assert r.status_code == 200, r.text
+            backlog = []
+            for i in range(N):
+                src = "MIC" if i % 2 == 0 else "SYS"
+                webapp._feed(src, np.full(160, i, dtype=np.float32), float(i))
+                backlog.append((src, float(i)))
+            build_gate.set()
+            assert fed_enough.wait(10.0), "the builder never started feeding the accepted backlog"
+            eng = webapp.STATE.preparing_engine
+            assert eng is not None, "not in catch-up"
+            # Stop while the builder is mid-feed of a large accepted backlog.
+            rs = client.post("/api/stop?what=all")
+            assert rs.status_code == 200, rs.text
+            assert wait_until(lambda: not webapp.STATE.running, 30.0), "stop never finalised the session"
+            with lock:
+                got = [(s, t) for (s, t, _n) in received]
+                threads = [n for (_s, _t, n) in received]
+                conc = concurrent[0]
+            assert got == backlog, f"reorder/loss across the hand-off (got {len(got)}/{N})"
+            assert conc is False, "two feeders were inside on_chunk at once (P1-3)"
+            builder_fed = sum(1 for n in threads if n == "engine-build")
+            stopdrain_fed = sum(1 for n in threads if n == "stop-drain")
+            # PROMPT hand-off: the builder fed only a prefix (NOT all N), the stop path fed the remainder.
+            assert 0 < builder_fed < N, f"builder fed {builder_fed}/{N}: it did not hand off promptly (P1-3)"
+            assert stopdrain_fed > 0, "the stop path fed nothing -> the builder never handed off (P1-3)"
+            assert builder_fed + stopdrain_fed == N, (builder_fed, stopdrain_fed)
+            assert eng.stopped_drain is True, "the private engine was not stopped by the stop path (leak)"
+    finally:
+        build_gate.set()
+        reset_state()
+    print("  OK  Stop during a large ACCEPTED backlog hands off within one chunk (prefix/suffix split), engine stopped (P1-3)")
+
+
 def test_dead_worker_during_replay_surfaces_error():
     # P1-6: a worker that dies DURING catch-up (after model_ready flipped) must surface a retryable
     # prepare_error, not sit forever on a "Listening" lie. The buffer is kept (P1-2) and the unsubmitted
@@ -836,10 +954,12 @@ if __name__ == "__main__":
                test_build_failure_keeps_capturing,
                test_stop_during_catchup_drains_backlog,
                test_stop_during_catchup_no_two_feeders,
+               test_stop_during_large_accepted_backlog_hands_off_promptly,
                test_partial_transcription_stop_makes_builder_bail,
                test_dead_worker_during_replay_surfaces_error,
                test_dead_worker_at_start_surfaces_error,
-               test_pending_buffer_bounds_and_drop_take_finalise):
+               test_pending_buffer_bounds_and_drop_take_finalise,
+               test_putback_front_enforces_cap_by_dropping_newest):
         try:
             fn()
         except AssertionError as e:
