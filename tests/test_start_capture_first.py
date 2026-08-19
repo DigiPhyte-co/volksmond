@@ -324,6 +324,33 @@ def test_putback_front_enforces_cap_by_dropping_newest():
     print("  OK  putback_front enforces the cap by dropping the NEWEST, preserving the returned tail (P2-c)")
 
 
+def test_putback_front_protection_survives_later_appends():
+    # P2-c (full close): after putback_front protects an older hand-off tail at the front, SUBSEQUENT
+    # append()s - capture keeps feeding during a catch-up failure, and the final capture flush can race
+    # the builder's putback on a full stop - must NOT evict the protected front via drop-oldest. They
+    # must drop the NEWEST instead. The protected timestamps survive; the newest appended chunks go.
+    pa = webapp._PendingAudio(max_samples=300)   # 3 x 100
+    older = [("MIC", np.full(100, 9, dtype=np.float32), 0.0),
+             ("MIC", np.full(100, 9, dtype=np.float32), 1.0)]
+    pa.putback_front(older)   # protect t=0,1 (200 samples)
+    # Capture keeps feeding after the putback: enough to exceed the cap several times over.
+    for i in range(6):
+        assert pa.append("MIC", np.full(100, 0, dtype=np.float32), float(200 + i)) is True
+    items = pa.take_all()
+    ts = [t for (_s, _a, t) in items]
+    assert ts[0] == 0.0 and ts[1] == 1.0, f"protected tail must stay at the front after appends: {ts}"
+    assert 0.0 in ts and 1.0 in ts, f"protected tail evicted by later appends (P2-c not closed): {ts}"
+    assert sum(len(a) for (_s, a, _t) in items) <= 300, f"cap not enforced: {ts}"
+    # Only the protected 200 + at most one more (100) fit; the newest appended were dropped.
+    assert 205.0 not in ts and 204.0 not in ts, f"the newest appended chunks must be dropped, not kept: {ts}"
+    # After a drain the protection is cleared: normal drop-oldest resumes.
+    for i in range(5):
+        pa.append("MIC", np.full(100, 0, dtype=np.float32), float(300 + i))
+    ts2 = [t for (_s, _a, t) in pa.take_all()]
+    assert ts2 == [302.0, 303.0, 304.0], f"drop-oldest must resume once protection is cleared: {ts2}"
+    print("  OK  putback_front protection survives later appends and clears on drain (P2-c)")
+
+
 def test_backlog_stays_ahead_of_live_during_replay():
     # THE seam-ordering property: chunks that arrive live DURING the backlog replay must land AFTER the
     # whole backlog and never be dropped. We buffer a backlog, then pause the engine inside the replay
@@ -959,7 +986,8 @@ if __name__ == "__main__":
                test_dead_worker_during_replay_surfaces_error,
                test_dead_worker_at_start_surfaces_error,
                test_pending_buffer_bounds_and_drop_take_finalise,
-               test_putback_front_enforces_cap_by_dropping_newest):
+               test_putback_front_enforces_cap_by_dropping_newest,
+               test_putback_front_protection_survives_later_appends):
         try:
             fn()
         except AssertionError as e:

@@ -339,6 +339,42 @@ class _PendingAudio:
         self._lock = threading.Lock()
         self._closed = False
         self._warned = False
+        # Count of chunks at the FRONT protected from cap eviction (P2-c): set by putback_front (the
+        # hand-off/retry tail that must survive), cleared once the buffer is drained (take_all /
+        # finalise_if_empty). While it is >0, cap enforcement drops the NEWEST (right) chunk, never the
+        # protected front; while it is 0 (the common case) append() drops the OLDEST exactly as before.
+        self._protected = 0
+
+    def _warn_once(self, newest):
+        if self._warned:
+            return
+        self._warned = True
+        which = "NEWEST" if newest else "oldest"
+        why = ("to preserve the earlier hand-off backlog " if newest else "")
+        print(f"[start] pending-audio buffer full while the model loads; dropping the {which} held "
+              f"transcription chunk {why}(recording, if on, is unaffected).", flush=True)
+
+    def _enforce_cap(self):
+        """Trim to the sample cap under the lock. With a protected front (a putback_front tail), evict the
+        NEWEST (right) and NEVER into the protected prefix - if the protected prefix alone already fills
+        the cap, the just-appended newest chunk is the one dropped. With no protection, drop the OLDEST,
+        exactly as the original bounded-drop-oldest behaviour (pinned by tests)."""
+        if self._protected > 0:
+            while self._samples > self._max and len(self._buf) > self._protected:
+                _s, new_audio, _t = self._buf.pop()          # newest (right)
+                try:
+                    self._samples -= len(new_audio)
+                except TypeError:
+                    pass
+                self._warn_once(newest=True)
+        else:
+            while self._samples > self._max and len(self._buf) > 1:
+                _s, old_audio, _t = self._buf.popleft()      # oldest (left)
+                try:
+                    self._samples -= len(old_audio)
+                except TypeError:
+                    pass
+                self._warn_once(newest=False)
 
     def append(self, source, audio, t_start):
         """Hold a chunk. Returns True if buffered, False once the buffer has been closed at the final
@@ -352,27 +388,19 @@ class _PendingAudio:
                 return False
             self._buf.append((source, audio, t_start))
             self._samples += n
-            while self._samples > self._max and len(self._buf) > 1:
-                _s, old_audio, _t = self._buf.popleft()
-                try:
-                    self._samples -= len(old_audio)
-                except TypeError:
-                    pass
-                if not self._warned:
-                    self._warned = True
-                    print("[start] pending-audio buffer full while the model loads; dropping the "
-                          "oldest held transcription chunk (recording, if on, is unaffected).", flush=True)
+            self._enforce_cap()
             return True
 
     def take_all(self):
         """Return everything currently held, in order, and clear it, LEAVING THE BUFFER OPEN so a
         concurrent _feed keeps appending live chunks behind the backlog (never dropped, never
         reordered). The drain loop replays each batch, then loops, until a batch comes back empty and
-        finalise_if_empty publishes the engine."""
+        finalise_if_empty publishes the engine. Draining clears any protected-front marker (P2-c)."""
         with self._lock:
             items = list(self._buf)
             self._buf.clear()
             self._samples = 0
+            self._protected = 0
             return items
 
     def putback_front(self, items):
@@ -383,10 +411,10 @@ class _PendingAudio:
 
         Cap enforcement (P2-c): the caller does NOT always drain immediately (a catch-up failure leaves
         the session in an error/retry state, still buffering), so the returned older tail plus the later
-        pending audio can exceed the cap. The returned tail is the resume point a retry needs, so if the
-        buffer must shrink we evict the NEWEST (rightmost) chunks, never the just-returned front - the
-        opposite of append()'s drop-oldest. Never evicts below the returned batch itself. A no-op once the
-        buffer is closed."""
+        pending audio can exceed the cap. The returned tail is the resume point a retry needs, so it is
+        marked PROTECTED: this putback and every SUBSEQUENT append() evict the NEWEST (rightmost) chunk
+        over the cap, never the protected front. The protection is cleared once the buffer is drained
+        (take_all / finalise_if_empty). A no-op once the buffer is closed."""
         if not items:
             return
         with self._lock:
@@ -398,18 +426,9 @@ class _PendingAudio:
                     self._samples += len(it[1])
                 except TypeError:
                     pass
-            n_returned = len(items)
-            while self._samples > self._max and len(self._buf) > n_returned:
-                _s, new_audio, _t = self._buf.pop()   # drop from the RIGHT (newest), preserving the tail
-                try:
-                    self._samples -= len(new_audio)
-                except TypeError:
-                    pass
-                if not self._warned:
-                    self._warned = True
-                    print("[start] pending-audio buffer full after a catch-up hand-off; dropping the "
-                          "NEWEST held transcription chunk to preserve the earlier backlog (recording, if "
-                          "on, is unaffected).", flush=True)
+            # All prepended chunks sit at the front and must survive later appends until drained.
+            self._protected = min(self._protected + len(items), len(self._buf))
+            self._enforce_cap()
 
     def finalise_if_empty(self, on_close):
         """The atomic buffer->engine flip. Under the buffer's lock: if the buffer is EMPTY, close it
@@ -418,8 +437,10 @@ class _PendingAudio:
         and loop. Because the close and the publish both happen under the same lock a _feed.append
         takes, no chunk can slip in between 'closed' and 'engine published': a chunk lands either
         before (replayed in the next take) or after (fed to the published engine directly, newest).
+        Either way the buffer is emptied/sealed, so the protected-front marker is cleared (P2-c).
         Returns None when finalised, or the straggler list (not finalised)."""
         with self._lock:
+            self._protected = 0
             if self._buf:
                 items = list(self._buf)
                 self._buf.clear()
