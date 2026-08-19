@@ -1,5 +1,17 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-08-20, v1.13.2: honest model presence, and the loaded model made visible
+
+`licensing.APP_VERSION` 1.13.1 -> 1.13.2.
+
+Three hardening fixes so the app's picture of which model is ready, and which one actually loaded, matches reality.
+
+- **"Already downloaded" now means the model that will actually load, including a local Afrikaans build.** The quality picker and the pre-start check judged a Fluister (Afrikaans) model present only by its downloaded copy, so a computer with a locally built Fluister could show "download first" even though the engine loads that local build and starts instantly. Presence now also counts the local build, so the picker matches what Begin will really do. (`live_transcribe/voicedl.py`, `live_transcribe/__main__.py`.)
+- **A part-finished model download no longer reads as ready.** If a model download was interrupted after some files landed but before the weights were complete, the app could report the model as present and then fail to load it at Begin. The presence check now confirms the model's weight file is actually there before treating the model as ready, so an interrupted download correctly shows as still needing a download. (`live_transcribe/voicedl.py`.)
+- **The engine badge now shows exactly which model is running, and flags a local build.** Hovering the model badge on the meeting screen now shows the exact model in use, and when the running model is a local build on this computer rather than a downloaded model, a small "local build" tag appears on the badge, so a local-build load is never mistaken for a downloaded-model load. (`web/static/app.js`, `web/static/styles.css`, `web/static/i18n.js`.)
+
+Verified: full local test suite green (script-run).
+
 ## 2026-08-19, v1.13.1: a rebuilt model-preparation experience, async from the first second
 
 `licensing.APP_VERSION` 1.13.0 -> 1.13.1.

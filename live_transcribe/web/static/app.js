@@ -3847,15 +3847,34 @@ function sizeLabelFromModel(model) {
   if (m.indexOf("af-lora") >= 0 || m.indexOf("fluister") >= 0) return "Best"; // bare Fluister == large-v3
   return "";
 }
-// The lean engine chip on the live / importing header: the family plus which size is running,
-// so the user can see it is e.g. Fluister at Balanced without opening anything.
+// True when the loaded model id is a local filesystem build (dev machine SA_LIVE_AF_MODEL / an
+// af-lora-* ct2 dir), as opposed to a hosted repo id (digiphyte/..., Systran/...) or a bare size
+// (small, large-v3). A hosted repo id is org/name (exactly one slash, no path structure); anything
+// with af-lora, a backslash, or extra slashes is a real path, i.e. a local build.
+function isLocalBuildModel(model) {
+  var m = model || "";
+  if (!m) return false;
+  if (m.indexOf("af-lora") >= 0) return true;                 // our local ct2 Fluister builds
+  if (m.indexOf("\\") >= 0) return true;                      // Windows path
+  if (/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(m)) return false;   // hosted repo id org/name
+  if (m.indexOf("/") >= 0) return true;                       // any other slashed path = local dir
+  return false;                                               // bare size name
+}
+// The lean engine chip on the live / importing header: the family plus which size is running, so the
+// user can see it is e.g. Fluister at Balanced without opening anything. The chip title always carries
+// the exact model id (repo or local path) for inspection, and a subtle "local build" tag is appended
+// when the running model loaded from a local ct2 dir rather than a downloaded model.
 function familyChip(family, model) {
   var size = sizeLabelFromModel(model);
-  if (family === "swivuriso") return el("span", { class: "chip accent", title: tr("South African languages model") }, [icon("globe", 12), el("span", {}, raw("Swivuriso"))]);
+  var titleFor = function (desc) { return model ? (tr(desc) + " (" + model + ")") : tr(desc); };
+  var localTag = isLocalBuildModel(model)
+    ? el("span", { class: "chip-note", title: tr("Running from a local model build on this computer, not a downloaded model.") }, "local build")
+    : null;
+  if (family === "swivuriso") return el("span", { class: "chip accent", title: titleFor("South African languages model") }, [icon("globe", 12), el("span", {}, raw("Swivuriso")), localTag]);
   var name = (family === "fluister") ? "Fluister" : "Whisper";
   var label = size ? (name + ", " + tr(size)) : name;
-  if (family === "fluister") return el("span", { class: "chip accent", title: tr("Afrikaans-optimised model") }, [icon("sparkle", 12), el("span", {}, raw(label))]);
-  return el("span", { class: "chip" }, [el("span", {}, raw(label))]);
+  if (family === "fluister") return el("span", { class: "chip accent", title: titleFor("Afrikaans-optimised model") }, [icon("sparkle", 12), el("span", {}, raw(label)), localTag]);
+  return el("span", { class: "chip" }, [el("span", {}, raw(label)), localTag]);
 }
 // The pre-meeting / import language picker: Afrikaans and English one tap away, everything else
 // behind "More languages" (one dropdown: the seven Swivuriso South African languages first, then

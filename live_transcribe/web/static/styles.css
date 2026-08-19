@@ -256,6 +256,14 @@ html, body { margin: 0; padding: 0; height: 100%; }
 .vm .chip.warn { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
 .vm .chip.accent { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
 .vm .chip.muted { color: var(--ink-3); }
+/* Subtle "local build" tag appended inside the engine chip when the running model loaded from a local
+   ct2 build dir (dev machine) rather than a downloaded model. Low-contrast and small so it reads as a
+   footnote on the badge, not a status of its own. */
+.vm .chip .chip-note {
+  font-size: 9px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase;
+  padding: 1px 5px; border-radius: 999px; opacity: 0.75;
+  background: var(--surface-3); color: var(--ink-3);
+}
 .vm .spinner.sm { width: 11px; height: 11px; border-width: 2px; }
 .vm .hist-row .stats { display: inline-flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
 

@@ -167,8 +167,15 @@ def _downloaded_sizes(family):
         from . import voicedl, transcribe
         out = set()
         for size in order:
-            target = transcribe.FLUISTER_REPOS.get(size) if family == "fluister" else size
-            if target and voicedl._present(target):
+            # Fluister presence must reflect what resolve_model actually loads: a local ct2 build dir
+            # counts, not only a cached HF repo (fluister_present), so a local build is not treated as
+            # "needs download" on the auto-pick / instant-switch paths. Whisper checks the stock size name.
+            if family == "fluister":
+                present = voicedl.fluister_present(size)
+            else:
+                target = size
+                present = bool(target and voicedl._present(target))
+            if present:
                 out.add(size)
         return out
     except Exception:

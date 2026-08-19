@@ -155,14 +155,57 @@ def _download_model(model, local_only=False):
         return download_model(model, local_files_only=False)
 
 
-def _present(model):
-    """True iff faster-whisper's required files for this model are already cached
-    (checked with local_files_only, so no network); i.e. Begin will not download."""
+# A real ct2 model.bin is tens of MB up to multiple GB. Anything below this is a stub/truncation, not a
+# usable weight file. We cannot verify the full bytes without the recorded hash (not available offline),
+# so this is a non-trivial-size floor: it reliably catches the "missing / 0-byte / interrupted-early"
+# cases that make snapshot_download hand back a path for a cache that will not load.
+_MIN_MODEL_BIN_BYTES = 1_000_000
+
+
+def _snapshot_has_weights(path):
+    """True iff `path` (a resolved snapshot dir) holds a non-trivial model.bin. Fail-safe: a falsy path,
+    a non-directory, a missing/tiny model.bin, or any error -> False (treat as not-present, so an
+    interrupted download is re-fetched instead of failing to load)."""
     try:
-        _download_model(model, local_only=True)
-        return True
+        if not path or not os.path.isdir(path):
+            return False
+        binp = os.path.join(path, "model.bin")
+        return os.path.isfile(binp) and os.path.getsize(binp) > _MIN_MODEL_BIN_BYTES
     except Exception:
         return False
+
+
+def _present(model):
+    """True iff faster-whisper's required files for this model are already cached AND the core weight
+    file is really there (checked with local_files_only, so no network); i.e. Begin will not download.
+
+    Trap this guards: hf_hub's snapshot_download(local_files_only=True) returns the snapshot path as soon
+    as refs/main + a snapshots/<hash>/ dir survive, WITHOUT verifying the files are complete ("we can't
+    check if all the files are actually there"). So a partial/interrupted download (model.bin missing or
+    truncated) would otherwise read as present here and then fail to load at Begin. Verify a non-trivial
+    model.bin under the returned snapshot dir before trusting it; any error -> not present (fail-safe)."""
+    try:
+        path = _download_model(model, local_only=True)
+    except Exception:
+        return False
+    return _snapshot_has_weights(path)
+
+
+def fluister_present(size, repo=None):
+    """True iff the Fluister model for `size` is ready to load without a download: a local ct2 build dir
+    exists (exactly what resolve_model will load on a dev machine / SA_LIVE_AF_MODEL override), OR the
+    hosted HF repo is fully cached. The picker/preflight must judge Fluister presence this way, or a
+    working local build reads as 'download first' while the engine actually loads it instantly (field
+    bug). Never touches the af-lora dirs beyond an isdir() probe. No network."""
+    try:
+        from . import transcribe
+        resolved = transcribe._FLUISTER.get(size)
+        if isinstance(resolved, str) and os.path.isdir(resolved):
+            return True
+    except Exception:
+        pass
+    repo = repo or FLUISTER_REPOS.get(size)
+    return bool(repo and _present(repo))
 
 
 _LOCK = threading.Lock()
@@ -453,13 +496,13 @@ def _effective_version(repo, present, rec=None):
 def fluister_catalogue():
     """Local-only install state of each Fluister (Afrikaans-tuned) model: size, repo, whether it is
     in the cache, the version we believe is installed, and on-disk size. Never touches the network
-    (the manual update check does that). NOTE: on a dev machine that overrides Fluister to a local
-    ct2 folder (SA_LIVE_AF_MODEL / an af-lora-* dir), the HF repo may read as not-present here even
-    though Afrikaans transcription works from the local build; the update flow manages the HF repo."""
+    (the manual update check does that). Presence is fluister_present(): a local ct2 build dir counts
+    as present (it is what resolve_model loads on a dev machine / SA_LIVE_AF_MODEL override), so a
+    working local build no longer reads as "download first"; the update flow still manages the HF repo."""
     rec = _installed_versions()
     out = []
     for size, repo in FLUISTER_REPOS.items():
-        present = _present(repo)
+        present = fluister_present(size, repo)
         out.append({
             "size": size,
             "repo": repo,

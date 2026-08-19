@@ -151,6 +151,9 @@ window.VM_I18N = {
     "Auto-detect": "Outomaties",
     "Engine: ": "Enjin: ",
     "Afrikaans-optimised model": "Afrikaans-geoptimeerde model",
+    "local build": "plaaslike bou",
+    "Running from a local model build on this computer, not a downloaded model.":
+      "Loop vanaf 'n plaaslike modelbou op hierdie rekenaar, nie 'n afgelaaide model nie.",
     "Afrikaans uses Fluister, our Afrikaans-tuned model. The size is chosen automatically for your computer.":
       "Afrikaans gebruik Fluister, ons Afrikaans-gestemde model. Die grootte word outomaties vir jou rekenaar gekies.",
     "Afrikaans currently uses standard Whisper. The Afrikaans-tuned Fluister model is not installed yet; it switches on automatically once it is.":
