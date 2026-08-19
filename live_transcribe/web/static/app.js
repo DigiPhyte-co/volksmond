@@ -69,6 +69,14 @@ var VM_AF = (window.VM_I18N && window.VM_I18N.af) || {};
 var LANG = "en";
 function afLang(s) { return (s && /^af/i.test(s.interface_language || "")) ? "af" : "en"; }
 function tr(s) { return (LANG === "af" && VM_AF[s] != null) ? VM_AF[s] : s; }
+// Translate a template that carries {named} placeholders: translate the WHOLE template first
+// (so a language can reorder the words), then substitute the dynamic values verbatim. Keeps the
+// i18n key stable ("{done} of {total} ({pct}%)") while the numbers stay untranslated.
+function trFmt(tmpl, subs) {
+  var s = tr(tmpl);
+  if (subs) for (var k in subs) s = s.split("{" + k + "}").join(String(subs[k]));
+  return s;
+}
 // Server notices can carry a dynamic tail (e.g. "Quiet audio boosted for transcription
 // (+13.6 dB)") and combine with " · ", which exact-key tr() cannot match. Translate the
 // fixed phrase per part and keep the dynamic values verbatim.
@@ -177,6 +185,11 @@ function freshLive() {
     // prepareError carries a model-load failure message (null while healthy). Both mirror
     // /api/status, adopted by the readiness poll and the silence reconcile.
     modelReady: false, prepareError: null,
+    // t0-capture prepare progress, mirrored from /api/status (preparing + the prepare object):
+    // preparing = still building; prepare = { phase: downloading|loading|ready|error, model,
+    // family, size, label, downloaded, total, stalled }; prepareStalledClient is set by the
+    // client-side watchdog when the byte count has not moved for a long time.
+    preparing: false, prepare: null, prepareStalledClient: false,
   };
 }
 var S = {
@@ -530,7 +543,15 @@ function liveTuneStrip() {
     field("Language", tuneSelect(transcribeLangOpts(), langVal, function (v) { reconfigureLive({ language: v }, "Language switched."); })),
     field("Engine", tuneSelect([["auto", "Auto"], ["fluister", "Fluister"], ["whisper", "Whisper"]], S.live.engine || "auto", function (v) { reconfigureLive({ engine: v }, "Model switched."); })),
   ];
-  items.push(field("Quality", tuneSelect(QUALITY_OPTS, normalizeQuality(S.live.tier), function (v) { reconfigureLive({ tier: v }, "Model switched."); })));
+  // Honest Quality options for the live family: a size whose build is not on disk is flagged
+  // "downloads first" (pre-translated, since a composite string is not an i18n key). Auto is left
+  // plain here (no cached live pre-flight). Same readiness helpers as the pre-meeting picker.
+  var liveFam = familyFor(S.live.language, S.live.engine);
+  var qOpts = QUALITY_OPTS.map(function (o) {
+    if (o[0] === "auto" || sizePresentInFamily(liveFam, o[0])) return o;
+    return [o[0], tr(o[1]) + " · " + tr("downloads first")];
+  });
+  items.push(field("Quality", tuneSelect(qOpts, normalizeQuality(S.live.tier), function (v) { reconfigureLive({ tier: v }, "Model switched."); })));
   return el("div", { class: "row gap-16", style: { flexWrap: "wrap", padding: "8px 16px", borderBottom: "1px solid var(--line)", background: "var(--surface-2)", alignItems: "center" } }, items);
 }
 
@@ -577,7 +598,43 @@ function warmChip() {
 }
 
 /* ── session lifecycle ────────────────────────────────────── */
+// True while Begin is in flight (pre-flight probe or /api/start). Drives the Begin button's
+// inline spinner so the pre-meeting screen stays put (sidebar + form visible): the live path
+// NEVER shows the old full-screen "Starting" takeover, which is what tripped cert 10.1.2.10.
+var _liveStarting = false;
+// Begin: pre-flight the chosen model first. If it is already downloaded, go straight to t0.
+// If it is not, open an informed-consent modal (name, size, rough time, or switch to a model
+// already on disk) BEFORE any download starts. Consent (Proceed) is the effective t0.
 async function startLive() {
+  if (_liveStarting) return;
+  _liveStarting = true; render();
+  var pf = null;
+  try {
+    pf = await api.post("/api/preflight-model", {
+      tier: S.form.tier, device: S.form.device, language: S.form.language, engine: S.form.engine,
+    });
+  } catch (e) { pf = null; }   // pre-flight unavailable: do not block Begin, fall through to start
+  if (pf && pf.present === false) {
+    _liveStarting = false; render();
+    preStartModal(pf,
+      function () { beginLive(); },                                  // Proceed and download (t0)
+      function (alt) { applyModelAlternative(alt); beginLive(); });  // Use a model already on disk
+    return;
+  }
+  beginLive();
+}
+// Adopt a downloaded alternative from the pre-start modal into the form, so Begin uses a model
+// already on disk (no download). Engine follows the family for Fluister/Whisper; a Swivuriso
+// alternative is reached through the language (engine stays Auto), so only the size changes.
+function applyModelAlternative(alt) {
+  if (!alt) return;
+  S.form.tier = alt.size;
+  if (alt.family === "fluister") S.form.engine = "fluister";
+  else if (alt.family === "whisper") S.form.engine = "whisper";
+  else if (alt.family === "swivuriso") S.form.engine = "auto";   // language routes to Swivuriso
+}
+async function beginLive() {
+  _liveStarting = true; render();
   var body = {
     topic: S.form.title || "",
     tier: S.form.tier, device: S.form.device, language: S.form.language, engine: S.form.engine,
@@ -588,10 +645,9 @@ async function startLive() {
     aec_live: !!S.form.aecLive,
     agc_live: !!S.form.agcLive,
   };
-  beginStarting("live", S.form.title || "Live meeting");
   try {
     var resp = await api.post("/api/start", body);
-    endStarting();
+    _liveStarting = false;
     S.form.context = null;   // the override applied to this run; the next meeting starts from the saved default again
     S.live = freshLive();
     S.live.running = true; S.live.transcribing = true; S.live.recording = !!resp.recording;
@@ -603,19 +659,59 @@ async function startLive() {
     S.live.title = S.form.title || "Live meeting";
     S.live.micDevice = S.form.mic; S.live.loopbackDevice = S.form.loopback;
     // t0-capture: /api/start now returns the instant capture is live; the model may still be loading.
-    // Go straight to the live screen (which shows a "preparing" chip until ready) instead of holding
+    // Go straight to the live screen (progress bar + "preparing" chip until ready) instead of holding
     // the user on a blocking spinner, and poll readiness until the transcript starts filling in.
     S.live.modelReady = !!resp.model_ready;
+    S.live.preparing = !resp.model_ready;
     go("live"); openStream(); startElapsed(); startLevels(); refreshLiveAec(); startSilencePoll();
     if (!S.live.modelReady) startReadinessPoll();
   } catch (e) {
-    // Surface the failure on the Starting screen (with Back), not just a toast that
-    // vanishes; the model-load error ("Could not load model ...") needs to be readable.
-    // Stop the elapsed interval first so it does not leak while the error is shown.
-    if (startingTimer) { clearInterval(startingTimer); startingTimer = null; }
-    if (S.route === "starting") { S.starting.error = e.message || "Could not start."; render(); }
-    else { toast(e.message || "Could not start.", true); }
+    // The blocking model-load stall is gone (the model builds in the background now, with its own
+    // on-screen progress + Retry), so an immediate /api/start failure is a quick device/capture
+    // problem: a toast is enough, and the pre-meeting screen stays put for another try.
+    _liveStarting = false;
+    toast(e.message || "Could not start.", true);
+    render();
   }
+}
+// Informed-consent modal shown ONLY when the chosen model is not yet on disk. It never downloads
+// anything itself: Proceed hands off to the normal Begin (the download then runs in the background
+// with visible progress), or the user picks a model already downloaded, or cancels back to the
+// picker. Reuses the shared .modal-backdrop / .modal markup.
+function preStartModal(pf, onProceed, onUseAlt) {
+  var alts = pf.downloaded_alternatives || [];
+  var altList = alts.length ? el("div", { style: { marginTop: "16px" } }, [
+    el("div", { class: "section-label", style: { marginBottom: "8px" }, text: "Start instantly with a model you already have" }),
+    el("div", { class: "stack", style: { gap: "8px" } }, alts.map(function (alt) {
+      return el("div", { class: "card", style: { padding: "12px 14px", display: "flex", gap: "12px", alignItems: "center" } }, [
+        el("div", { class: "grow", style: { minWidth: "0" } }, [
+          el("div", { style: { fontWeight: "600", fontSize: "13px" } }, [
+            raw(alt.label || alt.model || alt.size), el("span", { class: "chip", style: { marginLeft: "8px" } }, raw(familyDisplay(alt.family))),
+            el("span", { class: "chip", style: { marginLeft: "6px" } }, raw(fmtGB(alt.approx_bytes))),
+          ]),
+          alt.quality_note ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "3px" } }, raw(alt.quality_note)) : null,
+        ]),
+        el("button", { class: "btn sm", onclick: function () { modal.remove(); onUseAlt(alt); } }, "Use this"),
+      ]);
+    })),
+  ]) : null;
+
+  var modal = el("div", { class: "modal-backdrop", onclick: function (e) { if (e.target === modal) modal.remove(); } }, [
+    el("div", { class: "modal" }, [
+      el("h2", {}, raw(trFmt("Download the {label} model first?", { label: pf.label || pf.model || "" }))),
+      el("p", { class: "ink-2", style: { margin: "10px 0 4px", fontSize: "13px" } }, [
+        raw((pf.label || pf.model || "") + "  ·  " + familyDisplay(pf.family) + "  ·  "),
+        el("span", { text: trFmt("About {size}, and usually a few minutes on a normal connection.", { size: fmtGB(pf.approx_bytes) }) }),
+      ]),
+      el("p", { class: "ink-3", style: { margin: "0", fontSize: "12px" }, text: "Capture and recording begin immediately. Nothing is missed: the transcript fills in from the very start once the model is ready." }),
+      altList,
+      el("div", { class: "row gap-8", style: { justifyContent: "flex-end", marginTop: "18px" } }, [
+        el("button", { class: "btn ghost", onclick: function () { modal.remove(); } }, "Cancel"),
+        el("button", { class: "btn primary", onclick: function () { modal.remove(); onProceed(); } }, [icon("download", 14), "Proceed and download"]),
+      ]),
+    ]),
+  ]);
+  APP.appendChild(modal);
 }
 async function startRecordOnly() {
   try {
@@ -1596,6 +1692,13 @@ function stopSilencePoll() { if (silenceTimer) { clearInterval(silenceTimer); si
 // (like pollWarm) and flip the "preparing" chip to live the instant model_ready turns true, then stop
 // itself. The slower 10s silence reconcile also adopts these fields as a self-healing backstop.
 var READINESS_POLL_MS = 1500;
+// Client-side download-stall watchdog: if the downloaded byte count has not advanced for this
+// long WHILE a download is in flight, surface the same bounded failure the server raises at 60s.
+// Belt-and-braces in case a status poll is lost. Armed only during the "downloading" phase; a slow
+// model LOAD moves no bytes, so the server's separate load timeout owns that case (never this one).
+var PREPARE_STALL_MS = 90000;
+var _prepWatchBytes = -1, _prepWatchAt = 0;
+function resetPrepareWatch() { _prepWatchBytes = -1; _prepWatchAt = 0; }
 function startReadinessPoll() {
   if (readinessTimer) return;
   readinessTimer = setInterval(function () {
@@ -1608,16 +1711,57 @@ function startReadinessPoll() {
   }, READINESS_POLL_MS);
 }
 function stopReadinessPoll() { if (readinessTimer) { clearInterval(readinessTimer); readinessTimer = null; } }
-// Adopt the server's transcription-readiness onto S.live; returns true if anything changed (so the
-// caller can re-render). Shared by the readiness poll and the silence reconcile, so a steady state
-// never forces a re-render and the two stay in step.
+// Signature of the prepare object so a steady poll (same phase/bytes) never forces a re-render.
+function prepareSig(p) { return p ? (String(p.phase) + "|" + String(p.model) + "|" + String(p.downloaded) + "|" + String(p.total) + "|" + (p.stalled ? "1" : "0")) : ""; }
+// Adopt the server's transcription-readiness + prepare progress onto S.live; returns true if
+// anything changed (so the caller can re-render). Shared by the readiness poll and the silence
+// reconcile, so a steady state never forces a re-render and the two stay in step.
 function adoptReadiness(st) {
   var changed = false;
   var mr = !!st.model_ready;
   if (mr !== S.live.modelReady) { S.live.modelReady = mr; changed = true; }
+  var preparing = !!st.preparing;
+  if (preparing !== S.live.preparing) { S.live.preparing = preparing; changed = true; }
+  var prep = st.prepare || null;
+  if (prepareSig(prep) !== prepareSig(S.live.prepare)) { S.live.prepare = prep; changed = true; }
+  // Client download-stall watchdog: track the byte count only while downloading; reset otherwise.
+  var stalled = S.live.prepareStalledClient;
+  if (mr || !preparing || !prep || prep.phase !== "downloading") {
+    resetPrepareWatch();
+    if (stalled) { S.live.prepareStalledClient = false; changed = true; }
+  } else {
+    var dl = prep.downloaded || 0, now = Date.now();
+    if (dl !== _prepWatchBytes) {
+      _prepWatchBytes = dl; _prepWatchAt = now;
+      if (stalled) { S.live.prepareStalledClient = false; changed = true; }
+    } else if (_prepWatchAt && (now - _prepWatchAt) > PREPARE_STALL_MS && !stalled) {
+      S.live.prepareStalledClient = true; changed = true;
+    }
+  }
   var pe = st.prepare_error || null;
   if (pe !== S.live.prepareError) { S.live.prepareError = pe; changed = true; }
   return changed;
+}
+// The transcription-model failure message for the live screen, or null while healthy. Folds the
+// server's actionable prepare_error, an explicit prepare.phase==="error", and the client stall
+// watchdog into one signal, used by both the status chip and the empty-transcript panel.
+function liveFailureMsg() {
+  var L = S.live;
+  if (L.prepareError) return L.prepareError;
+  if (L.prepare && L.prepare.phase === "error") return tr("Could not load the transcription model on this computer.");
+  if (L.prepareStalledClient) return tr("The download stalled. Check your connection and try again.");
+  return null;
+}
+// Retry the model build after a bounded failure: clear the visible error, reset the watchdog and
+// ask the server to re-attempt. Capture and recording keep running; only the model build restarts.
+function retryPrepare() {
+  S.live.prepareError = null; S.live.prepareStalledClient = false; resetPrepareWatch();
+  if (S.live.prepare) S.live.prepare = null;
+  S.live.preparing = true;
+  render();
+  api.post("/api/prepare/retry").then(function () {
+    if (!S.live.modelReady) startReadinessPoll();
+  }).catch(function (e) { toast(e.message || "Could not retry.", true); });
 }
 function silenceSig(n) { return n ? (String(n.at || "") + "|" + String(n.count || 0)) : ""; }
 // The struggle nudge carries no timestamp; its identity is the model step plus whether
@@ -1870,7 +2014,9 @@ function preView() {
     ]),
     el("div", { style: { display: "grid", gridTemplateColumns: "1fr 320px", gap: "24px", alignItems: "start" } }, [left, right]),
     el("div", { class: "row gap-16", style: { marginTop: "24px", alignItems: "center" } }, [
-      el("button", { class: "btn primary big", onclick: startLive }, [icon("dot", 15), "Begin"]),
+      _liveStarting
+        ? el("button", { class: "btn primary big", disabled: true }, [el("span", { class: "spinner" }), "Starting"])
+        : el("button", { class: "btn primary big", onclick: startLive }, [icon("dot", 15), "Begin"]),
       el("button", { class: "btn ghost", onclick: function () { go("home"); } }, "Back"),
       warmChip(),
       el("span", { class: "ink-3", style: { fontSize: "11.5px", marginLeft: "auto" }, text: "Audio stays on this machine unless you opt in." }),
@@ -2145,13 +2291,61 @@ function notesRail() {
     ]));
 }
 
+// The live-screen empty-transcript panel while the model is still preparing, or a bounded failure
+// with Retry. Non-blocking: it sits inside the normal .doc area, chrome and audio strip intact.
+function preparePanel(failMsg) {
+  var L = S.live;
+  if (failMsg) {
+    return el("div", { class: "rec-stage", style: { maxWidth: "520px", margin: "0 auto" } }, [
+      el("div", { class: "tone-tile warn", style: { width: "44px", height: "44px" } }, icon("alert", 22)),
+      el("p", { class: "ink-2", style: { textAlign: "center", maxWidth: "440px" } }, raw(failMsg)),
+      el("p", { class: "ink-3", style: { fontSize: "12px", textAlign: "center", maxWidth: "440px" },
+        text: L.recording
+          ? "Your audio is still recording safely on this computer. Stop when you are done and transcribe the recording later."
+          : "Recording is off, so there is no live transcript. Set up the model in Settings, then start again." }),
+      el("div", { class: "row gap-8" }, [
+        el("button", { class: "btn primary", onclick: retryPrepare }, [icon("download", 14), "Retry"]),
+        el("button", { class: "btn ghost", onclick: function () { go("settings"); } }, "Set up models"),
+      ]),
+    ]);
+  }
+  var p = L.prepare || {};
+  var phase = p.phase || (L.preparing ? "loading" : "");
+  var reassure = (L.recording ? tr("Capturing and recording now on this computer.") : tr("Capturing now on this computer."))
+    + " " + tr("The transcription model is still loading. Nothing is missed: the transcript fills in from the very start the moment it is ready.");
+  var progressBlock;
+  if (phase === "downloading") {
+    var total = p.total || 0, dl = p.downloaded || 0;
+    var pct = total ? Math.min(100, Math.round(dl * 100 / total)) : 0;
+    progressBlock = el("div", { style: { width: "100%", maxWidth: "420px" } }, [
+      el("div", { style: { fontWeight: "600", fontSize: "13px", textAlign: "center" } },
+        [el("span", { text: "Downloading" }), raw(" " + (p.label || p.model || ""))]),
+      total ? voiceProgressBar(pct) : el("div", { class: "track", style: { marginTop: "10px" } }, el("div", { class: "indeterminate" })),
+      el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "6px", textAlign: "center" },
+        text: total ? trFmt("{done} of {total} ({pct}%)", { done: fmtGB(dl), total: fmtGB(total), pct: pct })
+                    : (fmtGB(dl) + " " + tr("downloaded so far")) }),
+    ]);
+  } else {
+    progressBlock = el("div", { style: { width: "100%", maxWidth: "420px" } }, [
+      el("div", { style: { fontWeight: "600", fontSize: "13px", textAlign: "center" }, text: "Loading into memory" }),
+      el("div", { class: "track", style: { marginTop: "10px" } }, el("div", { class: "indeterminate" })),
+    ]);
+  }
+  return el("div", { class: "rec-stage", style: { maxWidth: "520px", margin: "0 auto" } }, [
+    el("span", { class: "spinner" }),
+    el("p", { class: "ink-2", style: { textAlign: "center", maxWidth: "460px" }, text: reassure }),
+    progressBlock,
+  ]);
+}
+
 function liveView() {
   // t0-capture: while the model loads the screen is fully live (Stop, audio strip, elapsed all key
   // off running/startedAt), only the status chip and the empty-transcript line say "preparing". A
   // model-load failure shows a clear but non-alarming chip; capture/recording carry on regardless.
+  var fail = liveFailureMsg();
   var statusChip;
   if (S.live.stopping) statusChip = el("span", { class: "chip warn" }, [el("span", { class: "dot" }), el("span", { id: "live-status-text", text: "Finishing" })]);
-  else if (S.live.transcribing && S.live.prepareError) statusChip = el("span", { class: "chip warn" }, [icon("alert", 12), el("span", { text: "Transcription unavailable" })]);
+  else if (S.live.transcribing && fail) statusChip = el("span", { class: "chip warn" }, [icon("alert", 12), el("span", { text: "Transcription unavailable" })]);
   else if (S.live.transcribing && !S.live.modelReady) statusChip = el("span", { class: "chip prep" }, [el("span", { class: "dot" }), el("span", { text: "Preparing transcription model" })]);
   else if (S.live.transcribing) statusChip = el("span", { class: "chip rec" }, [el("span", { class: "dot" }), el("span", { text: "Listening" })]);
   else statusChip = el("span", { class: "chip ok" }, [el("span", { class: "dot" }), el("span", { text: "Saved" })]);
@@ -2171,22 +2365,16 @@ function liveView() {
     ]),
   ]);
 
-  // t0-capture reassurance in the empty transcript area: say plainly that capture (and recording, if
-  // on) is already running and that the transcript fills in from the start once the model is ready.
-  var emptyMsg;
-  if (S.live.transcribing && S.live.prepareError) {
-    emptyMsg = S.live.recording
-      ? "The transcription model could not load on this computer, but your audio is still recording here. Stop when you are done and transcribe the recording later."
-      : "The transcription model could not load on this computer, and recording is off, so there is no live transcript. Stop, set up the model in Settings, then start again.";
-  } else if (S.live.transcribing && !S.live.modelReady) {
-    emptyMsg = (S.live.recording ? "Capturing and recording now on this computer." : "Capturing now on this computer.")
-      + " The transcription model is still loading. Nothing is missed: the transcript fills in from the very start the moment it is ready.";
-  } else {
-    emptyMsg = "Listening. The transcript appears here as people talk.";
-  }
-  liveDocEl = el("div", { class: "doc" }, S.live.segments.length
-    ? S.live.segments.map(segRow)
-    : el("div", { class: "empty", text: emptyMsg }));
+  // Empty-transcript area (before the first segment lands): a NON-BLOCKING live panel inside the
+  // normal live shell, never a full-screen takeover. While the model is failing it shows the
+  // bounded error + Retry; while it is still preparing it shows the reassurance line plus a real
+  // determinate download bar (or a labelled "Loading into memory" once the bytes are in).
+  var docContent;
+  if (S.live.segments.length) docContent = S.live.segments.map(segRow);
+  else if (S.live.transcribing && fail) docContent = preparePanel(fail);
+  else if (S.live.transcribing && !S.live.modelReady) docContent = preparePanel(null);
+  else docContent = el("div", { class: "empty", text: "Listening. The transcript appears here as people talk." });
+  liveDocEl = el("div", { class: "doc" }, docContent);
   liveBodyEl = el("div", { class: "live-body" }, liveDocEl);
   setTimeout(function () { if (liveBodyEl) liveBodyEl.scrollTop = liveBodyEl.scrollHeight; }, 0);
 
@@ -3596,6 +3784,54 @@ function familyForLang(lang) { var l = (lang || "").toLowerCase().split("-")[0];
 function fluisterReady() { return !!(S.voiceModels && S.voiceModels.fluister_available); }
 function swivurisoReady() { return !!(S.voiceModels && S.voiceModels.swivuriso && S.voiceModels.swivuriso.present); }
 function familyLabelFor(lang) { var f = familyForLang(lang); if (f === "swivuriso") return swivurisoReady() ? "Swivuriso" : "Whisper"; return (f === "fluister" && fluisterReady()) ? "Fluister" : "Whisper"; }
+// Proper-noun family name shown to the user (never translated).
+function familyDisplay(family) { return family === "fluister" ? "Fluister" : family === "swivuriso" ? "Swivuriso" : "Whisper"; }
+// The family a run will ACTUALLY use, honouring an explicit engine override, else the language.
+// Mirrors the backend's family_for_language + engine-override resolution.
+function familyFor(language, engine) {
+  var eng = (engine || "auto").toLowerCase();
+  if (eng === "fluister") return "fluister";
+  if (eng === "whisper") return "whisper";
+  return familyForLang(language);
+}
+function familyForForm() { return familyFor(S.form.language, S.form.engine); }
+// The catalogue entry for a (family, size) from S.voiceModels, or null.
+function vmSizeEntry(family, size) {
+  var d = S.voiceModels || {};
+  if (family === "swivuriso") return d.swivuriso || null;   // one model serves every size
+  var list = family === "fluister" ? (d.fluister || []) : (d.models || []);
+  var keyName = family === "fluister" ? "size" : "model";
+  for (var i = 0; i < list.length; i++) { if (list[i][keyName] === size) return list[i]; }
+  return null;
+}
+// Is the (family, size) build already downloaded? Swivuriso is a single model that covers every
+// size, so any size is "present" once it is installed (Begin will not download for that language).
+function sizePresentInFamily(family, size) {
+  if (family === "swivuriso") return swivurisoReady();
+  var m = vmSizeEntry(family, size);
+  return !!(m && m.present);
+}
+// Approx download size in bytes for a (family, size), for the "Downloads first time (~X GB)" hint.
+function sizeApproxBytes(family, size) {
+  var m = vmSizeEntry(family, size);
+  return m ? (m.approx_bytes || 0) : 0;
+}
+// Cached pre-flight for the "Auto" tile, so it is honest instead of "always ready". Refetched only
+// when (language, engine, device) change, reusing the same signature-guard idea as warmRender so a
+// steady picker never re-hits the endpoint. _autoPf null = unknown/pending (tile stays neutral).
+var _autoPfSig = null, _autoPf = null;
+function autoPfSig() { return [S.form.language || "", S.form.engine || "auto", S.form.device || "auto"].join("|"); }
+function refreshAutoPreflight() {
+  var sig = autoPfSig();
+  if (sig === _autoPfSig) return;   // inputs unchanged: keep the cached answer, no network call
+  _autoPfSig = sig; _autoPf = null;
+  api.post("/api/preflight-model", { tier: "auto", device: S.form.device || "auto", language: S.form.language || "", engine: S.form.engine || "auto" })
+    .then(function (pf) {
+      if (autoPfSig() !== _autoPfSig) return;   // inputs moved again while in flight: drop this answer
+      _autoPf = pf;
+      if (S.route === "pre" || S.route === "importpre") render();
+    }).catch(function () {});
+}
 // Friendly size label from the loaded model id/path (a stock name like "large-v3", a hosted
 // Fluister repo like "digiphyte/fluister-medium", or a local ct2 dir). Mirrors the Quality
 // vocabulary so the live chip can read "Fluister, Best".
@@ -3790,30 +4026,43 @@ function normalizeQuality(q) {
   for (var i = 0; i < QUALITY_OPTS.length; i++) { if (QUALITY_OPTS[i][0] === q) return q; }
   return LEGACY_QUALITY[q] || "auto";
 }
-// The meeting / import Quality picker. A model not downloaded yet is greyed out;
-// clicking it starts that model's download (and selects it, ready once it lands).
-// "Auto" is always available and is the default.
+// The meeting / import Quality picker, honest about what is downloaded. Each tile's readiness is
+// read from the LANGUAGE-IMPLIED family (Afrikaans -> Fluister, SA languages -> Swivuriso, else
+// Whisper), so an Afrikaans meeting greys a size whose Fluister build is absent. "Auto" is driven
+// by a cached pre-flight, not assumed ready. Selecting a size never downloads: Begin's pre-start
+// modal handles consent, then the model downloads in the background with visible progress.
+function qualityTileState(family, key) {
+  if (key === "auto") {
+    if (_autoPf) return { ready: !!_autoPf.present, bytes: _autoPf.approx_bytes || 0, known: true };
+    return { ready: true, bytes: 0, known: false };   // pre-flight pending: stay neutral, do not grey
+  }
+  return { ready: sizePresentInFamily(family, key), bytes: sizeApproxBytes(family, key), known: true };
+}
+// "Downloads first time" hint, with the approx size when we know it (fall back to a sizeless
+// phrase rather than a bogus "~0.00 GB" when the catalogue has no byte estimate for that size).
+function downloadHint(bytes) {
+  return bytes > 0 ? trFmt("Downloads first time (~{size})", { size: fmtGB(bytes) }) : tr("Downloads first time");
+}
 function qualitySelector() {
-  var vm = S.voiceModels || {};
-  var present = {};
-  (vm.models || []).forEach(function (m) { present[m.model] = !!m.present; });
-  return el("div", { class: "segmented block" }, QUALITY_OPTS.map(function (o) {
-    var key = o[0], label = o[1], model = (key === "auto") ? null : key;
-    var ready = (model === null) || present[model];
+  var family = familyForForm();
+  refreshAutoPreflight();   // guarded: only hits the endpoint when language/engine/device change
+  var seg = el("div", { class: "segmented block" }, QUALITY_OPTS.map(function (o) {
+    var key = o[0], label = o[1];
+    var st = qualityTileState(family, key);
     return el("button", {
       class: S.form.tier === key ? "on" : "",
-      style: { opacity: ready ? "1" : "0.5" },
-      title: ready ? null : tr("Not downloaded yet. Click to download."),
-      onclick: function () {
-        S.form.tier = key;
-        if (model && !ready) {
-          startVoiceDownload(model);
-          toast("Downloading the model. You can begin once it is ready.");
-        }
-        render();
-      },
+      style: { opacity: st.ready ? "1" : "0.5" },
+      title: !st.known ? null : (st.ready ? tr("Starts instantly") : downloadHint(st.bytes)),
+      onclick: function () { S.form.tier = key; render(); },
     }, el("span", { text: label }));
   }));
+  // Honest one-line hint for the CURRENT choice: a "Starts instantly" pill, or the download size.
+  var cst = qualityTileState(family, normalizeQuality(S.form.tier));
+  var hint = !cst.known ? null
+    : (cst.ready
+        ? el("span", { class: "chip ok" }, [icon("check", 12), el("span", { text: "Starts instantly" })])
+        : el("span", { class: "chip prep" }, [icon("download", 12), el("span", {}, raw(downloadHint(cst.bytes)))]));
+  return el("div", {}, [seg, hint ? el("div", { style: { marginTop: "8px" } }, hint) : null]);
 }
 // EN/AF interface-language toggle (used on the first-run welcome screen).
 function langToggleSeg() {

@@ -225,6 +225,45 @@ window.VM_I18N = {
     "Listening. The transcript appears here as people talk.":
       "Luister. Die transkripsie verskyn hier soos mense praat.",
 
+    // t0-capture: live model-preparation progress, bounded failure + retry (live screen)
+    "Transcription unavailable": "Transkripsie nie beskikbaar nie",
+    "Loading into memory": "Laai in geheue",
+    "downloaded so far": "tot dusver afgelaai",
+    "{done} of {total} ({pct}%)": "{done} van {total} ({pct}%)",
+    "Capturing now on this computer.": "Vang nou op hierdie rekenaar op.",
+    "Capturing and recording now on this computer.":
+      "Vang op en neem nou op hierdie rekenaar op.",
+    "The transcription model is still loading. Nothing is missed: the transcript fills in from the very start the moment it is ready.":
+      "Die transkripsiemodel laai nog. Niks gaan verlore nie: die transkripsie vul van heel voor af in sodra dit gereed is.",
+    "Could not load the transcription model on this computer.":
+      "Kon nie die transkripsiemodel op hierdie rekenaar laai nie.",
+    "The download stalled. Check your connection and try again.":
+      "Die aflaai het vasgeval. Kontroleer jou verbinding en probeer weer.",
+    "Retry": "Probeer weer",
+    "Could not retry.": "Kon nie weer probeer nie.",
+    "Could not start.": "Kon nie begin nie.",
+    "Your audio is still recording safely on this computer. Stop when you are done and transcribe the recording later.":
+      "Jou klank word steeds veilig op hierdie rekenaar opgeneem. Stop wanneer jy klaar is en transkribeer die opname later.",
+    "Recording is off, so there is no live transcript. Set up the model in Settings, then start again.":
+      "Opname is af, so daar is geen lewendige transkripsie nie. Stel die model op in Instellings en begin dan weer.",
+
+    // t0-capture: pre-start (informed consent) modal for a model that is not yet downloaded
+    "Download the {label} model first?": "Laai eers die {label}-model af?",
+    "About {size}, and usually a few minutes on a normal connection.":
+      "Ongeveer {size}, en gewoonlik 'n paar minute op 'n normale verbinding.",
+    "Capture and recording begin immediately. Nothing is missed: the transcript fills in from the very start once the model is ready.":
+      "Opvang en opname begin dadelik. Niks gaan verlore nie: die transkripsie vul van heel voor af in sodra die model gereed is.",
+    "Start instantly with a model you already have":
+      "Begin dadelik met 'n model wat jy reeds het",
+    "Use this": "Gebruik hierdie",
+    "Proceed and download": "Gaan voort en laai af",
+
+    // Honest quality picker (pre-meeting + live tune panel)
+    "Starts instantly": "Begin dadelik",
+    "Downloads first time (~{size})": "Laai die eerste keer af (~{size})",
+    "Downloads first time": "Laai die eerste keer af",
+    "downloads first": "laai eers af",
+
     // Stop menu
     "You have recording and transcription on": "Jy het opname en transkripsie aan",
     "Stop transcription, keep recording": "Stop transkripsie, hou opname aan",
@@ -758,5 +797,11 @@ window.VM_I18N = {
       "Laai die transkripsiemodel op jou rekenaar. Die eerste keer wat jy 'n gehaltevlak gebruik kan 'n oomblik neem, en as daardie model nog afgelaai moet word kan dit 'n paar minute neem.",
     "You can keep this open. It switches to the transcript by itself.":
       "Jy kan dit oop hou. Dit wissel vanself na die transkripsie.",
+    // Live path uses t0-capture (no full-screen spinner), but keep these translated in case the
+    // brief starting screen is ever shown for a live session.
+    "Opening your microphone and system audio and starting to capture. This is quick.":
+      "Maak jou mikrofoon en stelselklank oop en begin opvang. Dit is vinnig.",
+    "The live screen opens by itself. Nothing is missed: the transcript fills in from the start once the model is ready.":
+      "Die lewendige skerm maak vanself oop. Niks gaan verlore nie: die transkripsie vul van voor af in sodra die model gereed is.",
   },
 };
