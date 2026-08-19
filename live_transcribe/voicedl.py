@@ -19,6 +19,7 @@ hash on download (a corrupt or truncated file is rejected). A per-model commit
 revision can be pinned later via the optional "revision" field; we leave it unset
 (latest) for now rather than bake in a guessed SHA that would break the fetch.
 """
+import contextlib
 import os
 import shutil
 import threading
@@ -144,7 +145,14 @@ def _download_model(model, local_only=False):
         from faster_whisper import download_model
     except Exception:
         from faster_whisper.utils import download_model
-    return download_model(model, local_files_only=local_only)
+    if local_only:
+        # Presence probe only: no network, no progress needed.
+        return download_model(model, local_files_only=True)
+    # Real download: instrument it so progress() tracks true transferred bytes in granular HTTP chunks
+    # (not the blind on-disk snapshot, and not Xet's coarse/late reporting). Same file set / kwargs as
+    # faster_whisper; only the tqdm class and the backend selection change for the duration.
+    with _download_ctx():
+        return download_model(model, local_files_only=False)
 
 
 def _present(model):
@@ -170,19 +178,119 @@ def _set(**kw):
         _STATE.update(kw)
 
 
+# ── real transferred-byte progress ─────────────────────────────────────────
+# With HF_HUB_DISABLE_SYMLINKS=1 (forced in __init__ so ct2 can open the cache), hf_hub streams the
+# big model.bin into a temp/incomplete location and only drops the finished file into the counted
+# snapshot folder at the very END. Worse, on the xet backend the transferring bytes are not visible
+# ANYWHERE under the HF cache during transfer. So an os.walk of the cache reads ~0 bytes for minutes
+# and the byte-delta stall detector false-fires on a healthy download (field bug: "The download
+# stalled" after 60s on every fresh model). Instead we drive progress from the REAL bytes hf transfers
+# via the tqdm_class it calls per chunk. faster_whisper hardcodes tqdm_class=disabled_tqdm; we swap it
+# for the duration of one download (safe: one global download slot at a time, guarded by _STATE/_LOCK).
+
+def _add_transferred(n):
+    """Accumulate real transferred bytes (from hf's per-chunk tqdm callback) into the download state,
+    but only while a download is in flight. Monotonic by construction; the sole writer of downloaded."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return
+    if n <= 0:
+        return
+    with _LOCK:
+        if _STATE["state"] == "downloading":
+            _STATE["downloaded"] = int(_STATE.get("downloaded") or 0) + n
+
+
+_PROGRESS_TQDM_CLS = None
+
+
+def _progress_tqdm_cls():
+    """A never-rendered tqdm subclass that harvests real transferred bytes into the download state.
+    hf_hub 1.15 uses the injected tqdm_class in two roles: a SHARED bytes bar (unit="B") that every
+    per-file download forwards its chunk bytes into, and the thread_map outer FILE-count bar (no
+    unit). We subclass the real tqdm so the full contract thread_map needs (get_lock/set_lock, the
+    iteration protocol, total/refresh) still works, force disable=True so nothing is drawn (frozen app
+    has no console), and override update() to accumulate ONLY the bytes bar. Built lazily and cached so
+    voicedl imports without a hard tqdm dependency."""
+    global _PROGRESS_TQDM_CLS
+    if _PROGRESS_TQDM_CLS is not None:
+        return _PROGRESS_TQDM_CLS
+    from tqdm.auto import tqdm as _base_tqdm
+
+    class _ProgressTqdm(_base_tqdm):
+        def __init__(self, *args, **kwargs):
+            # Capture the byte-bar identity from the CONSTRUCTOR kwargs, not self.unit: a disabled tqdm
+            # never sets self.unit as an instance attribute, so reading it back returns nothing. In hf
+            # 1.15 snapshot_download the shared "bytes_progress" bar (unit="B") receives every file's
+            # transferred chunks (via _AggregatedTqdm); the thread_map outer bar (no unit) only counts
+            # files - so we sum bytes ONLY from the unit="B" bar and never double-count file ticks.
+            self._vm_is_bytes = kwargs.get("unit") == "B"
+            kwargs["disable"] = True   # never render; we only harvest bytes
+            super().__init__(*args, **kwargs)
+
+        def update(self, n=1):
+            if self._vm_is_bytes:
+                _add_transferred(n)
+            return super().update(n)
+
+    _PROGRESS_TQDM_CLS = _ProgressTqdm
+    return _PROGRESS_TQDM_CLS
+
+
+@contextlib.contextmanager
+def _download_ctx():
+    """Instrument ONE model download so its progress is both accurate and granular:
+
+    1. Swap faster_whisper.download_model's hardcoded disabled tqdm for our accumulating one, so
+       progress()/the stall detector track REAL transferred bytes (download_model reads `disabled_tqdm`
+       from faster_whisper.utils' globals at call time, so reassigning it there takes effect).
+    2. Force the plain HTTP backend by disabling hf's Xet backend for the duration. Xet reports
+       progress only when each ~64 MB reconstruction block finishes AND spends the first tens of
+       seconds in silent connection/negotiation, so on a slower link the transferred-byte signal stays
+       FLAT past PREPARE_DOWNLOAD_STALL_SECONDS and the stall detector false-fires on a healthy
+       download (the field bug). HTTP streams in 10 MB chunks (constants.DOWNLOAD_CHUNK_SIZE), so bytes
+       move every few seconds and the stall detector only fires on a genuinely dead connection. Xet's
+       first-download speed edge is marginal (nothing local to dedup against); reliable progress wins.
+
+    The global download slot serialises downloads, so both process-wide swaps are never concurrent, and
+    both are restored on exit. Any failure to set up degrades gracefully (progress() still has the
+    on-disk floor; the download itself is unaffected)."""
+    restore = []
+    try:
+        import faster_whisper.utils as u
+        cls = _progress_tqdm_cls()
+        restore.append(("tqdm", u, "disabled_tqdm", getattr(u, "disabled_tqdm", None)))
+        u.disabled_tqdm = cls
+    except Exception:
+        pass
+    try:
+        import huggingface_hub.constants as _hc
+        restore.append(("xet", _hc, "HF_HUB_DISABLE_XET", _hc.HF_HUB_DISABLE_XET))
+        _hc.HF_HUB_DISABLE_XET = True
+    except Exception:
+        pass
+    try:
+        yield
+    finally:
+        for _tag, mod, attr, prev in reversed(restore):
+            try:
+                setattr(mod, attr, prev)
+            except Exception:
+                pass
+
+
 def progress():
     with _LOCK:
         snap = dict(_STATE)
-    # While downloading, report the live on-disk size of the model's cache folder
-    # (snapshot_download streams into it, including *.incomplete blobs), so the bar
-    # moves without depending on a tqdm hook.
+    # While downloading, report the REAL transferred-byte count (snap["downloaded"], driven by the
+    # tqdm hook hf calls per chunk). Fall back to the on-disk snapshot size only as a floor, so a
+    # backend that somehow reported no tqdm bytes still shows the final file drop. The floor is NOT
+    # written back into _STATE, so the tqdm accumulator stays the sole writer of downloaded.
     if snap["state"] == "downloading" and snap.get("model"):
-        live = _dir_size(_repo_dir(snap.get("repo") or _repo_id(snap["model"])))
-        if live > snap["downloaded"]:
-            snap["downloaded"] = live
-            with _LOCK:
-                if _STATE["state"] == "downloading":
-                    _STATE["downloaded"] = live
+        floor = _dir_size(_repo_dir(snap.get("repo") or _repo_id(snap["model"])))
+        if floor > snap["downloaded"]:
+            snap["downloaded"] = floor
     return snap
 
 

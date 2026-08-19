@@ -2304,7 +2304,7 @@ function preparePanel(failMsg) {
         text: L.recording
           ? "Your audio is still recording safely on this computer. Stop when you are done and transcribe the recording later."
           : "Recording is off, so there is no live transcript. Set up the model in Settings, then start again." }),
-      el("div", { class: "row gap-8" }, [
+      el("div", { class: "prep-actions" }, [
         el("button", { class: "btn primary", onclick: retryPrepare }, [icon("download", 14), "Retry"]),
         el("button", { class: "btn ghost", onclick: function () { go("settings"); } }, "Set up models"),
       ]),

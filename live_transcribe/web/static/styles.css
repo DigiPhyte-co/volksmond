@@ -563,6 +563,11 @@ html, body { margin: 0; padding: 0; height: 100%; }
 
 /* Record-only big indicator */
 .rec-stage { display: flex; flex-direction: column; align-items: center; gap: 18px; padding: 24px 0; }
+/* Prepare/failure panel action row. It renders inside .doc, so it must NOT use the generic .row class
+ * (the .doc .row transcript grid would squeeze the primary button into a 60px column and baseline-
+ * misalign the two actions). A dedicated flex row keeps both .btn actions on one centred baseline with
+ * an even gap, natural button widths, and wrapping on a narrow window. */
+.vm .prep-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 10px; }
 .rec-pulse { width: 120px; height: 120px; border-radius: 50%; background: var(--record-soft); display: flex; align-items: center; justify-content: center; animation: vm-pulse 2.4s ease-in-out infinite; }
 .rec-pulse .core { width: 64px; height: 64px; border-radius: 50%; background: var(--record); display: flex; align-items: center; justify-content: center; }
 .rec-pulse .core i { width: 22px; height: 22px; border-radius: 4px; background: #fff; }
