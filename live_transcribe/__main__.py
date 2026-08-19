@@ -188,12 +188,25 @@ def _best_downloaded_size(family):
     return None
 
 
-def _cpu_auto_downloaded_tier(family):
-    """CPU 'auto': the largest DOWNLOADED size within today's CPU-auto ceiling (_cpu_auto_tier()'s
-    size - medium on >=8 cores, else small), mapped to its CPU tier. Rewards an existing download so a
-    live meeting starts on a cached model instead of triggering one; falls back to today's ambitious
-    _cpu_auto_tier() when nothing suitable is downloaded (which then downloads on demand and self-
-    downgrades). NEVER exceeds the ceiling: turbo/large-v3 are too slow to hold real-time on CPU."""
+# The two families "auto" may cross between when the language-preferred one has nothing downloaded.
+# Swivuriso is never crossed (one credited model, seven SA languages); an SA session prefers it and
+# downloads it rather than silently degrading to stock Whisper.
+_USABLE_FAMILIES = ("fluister", "whisper")
+
+
+def _gpu_tier_for_family(family):
+    """GPU auto tier for a usable family from what is DOWNLOADED: the best downloaded size mapped to
+    its GPU tier, or None when the family has nothing on disk. The GPU has no real-time ceiling, so any
+    downloaded size is usable."""
+    size = _best_downloaded_size(family)
+    return _QUALITY_TO_GPU_TIER.get(size, "gpu") if size else None
+
+
+def _cpu_within_ceiling_tier(family):
+    """CPU: the largest DOWNLOADED size AT OR BELOW today's CPU-auto live ceiling (_cpu_auto_tier()'s
+    size - medium on >=8 cores, else small), mapped to its CPU tier; None when nothing downloaded sits
+    within the ceiling. This is the preferred pick (step 2): starts on a cached model that can hold
+    real-time."""
     ceiling_tier = _cpu_auto_tier()
     from . import transcribe
     ceiling_size = transcribe.TIER_CONFIG.get(ceiling_tier, {}).get("model", "medium")
@@ -203,63 +216,115 @@ def _cpu_auto_downloaded_tier(family):
     for size in reversed(candidates):     # largest size at or below the ceiling first
         if size in downloaded:
             return _QUALITY_TO_CPU_TIER.get(size, ceiling_tier)
-    return ceiling_tier
+    return None
 
 
-def resolve_tier(quality, device="auto", language=None, engine="auto"):
-    """Resolve a UI quality choice + device + language to a concrete TIER_CONFIG tier.
+def _cpu_largest_downloaded_tier(family):
+    """CPU: the highest-accuracy DOWNLOADED size for the family (which MAY exceed the live ceiling, e.g.
+    large-v3), mapped to its CPU tier; None when nothing is downloaded. Used for the cert win (step 4):
+    when only an above-ceiling model is on disk, start on it (the live CPU ladder claws back real-time)
+    rather than triggering a surprise multi-GB download of the ceiling model at Begin."""
+    order = _FAMILY_SIZE_ORDER.get(family, [])
+    downloaded = _downloaded_sizes(family)
+    best = None
+    for size in order:
+        if size in downloaded:
+            best = size
+    return _QUALITY_TO_CPU_TIER.get(best) if best else None
 
-    device: "cpu" forces the CPU even when a GPU is present; "auto"/"gpu" use the GPU when ready.
-    An EXPLICIT quality (a size like "medium"/"large-v3") is honoured as-is, on GPU or CPU, so the
-    user always gets the model they asked for. "auto" prefers the LARGEST size already DOWNLOADED for
-    the chosen language's family, within the hardware ceiling (GPU: up to the family best; CPU: up to
-    _cpu_auto_tier()'s medium/small live ceiling) - rewarding an existing download and avoiding a
-    surprise multi-minute download at Begin. When nothing suitable is downloaded it falls back to
-    today's biggest-size pick (Afrikaans -> turbo, English -> large-v3), which then downloads on
-    demand. Swivuriso is one model at a nominal size, so it is unaffected. On the CPU the engine still
-    downgrades along CPU_LADDER if the chosen model cannot keep up live."""
+
+def _cpu_tier_for_family(family):
+    """CPU auto tier for a usable family from what is DOWNLOADED, preferring a within-ceiling size
+    (step 2) and otherwise using the largest above-ceiling download (step 4). None when the family has
+    nothing on disk (the caller then crosses families or falls back to the ambitious pick)."""
+    return _cpu_within_ceiling_tier(family) or _cpu_largest_downloaded_tier(family)
+
+
+def resolve_tier_engine(quality, device="auto", language=None, engine="auto"):
+    """Resolve a UI quality choice + device + language + engine pref to a concrete TIER_CONFIG tier AND
+    an engine_override (a model FAMILY to force, or None to follow the language/engine pref).
+
+    An EXPLICIT quality (a size like "medium"/"large-v3") is honoured as-is on GPU or CPU, override
+    None. For "auto", the model is chosen to reward what is already downloaded and avoid a surprise
+    download at Begin:
+      1. Preferred family `fam` (from the language, unless the engine pref forces one).
+      2. If `fam` has a usable downloaded size (within the CPU live ceiling on CPU; any size on GPU),
+         use it, override None.
+      3. Else, if the OTHER usable family has a usable download, cross to it and return that family as
+         the override (only for an auto engine pick; never override an explicit engine choice).
+      4. On CPU, if `fam` has ONLY an above-ceiling download (e.g. large-v3), use it anyway (the live
+         ladder protects real-time) - this is handled inside step 2's _cpu_tier_for_family.
+      5. When NOTHING usable is downloaded anywhere, fall back to today's ambitious best-size pick
+         (Afrikaans -> turbo, English -> large-v3), which then legitimately downloads. Swivuriso is one
+         nominal model and is never crossed off - an SA session prefers it and downloads it."""
     explicit = bool(quality) and quality != "auto"
-    # For "auto", resolve the model FAMILY once so the size pick can prefer what is already on disk.
-    # Swivuriso never participates (one model, nominal size); any failure leaves fam None, i.e.
-    # today's biggest-size behaviour.
+    eng = (engine or "auto").lower()
+    explicit_family = eng in ("fluister", "whisper", "swivuriso")
     fam = None
     if not explicit:
         try:
             from . import transcribe
-            eng = (engine or "auto").lower()
-            fam = eng if eng in ("fluister", "whisper", "swivuriso") else transcribe.family_for_language(language)
+            fam = eng if explicit_family else transcribe.family_for_language(language)
         except Exception:
             fam = None
+    # Crossing families only for an AUTO engine pick on a usable family: never override an explicit
+    # engine choice, and never silently cross a South African (Swivuriso) session onto stock Whisper.
+    allow_cross = (not explicit) and (not explicit_family) and (fam in _USABLE_FAMILIES)
+
+    gpu_ready = False
     if device != "cpu":
         try:
             from . import cudadl
-            if cudadl.cuda_ready():
-                # Do NOT route through pick_tier() here: it honours the SA_LIVE_TIER env override
-                # (a CLI-only feature), which could force a CPU tier even though the GPU is ready.
-                if explicit:
-                    size = quality
-                elif fam in ("fluister", "whisper"):
-                    # Prefer the largest DOWNLOADED size; only when none is on disk fall back to
-                    # today's family best (which downloads on demand).
-                    size = _best_downloaded_size(fam) or _best_size_for(language, engine)
-                else:
-                    size = _best_size_for(language, engine)
-                return _QUALITY_TO_GPU_TIER.get(size, "gpu")
+            gpu_ready = cudadl.cuda_ready()
         except Exception:
-            pass
+            gpu_ready = False
+
+    if gpu_ready:
+        # Do NOT route through pick_tier() here: it honours the SA_LIVE_TIER env override (a CLI-only
+        # feature), which could force a CPU tier even though the GPU is ready.
+        if explicit:
+            return _QUALITY_TO_GPU_TIER.get(quality, "gpu"), None
+        if fam in _USABLE_FAMILIES:
+            t = _gpu_tier_for_family(fam)
+            if t:
+                return t, None
+            if allow_cross:
+                for xfam in _USABLE_FAMILIES:
+                    if xfam != fam:
+                        xt = _gpu_tier_for_family(xfam)
+                        if xt:
+                            return xt, xfam
+            return _QUALITY_TO_GPU_TIER.get(_best_size_for(language, engine), "gpu"), None
+        # Swivuriso / unknown family: one nominal model, no crossing.
+        return _QUALITY_TO_GPU_TIER.get(_best_size_for(language, engine), "gpu"), None
+
     # CPU path (forced, or no usable GPU): honour the picked quality, never a GPU tier.
     if not explicit:
-        # Prefer the largest downloaded size within the CPU live ceiling; swivuriso and any
-        # family-detection failure keep today's ambitious core-count pick.
-        if fam in ("fluister", "whisper"):
-            return _cpu_auto_downloaded_tier(fam)
-        return _cpu_auto_tier()
+        if fam in _USABLE_FAMILIES:
+            t = _cpu_tier_for_family(fam)
+            if t:
+                return t, None
+            if allow_cross:
+                for xfam in _USABLE_FAMILIES:
+                    if xfam != fam:
+                        xt = _cpu_tier_for_family(xfam)
+                        if xt:
+                            return xt, xfam
+            return _cpu_auto_tier(), None
+        # Swivuriso / family-detection failure: today's ambitious core-count pick.
+        return _cpu_auto_tier(), None
     if quality in TIER_CHOICES:
         t = pick_tier(quality)
-        return "cpu-large" if t in ("gpu", "gpu-4gb") else t
+        return ("cpu-large" if t in ("gpu", "gpu-4gb") else t), None
     if quality == "large-v3":
-        return "cpu-large"
-    return _QUALITY_TO_CPU_TIER.get(quality, _cpu_auto_tier())
+        return "cpu-large", None
+    return _QUALITY_TO_CPU_TIER.get(quality, _cpu_auto_tier()), None
+
+
+def resolve_tier(quality, device="auto", language=None, engine="auto"):
+    """Thin wrapper over resolve_tier_engine returning just the concrete tier (keeps every existing
+    caller and test green). See resolve_tier_engine for the auto model-selection + cross-family logic."""
+    return resolve_tier_engine(quality, device, language, engine)[0]
 
 
 def default_chunk_seconds(tier):

@@ -32,7 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .. import audioboost, buildflags, capture, config, licensing, paths, silencewatch, sinks, transcribe
-from ..__main__ import default_chunk_seconds, pick_tier, resolve_tier
+from ..__main__ import default_chunk_seconds, pick_tier, resolve_tier, resolve_tier_engine
 
 app = FastAPI(title="SA-Live-Transcribe")
 STATIC_DIR = Path(__file__).parent / "static"
@@ -184,6 +184,17 @@ class _State:
         self.preparing: bool = False
         self.prepare_error: Optional[str] = None
         self.pending_audio: Optional["_PendingAudio"] = None
+        # Ready-state hardening (WP-1): model_ready is the AUTHORITATIVE "transcription is live" flag,
+        # set to True the instant the engine is built AND engine.start() is called (phase-1 end), NOT
+        # derived from STATE.engine (which stays None during the backlog drain, so deriving readiness
+        # from it is the "stuck on preparing" bug). prepare_phase is a breadcrumb
+        # ("downloading"|"loading"|"ready"|""); prepare is the live download/load progress dict the UI
+        # polls (or None); prepare_args stashes the background-build arguments so /api/prepare/retry can
+        # re-spawn the build after a bounded failure without restarting capture/recording.
+        self.model_ready: bool = False
+        self.prepare_phase: str = ""
+        self.prepare: Optional[dict] = None
+        self.prepare_args: Optional[tuple] = None
 
     def reset(self):
         self.engine = None
@@ -222,6 +233,11 @@ class _State:
         self.preparing = False
         self.prepare_error = None
         self.pending_audio = None
+        # Ready-state hardening (WP-1): a fresh session is not ready and has no prepare progress.
+        self.model_ready = False
+        self.prepare_phase = ""
+        self.prepare = None
+        self.prepare_args = None
 
 
 STATE = _State()
@@ -258,6 +274,26 @@ def _summary_running():
 # only has to cover a realistic model load/download; an unbounded buffer against a model that never
 # loads would OOM the app, so the cap is deliberate, not incidental.
 _PENDING_MAX_SAMPLES = 16000 * 60 * 20 * 2   # 20 min of both-source 16 kHz float32 samples
+
+# Bounded-failure thresholds for the background model prepare (WP-2). A first-run download that makes
+# NO progress for PREPARE_DOWNLOAD_STALL_SECONDS is treated as stalled (dead connection / HuggingFace
+# unreachable) and surfaced as a retryable error rather than an indefinite spinner - the exact MS Store
+# 10.1.2.10 failure. PREPARE_LOAD_TIMEOUT_SECONDS bounds the model LOAD (a fast local_files_only cache
+# hit once the files are present); a load that never returns is a retryable error too. Capture and
+# recording keep running through either failure, so the audio is never lost.
+PREPARE_DOWNLOAD_STALL_SECONDS = 60
+PREPARE_LOAD_TIMEOUT_SECONDS = 120
+# How often the background builder polls voicedl.progress() into STATE.prepare while downloading.
+_PREPARE_POLL_SECONDS = 0.5
+
+# Human-readable quality label per model size, mirroring the picker's four tiers (voicedl._OFFER):
+# Fast=small, Balanced=medium, High quality=large-v3-turbo, Best=large-v3. base/tiny are internal
+# live-downgrade rungs; they only appear here as a fallback label for a resolved cpu-min start.
+_QUALITY_LABEL = {
+    "small": "Fast", "medium": "Balanced",
+    "large-v3-turbo": "High quality", "large-v3": "Best",
+    "base": "Basic", "tiny": "Basic",
+}
 
 
 class _PendingAudio:
@@ -370,7 +406,12 @@ def _feed(source, audio, t_start):
     if not STATE.transcribing:
         return   # record-only (or nothing to transcribe): nothing else to do
     pb = STATE.pending_audio
-    if STATE.preparing and pb is not None and pb.append(source, audio, t_start):
+    # Buffer-OPEN is the gate, not STATE.preparing (WP-1): the ready flip clears `preparing` at
+    # phase-1 end while the engine is still None and the buffer is still open for the backlog drain,
+    # so gating on `preparing` here could drop a chunk in that window. pending_audio is set to None
+    # only at the atomic engine-publish (finalise_if_empty) and in reset()/the failure path, so
+    # "pb is not None and append() succeeded" is exactly "still catching up, hold this chunk".
+    if pb is not None and pb.append(source, audio, t_start):
         return   # held in the buffer; the builder replays it in order once the engine is ready
     # Not buffered (buffer closed at the handoff instant, or the engine came up between our reads):
     # feed the engine directly if it is live now, so nothing slips through the preparing->ready seam.
@@ -835,12 +876,18 @@ def status():
             "recording_started": STATE.recording_started,
             # t0-capture: transcription-model readiness. Capture (and recording, if on) are already
             # live from Begin; while the model loads on the background thread the UI shows a
-            # "preparing" state and polls this. model_ready flips true once the engine is attached;
+            # "preparing" state and polls this. model_ready is the AUTHORITATIVE flag (set at phase-1
+            # end, engine built + started), NOT derived from STATE.engine (which stays None during the
+            # backlog drain); deriving it from the engine was the "stuck on preparing" residual bug.
             # prepare_error carries a short model-load failure message (None while healthy) so a
             # failed load can be surfaced without hiding that capture/recording carried on.
-            "model_ready": STATE.engine is not None and not STATE.preparing,
+            "model_ready": STATE.model_ready,
             "preparing": STATE.preparing,
             "prepare_error": STATE.prepare_error,
+            # Live download/load progress for the non-blocking "preparing" UI, present while preparing
+            # OR on error (else null). Shape: {phase, model, family, size, label, downloaded, total,
+            # stalled}. See _build_engine_async / the pinned API contract.
+            "prepare": STATE.prepare if (STATE.preparing or STATE.prepare_error) else None,
         }
         # Live AEC truth for the in-meeting toggle: the ENGINE'S actual state, never the stored
         # setting (a long-running instance can drift from disk; the toggle must not lie).
@@ -1239,8 +1286,114 @@ def warm_up(req: WarmUpRequest):
     device = (getattr(req, "device", None) or settings.get("device") or "auto")
     language = req.language or None     # "" (auto-detect) -> None, matching Begin
     engine_pref = (req.engine or settings.get("engine") or "auto")
-    tier = resolve_tier(quality, device, language, engine_pref)
-    return transcribe.warm_up_async(tier, language, engine_pref)
+    # Thread the auto cross-family override (WP-3) so warm-up warms the model Begin will ACTUALLY use
+    # (e.g. Afrikaans falling back to a downloaded Whisper), not the language-default family.
+    tier, engine_override = resolve_tier_engine(quality, device, language, engine_pref)
+    return transcribe.warm_up_async(tier, language, engine_override or engine_pref)
+
+
+class PreflightRequest(BaseModel):
+    tier: str = "auto"
+    device: str = "auto"
+    language: str = "af"
+    engine: str = "auto"
+
+
+def _preflight_device(device_pref):
+    """The honest processor Begin will use: 'cpu' when forced or no usable CUDA, else 'gpu'. Surfaced
+    so the modal's size/label/time match reality even on a frozen build with no GPU libs."""
+    if device_pref == "cpu":
+        return "cpu"
+    try:
+        from .. import cudadl
+        return "gpu" if cudadl.cuda_ready() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def _downloaded_alternatives(exclude_family, exclude_size):
+    """Usable transcription models already on disk (any family), for the pre-start modal's
+    instant-switch list. Excludes the model Begin will already use. Each entry mirrors the pinned
+    contract: {size, family, label, model, approx_bytes, quality_note}."""
+    from ..__main__ import _downloaded_sizes, _FAMILY_SIZE_ORDER
+    from .. import voicedl
+    notes = {"fluister": "Afrikaans-tuned", "whisper": "Good; not Afrikaans-tuned",
+             "swivuriso": "South African languages"}
+    out = []
+    for family in ("fluister", "whisper"):
+        try:
+            sizes = _downloaded_sizes(family)
+        except Exception:
+            sizes = set()
+        for size in _FAMILY_SIZE_ORDER.get(family, []):
+            if size not in sizes:
+                continue
+            if family == exclude_family and size == exclude_size:
+                continue
+            target = transcribe.FLUISTER_REPOS.get(size) if family == "fluister" else size
+            approx = (voicedl._FLUISTER_SIZES if family == "fluister" else voicedl._SIZES).get(size, 0)
+            out.append({"size": size, "family": family, "label": _QUALITY_LABEL.get(size, size),
+                        "model": target, "approx_bytes": approx, "quality_note": notes.get(family, "")})
+    # Swivuriso is one model at a nominal size; list it when present and not the primary pick.
+    try:
+        if (transcribe.swivuriso_available() or voicedl._present(transcribe.SWIVURISO_REPO)) \
+                and exclude_family != "swivuriso":
+            out.append({"size": "turbo", "family": "swivuriso", "label": "South African",
+                        "model": transcribe.SWIVURISO_REPO, "approx_bytes": voicedl._SWIVURISO_SIZE,
+                        "quality_note": notes["swivuriso"]})
+    except Exception:
+        pass
+    return out
+
+
+@app.post("/api/preflight-model")
+def preflight_model(req: PreflightRequest):
+    """Stateless pre-flight for the pre-start modal: what model will Begin load, is it already on disk
+    (present==True means Begin will NOT download), how big is it, and which downloaded alternatives
+    could be used instantly. Starts nothing and takes no lock; uses the SAME resolver + download-plan
+    Begin uses, so the picker/modal/Begin always agree."""
+    settings = config.load()
+    quality = req.tier if (req.tier and req.tier != "auto") else (settings.get("tier") or "auto")
+    device = (req.device or settings.get("device") or "auto")
+    language = req.language if req.language else None    # "" -> None (auto-detect), matching Begin
+    engine_pref = (req.engine or settings.get("engine") or "auto")
+    tier, engine_override = resolve_tier_engine(quality or "auto", device, language, engine_pref)
+    effective_engine = engine_override or engine_pref
+    plan = _resolve_download_plan(tier, language, effective_engine)
+    return {
+        "model": plan["target"] or plan["model"],
+        "size": plan["size"],
+        "family": plan["family"],
+        "label": plan["label"],
+        "present": plan["present"],
+        "approx_bytes": plan["approx_bytes"] or 0,
+        "device": _preflight_device(device),
+        "engine_override": engine_override,
+        "downloaded_alternatives": _downloaded_alternatives(plan["family"], plan["size"]),
+    }
+
+
+@app.post("/api/prepare/retry")
+def prepare_retry():
+    """Retry a bounded model-prepare failure without disturbing the live capture/recording. Clears the
+    error, re-opens the pending-audio buffer so _feed holds chunks again, and re-spawns the background
+    build from the stashed args (same session, same t0). 409 if there is no error to retry."""
+    with STATE.lock:
+        if not (STATE.running and STATE.prepare_error):
+            raise HTTPException(status_code=409, detail="There is no model-preparation error to retry.")
+        args = STATE.prepare_args
+        if not args:
+            raise HTTPException(status_code=409, detail="Nothing to retry for this session.")
+        # Clear the error and re-arm the preparing state. Capture + recording are untouched.
+        STATE.prepare_error = None
+        STATE.preparing = True
+        STATE.model_ready = False
+        STATE.prepare_phase = ""
+        STATE.prepare = None
+        # Re-open the hold so chunks captured from now on are buffered for the retried build to replay.
+        STATE.pending_audio = _PendingAudio(_PENDING_MAX_SAMPLES)
+        threading.Thread(target=_build_engine_async, args=args, daemon=True, name="engine-build").start()
+    return {"ok": True}
 
 
 def _resolve_tier_lang_prompt(req):
@@ -1255,13 +1408,19 @@ def _resolve_tier_lang_prompt(req):
     device = getattr(req, "device", None) or settings.get("device") or "auto"
     language = req.language if req.language else None  # "" -> None (auto-detect)
     engine_pref = (getattr(req, "engine", None) or settings.get("engine") or "auto")
-    tier = resolve_tier(quality or "auto", device, language, engine_pref)
+    # Auto model resolution (WP-3) can CROSS families when the language-preferred family has nothing
+    # downloaded but another usable family does (e.g. Afrikaans with only stock large-v3 on disk ->
+    # Whisper). resolve_tier_engine returns that crossing; fold it into the effective engine pref so
+    # the engine, warm-up and pre-flight all load the model Begin will actually use.
+    tier, engine_override = resolve_tier_engine(quality or "auto", device, language, engine_pref)
+    engine_pref = engine_override or engine_pref
     # Record the device decision in the log so a "why is it on CPU?" is answerable at a
     # glance (calling cuda_ready here also registers the libs before the engine loads).
     try:
         from .. import cudadl
         print(f"[tier] quality={quality!r} device={device!r} gpu_present={cudadl.gpu_present()} "
-              f"installed={cudadl.installed()} cuda_ready={cudadl.cuda_ready()} -> {tier}", flush=True)
+              f"installed={cudadl.installed()} cuda_ready={cudadl.cuda_ready()} "
+              f"engine_override={engine_override!r} -> {tier}", flush=True)
     except Exception:
         pass
     # default_context is prepended to the per-meeting prompt (participants + terms). Both StartRequest
@@ -1274,6 +1433,66 @@ def _resolve_tier_lang_prompt(req):
     parts = [p for p in (ctx.strip(), req.prompt.strip()) if p]
     prompt = ", ".join(parts) or None
     return tier, language, prompt, engine_pref
+
+
+def _resolve_download_plan(tier, language, engine_pref):
+    """The concrete model Begin will load AND its on-disk download target, so the async builder,
+    /api/preflight-model and Begin all agree on exactly what will (or will not) be fetched. Pure and
+    network-free (voicedl._present is a local-cache probe). Returns a dict:
+      model  - the concrete id to display/track (a Whisper size, a Fluister/Swivuriso repo, or a
+               local ct2 path on a dev machine),
+      target - the voicedl download target (a size for stock Whisper, a repo id for Fluister/Swivuriso),
+      family - "fluister" | "whisper" | "swivuriso",
+      size   - the stock size key (from the tier),
+      label  - the human quality label ("Fast"/"Balanced"/...),
+      approx_bytes - rough on-disk size for the progress estimate,
+      present - True iff Begin will NOT have to download (files already cached, or a local build)."""
+    from .. import voicedl
+    size = transcribe.TIER_CONFIG.get(tier, {}).get("model", "small")
+    model_id, family = transcribe.resolve_model(size, language, engine_pref)
+    if family == "fluister":
+        target = transcribe.FLUISTER_REPOS.get(size)
+        approx = voicedl._FLUISTER_SIZES.get(size, 0)
+    elif family == "swivuriso":
+        target = transcribe.SWIVURISO_REPO
+        approx = voicedl._SWIVURISO_SIZE
+    else:   # whisper (stock)
+        target = size
+        approx = voicedl._SIZES.get(size, 0)
+    # A local ct2 build (dev machine SA_LIVE_AF_MODEL / an af-lora-* or swivuriso dir) is present even
+    # though its HF repo is not cached; treat an existing local model dir as present so we never trigger
+    # a spurious repo download over a working local build.
+    present = False
+    if isinstance(model_id, str) and os.path.isdir(model_id):
+        present = True
+    elif target:
+        try:
+            present = voicedl._present(target)
+        except Exception:
+            present = False
+    return {"model": model_id, "target": target, "family": family, "size": size,
+            "label": _QUALITY_LABEL.get(size, size), "approx_bytes": approx, "present": present}
+
+
+def _start_model_download(family, size):
+    """Kick the matching voicedl background download for this family/size. Tolerates the single global
+    download slot already being busy (a Settings download, or a prior prepare attempt) by treating
+    "already downloading" as success - the builder then polls the existing progress. Returns True if a
+    download is running (ours or a pre-existing one), False if the kick failed for another reason."""
+    from .. import voicedl
+    try:
+        if family == "fluister":
+            voicedl.start_fluister_download(size)
+        elif family == "swivuriso":
+            voicedl.start_swivuriso_download()
+        else:
+            voicedl.start_download(size)
+        return True
+    except RuntimeError:
+        return True     # already downloading: poll the existing progress rather than erroring
+    except Exception as e:
+        print(f"[start] could not begin model download ({family}/{size}): {e}", flush=True)
+        return False
 
 
 def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_sink, browser_sink):
@@ -1295,28 +1514,138 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
     own lock, so no _feed.append can interleave. Session identity (started_at object identity,
     mirroring record_from_here / _on_downgrade) is re-checked at every step; a Stop/switch/new-start
     discards the engine. On build failure we surface prepare_error and leave capture + recording
-    running, so a model problem never loses the audio."""
-    try:
-        engine = transcribe.Engine(tier=tier, language=language, initial_prompt=prompt, engine=engine_pref)
-    except Exception as e:
-        # Do NOT crash the app or the session: capture + recording carry on (audio safe on disk if
-        # recording). Stop waiting for a model that will not arrive, surface the error for the UI, and
-        # free the held transcription audio (no engine will ever consume it).
-        print(f"[start] engine build failed: {e}", flush=True)
+    running, so a model problem never loses the audio.
+
+    WP-2 adds a real two-phase prepare BEFORE the engine is wired up: a "downloading" phase (only when
+    the model is not already cached) that polls voicedl.progress() into STATE.prepare and gives up with
+    a retryable error if no bytes arrive for PREPARE_DOWNLOAD_STALL_SECONDS, then a "loading" phase
+    (the Engine build, now a fast local_files_only cache hit) bounded by a PREPARE_LOAD_TIMEOUT_SECONDS
+    watchdog. Either failure leaves capture + recording running and is retryable via /api/prepare/retry.
+    WP-1 flips STATE.model_ready True at phase-1 end (engine built + started), independent of the
+    backlog drain, so a slow CPU can never leave the UI stuck on "preparing"."""
+    from .. import voicedl
+
+    def _still_ours():
+        # Cheap identity/liveness guard. NOTE it deliberately does NOT test STATE.preparing: WP-1 flips
+        # preparing False at phase-1 end while the drain is still running (and STATE.engine still None),
+        # so gating on preparing here would abort the drain the instant readiness flips. Stop/switch/
+        # new-start are detected via running/stopping/started_at, which is all this needs.
+        return (STATE.running and not STATE.stopping and STATE.started_at is session_token)
+
+    def _fail(msg, stalled=False):
+        # Surface a bounded, retryable prepare failure and stop waiting. Capture + recording keep
+        # running (audio safe on disk if recording); the held transcription backlog is freed since no
+        # engine will consume it. Session-identity guarded so a Stop/switch/new-start is never clobbered.
+        print(f"[start] model prepare failed: {msg}", flush=True)
         with STATE.lock:
             if (STATE.running and not STATE.stopping and STATE.started_at is session_token
                     and STATE.preparing):
-                STATE.prepare_error = f"Could not load the transcription model: {e}"
+                if isinstance(STATE.prepare, dict):
+                    STATE.prepare.update(phase="error", stalled=stalled)
+                STATE.prepare_error = msg
                 STATE.preparing = False
+                STATE.model_ready = False
+                STATE.prepare_phase = "error"
                 STATE.pending_audio = None
+
+    # Stash the build args so /api/prepare/retry can re-spawn this build (idempotent; start() stashes
+    # them too, but a retry re-enters here and must keep them fresh).
+    with STATE.lock:
+        if _still_ours() and STATE.preparing:
+            STATE.prepare_args = (session_token, tier, language, prompt, engine_pref, md_sink, browser_sink)
+
+    # Resolve the concrete model + on-disk download target (network-free) so progress + preflight agree.
+    try:
+        plan = _resolve_download_plan(tier, language, engine_pref)
+    except Exception as e:
+        _fail(f"Could not work out which transcription model to load: {e}")
         return
 
-    def _still_ours():
-        # Cheap identity/liveness guard, used lock-free in the drain loop and re-checked under the
-        # lock at the flip. During the drain STATE.engine is still None, so the Stop path cannot stop
-        # THIS engine; STATE.stopping is our signal to abort and clean up.
-        return (STATE.running and not STATE.stopping and STATE.started_at is session_token
-                and STATE.preparing)
+    def _set_prepare(phase, **extra):
+        with STATE.lock:
+            if not (_still_ours() and STATE.preparing):
+                return
+            d = {"phase": phase, "model": plan["target"] or plan["model"], "family": plan["family"],
+                 "size": plan["size"], "label": plan["label"],
+                 "downloaded": 0, "total": plan["approx_bytes"] or 0, "stalled": False}
+            if isinstance(STATE.prepare, dict):      # carry any bytes already observed across a phase change
+                for k in ("downloaded", "total"):
+                    d[k] = STATE.prepare.get(k, d[k])
+            d.update(extra)
+            STATE.prepare = d
+            STATE.prepare_phase = phase
+
+    # --- phase "downloading": only when the exact model file set is not already on disk. ---
+    if not plan["present"]:
+        _set_prepare("downloading")
+        if not _still_ours():
+            return
+        if not _start_model_download(plan["family"], plan["size"]):
+            _fail("Could not start the transcription model download. Check your connection and try again.")
+            return
+        last_downloaded = -1
+        last_change = time.monotonic()
+        while True:
+            if not _still_ours():
+                return
+            try:
+                prog = voicedl.progress()
+            except Exception:
+                prog = {}
+            dl = int(prog.get("downloaded") or 0)
+            tot = int(prog.get("total") or plan["approx_bytes"] or 0)
+            with STATE.lock:
+                if _still_ours() and isinstance(STATE.prepare, dict):
+                    STATE.prepare.update(downloaded=dl, total=tot)
+            if prog.get("state") == "error":
+                _fail("The model download failed. Check your connection and try again.")
+                return
+            done = prog.get("state") == "done"
+            if not done:
+                try:
+                    done = voicedl._present(plan["target"])
+                except Exception:
+                    done = False
+            if done:
+                break
+            # Stall detection: no byte growth for the whole window is a dead connection, not patience.
+            if dl > last_downloaded:
+                last_downloaded = dl
+                last_change = time.monotonic()
+            elif time.monotonic() - last_change >= PREPARE_DOWNLOAD_STALL_SECONDS:
+                _fail("The download stalled. Check your connection and try again.", stalled=True)
+                return
+            time.sleep(_PREPARE_POLL_SECONDS)
+
+    # --- phase "loading": build the Engine (a fast local_files_only cache hit now the files are
+    # present), bounded by a watchdog so a load that never returns becomes a retryable error instead of
+    # an endless spinner. The build runs in a sub-thread we join with a timeout; on timeout we bail and
+    # leave that thread to finish or die on its own (rare pathological case; documented seam).
+    _set_prepare("loading")
+    if not _still_ours():
+        return
+    build = {}
+
+    def _load():
+        try:
+            build["engine"] = transcribe.Engine(tier=tier, language=language,
+                                                 initial_prompt=prompt, engine=engine_pref)
+        except Exception as e:   # surfaced as prepare_error below; never crashes the app or session
+            build["error"] = e
+
+    lt = threading.Thread(target=_load, daemon=True, name="engine-load")
+    lt.start()
+    lt.join(PREPARE_LOAD_TIMEOUT_SECONDS)
+    if lt.is_alive():
+        _fail("Loading the transcription model timed out. Please try again.")
+        return
+    if "error" in build:
+        _fail(f"Could not load the transcription model: {build['error']}")
+        return
+    engine = build.get("engine")
+    if engine is None:
+        _fail("Could not load the transcription model on this computer.")
+        return
 
     def _replay(items):
         # Replay a batch into the engine in order. block=True with a short timeout so a healthy replay
@@ -1328,8 +1657,11 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
                     return False
         return True
 
-    # --- phase 1: wire the engine up, but DO NOT publish it yet. STATE.engine stays None, preparing
-    # stays True and the buffer stays OPEN, so _feed keeps buffering live chunks behind the backlog.
+    # --- phase 1: wire the engine up and DECLARE READINESS, but DO NOT publish STATE.engine yet.
+    # STATE.engine stays None and the buffer stays OPEN so _feed keeps buffering live chunks behind the
+    # backlog (ordering integrity); STATE.model_ready flips True here (WP-1) so the UI goes live the
+    # instant transcription can run, decoupled from the drain. If catch-up never completes, STATE.engine
+    # simply stays None forever and that is fine: the UI is already live and the transcript streams.
     with STATE.lock:
         if not _still_ours():
             try:
@@ -1361,6 +1693,14 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
         # Re-affirm model/family from the built engine (set optimistically from resolve_model at Begin).
         STATE.model = engine.model_name
         STATE.family = engine.family
+        # WP-1 ready flip: transcription is live NOW (engine built + started). Clear preparing, mark
+        # ready, drop the prepare-progress object. Keep STATE.engine None + the buffer OPEN for the
+        # drain below. This is the single point that eliminates the "stuck on preparing" residual.
+        STATE.preparing = False
+        STATE.model_ready = True
+        STATE.prepare_phase = "ready"
+        STATE.prepare = None
+        STATE.prepare_error = None
         pb = STATE.pending_audio
 
     if pb is None:                       # defensive: a stop between publish and here cleared it
@@ -1404,14 +1744,20 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
             def _publish():
                 # Runs under the buffer lock (see finalise_if_empty): from here append() returns False,
                 # so _feed feeds the now-published engine directly, in order, after everything drained.
+                # preparing/model_ready were already settled at phase-1 end; this only completes the
+                # backlog->live ordering flip.
                 STATE.engine = engine
                 STATE.preparing = False
                 STATE.pending_audio = None
 
             stragglers = pb.finalise_if_empty(_publish)
             if stragglers is None:
-                # Published. Arm the long-silence watcher (it reads the engine + rings); a record-only
-                # session armed its own in start(). Under the lock, as _silence_start expects.
+                # Published. Arm the long-silence watcher (it reads STATE.engine + rings); a record-only
+                # session armed its own in start(). Under the lock, as _silence_start expects. Kept at
+                # the publish point (not phase-1 end) deliberately: the watcher reads STATE.engine, which
+                # is None until here; a minutes-scale silence nudge is unaffected by arming ~1 drain
+                # cycle later, and in the pathological never-publish case the audio is demonstrably
+                # non-silent (a growing backlog), so there is nothing for it to catch anyway.
                 _silence_start(STATE.capture)
         if stragglers is None:
             break                        # finalised: the engine is live and _feed feeds it directly
@@ -1477,7 +1823,13 @@ def start(req: StartRequest):
         STATE.recording_started = record_on   # latch: a start-time recording counts as "has recorded"
         STATE.transcribing = transcribe_on
         STATE.preparing = transcribe_on       # only a transcription session waits on a model load
+        # Ready-state hardening (WP-1): a record-only session is "ready" immediately (nothing to load);
+        # a transcription session is not ready until the background build flips model_ready at phase-1
+        # end. Clear any prior error / progress so a fresh session starts clean.
+        STATE.model_ready = (not transcribe_on)
         STATE.prepare_error = None
+        STATE.prepare_phase = ""
+        STATE.prepare = None
         # The transcription copy of every pre-engine chunk (bounded, drop-oldest). Recording, if on,
         # is already on disk from t0 via the recorder, so this only has to cover the model load.
         STATE.pending_audio = _PendingAudio(_PENDING_MAX_SAMPLES) if transcribe_on else None
@@ -1539,9 +1891,13 @@ def start(req: StartRequest):
         # Kick off the background model load + engine attach. Capture and recording are already live;
         # this only fills in transcription, replaying everything held since Begin once the model is up.
         if transcribe_on:
+            build_args = (session_token, tier, language, prompt, engine_pref, md_sink, browser_sink)
+            # Stash the build args so /api/prepare/retry can re-spawn the background build after a
+            # bounded failure without restarting capture/recording (same session_token => same session).
+            STATE.prepare_args = build_args
             threading.Thread(
                 target=_build_engine_async,
-                args=(session_token, tier, language, prompt, engine_pref, md_sink, browser_sink),
+                args=build_args,
                 daemon=True, name="engine-build").start()
 
         return {
@@ -2516,8 +2872,9 @@ def voice_model_delete(req: VoiceDownloadRequest):
     with STATE.lock:
         # A live CPU session can downgrade to a smaller model on the fly (the CPU
         # ladder in transcribe.py), so STATE.model is not a reliable "in use" marker.
-        # Refuse removing ANY transcription model while an engine is loaded.
-        if STATE.engine is not None:
+        # Refuse removing ANY transcription model while an engine is loaded OR a session is still
+        # preparing one (STATE.engine is None during prepare, so preparing must be checked too).
+        if STATE.engine is not None or STATE.preparing:
             raise HTTPException(status_code=409, detail="A transcription session is running. Stop it before removing a transcription model.")
     try:
         voicedl.delete(req.model)
@@ -2564,7 +2921,7 @@ def voice_model_update(req: VoiceUpdateRequest):
     since updating swaps the files a live engine may load."""
     from .. import voicedl
     with STATE.lock:
-        if STATE.engine is not None:
+        if STATE.engine is not None or STATE.preparing:
             raise HTTPException(status_code=409, detail="A transcription session is running. Stop it before updating a model.")
     try:
         voicedl.start_fluister_update(req.size)
@@ -2586,7 +2943,7 @@ def voice_model_swivuriso_download():
     engine may read."""
     from .. import voicedl
     with STATE.lock:
-        if STATE.engine is not None:
+        if STATE.engine is not None or STATE.preparing:
             raise HTTPException(status_code=409, detail="A transcription session is running. Stop it before downloading a model.")
     try:
         voicedl.start_swivuriso_download()
@@ -2602,7 +2959,7 @@ def voice_model_fluister_download(req: VoiceUpdateRequest):
     silently at first use. Background; the UI polls /api/voice-models. Refused while a session runs."""
     from .. import voicedl
     with STATE.lock:
-        if STATE.engine is not None:
+        if STATE.engine is not None or STATE.preparing:
             raise HTTPException(status_code=409, detail="A transcription session is running. Stop it before downloading a model.")
     try:
         voicedl.start_fluister_download(req.size)

@@ -74,17 +74,22 @@ class FakeCapture:
 @contextlib.contextmanager
 def stubs(engine_cls):
     tmp = Path(tempfile.mkdtemp())
+    from live_transcribe import voicedl as _voicedl
     saved = (webapp._sessions_dir, webapp._silence_start,
-             webapp.capture.AudioCapture, webapp.transcribe.Engine)
+             webapp.capture.AudioCapture, webapp.transcribe.Engine, _voicedl._present)
     webapp._sessions_dir = lambda: tmp
     webapp._silence_start = lambda cap: None            # no watcher threads in the test
     webapp.capture.AudioCapture = FakeCapture
     webapp.transcribe.Engine = engine_cls
+    # Model is always "present" so the async builder skips its download phase and goes straight to the
+    # (stubbed) load: these tests pin the capture/replay seam, not model fetching, and must not depend
+    # on which models happen to be cached on the machine running them.
+    _voicedl._present = lambda target: True
     try:
         yield
     finally:
         (webapp._sessions_dir, webapp._silence_start,
-         webapp.capture.AudioCapture, webapp.transcribe.Engine) = saved
+         webapp.capture.AudioCapture, webapp.transcribe.Engine, _voicedl._present) = saved
 
 
 def reset_state():
@@ -382,11 +387,91 @@ def test_backlog_stays_ahead_of_live_during_replay():
     print("  OK  live chunks arriving DURING replay land strictly after the whole backlog, in order, zero drops")
 
 
+def test_asr_slower_than_realtime_forever_stays_ready():
+    # WP-1 ready-state hardening: if transcription can NEVER catch up (a stub engine whose queue never
+    # drains), model_ready must STILL flip True at phase-1 end and STAY True, preparing must clear, the
+    # engine must never be published (STATE.engine stays None while the backlog never drains), and
+    # _feed must drop ZERO chunks - it just keeps buffering. This is the exact case that used to leave
+    # the UI stuck on "preparing"; readiness is now decoupled from the drain completing.
+    reset_state()
+    release = threading.Event()
+    seen = []
+    slock = threading.Lock()
+
+    class NeverDrainsEngine:
+        model_name = "fake-model"
+        family = "whisper"
+        engine = "auto"
+
+        def __init__(self, **kw):
+            if not release.wait(timeout=20.0):
+                raise RuntimeError("test never released the engine build")
+
+        def subscribe(self, fn):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def pending(self):
+            return 999
+
+        def on_chunk(self, source, audio, t_start, block=False, timeout=None):
+            # The queue is perpetually full: record the attempt, wait like the real block=True path so
+            # the drain is not a busy-spin, and report failure so the backlog never drains and the
+            # engine is never published.
+            with slock:
+                seen.append(t_start)
+            time.sleep(min(timeout or 0.05, 0.05))
+            return False
+
+    try:
+        with stubs(NeverDrainsEngine):
+            r = client.post("/api/start", json=START_BODY)
+            assert r.status_code == 200, r.text
+            # Buffer a backlog WHILE the build is blocked, so once it releases the drain has something
+            # to (fail to) replay and can never reach the empty-buffer finalise.
+            for i in range(20):
+                src = "MIC" if i % 2 == 0 else "SYS"
+                webapp._feed(src, np.full(160, i, dtype=np.float32), float(i))
+            assert webapp.STATE.pending_audio is not None, "no pending buffer while preparing"
+            # Release the build: model_ready must flip true even though the drain will never complete.
+            release.set()
+            assert wait_until(lambda: client.get("/api/status").json().get("model_ready") is True, 10.0), \
+                "model_ready never flipped true for a never-draining engine"
+            st = client.get("/api/status").json()
+            assert st["preparing"] is False and st["prepare_error"] is None, st
+            assert webapp.STATE.engine is None, "engine must NOT be published while the backlog never drains"
+            # Feed MORE after readiness: still buffered behind the stuck backlog, still zero drops.
+            for i in range(20, 40):
+                src = "MIC" if i % 2 == 0 else "SYS"
+                webapp._feed(src, np.full(160, i, dtype=np.float32), float(i))
+            time.sleep(0.5)   # let the drain spin a few cycles on the stuck first chunk
+            st2 = client.get("/api/status").json()
+            assert st2["model_ready"] is True and st2["preparing"] is False, st2
+            assert webapp.STATE.engine is None, "engine published despite a never-draining backlog"
+            assert webapp.STATE.pending_audio is not None, "buffer closed though the drain never finished"
+            assert webapp.STATE.pending_audio._warned is False, "the pending buffer dropped a chunk (overflow); it must not"
+            # The stub is stuck retrying the FIRST backlog chunk (t=0.0): the drain never advances while
+            # readiness is already live, which is exactly the decoupling being asserted.
+            with slock:
+                distinct = sorted(set(seen))
+            assert distinct == [0.0], f"drain advanced past / away from the stuck first chunk: {distinct}"
+    finally:
+        release.set()
+        reset_state()
+    print("  OK  never-draining ASR: model_ready flips true and STAYS true, preparing clears, engine unpublished, zero drops")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_start_returns_before_model_loads,
                test_buffer_and_replay_in_order_no_drops,
                test_backlog_stays_ahead_of_live_during_replay,
+               test_asr_slower_than_realtime_forever_stays_ready,
                test_build_failure_keeps_capturing,
                test_pending_buffer_bounds_and_drop_take_finalise):
         try:

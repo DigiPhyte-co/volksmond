@@ -202,22 +202,25 @@ def test_auto_prefers_downloaded_size():
         # (7) reward the smaller download: only small present -> cpu (avoids a surprise medium download).
         M._downloaded_sizes = lambda fam: {"small"}
         assert M.resolve_tier("auto", "cpu", "af") == "cpu", "cpu small present -> cpu"
-        # (7) NEVER exceed the ceiling: turbo/large-v3 downloaded but medium/small absent -> ceiling.
+        # (4, cert win) Only an above-ceiling model on disk (turbo/large-v3, no medium/small): START on
+        # it rather than triggering a surprise download of the ceiling model - the live CPU ladder
+        # claws real-time back. Largest downloaded here is large-v3-turbo -> cpu-strong.
         M._downloaded_sizes = lambda fam: {"large-v3", "large-v3-turbo"}
-        assert M.resolve_tier("auto", "cpu", "af") == "cpu-mid", "cpu above-ceiling ignored -> ceiling"
+        assert M.resolve_tier("auto", "cpu", "af") == "cpu-strong", "cpu above-ceiling-only -> use it (cpu-strong)"
         # (7) nothing downloaded -> today's _cpu_auto_tier() result (no regression).
         M._downloaded_sizes = lambda fam: set()
         assert M.resolve_tier("auto", "cpu", "af") == "cpu-mid", "cpu nothing -> _cpu_auto_tier()"
-        # (7) weak CPU (ceiling = small): a downloaded medium sits ABOVE the ceiling -> falls back to cpu.
+        # (4, cert win) weak CPU (ceiling = small): only a downloaded medium (above the ceiling) -> use
+        # it anyway (cpu-mid) instead of downloading small, since it is already on disk.
         M._cpu_auto_tier = lambda: "cpu"
         M._downloaded_sizes = lambda fam: {"medium"}
-        assert M.resolve_tier("auto", "cpu", "af") == "cpu", "weak-cpu medium above small ceiling -> cpu"
+        assert M.resolve_tier("auto", "cpu", "af") == "cpu-mid", "weak-cpu above-ceiling medium -> use it (cpu-mid)"
         # (1) explicit CPU pick unchanged.
         M._downloaded_sizes = lambda fam: {"small"}
         assert model(M.resolve_tier("large-v3", "cpu", "en")) == "large-v3", "explicit large-v3 on cpu honoured"
     finally:
         _cudadl.cuda_ready, M._downloaded_sizes, M._cpu_auto_tier = orig_cuda, orig_dl, orig_cpu
-    print("  OK  auto prefers largest downloaded size within the hardware ceiling; explicit + swivuriso unchanged")
+    print("  OK  auto prefers a downloaded size (within ceiling, else above-ceiling for the cert win); explicit + swivuriso unchanged")
 
 
 def test_context_override():
@@ -229,9 +232,11 @@ def test_context_override():
     import types
     from live_transcribe.web import app as A
     from live_transcribe import config as C
-    orig_load, orig_resolve = C.load, A.resolve_tier
+    orig_load, orig_resolve = C.load, A.resolve_tier_engine
     C.load = lambda: {"default_context": "CompanyCtx", "tier": "auto", "device": "auto", "engine": "auto"}
-    A.resolve_tier = lambda *a, **k: "cpu-mid"          # isolate the prompt merge from tier/CUDA
+    # _resolve_tier_lang_prompt resolves the tier via resolve_tier_engine (which also returns the
+    # cross-family override); stub it to isolate the prompt merge from tier/CUDA/disk.
+    A.resolve_tier_engine = lambda *a, **k: ("cpu-mid", None)
     try:
         prompt = lambda req: A._resolve_tier_lang_prompt(req)[2]
         # No override: saved default prepended (behaviour unchanged).
@@ -247,7 +252,7 @@ def test_context_override():
         # A request without the field (defensive getattr) still resolves to the saved default.
         assert prompt(types.SimpleNamespace(tier="auto", device="auto", language="af", prompt="Z", engine="auto")) == "CompanyCtx, Z"
     finally:
-        C.load, A.resolve_tier = orig_load, orig_resolve
+        C.load, A.resolve_tier_engine = orig_load, orig_resolve
     print("  OK  context override: per-meeting replaces default, empty suppresses, import honours it")
 
 
@@ -1441,6 +1446,96 @@ def test_store_build_registers_no_app_update_check():
     print("  OK  the store build strips only /api/check-updates; model updates and calendar stay")
 
 
+def test_preflight_model_api():
+    # WP-3 pre-flight: what model Begin will load, whether it is already on disk (present==True means
+    # Begin will NOT download), and the downloaded alternatives for the pre-start modal. Stateless and
+    # CSRF-protected; agrees with resolve_tier_engine + the download plan Begin uses.
+    from live_transcribe import __main__ as M
+    from live_transcribe import cudadl as _cudadl
+    from live_transcribe import voicedl as V
+    bare = TestClient(app, base_url="http://localhost")
+    assert bare.post("/api/preflight-model", json={}).status_code == 403, "preflight not CSRF-protected"
+    # Full response schema; on this machine models are cached so present is True.
+    j = client.post("/api/preflight-model",
+                    json={"tier": "auto", "device": "auto", "language": "af", "engine": "auto"}).json()
+    for k in ("model", "size", "family", "label", "present", "approx_bytes", "device",
+              "engine_override", "downloaded_alternatives"):
+        assert k in j, (k, j)
+    assert isinstance(j["present"], bool) and isinstance(j["downloaded_alternatives"], list), j
+    assert j["device"] in ("cpu", "gpu"), j
+    for a in j["downloaded_alternatives"]:
+        for k in ("size", "family", "label", "model", "approx_bytes", "quality_note"):
+            assert k in a, (k, a)
+    # present==False when the model is not on disk: stub the cache probe AND force a non-local repo so
+    # this dev machine's local Fluister build does not mask absence.
+    orig_present, orig_resolve = V._present, webapp.transcribe.resolve_model
+    V._present = lambda t: False
+    webapp.transcribe.resolve_model = lambda size, language, engine="auto": ("digiphyte/fluister-" + size, "fluister")
+    try:
+        jf = client.post("/api/preflight-model",
+                         json={"tier": "medium", "device": "cpu", "language": "af", "engine": "auto"}).json()
+        assert jf["present"] is False, jf
+    finally:
+        V._present, webapp.transcribe.resolve_model = orig_present, orig_resolve
+    # engine_override is surfaced when Auto crosses families (language family empty, other family has a
+    # download). Stub cuda_ready + the on-disk check so it is deterministic.
+    orig_cuda, orig_dl = _cudadl.cuda_ready, M._downloaded_sizes
+    _cudadl.cuda_ready = lambda: True
+    M._downloaded_sizes = lambda fam: {"large-v3"} if fam == "whisper" else set()
+    try:
+        jc = client.post("/api/preflight-model",
+                         json={"tier": "auto", "device": "auto", "language": "af", "engine": "auto"}).json()
+        assert jc["engine_override"] == "whisper", jc
+        assert jc["family"] == "whisper", jc
+    finally:
+        _cudadl.cuda_ready, M._downloaded_sizes = orig_cuda, orig_dl
+    print("  OK  /api/preflight-model: full schema, present true/false, cross-family engine_override, CSRF-protected")
+
+
+def test_status_prepare_block_schema():
+    # WP-1/WP-2: the /api/status running dict carries model_ready (authoritative), preparing,
+    # prepare_error, and a prepare block present ONLY while preparing OR on error, with the pinned
+    # schema. Drive it by setting STATE directly (the same pattern the silence/struggle tests use).
+    from live_transcribe.web import app as A
+    with A.STATE.lock:
+        saved = (A.STATE.running, A.STATE.source_kind, A.STATE.preparing, A.STATE.model_ready,
+                 A.STATE.prepare, A.STATE.prepare_error)
+        A.STATE.running = True
+        A.STATE.source_kind = "live"
+        A.STATE.preparing = True
+        A.STATE.model_ready = False
+        A.STATE.prepare_error = None
+        A.STATE.prepare = {"phase": "downloading", "model": "digiphyte/fluister-small",
+                           "family": "fluister", "size": "small", "label": "Fast",
+                           "downloaded": 50, "total": 250, "stalled": False}
+    try:
+        st = client.get("/api/status").json()
+        assert st["preparing"] is True and st["model_ready"] is False and st["prepare_error"] is None, st
+        p = st["prepare"]
+        assert isinstance(p, dict), st
+        for k in ("phase", "model", "family", "size", "label", "downloaded", "total", "stalled"):
+            assert k in p, (k, p)
+        # Ready: prepare is null (present only while preparing or on error).
+        with A.STATE.lock:
+            A.STATE.preparing = False
+            A.STATE.model_ready = True
+        assert client.get("/api/status").json()["prepare"] is None, "prepare should be null once ready"
+        # Error: prepare is present again alongside prepare_error.
+        with A.STATE.lock:
+            A.STATE.model_ready = False
+            A.STATE.prepare_error = "The download stalled. Check your connection and try again."
+            A.STATE.prepare = {"phase": "error", "model": "digiphyte/fluister-small",
+                               "family": "fluister", "size": "small", "label": "Fast",
+                               "downloaded": 0, "total": 250, "stalled": True}
+        se = client.get("/api/status").json()
+        assert se["prepare_error"] and se["prepare"] and se["prepare"]["stalled"] is True, se
+    finally:
+        with A.STATE.lock:
+            (A.STATE.running, A.STATE.source_kind, A.STATE.preparing, A.STATE.model_ready,
+             A.STATE.prepare, A.STATE.prepare_error) = saved
+    print("  OK  /api/status: model_ready authoritative + prepare block present only while preparing or on error")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_app_info,
@@ -1493,7 +1588,9 @@ if __name__ == "__main__":
                test_notify_meeting_needs_a_business_licence,
                test_notify_meeting_shows_one_toast_with_the_subject,
                test_offline_build_registers_no_calendar_routes,
-               test_store_build_registers_no_app_update_check):
+               test_store_build_registers_no_app_update_check,
+               test_preflight_model_api,
+               test_status_prepare_block_schema):
         try:
             fn()
         except AssertionError as e:
