@@ -616,6 +616,217 @@ def test_partial_transcription_stop_makes_builder_bail():
     print("  OK  stopping only transcription mid-load makes the in-flight builder bail, no resurrection (P1-4)")
 
 
+def test_stop_during_catchup_no_two_feeders():
+    # P1-3 (hand-off, not a timeout that proceeds concurrently): when Stop lands while the builder is
+    # STILL feeding a SLOW engine mid-replay, the builder must release ownership PROMPTLY - put its
+    # unsubmitted tail back at the front of the buffer and exit - so the stop path is the SOLE feeder.
+    # Assert: no reorder, no lost tail, and never two threads inside on_chunk at once. The engine here
+    # accepts a prefix from the builder then blocks it (returns False) so the join would have timed out
+    # under the old design; the fix hands off instead.
+    reset_state()
+    build_gate = threading.Event()
+    reached_full = threading.Event()
+    lock = threading.Lock()
+    received = []
+    inside = [0]
+    concurrent = [False]
+    builder_accepted = [0]
+    K = 5
+
+    class SlowHandoffEngine:
+        model_name = "fake-model"
+        family = "whisper"
+        engine = "auto"
+
+        def __init__(self, **kw):
+            self.stopped_drain = None
+            if not build_gate.wait(20.0):
+                raise RuntimeError("test never released the engine build")
+
+        def subscribe(self, fn):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self, drain=False, timeout=None):
+            self.stopped_drain = drain
+
+        def pending(self):
+            return 0
+
+        def is_alive(self):
+            return True
+
+        def on_chunk(self, source, audio, t_start, block=False, timeout=None):
+            tname = threading.current_thread().name
+            with lock:
+                inside[0] += 1
+                if inside[0] > 1:
+                    concurrent[0] = True
+                bfed = builder_accepted[0]
+            try:
+                # Once the builder has fed K, the engine "fills up" for it (returns False), so the builder
+                # spins in the replay retry loop where it must notice the Stop and hand off. The stop-path
+                # drain thread ("stop-drain") is always accepted, so it feeds the handed-back tail.
+                if tname == "engine-build" and bfed >= K:
+                    reached_full.set()
+                    time.sleep(min(timeout or 0.05, 0.05))
+                    return False
+                with lock:
+                    received.append((source, t_start, tname))
+                    if tname == "engine-build":
+                        builder_accepted[0] += 1
+                return True
+            finally:
+                with lock:
+                    inside[0] -= 1
+
+    try:
+        with stubs(SlowHandoffEngine):
+            r = client.post("/api/start", json=START_BODY)
+            assert r.status_code == 200, r.text
+            backlog = []
+            for i in range(15):
+                src = "MIC" if i % 2 == 0 else "SYS"
+                webapp._feed(src, np.full(160, i, dtype=np.float32), float(i))
+                backlog.append((src, float(i)))
+            build_gate.set()
+            assert reached_full.wait(10.0), "builder never reached the mid-replay full state"
+            assert webapp.STATE.engine is None and webapp.STATE.preparing_engine is not None, "not in catch-up"
+            eng = webapp.STATE.preparing_engine
+            with lock:
+                fed_before = [(s, t) for (s, t, _n) in received]
+            assert fed_before == backlog[:K], f"builder should have fed exactly the first {K}: {fed_before}"
+            # Stop mid-replay. The builder hands off; the stop path drains the rest.
+            rs = client.post("/api/stop?what=all")
+            assert rs.status_code == 200, rs.text
+            assert wait_until(lambda: not webapp.STATE.running, 15.0), "stop never finalised the session"
+            with lock:
+                got = [(s, t) for (s, t, _n) in received]
+                threads = [n for (_s, _t, n) in received]
+                conc = concurrent[0]
+            assert got == backlog, f"reorder/loss across the hand-off:\n got {got}\n exp {backlog}"
+            assert conc is False, "two feeders were inside on_chunk at once (P1-3)"
+            assert eng.stopped_drain is True, "the stop path did not drain the private engine"
+            # Clean boundary: the builder fed the prefix, the stop-drain thread fed the handed-back tail.
+            assert threads[:K] == ["engine-build"] * K, threads
+            assert all(n == "stop-drain" for n in threads[K:]), threads
+    finally:
+        build_gate.set()
+        reset_state()
+    print("  OK  Stop mid-catch-up hands off cleanly: no reorder, no lost tail, single feeder at a time (P1-3)")
+
+
+def test_dead_worker_during_replay_surfaces_error():
+    # P1-6: a worker that dies DURING catch-up (after model_ready flipped) must surface a retryable
+    # prepare_error, not sit forever on a "Listening" lie. The buffer is kept (P1-2) and the unsubmitted
+    # tail put back so a retry resumes.
+    reset_state()
+    build_gate = threading.Event()
+    dead = threading.Event()
+    lock = threading.Lock()
+    received = []
+    K = 3
+
+    class DyingEngine:
+        model_name = "fake-model"
+        family = "whisper"
+        engine = "auto"
+
+        def __init__(self, **kw):
+            if not build_gate.wait(20.0):
+                raise RuntimeError("test never released the engine build")
+
+        def subscribe(self, fn):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self, drain=False, timeout=None):
+            pass
+
+        def pending(self):
+            return 0
+
+        def is_alive(self):
+            return not dead.is_set()
+
+        def on_chunk(self, source, audio, t_start, block=False, timeout=None):
+            with lock:
+                if len(received) >= K:
+                    dead.set()          # the worker "dies" mid-replay
+                    return False
+                received.append((source, t_start))
+            return True
+
+    try:
+        with stubs(DyingEngine):
+            r = client.post("/api/start", json=START_BODY)
+            assert r.status_code == 200, r.text
+            for i in range(10):
+                src = "MIC" if i % 2 == 0 else "SYS"
+                webapp._feed(src, np.full(160, i, dtype=np.float32), float(i))
+            build_gate.set()
+            assert wait_until(lambda: client.get("/api/status").json().get("prepare_error"), 10.0), \
+                "a dead worker during catch-up never surfaced prepare_error (P1-6)"
+            st = client.get("/api/status").json()
+            assert st["model_ready"] is False, "model_ready stuck True with a dead engine (the 'Listening' lie)"
+            assert st["running"] is True, st            # capture kept running
+            assert webapp.STATE.engine is None and webapp.STATE.preparing_engine is None, st
+            assert webapp.STATE.pending_audio is not None, "buffer must be retained for a retry after a dead worker"
+    finally:
+        build_gate.set()
+        reset_state()
+    print("  OK  a worker that dies mid catch-up surfaces a retryable error, not a permanent 'Listening' (P1-6)")
+
+
+def test_dead_worker_at_start_surfaces_error():
+    # P1-6: a worker that is already dead the instant it starts (empty backlog, so the replay-loop
+    # liveness check never runs) must STILL surface a retryable error rather than be published ready.
+    reset_state()
+
+    class DeadAtStartEngine:
+        model_name = "fake-model"
+        family = "whisper"
+        engine = "auto"
+
+        def __init__(self, **kw):
+            pass
+
+        def subscribe(self, fn):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self, drain=False, timeout=None):
+            pass
+
+        def pending(self):
+            return 0
+
+        def is_alive(self):
+            return False   # the worker never came up
+
+        def on_chunk(self, source, audio, t_start, block=False, timeout=None):
+            return True
+
+    try:
+        with stubs(DeadAtStartEngine):
+            r = client.post("/api/start", json=START_BODY)
+            assert r.status_code == 200, r.text
+            assert wait_until(lambda: client.get("/api/status").json().get("prepare_error"), 10.0), \
+                "a worker dead at start never surfaced prepare_error (P1-6)"
+            st = client.get("/api/status").json()
+            assert st["model_ready"] is False, "model_ready went True for a worker that never ran (P1-6)"
+            assert webapp.STATE.engine is None and webapp.STATE.preparing_engine is None, st
+    finally:
+        reset_state()
+    print("  OK  a worker dead immediately after start surfaces a retryable error, not a fake 'ready' (P1-6)")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_start_returns_before_model_loads,
@@ -624,7 +835,10 @@ if __name__ == "__main__":
                test_asr_slower_than_realtime_forever_stays_ready,
                test_build_failure_keeps_capturing,
                test_stop_during_catchup_drains_backlog,
+               test_stop_during_catchup_no_two_feeders,
                test_partial_transcription_stop_makes_builder_bail,
+               test_dead_worker_during_replay_surfaces_error,
+               test_dead_worker_at_start_surfaces_error,
                test_pending_buffer_bounds_and_drop_take_finalise):
         try:
             fn()

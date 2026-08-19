@@ -299,6 +299,11 @@ PREPARE_DOWNLOAD_STALL_SECONDS = 60
 # total, flat) still fails at PREPARE_DOWNLOAD_STALL_SECONDS.
 PREPARE_VERIFY_GRACE_SECONDS = 180
 PREPARE_LOAD_TIMEOUT_SECONDS = 120
+# A DIFFERENT model may already own the single global download slot (a Settings download). We wait for
+# it rather than fight, but only for a bounded time: an indefinitely-occupied slot would starve this
+# session forever (another "loads indefinitely"), so past this we surface a distinct retryable error and
+# let Retry pick up once the slot is free (new P2).
+PREPARE_FOREIGN_SLOT_TIMEOUT_SECONDS = 180
 # How often the background builder polls voicedl.progress() into STATE.prepare while downloading.
 _PREPARE_POLL_SECONDS = 0.5
 
@@ -370,6 +375,25 @@ class _PendingAudio:
             self._samples = 0
             return items
 
+    def putback_front(self, items):
+        """Return an unsubmitted batch to the FRONT of the buffer, in order, so it drains again AHEAD of
+        any later chunks. Used at the stop hand-off (P1-3): when the builder is asked to stop mid-replay
+        it puts its not-yet-enqueued tail back here (earliest t_start) so the stop path re-drains it
+        before the chunks that arrived behind it, with no reorder and no loss. Deliberately does NOT
+        enforce the sample cap (the caller drains immediately; dropping the just-returned oldest chunks
+        would be the opposite of the intent). A no-op once the buffer is closed."""
+        if not items:
+            return
+        with self._lock:
+            if self._closed:
+                return
+            for it in reversed(items):
+                self._buf.appendleft(it)
+                try:
+                    self._samples += len(it[1])
+                except TypeError:
+                    pass
+
     def finalise_if_empty(self, on_close):
         """The atomic buffer->engine flip. Under the buffer's lock: if the buffer is EMPTY, close it
         and run on_close() (which publishes the engine) BEFORE releasing the lock, then return None;
@@ -398,10 +422,13 @@ def _engine_alive(engine):
         return True
 
 
-# How long a Stop during model catch-up waits for the background builder to hand off the private engine
-# before draining it (P1-3). The builder yields within one replay timeout of the Stop, so this is only a
-# safety cap; a healthy hand-off returns almost immediately.
-_BUILDER_HANDOFF_JOIN_SECONDS = 15
+# How long a Stop during model catch-up waits for the background builder to RELEASE the private engine
+# (return from its thread) before it may drain that engine. The builder yields within one replay timeout
+# of the Stop (it puts its unsubmitted tail back and returns), so a healthy hand-off completes in well
+# under a second; this is only a safety cap. If it is EXCEEDED the stop path must ABORT the drain rather
+# than feed/stop the engine while the builder might still feed it - two concurrent feeders would reorder
+# and lose audio (P1-3). It never fires in practice.
+_BUILDER_HANDOFF_JOIN_SECONDS = 30
 
 
 def _drain_pending_into_engine(engine, pb):
@@ -1664,6 +1691,7 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
             return
         last_downloaded = -1
         last_change = time.monotonic()
+        foreign_since = None   # when a DIFFERENT model started occupying the slot (bounded, see below)
         while True:
             if not _still_ours():
                 return
@@ -1687,6 +1715,7 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
                 _fail("The model download failed. Check your connection and try again.")
                 return
             if state == "downloading" and ours:
+                foreign_since = None
                 dl = int(prog.get("downloaded") or 0)
                 tot = int(prog.get("total") or plan["approx_bytes"] or 0)
                 with STATE.lock:
@@ -1707,15 +1736,25 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
                 # The slot is free (idle / a foreign download finished or errored) but our model is not
                 # present yet: (re)start our own download rather than poll a slot that will never become
                 # ours (P1-5). A stall attempt that reached a terminal state is thus restartable on retry.
+                foreign_since = None
                 if not _start_model_download(plan["family"], plan["size"]):
                     _fail("Could not start the transcription model download. Check your connection and try again.")
                     return
                 last_downloaded = -1
                 last_change = time.monotonic()
             else:
-                # A DIFFERENT model holds the slot: wait for it without failing ourselves as stalled.
+                # A DIFFERENT model holds the slot: wait for it, but BOUNDED - a stuck foreign download
+                # must not starve us forever. Keep our own stall clock paused (we are not the one
+                # downloading), and after the bound surface a distinct retryable error so Retry can pick up
+                # once the slot is free (new P2 from the P1-5 fix).
+                now = time.monotonic()
+                if foreign_since is None:
+                    foreign_since = now
+                elif now - foreign_since >= PREPARE_FOREIGN_SLOT_TIMEOUT_SECONDS:
+                    _fail("Another model is still downloading. Please try again shortly.")
+                    return
                 last_downloaded = -1
-                last_change = time.monotonic()
+                last_change = now
             time.sleep(_PREPARE_POLL_SECONDS)
 
     # --- phase "loading": build the Engine (a fast local_files_only cache hit now the files are
@@ -1755,22 +1794,55 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
             if STATE.preparing_engine is engine:
                 STATE.preparing_engine = None
 
+    def _catchup_failed(msg, remainder=None):
+        # A failure DURING catch-up, i.e. AFTER phase-1 already flipped model_ready True and cleared
+        # STATE.preparing (a dead/wedged engine worker). _fail() is keyed on STATE.preparing and would be
+        # a no-op here, which used to leave model_ready True, engine None and the buffer open forever -
+        # a permanent "Listening" lie (P1-6). This transition is keyed on preparing_engine identity
+        # INSTEAD, undoes readiness, surfaces a retryable prepare_error, and stops+releases the failed
+        # engine. The pending buffer is KEPT (P1-2) and any unsubmitted batch is put back at its front so
+        # a retry resumes from where the worker died rather than dropping more audio.
+        print(f"[start] transcription engine failed during catch-up: {msg}", flush=True)
+        try:
+            engine.stop(drain=False)
+        except Exception:
+            pass
+        with STATE.lock:
+            if STATE.preparing_engine is not engine:
+                return   # superseded / already handled by a newer path
+            if remainder:
+                pb2 = STATE.pending_audio
+                if pb2 is not None:
+                    pb2.putback_front(remainder)
+            STATE.model_ready = False
+            STATE.preparing = False
+            STATE.prepare_error = msg
+            STATE.prepare_phase = "error"
+            if isinstance(STATE.prepare, dict):
+                STATE.prepare.update(phase="error")
+            STATE.preparing_engine = None
+
     def _replay(items):
         # Replay a batch into the engine in order. block=True with a short timeout so a healthy replay
-        # never drops on the maxsize=32 queue (it waits for space and retries). Returns:
-        #   "ok"         - the whole batch was enqueued;
-        #   "superseded" - the session was replaced/reset mid-batch (discard the engine);
-        #   "dead"       - the engine worker exited mid-batch (a wedged/dead worker: fail, don't loop
-        #                  forever lying that we are Listening - P1-6).
-        # A plain Stop of THIS session is deliberately NOT an abort: the batch finishes feeding the
-        # engine so the stop path can drain it (block=True still enqueues while the worker consumes).
-        for (src, audio, t_start) in items:
+        # never drops on the maxsize=32 queue (it waits for space and retries). Returns (status, remainder)
+        # where remainder is the not-yet-enqueued tail of `items`:
+        #   ("ok", [])            - the whole batch was enqueued;
+        #   ("superseded", tail)  - the session was replaced/reset mid-batch (discard the engine);
+        #   ("dead", tail)        - the engine worker exited mid-batch (P1-6: fail, don't loop forever
+        #                           lying that we are Listening);
+        #   ("handoff", tail)     - THIS session is stopping: stop feeding NOW and give the tail back so
+        #                           the stop path owns the drain, with no two-feeder race (P1-3).
+        for i, (src, audio, t_start) in enumerate(items):
             while not engine.on_chunk(src, audio, t_start, block=True, timeout=0.5):
                 if _superseded():
-                    return "superseded"
+                    return "superseded", items[i:]
                 if not _engine_alive(engine):
-                    return "dead"
-        return "ok"
+                    return "dead", items[i:]
+                if not _still_ours():
+                    # Our session is stopping (or transcription-stopping): release promptly with the
+                    # unsubmitted tail so the stop path is the SOLE feeder (never concurrent with us).
+                    return "handoff", items[i:]
+        return "ok", []
 
     # --- phase 1: wire the engine up and DECLARE READINESS, but DO NOT publish STATE.engine yet.
     # STATE.engine stays None and the buffer stays OPEN so _feed keeps buffering live chunks behind the
@@ -1790,40 +1862,49 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
         engine.subscribe(md_sink)
         engine.subscribe(browser_sink)
         engine.start()
+        # Liveness gate (P1-6): a worker that died the instant it started must NOT be advertised ready.
+        # Check before flipping model_ready; if it is dead, leave preparing/model_ready untouched and
+        # surface the failure below (outside the lock, to avoid re-entering STATE.lock).
+        started_alive = _engine_alive(engine)
         # Stop-safety (P1-3): expose the built + started engine under its own handle BEFORE flipping
         # model_ready, while STATE.engine stays None so _feed keeps routing through pending_audio. From
         # here a Stop during catch-up can reach and drain this engine instead of losing the transcript.
         STATE.preparing_engine = engine
-        # Attach the energy rings NOW (they live on the engine, fed by the capture callback in real
-        # time): the live CPU-downgrade nudge, the SYS echo-veto reference, and the gain-invariant
-        # raw-MIC feed. Attaching here means every chunk captured from now on has ring history by the
-        # time it is replayed; the pre-engine backlog (captured during the model load) has none and
-        # falls back to sample-based tests. on_downgrade is inert until STATE.engine is published (the
-        # _on_downgrade guard drops callbacks whose engine is not STATE.engine), so no spurious
-        # "struggling" nudge fires during the expected catch-up.
-        cap = STATE.capture
-        engine.on_downgrade = lambda old, new, _e=engine: _on_downgrade(_e, old, new)
-        _sys_ring = transcribe.EnergyRing()
-        engine.sys_env = _sys_ring
-        if cap is not None:
-            cap.attach_sys_ring(_sys_ring)
-        if transcribe.raw_mic_ring_on():
-            _mic_ring = transcribe.EnergyRing()
-            engine.mic_env = _mic_ring
+        if started_alive:
+            # Attach the energy rings NOW (they live on the engine, fed by the capture callback in real
+            # time): the live CPU-downgrade nudge, the SYS echo-veto reference, and the gain-invariant
+            # raw-MIC feed. Attaching here means every chunk captured from now on has ring history by the
+            # time it is replayed; the pre-engine backlog (captured during the model load) has none and
+            # falls back to sample-based tests. on_downgrade is inert until STATE.engine is published (the
+            # _on_downgrade guard drops callbacks whose engine is not STATE.engine), so no spurious
+            # "struggling" nudge fires during the expected catch-up.
+            cap = STATE.capture
+            engine.on_downgrade = lambda old, new, _e=engine: _on_downgrade(_e, old, new)
+            _sys_ring = transcribe.EnergyRing()
+            engine.sys_env = _sys_ring
             if cap is not None:
-                cap.attach_mic_ring(_mic_ring)
-        # Re-affirm model/family from the built engine (set optimistically from resolve_model at Begin).
-        STATE.model = engine.model_name
-        STATE.family = engine.family
-        # WP-1 ready flip: transcription is live NOW (engine built + started). Clear preparing, mark
-        # ready, drop the prepare-progress object. Keep STATE.engine None + the buffer OPEN for the
-        # drain below. This is the single point that eliminates the "stuck on preparing" residual.
-        STATE.preparing = False
-        STATE.model_ready = True
-        STATE.prepare_phase = "ready"
-        STATE.prepare = None
-        STATE.prepare_error = None
+                cap.attach_sys_ring(_sys_ring)
+            if transcribe.raw_mic_ring_on():
+                _mic_ring = transcribe.EnergyRing()
+                engine.mic_env = _mic_ring
+                if cap is not None:
+                    cap.attach_mic_ring(_mic_ring)
+            # Re-affirm model/family from the built engine (set optimistically from resolve_model at Begin).
+            STATE.model = engine.model_name
+            STATE.family = engine.family
+            # WP-1 ready flip: transcription is live NOW (engine built + started). Clear preparing, mark
+            # ready, drop the prepare-progress object. Keep STATE.engine None + the buffer OPEN for the
+            # drain below. This is the single point that eliminates the "stuck on preparing" residual.
+            STATE.preparing = False
+            STATE.model_ready = True
+            STATE.prepare_phase = "ready"
+            STATE.prepare = None
+            STATE.prepare_error = None
         pb = STATE.pending_audio
+
+    if not started_alive:                # P1-6: worker died at start -> retryable error, not a fake ready
+        _catchup_failed("The transcription model failed to start on this computer. Please try again.")
+        return
 
     if pb is None:                       # defensive: a full reset between publish and here cleared it
         try:
@@ -1854,7 +1935,7 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
             return                       # Stop/partial-stop: hand the engine off to the stop path
         items = pb.take_all()
         if items:
-            r = _replay(items)
+            r, remainder = _replay(items)
             if r == "superseded":
                 try:
                     engine.stop()
@@ -1863,13 +1944,20 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
                 _release_prep_engine()
                 return
             if r == "dead":
-                _fail("The transcription model stopped responding while catching up. Please try again.")
-                _release_prep_engine()
+                _catchup_failed("The transcription model stopped responding while catching up. "
+                                "Please try again.", remainder)
+                return
+            if r == "handoff":
+                # Stop/partial-stop mid-replay: return the unsubmitted tail to the FRONT of the buffer so
+                # the stop path re-drains it (ahead of later chunks), and exit WITHOUT touching the engine.
+                # The stop path joins this thread, so once we return it is the SOLE feeder - no race (P1-3).
+                pb.putback_front(remainder)
                 return
             continue                     # more live chunks may have queued behind; drain again
         # The buffer looked empty: try to finalise. Under STATE.lock (re-check identity) AND the
         # buffer's own lock (finalise_if_empty), the close + publish are atomic against _feed.append.
         stragglers = None
+        publish_dead = False
         with STATE.lock:
             if not _still_ours():
                 # Supersede -> discard; plain stop -> hand off (leave the engine for the stop path).
@@ -1880,33 +1968,38 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
                         pass
                     _release_prep_engine()
                 return
+            if not _engine_alive(engine):
+                # P1-6: never seal + publish a dead worker as ready. Handle below (outside the lock).
+                publish_dead = True
+            else:
+                def _publish():
+                    # Runs under the buffer lock (see finalise_if_empty): from here append() returns False,
+                    # so _feed feeds the now-published engine directly, in order, after everything drained.
+                    # preparing/model_ready were already settled at phase-1 end; this only completes the
+                    # backlog->live ordering flip. The private handle is dropped now STATE.engine owns it.
+                    STATE.engine = engine
+                    STATE.preparing = False
+                    STATE.pending_audio = None
+                    STATE.preparing_engine = None
 
-            def _publish():
-                # Runs under the buffer lock (see finalise_if_empty): from here append() returns False,
-                # so _feed feeds the now-published engine directly, in order, after everything drained.
-                # preparing/model_ready were already settled at phase-1 end; this only completes the
-                # backlog->live ordering flip. The private handle is dropped now that STATE.engine owns it.
-                STATE.engine = engine
-                STATE.preparing = False
-                STATE.pending_audio = None
-                STATE.preparing_engine = None
-
-            stragglers = pb.finalise_if_empty(_publish)
-            if stragglers is None:
-                # Published. Arm the long-silence watcher (it reads STATE.engine + rings); a record-only
-                # session armed its own in start(). Under the lock, as _silence_start expects. Kept at
-                # the publish point (not phase-1 end) deliberately: the watcher reads STATE.engine, which
-                # is None until here; a minutes-scale silence nudge is unaffected by arming ~1 drain
-                # cycle later, and in the pathological never-publish case the audio is demonstrably
-                # non-silent (a growing backlog), so there is nothing for it to catch anyway.
-                _silence_start(STATE.capture)
+                stragglers = pb.finalise_if_empty(_publish)
+                if stragglers is None:
+                    # Published. Arm the long-silence watcher (it reads STATE.engine + rings); a
+                    # record-only session armed its own in start(). Under the lock, as _silence_start
+                    # expects. Kept at the publish point (not phase-1 end) deliberately: the watcher reads
+                    # STATE.engine, which is None until here; a minutes-scale silence nudge is unaffected
+                    # by arming ~1 drain cycle later, and in the pathological never-publish case the audio
+                    # is demonstrably non-silent (a growing backlog), so there is nothing to catch anyway.
+                    _silence_start(STATE.capture)
+        if publish_dead:
+            _catchup_failed("The transcription model stopped responding while catching up. Please try again.")
+            return
         if stragglers is None:
             break                        # finalised: the engine is live and _feed feeds it directly
         # A straggler slipped in between take_all and the flip: replay it (outside the lock, buffer
         # left OPEN) and loop. Converges because once caught up the engine consumes at >= real time. A
-        # plain stop returns "ok" here (the batch finishes feeding) and is handled at the loop top's
-        # hand-off; only a supersede/dead exit discards or fails.
-        r = _replay(stragglers)
+        # plain stop returns "handoff" here; supersede/dead discard or fail.
+        r, remainder = _replay(stragglers)
         if r == "superseded":
             try:
                 engine.stop()
@@ -1915,8 +2008,11 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
             _release_prep_engine()
             return
         if r == "dead":
-            _fail("The transcription model stopped responding while catching up. Please try again.")
-            _release_prep_engine()
+            _catchup_failed("The transcription model stopped responding while catching up. "
+                            "Please try again.", remainder)
+            return
+        if r == "handoff":
+            pb.putback_front(remainder)
             return
 
 
@@ -2559,13 +2655,25 @@ def stop(what: str = "all"):
             pending = (prep_eng.pending() if prep_eng else (engine.pending() if engine else 0))
 
             def _drain_transcription():
+                drain_sink = True
                 if preparing_case:
-                    # Wait for the builder to hand off the private engine, then drain the held backlog
-                    # into it and flush. Recording (if on) is untouched; capture keeps running.
+                    # Wait for the builder to RELEASE the private engine (return from its thread), which
+                    # it does promptly on the stop (it hands its unsubmitted tail back to the buffer). Only
+                    # once it has released are we the SOLE feeder and may drain + flush. Recording (if on)
+                    # is untouched; capture keeps running.
+                    released = True
                     if build_thread is not None:
                         build_thread.join(timeout=_BUILDER_HANDOFF_JOIN_SECONDS)
-                    _drain_pending_into_engine(prep_eng, pb)
-                    drained_engine = prep_eng
+                        released = not build_thread.is_alive()
+                    if released:
+                        _drain_pending_into_engine(prep_eng, pb)
+                        drained_engine = prep_eng
+                    else:
+                        # ABORT (P1-3): never drain/stop the engine while the builder might still feed it.
+                        print("[stop] transcription builder did not release the engine in time; aborting "
+                              "the concurrent drain", flush=True)
+                        drained_engine = None
+                        drain_sink = False   # leave the sink to the (still-running) builder; do not race it
                 else:
                     drained_engine = engine
                 try:
@@ -2574,11 +2682,11 @@ def stop(what: str = "all"):
                 except Exception:
                     pass
                 try:
-                    if md_sink is not None:
+                    if drain_sink and md_sink is not None:
                         md_sink.close()
                 except Exception:
                     pass
-                err = md_sink.last_error if md_sink else None
+                err = md_sink.last_error if (drain_sink and md_sink) else None
                 cap_to_stop = None
                 should_finalise = False
                 with STATE.lock:
@@ -2660,15 +2768,27 @@ def stop(what: str = "all"):
                 cap.stop()
         except Exception:
             pass
+        drain_sink = True
         if preparing_case:
             # Model still catching up: cap.stop() above flushed the final chunk into pending_audio (the
-            # engine is unpublished, so _feed buffers it). Wait for the builder to hand the private engine
-            # off, then drain the whole held backlog into it and flush - so a Stop on a slow CPU saves the
-            # transcript from t0 instead of dropping it (P1-3).
+            # engine is unpublished, so _feed buffers it). Wait for the builder to RELEASE the private
+            # engine (return from its thread - it does so promptly on the stop, handing its unsubmitted
+            # tail back to the buffer). Only once it has released are we the SOLE feeder and may drain the
+            # whole held backlog into it and flush - so a Stop on a slow CPU saves the transcript from t0
+            # instead of dropping it, with no two-feeder race (P1-3).
+            released = True
             if build_thread is not None:
                 build_thread.join(timeout=_BUILDER_HANDOFF_JOIN_SECONDS)
-            _drain_pending_into_engine(prep_eng, pb)
-            drained_engine = prep_eng
+                released = not build_thread.is_alive()
+            if released:
+                _drain_pending_into_engine(prep_eng, pb)
+                drained_engine = prep_eng
+            else:
+                # ABORT (P1-3): never drain/stop the engine while the builder might still feed it.
+                print("[stop] builder did not release the engine in time; aborting the concurrent drain",
+                      flush=True)
+                drained_engine = None
+                drain_sink = False
         else:
             drained_engine = engine
         try:
@@ -2677,7 +2797,7 @@ def stop(what: str = "all"):
         except Exception:
             pass
         try:
-            if md_sink is not None:
+            if drain_sink and md_sink is not None:
                 md_sink.close()
         except Exception:
             pass
@@ -2686,7 +2806,8 @@ def stop(what: str = "all"):
                 rec.close()
         except Exception:
             pass
-        err = (md_sink.last_error if md_sink else None) or (rec.last_error if rec else None)
+        err = ((md_sink.last_error if (drain_sink and md_sink) else None)
+               or (rec.last_error if rec else None))
         with STATE.lock:
             STATE.reset()
             STATE.sink_error = err

@@ -417,6 +417,38 @@ def test_verification_tail_is_not_a_false_stall():
     print("  OK  a flat-at-total verification tail is not failed as a stall within the download window (P2-2)")
 
 
+def test_foreign_slot_starvation_is_bounded():
+    # New P2 (from the P1-5 fix): a DIFFERENT model stuck "downloading" in the single global slot must
+    # NOT starve this session forever. Past a bounded wait it surfaces a DISTINCT retryable error (not
+    # treated as our progress, not a generic stall), capture kept running, buffer retained for a retry.
+    reset_state()
+
+    def progress():   # a foreign download that never finishes and never yields the slot
+        return {"state": "downloading", "repo": "someone/else-model", "downloaded": 123, "total": 1000}
+
+    saved = webapp.PREPARE_FOREIGN_SLOT_TIMEOUT_SECONDS
+    try:
+        # High same-target stall window so ONLY the foreign-slot bound can fire; short foreign bound.
+        with stubs(progress, present_fn=lambda t: False, stall_s=30, poll_s=0.02):
+            webapp.PREPARE_FOREIGN_SLOT_TIMEOUT_SECONDS = 0.4
+            t0 = time.monotonic()
+            r = client.post("/api/start", json=START_BODY)
+            assert r.status_code == 200, r.text
+            assert wait_until(lambda: client.get("/api/status").json().get("prepare_error"), 5.0), \
+                "a stuck foreign download never surfaced a bounded error (new P2)"
+            elapsed = time.monotonic() - t0
+            assert elapsed < 4.0, f"foreign-slot timeout took too long ({elapsed:.1f}s) vs a 0.4s bound"
+            st = client.get("/api/status").json()
+            assert st["running"] is True, st                       # capture kept running
+            err = (st["prepare_error"] or "").lower()
+            assert "another model" in err or "still downloading" in err, st   # distinct, not a generic stall
+            assert webapp.STATE.pending_audio is not None, "buffer must be retained for a retry"
+    finally:
+        webapp.PREPARE_FOREIGN_SLOT_TIMEOUT_SECONDS = saved
+        reset_state()
+    print("  OK  a stuck foreign download in the slot is bounded and surfaces a distinct retryable error (new P2)")
+
+
 def st_err():
     return f"prepare_error never set: {client.get('/api/status').json()}"
 
@@ -428,7 +460,8 @@ if __name__ == "__main__":
              test_retry_recovers_without_restarting_capture,
              test_retry_replays_the_buffer_from_t0,
              test_foreign_download_in_slot_is_not_misread,
-             test_verification_tail_is_not_a_false_stall)
+             test_verification_tail_is_not_a_false_stall,
+             test_foreign_slot_starvation_is_bounded)
     failures = 0
     for fn in tests:
         try:
