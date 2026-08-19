@@ -1,5 +1,19 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-08-19, v1.13.1: a rebuilt model-preparation experience, async from the first second
+
+`licensing.APP_VERSION` 1.13.0 -> 1.13.1.
+
+This release rebuilds what happens between pressing Begin and the transcript appearing, replacing an indefinite full-screen spinner (which could sit forever if a model was still downloading) with a bounded, honest, non-blocking flow.
+
+- **Real progress while the model prepares, not an indefinite spinner.** When the transcription model needs to download or load, you now see real progress on the normal screen (the model name, its size, and a percent) with the recording indicator in view, instead of a full-screen spinner that gave no sign of how long it would take. (`web/static/app.js`, `web/static/i18n.js`, `web/static/styles.css`, `web/app.py`.)
+- **Capture and recording start the moment you press Begin.** Model preparation now runs in the background: your audio is captured, and recorded if you switched recording on, from the very first second, the model loads behind the scenes, and the transcript fills in from the very start once it is ready. (`web/app.py`, `web/static/app.js`.)
+- **A stalled or failed download now ends in a clear, bounded failure with a Retry button.** If a download stalls or fails, preparation stops with an honest message and a Retry button rather than loading indefinitely; if you were recording, your audio keeps saving safely in the meantime. (`web/app.py`, `web/static/app.js`, `web/static/i18n.js`.)
+- **"Auto" quality now prefers a model you already have.** On the Auto setting Volksmond reuses a model already on your computer, including one from another model family, instead of downloading one unnecessarily. The quality picker now shows which options start instantly and which download the first time you use them. (`live_transcribe/__main__.py`, `web/static/app.js`, `web/static/i18n.js`.)
+- **A heads-up before a meeting has to wait on a download.** When the model you chose is not downloaded yet, a pre-start prompt tells you before you begin and offers a model you already have that starts instantly. (`web/static/app.js`, `web/static/i18n.js`.)
+
+Verified: full local test suite green (script-run), and the async model-prepare and stop-drain concurrency reworked and confirmed over four independent adversarial (codex) review passes with all correctness findings closed.
+
 ## 2026-08-18, v1.13.0: a Microsoft Store edition, steadier live setup, and record-from-here
 
 `licensing.APP_VERSION` 1.12.0 -> 1.13.0.

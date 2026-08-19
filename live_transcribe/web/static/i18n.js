@@ -230,9 +230,9 @@ window.VM_I18N = {
     "Loading into memory": "Laai in geheue",
     "downloaded so far": "tot dusver afgelaai",
     "{done} of {total} ({pct}%)": "{done} van {total} ({pct}%)",
-    "Capturing now on this computer.": "Vang nou op hierdie rekenaar op.",
+    "Capturing now on this computer.": "Die klank word nou op hierdie rekenaar opgeneem.",
     "Capturing and recording now on this computer.":
-      "Vang op en neem nou op hierdie rekenaar op.",
+      "Die klank word nou op hierdie rekenaar opgeneem en gestoor.",
     "The transcription model is still loading. The transcript fills in from the start the moment it is ready, and if you are recording, the audio is saved from the very beginning.":
       "Die transkripsiemodel laai nog. Die transkripsie vul van voor af in sodra dit gereed is, en as jy opneem, word die klank van heel voor af gestoor.",
     "Could not load the transcription model on this computer.":
@@ -252,7 +252,7 @@ window.VM_I18N = {
     "About {size}, and usually a few minutes on a normal connection.":
       "Ongeveer {size}, en gewoonlik 'n paar minute op 'n normale verbinding.",
     "Capture and recording begin immediately. The transcript fills in from the start once the model is ready, and if you are recording, the audio is saved from the very beginning.":
-      "Opvang en opname begin dadelik. Die transkripsie vul van voor af in sodra die model gereed is, en as jy opneem, word die klank van heel voor af gestoor.",
+      "Die klank word dadelik opgeneem. Die transkripsie vul van voor af in sodra die model gereed is, en as jy opneem, word die klank van heel voor af gestoor.",
     "Start instantly with a model you already have":
       "Begin dadelik met 'n model wat jy reeds het",
     "Use this": "Gebruik hierdie",
@@ -800,7 +800,7 @@ window.VM_I18N = {
     // Live path uses t0-capture (no full-screen spinner), but keep these translated in case the
     // brief starting screen is ever shown for a live session.
     "Opening your microphone and system audio and starting to capture. This is quick.":
-      "Maak jou mikrofoon en stelselklank oop en begin opvang. Dit is vinnig.",
+      "Maak jou mikrofoon en stelselklank oop en begin opneem. Dit is vinnig.",
     "The live screen opens by itself. The transcript fills in from the start once the model is ready.":
       "Die lewendige skerm maak vanself oop. Die transkripsie vul van voor af in sodra die model gereed is.",
   },
