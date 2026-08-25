@@ -45,12 +45,13 @@ permissions:
 
 jobs:
   build:
-    # macos-14 is GitHub's Apple Silicon (arm64) image, matching the arm64-only target. The app's
-    # LSMinimumSystemVersion 14.4 floor is set by the spec's Info.plist (WP-E), independent of the
-    # runner OS. If GitHub retires macos-14, bump to the next arm64 image (macos-15).
+    # macos-15 is GitHub's Apple Silicon (arm64) image, matching the arm64-only target (macos-14 is
+    # being retired by GitHub ~2 Nov 2026, hence the bump). The app's LSMinimumSystemVersion 14.4
+    # floor is set by the spec's Info.plist (WP-E), independent of the runner OS. If GitHub retires
+    # macos-15 in turn, bump to the next arm64 image.
     # TODO(ci-verify): confirm the default Xcode/Swift toolchain on this image exposes the Core Audio
     # process-tap SDK symbols (AudioHardwareCreateProcessTap, 14.2+) the WP-B helper needs.
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 90
 
     # Secrets are legal in job-level env expressions (they are not in workflow-level env). SIGNING_READY
@@ -201,6 +202,66 @@ jobs:
           # secure timestamp, both of which notarisation requires (plan R5).
           bash mac/build-app-mac.sh
           echo "Build driver finished."
+
+      # Post-build bundle verification (codex review finding L2): assert dist/Volksmond.app is
+      # well-formed right after the build, before we go hunting for a DMG to rename. The structural
+      # checks (helper present + executable, app binary present, .app/Info.plist shape) hold in BOTH
+      # modes. The codesign/entitlement checks only make sense once a real Developer ID signature
+      # exists (an ad-hoc/unsigned build fails --verify by design), so those are gated to release mode.
+      - name: Verify built bundle (post-build asserts)
+        run: |
+          set -euo pipefail
+          MODE="${{ steps.preflight.outputs.mode }}"
+          APP="dist/Volksmond.app"
+          HELPER="$APP/Contents/Resources/bin/volksmond-audiotap"
+          EXE="$APP/Contents/MacOS/Volksmond"
+          PLIST="$APP/Contents/Info.plist"
+
+          echo "==> Asserting bundle structure (mode: $MODE)"
+          [ -d "$APP" ] || { echo "::error title=Bundle check::Missing $APP"; exit 1; }
+          [ -f "$PLIST" ] || { echo "::error title=Bundle check::Missing $PLIST"; exit 1; }
+          [ -x "$EXE" ] || { echo "::error title=Bundle check::Missing or non-executable app binary: $EXE"; exit 1; }
+          [ -x "$HELPER" ] || { echo "::error title=Bundle check::Missing or non-executable helper: $HELPER"; exit 1; }
+
+          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")"
+          if [ "$BUNDLE_ID" != "com.digiphyte.volksmond" ]; then
+            echo "::error title=Bundle check::CFBundleIdentifier is '$BUNDLE_ID', expected com.digiphyte.volksmond"
+            exit 1
+          fi
+          MIN_OS="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$PLIST")"
+          if [ -z "$MIN_OS" ]; then
+            echo "::error title=Bundle check::LSMinimumSystemVersion missing from $PLIST"
+            exit 1
+          fi
+          echo "    Info.plist OK (bundle id $BUNDLE_ID, LSMinimumSystemVersion $MIN_OS)"
+          echo "    app binary OK: $EXE"
+          echo "    helper OK: $HELPER"
+
+          if [ "$MODE" = "release" ]; then
+            echo "==> Asserting Developer ID signature + entitlements (release mode)"
+            codesign --verify --strict "$HELPER" || {
+              echo "::error title=Bundle check::codesign --verify --strict failed for helper $HELPER"
+              exit 1
+            }
+            codesign --verify --deep --strict "$APP" || {
+              echo "::error title=Bundle check::codesign --verify --deep --strict failed for $APP"
+              exit 1
+            }
+            ENTS="$(codesign -d --entitlements :- "$EXE" 2>/dev/null)"
+            for KEY in com.apple.security.device.audio-input \
+                       com.apple.security.cs.allow-unsigned-executable-memory \
+                       com.apple.security.cs.disable-library-validation; do
+              printf '%s' "$ENTS" | grep -q "$KEY" || {
+                echo "::error title=Bundle check::Entitlement $KEY missing from $EXE"
+                exit 1
+              }
+            done
+            echo "    codesign --verify OK (helper + app); entitlements present."
+          else
+            echo "==> Skipping codesign/entitlement asserts ($MODE build is ad-hoc/unsigned by design)."
+          fi
+
+          echo "==> Bundle verification passed ($MODE)."
 
       # Locate the DMG the driver produced and give it the canonical, versioned name release.ps1 records in
       # trust.json (filename = "Volksmond-<ver>.dmg", release.ps1:395). Renaming here means the artifact
