@@ -35,6 +35,7 @@ from live_transcribe.capture_mac import (
     _classify_header,
     _iter_pcm_frames,
     _parse_header_line,
+    _parse_stats_line,
     _read_exactly,
 )
 
@@ -56,6 +57,7 @@ class _FakeProc:
     methods are no-ops. Lets us drive _AudioTapHelper._run without spawning."""
 
     def __init__(self, stdout_bytes=b"", stderr_bytes=b"", returncode=0):
+        self.stdin = io.BytesIO()
         self.stdout = io.BytesIO(stdout_bytes)
         self.stderr = io.BytesIO(stderr_bytes)
         self._rc = returncode
@@ -235,9 +237,10 @@ def test_classify_header():
 def test_validate_format():
     from live_transcribe.capture_mac import _validate_format
     assert _validate_format({"format": "f32le", "rate": 16000, "channels": 1}) == (16000, 1)
-    assert _validate_format({"format": "f32le", "rate": 48000, "channels": 2}) == (48000, 2)
+    assert _validate_format({"format": "f32le", "rate": 48000, "channels": 1}) == (48000, 1)
     for bad in ({"format": "s16le", "rate": 16000, "channels": 1},   # wrong format
                 {"rate": 0, "channels": 1},                          # non-positive rate
+                {"rate": 16000, "channels": 2},                      # stereo: rejected (M3, --mono only)
                 {"rate": 16000, "channels": 3},                      # bad channel count
                 {"rate": 16000},                                     # missing channels
                 {"channels": 1}):                                    # missing rate
@@ -246,7 +249,60 @@ def test_validate_format():
         except HelperProtocolError:
             continue
         raise AssertionError(f"_validate_format accepted bad meta: {bad!r}")
-    print("  OK  _validate_format enforces f32le / positive rate / channels in {1,2}")
+    print("  OK  _validate_format enforces f32le / positive rate / channels == 1 (mono only)")
+
+
+def test_validate_format_rejects_stereo():
+    # M3: the PCM path reshapes flat samples to (-1, 1) mono, so a stereo (interleaved)
+    # stream would be misread as double-rate mono. The tap is always invoked --mono, so a
+    # channels != 1 format line is a contract violation we reject (degrading SYS to mic-only)
+    # rather than silently mangle.
+    from live_transcribe.capture_mac import _validate_format
+    for ch in (2, 4, 0):
+        try:
+            _validate_format({"format": "f32le", "rate": 16000, "channels": ch})
+        except HelperProtocolError as e:
+            assert "channel" in str(e).lower(), e
+            continue
+        raise AssertionError(f"_validate_format accepted a non-mono channel count {ch}")
+    print("  OK  _validate_format rejects any non-mono channel count (M3)")
+
+
+# ---- STATS diagnostics (M5) ------------------------------------------------
+
+def test_parse_stats_line():
+    assert _parse_stats_line("STATS seq=1 dropped=0 host_ms=10") == {
+        "seq": 1, "dropped": 0, "host_ms": 10}
+    # Extra key=int tokens tolerated (forward compat); key order irrelevant.
+    assert _parse_stats_line("STATS dropped=7 seq=42 host_ms=3 extra=9")["dropped"] == 7
+    for bad in ("STATS",                       # no fields
+                "STATS seq=1 dropped=0",       # missing host_ms
+                "STATS seq=1 dropped=x host_ms=3",  # non-integer value
+                "STATS seq=1 dropped host_ms=3",    # token without '='
+                "not a stats line",            # wrong prefix
+                "STATSseq=1 dropped=0 host_ms=3"):  # prefix not followed by a space
+        assert _parse_stats_line(bad) is None, bad
+    print("  OK  _parse_stats_line parses well-formed STATS lines, rejects malformed ones")
+
+
+def test_stderr_stats_warns_on_dropped_increase():
+    import contextlib
+    stderr = (b"STATS seq=1 dropped=0 host_ms=10\n"
+              b"helper: starting up\n"                 # non-STATS: echoed as a helper log
+              b"STATS seq=2 dropped=0 host_ms=20\n"    # no increase: no warning
+              b"STATS seq=3 dropped=5 host_ms=30\n"    # increase 0 -> 5: warn
+              b"STATS seq=4 dropped=5 host_ms=40\n"    # no increase: no warning
+              b"STATS totally malformed line\n"        # malformed STATS: ignored, no warning
+              b"STATS seq=5 dropped=9 host_ms=50\n")   # increase 5 -> 9: warn
+    h = capture_mac._AudioTapHelper("audiotap", on_frame=lambda a: None)
+    h._proc = _FakeProc(stderr_bytes=stderr)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        h._drain_stderr()
+    out = buf.getvalue()
+    assert out.count("system audio may glitch") == 2, out   # exactly the two increases
+    assert "helper: starting up" in out, out                # non-STATS handling preserved
+    print("  OK  _drain_stderr warns only when the helper's dropped count increases (M5)")
 
 
 # ---- _AudioTapHelper handshake + gated frames ------------------------------
@@ -300,6 +356,60 @@ def test_helper_early_exit_before_started():
     assert h.started_ok is False
     assert h.error
     print("  OK  helper: EOF before 'started' fails cleanly with an error")
+
+
+def test_helper_unexpected_eof_after_started_fires_on_failed():
+    # H1: the helper handshakes, delivers a frame, then its stdout hits EOF with no stop
+    # requested -> an unexpected post-'started' end must fire on_failed (the mic keeps going).
+    header = (b'{"format":"f32le","rate":16000,"channels":1}\n'
+              b'{"event":"started"}\n')
+    body = _encode_frame([0.1])
+    failed = threading.Event()
+    h = capture_mac._AudioTapHelper("audiotap", on_frame=lambda a: None,
+                                    on_failed=failed.set)
+    h._proc = _FakeProc(header + body)   # stdout EOFs right after the single frame
+    h._reader_thread = threading.Thread(target=h._run, daemon=True)
+    h._reader_thread.start()
+    assert h._ready.wait(2.0)
+    h.begin()   # open the gate: the frame flows, then EOF is seen as an unexpected exit
+    h._reader_thread.join(2.0)
+    assert failed.wait(2.0), "on_failed did not fire on an unexpected post-started EOF"
+    print("  OK  helper: an unexpected EOF after 'started' fires on_failed (H1)")
+
+
+def test_helper_clean_stop_does_not_fire_on_failed():
+    # H1: a deliberate stop() (reader blocked on read, stop flag set, stdout closed like a
+    # SIGTERM would) must NOT look like a failure - on_failed stays unfired.
+    r_fd, w_fd = os.pipe()
+    rf = os.fdopen(r_fd, "rb", buffering=0)
+    wf = os.fdopen(w_fd, "wb", buffering=0)
+    proc = _FakeProc()
+    proc.stdout = rf
+    failed = threading.Event()
+    h = capture_mac._AudioTapHelper("audiotap", on_frame=lambda a: None, on_failed=failed.set)
+    h._proc = proc
+    h._reader_thread = threading.Thread(target=h._run, daemon=True)
+    h._reader_thread.start()
+    wf.write(b'{"format":"f32le","rate":16000,"channels":1}\n')
+    wf.write(b'{"event":"started"}\n')
+    assert h._ready.wait(2.0)
+    h.begin()
+    time.sleep(0.1)        # let the reader reach its blocking read in Phase 2
+    h._stop_event.set()    # simulate stop(): request shutdown...
+    wf.close()             # ...and close the helper's stdout (EOF), as terminate would
+    h._reader_thread.join(2.0)
+    assert not failed.is_set(), "on_failed fired on a clean stop"
+    print("  OK  helper: a clean stop does not fire on_failed (H1)")
+
+
+def test_stop_closes_helper_stdin():
+    # M4: stop() closes the helper's stdin (clean-shutdown EOF signal, additive to SIGTERM).
+    h = capture_mac._AudioTapHelper("audiotap", on_frame=lambda a: None)
+    proc = _FakeProc()
+    h._proc = proc
+    h.stop()
+    assert proc.stdin.closed, "stop() should close the helper's stdin"
+    print("  OK  stop() closes the helper's stdin as a clean-shutdown signal (M4)")
 
 
 # ---- negative handshake state machine (fix 10) -----------------------------
@@ -399,6 +509,7 @@ class _FakeHelper:
         self.rate = rate
         self.channels = channels
         self.error = None
+        self.permission_denied = False
         self.began = False
         self.stopped = False
         self._started = threading.Event()
@@ -452,6 +563,93 @@ def test_open_system_tap_waiting_defers_registration():
         capture_mac._AudioTapHelper = orig_cls
         cap._stop_event.set()   # let the spawned chunker flush (empty) and exit
     print("  OK  _open_system_tap: WAITING defers SYS registration + chunker to the grant")
+
+
+def _patch_helper(fake):
+    """Install fake _resolve_helper_path + _AudioTapHelper; return a restore() callable."""
+    orig_resolve = capture_mac._resolve_helper_path
+    orig_cls = capture_mac._AudioTapHelper
+    capture_mac._resolve_helper_path = lambda: capture_mac.Path("fake/volksmond-audiotap")
+    capture_mac._AudioTapHelper = lambda path, on_frame, **kw: fake
+
+    def restore():
+        capture_mac._resolve_helper_path = orig_resolve
+        capture_mac._AudioTapHelper = orig_cls
+
+    return restore
+
+
+def test_open_system_tap_started_sets_active():
+    # H1: START_STARTED registers SYS, opens the gate, and reports sys_state='active'.
+    cap = capture_mac.AudioCapture()
+    cap._t0 = 0.0
+    assert cap.sys_state == "disabled"   # initial value before any SYS attempt
+    fake = _FakeHelper(capture_mac.START_STARTED)
+    restore = _patch_helper(fake)
+    try:
+        cap._open_system_tap()
+        assert cap.sys_state == "active", cap.sys_state
+        assert "SYS" in cap._buffers
+        assert fake.began
+    finally:
+        restore()
+    print("  OK  _open_system_tap: START_STARTED sets sys_state='active' (H1)")
+
+
+def test_open_system_tap_failed_denied_sets_state_and_raises():
+    # H1: START_FAILED from a TCC denial sets sys_state='permission_denied' and raises so the
+    # caller degrades to mic-only; SYS is left unregistered.
+    cap = capture_mac.AudioCapture()
+    cap._t0 = 0.0
+    fake = _FakeHelper(capture_mac.START_FAILED)
+    fake.permission_denied = True
+    fake.error = "system-audio capture permission denied"
+    restore = _patch_helper(fake)
+    try:
+        raised = False
+        try:
+            cap._open_system_tap()
+        except RuntimeError:
+            raised = True
+        assert raised, "START_FAILED should raise to the caller"
+        assert cap.sys_state == "permission_denied", cap.sys_state
+        assert "SYS" not in cap._buffers
+        assert fake.stopped
+    finally:
+        restore()
+    print("  OK  _open_system_tap: START_FAILED (denied) sets sys_state='permission_denied', raises (H1)")
+
+
+def test_await_system_tap_denial_after_wait_sets_state():
+    # H1: on the deferred path, a denial/timeout after the extended wait sets sys_state and
+    # stops the helper (mic continues). Shorten the ceiling so the test does not block.
+    cap = capture_mac.AudioCapture()
+    cap._t0 = 0.0
+    fake = _FakeHelper(capture_mac.START_WAITING)
+    fake.permission_denied = True   # denial arrives during the wait
+    orig_wait = capture_mac._PERMISSION_WAIT_S
+    capture_mac._PERMISSION_WAIT_S = 0.05
+    try:
+        cap._await_system_tap(fake, capture_mac.Path("fake/volksmond-audiotap"))
+    finally:
+        capture_mac._PERMISSION_WAIT_S = orig_wait
+    assert cap.sys_state == "permission_denied", cap.sys_state
+    assert fake.stopped
+    assert "SYS" not in cap._buffers
+    print("  OK  _await_system_tap: a denial after the wait sets sys_state='permission_denied' (H1)")
+
+
+def test_await_system_tap_teardown_is_not_a_failure():
+    # H1: if stop() woke the wait during teardown, the deferred path must NOT mark it failed.
+    cap = capture_mac.AudioCapture()
+    cap._t0 = 0.0
+    fake = _FakeHelper(capture_mac.START_WAITING)
+    fake.stop()           # stop() already ran: wait_started returns promptly, False (teardown)
+    cap.sys_state = "pending"
+    cap._await_system_tap(fake, capture_mac.Path("fake/volksmond-audiotap"))
+    assert cap.sys_state == "pending", cap.sys_state   # unchanged, not 'failed'
+    assert "SYS" not in cap._buffers
+    print("  OK  _await_system_tap: a teardown-driven wake is not treated as a SYS failure (H1)")
 
 
 # ---- devices_mac -----------------------------------------------------------
@@ -584,15 +782,25 @@ TESTS = [
     test_parse_header_line_malformed,
     test_classify_header,
     test_validate_format,
+    test_validate_format_rejects_stereo,
+    test_parse_stats_line,
+    test_stderr_stats_warns_on_dropped_increase,
     test_helper_started_then_frames,
     test_helper_permission_denied,
     test_helper_early_exit_before_started,
+    test_helper_unexpected_eof_after_started_fires_on_failed,
+    test_helper_clean_stop_does_not_fire_on_failed,
+    test_stop_closes_helper_stdin,
     test_helper_started_before_format_rejected,
     test_helper_error_event_degrades_immediately,
     test_helper_bad_channels_in_format_rejected,
     test_helper_unknown_event_tolerated_then_started,
     test_helper_waiting_permission_extends_deadline,
     test_open_system_tap_waiting_defers_registration,
+    test_open_system_tap_started_sets_active,
+    test_open_system_tap_failed_denied_sets_state_and_raises,
+    test_await_system_tap_denial_after_wait_sets_state,
+    test_await_system_tap_teardown_is_not_a_failure,
     test_list_ui_devices_shape,
     test_merge_default_absent_multiple_mics,
     test_merge_default_absent_single_mic,

@@ -35,7 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .capture_core import BLOCK_SECONDS, CaptureBase
+from .capture_core import BLOCK_SECONDS, TARGET_RATE, CaptureBase
 from .devices_mac import resolve_loopback, resolve_mic
 
 # ---- frozen helper contract (mac-port plan section 2.2) -------------------
@@ -189,9 +189,14 @@ def _classify_header(obj):
 
 def _validate_format(meta):
     """Validate a classified 'format' meta dict against the frozen contract
-    (CONTRACT.md 2.1): format == 'f32le', rate a positive int, channels in {1, 2}.
+    (CONTRACT.md 2.1): format == 'f32le', rate a positive int, channels == 1.
     Returns (rate, channels). Raises HelperProtocolError on any violation. Split out
-    so the handshake state machine's validation is unit-testable."""
+    so the handshake state machine's validation is unit-testable.
+
+    Only mono is accepted: the tap is always invoked --mono (HELPER_INVOCATION_ARGS) and
+    the PCM path (`_iter_pcm_frames` -> `reshape(-1, 1)`) treats every float32 sample as one
+    mono frame. A stereo (interleaved) stream would be misread as double-rate mono garbage,
+    so a non-mono format line is a contract violation we reject rather than silently mangle."""
     fmt = meta.get("format")
     if fmt is not None and fmt != "f32le":
         raise HelperProtocolError(f"unsupported helper format {fmt!r}, expected 'f32le'")
@@ -199,9 +204,35 @@ def _validate_format(meta):
     if not isinstance(rate, int) or isinstance(rate, bool) or rate <= 0:
         raise HelperProtocolError(f"invalid helper sample rate {rate!r} (want a positive integer)")
     channels = meta.get("channels")
-    if channels not in (1, 2):
-        raise HelperProtocolError(f"invalid helper channel count {channels!r} (want 1 or 2)")
+    if channels != 1:
+        raise HelperProtocolError(
+            f"unsupported helper channel count {channels!r}: the tap is invoked --mono, so "
+            "exactly 1 channel is expected (the PCM path treats each sample as one mono frame)")
     return rate, channels
+
+
+def _parse_stats_line(line):
+    """Parse a helper STDERR diagnostics line (CROSS-AGENT CONTRACT 2), formatted exactly
+    `STATS seq=<int> dropped=<int> host_ms=<int>`, into {'seq', 'dropped', 'host_ms'} ints.
+
+    Returns None for any line that is not a well-formed STATS line (not the STATS prefix,
+    a token without `=`, a non-integer value, or a missing required field), so a malformed
+    STATS line is simply ignored. Extra key=int tokens are tolerated (forward compatibility).
+    Pure + side-effect-free so the diagnostics contract is unit-testable without a subprocess."""
+    if not line.startswith("STATS "):
+        return None
+    fields = {}
+    for tok in line[len("STATS "):].split():
+        key, sep, val = tok.partition("=")
+        if not sep:
+            return None
+        try:
+            fields[key] = int(val)
+        except ValueError:
+            return None
+    if not {"seq", "dropped", "host_ms"} <= fields.keys():
+        return None
+    return {"seq": fields["seq"], "dropped": fields["dropped"], "host_ms": fields["host_ms"]}
 
 
 # ---- helper path resolution ------------------------------------------------
@@ -263,9 +294,13 @@ class _AudioTapHelper:
     `on_frame(samples_1d)` is called per PCM frame.
     """
 
-    def __init__(self, path, on_frame, log_prefix="[SYS]"):
+    def __init__(self, path, on_frame, on_failed=None, log_prefix="[SYS]"):
         self._path = Path(path)
         self._on_frame = on_frame
+        # Fired at most once from the reader thread on an UNEXPECTED post-'started' end
+        # (EOF/exit, desync, or reader error while streaming), so the capture layer can flip
+        # sys_state to 'failed' and the UI can warn. Never fired for a clean stop() (H1).
+        self._on_failed = on_failed
         self._log_prefix = log_prefix
         self._proc = None
         self._reader_thread = None
@@ -275,7 +310,9 @@ class _AudioTapHelper:
         self._waiting = threading.Event()  # 'waiting_permission' seen; 'started' still pending
         self._go = threading.Event()       # consumer registered SYS: frames may flow
         self._stop_event = threading.Event()
+        self._failed_notified = False      # _on_failed has fired (fire-once guard)
         self.started_ok = False
+        self.permission_denied = False     # the terminal failure was a TCC denial (vs any other)
         self.rate = HELPER_SAMPLE_RATE
         self.channels = 1
         self.error = None
@@ -290,6 +327,9 @@ class _AudioTapHelper:
         try:
             self._proc = subprocess.Popen(
                 [str(self._path)] + HELPER_INVOCATION_ARGS,
+                # stdin is a pipe purely so stop() can signal a clean shutdown by CLOSING it
+                # (EOF), a signal the helper still gets if the SIGTERM is missed (CONTRACT 1).
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -326,20 +366,54 @@ class _AudioTapHelper:
         """Open the frame gate: the SYS source is registered, frames may flow."""
         self._go.set()
 
+    @property
+    def stopped(self):
+        """True once stop() has been called: distinguishes a deliberate teardown from a
+        genuine helper failure on the deferred permission-wait path (H1)."""
+        return self._stop_event.is_set()
+
+    def _notify_failed(self):
+        """Fire the on_failed callback exactly once (post-'started' SYS failure). Guarded so
+        no reader-exit path can double-fire; swallows any callback error."""
+        if self._failed_notified:
+            return
+        self._failed_notified = True
+        cb = self._on_failed
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                pass
+
     def _drain_stderr(self):
-        # Human-readable helper logs. Draining also stops a full stderr pipe from
-        # blocking the helper.
+        # Human-readable helper logs + out-of-band STATS diagnostics (CONTRACT 2). Draining
+        # also stops a full stderr pipe from blocking the helper. The PCM frame format on
+        # STDOUT is untouched: diagnostics ride STDERR only.
         proc = self._proc
         if proc is None or proc.stderr is None:
             return
+        last_dropped = 0
         try:
             for raw in iter(proc.stderr.readline, b""):
                 try:
                     line = raw.decode("utf-8", "replace").rstrip()
                 except Exception:
                     line = repr(raw)
-                if line:
-                    print(f"{self._log_prefix} helper: {line}", flush=True)
+                if not line:
+                    continue
+                if line.startswith("STATS "):
+                    # `STATS seq=<int> dropped=<int> host_ms=<int>` (~1/s and on overflow):
+                    # warn whenever the helper's dropped-frame count rises since the last STATS
+                    # line; ignore malformed STATS lines. Not echoed as a generic helper log.
+                    stats = _parse_stats_line(line)
+                    if stats is not None:
+                        if stats["dropped"] > last_dropped:
+                            print(f"{self._log_prefix} helper dropped audio frames "
+                                  f"(dropped={stats['dropped']}, seq={stats['seq']}); "
+                                  "system audio may glitch.", flush=True)
+                        last_dropped = stats["dropped"]
+                    continue
+                print(f"{self._log_prefix} helper: {line}", flush=True)
         except Exception:
             pass
 
@@ -386,6 +460,7 @@ class _AudioTapHelper:
                     self._first.set()
                     continue
                 if kind == "permission_denied":
+                    self.permission_denied = True
                     self.error = (
                         "system-audio capture permission denied (grant Volksmond "
                         "audio capture in System Settings > Privacy & Security)"
@@ -419,6 +494,16 @@ class _AudioTapHelper:
                 if self._stop_event.is_set():
                     break
                 self._on_frame(arr)
+            else:
+                # _iter_pcm_frames returned (clean EOF at a frame boundary) without us asking
+                # to stop: the helper closed stdout / exited on its own AFTER 'started'. That is
+                # an unexpected post-'started' end -> surface it as a SYS failure so the UI warns,
+                # while the mic keeps going (H1). A stop() request breaks out above, skipping this.
+                if not self._stop_event.is_set():
+                    print(f"{self._log_prefix} audiotap stream ended unexpectedly "
+                          f"(helper exit code {proc.poll()}). "
+                          "System audio stopped; the microphone continues.", flush=True)
+                    self._notify_failed()
         except HelperProtocolError as e:
             # A mid-stream desync: SYS goes quiet, the session continues on MIC.
             # No auto-restart in v1 (the plan degrades rather than blocks).
@@ -430,12 +515,14 @@ class _AudioTapHelper:
             elif not self._stop_event.is_set():
                 print(f"{self._log_prefix} audiotap stream desynced: {e}. "
                       "System audio stopped; the microphone continues.", flush=True)
+                self._notify_failed()   # post-'started' failure -> sys_state='failed' (H1)
         except Exception as e:
             if not self._ready.is_set():
                 self.error = f"helper reader error: {e}"
                 self._signal_ready()
             elif not self._stop_event.is_set():
                 print(f"{self._log_prefix} audiotap reader stopped: {e}", flush=True)
+                self._notify_failed()   # post-'started' failure -> sys_state='failed' (H1)
         finally:
             # Every reader-thread exit path (clean EOF, protocol desync, callback
             # failure, gate timeout, header failure) fully reaps the child so it
@@ -469,7 +556,7 @@ class _AudioTapHelper:
                     proc.wait(timeout=3.0)
                 except Exception:
                     pass
-            for stream in (proc.stdout, proc.stderr):
+            for stream in (getattr(proc, "stdin", None), proc.stdout, proc.stderr):
                 if stream is not None:
                     try:
                         stream.close()
@@ -479,10 +566,18 @@ class _AudioTapHelper:
     def stop(self):
         self._stop_event.set()
         self._go.set()   # release the reader if it is still waiting at the gate
-        # Terminate first so a reader blocked on read() unblocks and its own finally
-        # reaps; then join, then a final idempotent reap in case the reader never ran.
+        # Close stdin first: a clean-shutdown signal (EOF) the helper still receives even if
+        # the SIGTERM below is missed (CONTRACT 1). Additive - the terminate/kill path below
+        # is unchanged. Terminate then unblocks a reader stuck on read() so its finally reaps;
+        # then join, then a final idempotent reap in case the reader never ran.
         proc = self._proc
         if proc is not None:
+            stdin = getattr(proc, "stdin", None)
+            if stdin is not None:
+                try:
+                    stdin.close()
+                except Exception:
+                    pass
             try:
                 proc.terminate()
             except Exception:
@@ -506,6 +601,16 @@ class AudioCapture(CaptureBase):
         self._mic_stream = None
         self._helper = None
         self._sys_await_thread = None   # deferred permission-wait completion thread
+        # System-audio status for the UI (CROSS-AGENT CONTRACT). One of 'disabled' (no SYS
+        # source requested), 'pending' (waiting on permission/startup), 'active' (frames
+        # flowing), 'permission_denied', 'failed'. The web layer reads it as
+        # getattr(capture, 'sys_state', 'active'); updated at each transition below.
+        self.sys_state = "disabled"
+        # Serialises the deferred SYS registration + chunker creation against the base start()
+        # chunker loop, and guards the one-chunker-per-source claim (M1). Re-entrant so the
+        # await path can hold it across _register_source + _ensure_chunker in one critical section.
+        self._sys_lifecycle_lock = threading.RLock()
+        self._chunker_running = set()   # sources with a live chunker (one-per-source dedup, M1)
 
     def _open_sources(self):
         # Transactional: on ANY failure, stop/close everything opened so far (a
@@ -528,9 +633,15 @@ class AudioCapture(CaptureBase):
             print(f"[SYS] system audio disabled: {e}", flush=True)
 
         if loop_desc is not None:
+            self.sys_state = "pending"
             try:
                 self._open_system_tap()
             except Exception as e:
+                # _open_system_tap sets the precise terminal state ('permission_denied' /
+                # 'failed') before it raises; only fall back to 'failed' if it raised before
+                # deciding (e.g. the helper binary is missing), so a denial is not clobbered.
+                if self.sys_state == "pending":
+                    self.sys_state = "failed"
                 print(f"[SYS] could not start system-audio tap: {e}. "
                       "Continuing with the microphone only.", flush=True)
 
@@ -579,6 +690,7 @@ class AudioCapture(CaptureBase):
         helper = _AudioTapHelper(
             path,
             on_frame=lambda samples: self._ingest_block("SYS", samples.reshape(-1, 1)),
+            on_failed=self._on_sys_failed,
         )
         status = helper.start()
 
@@ -588,6 +700,9 @@ class AudioCapture(CaptureBase):
             # frame has a buffer to land in. mono -> 1 channel.
             self._helper = helper
             self._register_source("SYS", helper.rate, helper.channels)
+            # 'active' BEFORE begin() so a near-instant post-'started' EOF (via on_failed)
+            # cannot be overwritten back to 'active' after it flipped to 'failed' (H1).
+            self.sys_state = "active"
             helper.begin()
             print(f"[SYS] system-audio tap started via {path.name} "
                   f"@ {helper.rate} Hz x{helper.channels}ch", flush=True)
@@ -601,6 +716,7 @@ class AudioCapture(CaptureBase):
             # The SYS-registered-before-gate invariant is preserved: the await thread
             # registers SYS (and its chunker) BEFORE calling begin().
             self._helper = helper
+            self.sys_state = "pending"
             self._sys_await_thread = threading.Thread(
                 target=self._await_system_tap, args=(helper, path),
                 daemon=True, name="audiotap-await")
@@ -610,7 +726,9 @@ class AudioCapture(CaptureBase):
                   flush=True)
             return
 
-        # START_FAILED: degrade to mic-only.
+        # START_FAILED: degrade to mic-only. Record whether it was a TCC denial (a distinct
+        # UI state) versus any other startup failure before surfacing it to the caller (H1).
+        self.sys_state = "permission_denied" if helper.permission_denied else "failed"
         try:
             helper.stop()
         except Exception:
@@ -622,6 +740,11 @@ class AudioCapture(CaptureBase):
         # extended permission ceiling; on success register SYS + its chunker and open
         # the frame gate; on failure/timeout degrade to mic-only.
         if not helper.wait_started(_PERMISSION_WAIT_S):
+            if helper.stopped:
+                # stop() woke the wait during a deliberate teardown: not a failure, and the
+                # session is ending anyway, so leave sys_state as it is and just exit.
+                return
+            self.sys_state = "permission_denied" if helper.permission_denied else "failed"
             print(f"[SYS] system audio not started: "
                   f"{helper.error or 'timed out waiting for capture permission'}. "
                   "Continuing with the microphone only.", flush=True)
@@ -630,24 +753,107 @@ class AudioCapture(CaptureBase):
             except Exception:
                 pass
             return
-        # Register SYS and spawn its chunker BEFORE opening the gate so the first SYS
-        # frame has both a buffer and a drainer. start() has already spawned the MIC
-        # chunker; SYS registered late needs its own (start() only saw MIC).
-        self._register_source("SYS", helper.rate, helper.channels)
-        self._spawn_sys_chunker()
-        helper.begin()
+        # Register SYS and spawn its chunker BEFORE opening the gate so the first SYS frame
+        # has both a buffer and a drainer. Under the lifecycle lock so this cannot race the
+        # base start() chunker loop into two SYS chunkers (M1). start() already spawned the
+        # MIC chunker; SYS registered late needs its own (start() only saw MIC).
+        with self._sys_lifecycle_lock:
+            self._register_source("SYS", helper.rate, helper.channels)
+            self._ensure_chunker("SYS")
+        # Best-effort: upgrade a mic-only (AGC-only) processing worker to an echo-cancelling
+        # MIC+SYS worker now the far end exists, so AEC is available for the rest of the
+        # meeting instead of staying off (H3). No-op (documented native-SYS fallback) when
+        # there is no worker, the binding is missing, or the rebuild fails. Done outside the
+        # lifecycle lock: it may build/stop a worker (slow) and must not block chunker entry.
+        self._maybe_engage_aec_after_grant(helper)
+        self.sys_state = "active"   # set before begin() (see _open_system_tap) so a fast
+        helper.begin()              # post-'started' EOF flipping 'failed' is not overwritten.
         print(f"[SYS] system-audio tap started via {path.name} "
               f"@ {helper.rate} Hz x{helper.channels}ch (after permission grant)",
               flush=True)
 
-    def _spawn_sys_chunker(self):
-        # Spawn the per-source chunker for a SYS source registered AFTER start() ran
-        # (the deferred permission-wait path). Mirrors the chunker spawn in
-        # CaptureBase.start(), which only sees sources registered before it runs.
-        t = threading.Thread(target=self._chunker, args=("SYS",),
-                             daemon=True, name="chunker-SYS")
+    def _maybe_engage_aec_after_grant(self, helper):
+        """Upgrade a live mic-only AGC worker to an echo-cancelling MIC+SYS worker after a late
+        system-audio grant, so echo cancellation works for the rest of the meeting rather than
+        staying off (H3). Best-effort and fully reversible to the pre-grant behaviour:
+
+        Returns without changing anything (leaving the documented native-SYS + AGC-only path,
+        see capture_core._worker_takes) when there is no worker to upgrade, it already has a far
+        end, the LiveKit binding is absent, or the rebuild raises. Only ever ADDS echo
+        cancellation; it never makes a working session worse.
+
+        Safe here because the helper's SYS rate is the 16 kHz target, so no live buffer's rate is
+        swapped: the mic buffer is already 16 kHz (the AGC worker flipped it at start()), and the
+        new worker emits 16 kHz for both ends. The new worker is started and swapped in BEFORE the
+        old one is stopped, so mic blocks route to a live worker throughout (a stray block landing
+        on the just-stopped old worker is dropped, the same tiny gap start()'s AEC engagement
+        accepts)."""
+        old = self._live_aec
+        # Only a live AGC-only worker (mic-only start that engaged AGC) can be upgraded. No worker
+        # (AGC off / binding missing) or one that already has a far end -> nothing to do.
+        if old is None or getattr(old, "has_far", True):
+            return
+        # The upgrade routes SYS through the worker (which emits 16 kHz). That only lines up with
+        # the SYS chunker, already reading _rates["SYS"], when the helper's own rate is the target,
+        # which the frozen --sample-rate 16000 contract guarantees. If it ever is not, keep the
+        # native-SYS fallback rather than swap a rate under a running chunker.
+        if helper.rate != TARGET_RATE:
+            return
+        try:
+            from . import aec as _aec
+            if not _aec.available():
+                return
+            from .aec_live import LiveAEC
+            new = LiveAEC(
+                self._native_rates["MIC"], helper.rate,
+                on_near=lambda x: self._append_16k("MIC", x),
+                on_far=lambda x: self._append_16k("SYS", x),
+                bypass=not self.aec,
+                agc=self.agc,
+            )
+            new.start()   # builds the APM + worker thread; raises here if the lib is broken
+        except Exception as e:
+            print(f"[aec] could not engage echo cancellation after the permission grant "
+                  f"({e}); system audio continues without it", flush=True)
+            return
+        # Commit: swap to the new worker (atomic pointer write) so mic callbacks and SYS blocks
+        # both route to it, mark SYS as 16 kHz (a no-op given the 16 kHz helper), THEN stop the
+        # old worker so it flushes its near tail into the 16 kHz mic buffer and exits.
+        self._live_aec = new
+        self._rates["SYS"] = TARGET_RATE
+        try:
+            old.stop()
+        except Exception:
+            pass
+        print(f"[aec] live echo canceller engaged after the permission grant "
+              f"({'active' if self.aec else 'bypassed, ready to toggle on'})", flush=True)
+
+    def _on_sys_failed(self):
+        """Reader-thread callback for an UNEXPECTED post-'started' SYS end (EOF/exit, desync, or
+        reader error while streaming). Surface it so the UI can warn; the mic keeps going (H1).
+        A plain string write is atomic; a clean stop() never triggers this."""
+        self.sys_state = "failed"
+
+    def _ensure_chunker(self, source):
+        # Launch the per-source chunker for a source registered AFTER start() ran (the deferred
+        # permission-wait path). Idempotency is enforced at _chunker entry, so if the base
+        # start() loop ALSO spawned one for this source (grant landed mid-startup), exactly one
+        # ends up running (M1). Mirrors the chunker spawn in CaptureBase.start().
+        t = threading.Thread(target=self._chunker, args=(source,),
+                             daemon=True, name=f"chunker-{source}")
         t.start()
         self._workers.append(t)
+
+    def _chunker(self, source):
+        # Exactly one chunker per source may run, regardless of how many threads were spawned:
+        # the base start() loop and the deferred permission-wait path can both spawn a SYS
+        # chunker if the grant lands mid-startup (M1). The first thread to claim the source runs
+        # the shared chunker; any duplicate returns immediately (it is still joined in stop()).
+        with self._sys_lifecycle_lock:
+            if source in self._chunker_running:
+                return
+            self._chunker_running.add(source)
+        super()._chunker(source)
 
     def _open_mic(self, desc):
         import sounddevice as sd
