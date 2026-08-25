@@ -35,18 +35,21 @@ VER="$(sed -n 's/.*APP_VERSION *= *"\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p' live_tra
 echo "==> Building Volksmond $VER (macOS arm64)"
 
 # --- Python venv -----------------------------------------------------------------------
-# Reuse a dedicated venv so repeat builds are fast; create + populate it on first run.
+# Reuse a dedicated venv so repeat builds are fast; create it on first run only. Dependency
+# install runs on EVERY build (not just venv creation), so a changed requirements.txt is never
+# silently skipped; pip's own cache keeps a no-op reinstall fast.
 PYTHON="${PYTHON:-python3}"
 VENV="$ROOT/build-mac/venv"
 if [ ! -x "$VENV/bin/python" ]; then
     echo "==> Creating build venv at $VENV"
     "$PYTHON" -m venv "$VENV"
     "$VENV/bin/python" -m pip install --upgrade pip
-    # requirements.txt is platform-markered (WP-C: pyaudiowpatch is win32-only, sounddevice mac).
-    "$VENV/bin/python" -m pip install -r requirements.txt
-    "$VENV/bin/python" -m pip install pyinstaller dmgbuild
 fi
 PY="$VENV/bin/python"
+# requirements.txt is platform-markered (WP-C: pyaudiowpatch is win32-only, sounddevice mac).
+echo "==> Installing dependencies (pip cache keeps repeat installs fast)"
+"$PY" -m pip install -r requirements.txt
+"$PY" -m pip install pyinstaller dmgbuild
 
 # --- Swift SYS-capture helper (WP-B) ---------------------------------------------------
 # Compile mac/volksmond-audiotap (its own SwiftPM package) and hand the binary to the spec via
