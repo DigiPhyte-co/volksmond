@@ -35,7 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .capture_core import BLOCK_SECONDS, TARGET_RATE, CaptureBase
+from .capture_core import BLOCK_SECONDS, CaptureBase
 from .devices_mac import resolve_loopback, resolve_mic
 
 # ---- frozen helper contract (mac-port plan section 2.2) -------------------
@@ -760,73 +760,11 @@ class AudioCapture(CaptureBase):
         with self._sys_lifecycle_lock:
             self._register_source("SYS", helper.rate, helper.channels)
             self._ensure_chunker("SYS")
-        # Best-effort: upgrade a mic-only (AGC-only) processing worker to an echo-cancelling
-        # MIC+SYS worker now the far end exists, so AEC is available for the rest of the
-        # meeting instead of staying off (H3). No-op (documented native-SYS fallback) when
-        # there is no worker, the binding is missing, or the rebuild fails. Done outside the
-        # lifecycle lock: it may build/stop a worker (slow) and must not block chunker entry.
-        self._maybe_engage_aec_after_grant(helper)
         self.sys_state = "active"   # set before begin() (see _open_system_tap) so a fast
         helper.begin()              # post-'started' EOF flipping 'failed' is not overwritten.
         print(f"[SYS] system-audio tap started via {path.name} "
               f"@ {helper.rate} Hz x{helper.channels}ch (after permission grant)",
               flush=True)
-
-    def _maybe_engage_aec_after_grant(self, helper):
-        """Upgrade a live mic-only AGC worker to an echo-cancelling MIC+SYS worker after a late
-        system-audio grant, so echo cancellation works for the rest of the meeting rather than
-        staying off (H3). Best-effort and fully reversible to the pre-grant behaviour:
-
-        Returns without changing anything (leaving the documented native-SYS + AGC-only path,
-        see capture_core._worker_takes) when there is no worker to upgrade, it already has a far
-        end, the LiveKit binding is absent, or the rebuild raises. Only ever ADDS echo
-        cancellation; it never makes a working session worse.
-
-        Safe here because the helper's SYS rate is the 16 kHz target, so no live buffer's rate is
-        swapped: the mic buffer is already 16 kHz (the AGC worker flipped it at start()), and the
-        new worker emits 16 kHz for both ends. The new worker is started and swapped in BEFORE the
-        old one is stopped, so mic blocks route to a live worker throughout (a stray block landing
-        on the just-stopped old worker is dropped, the same tiny gap start()'s AEC engagement
-        accepts)."""
-        old = self._live_aec
-        # Only a live AGC-only worker (mic-only start that engaged AGC) can be upgraded. No worker
-        # (AGC off / binding missing) or one that already has a far end -> nothing to do.
-        if old is None or getattr(old, "has_far", True):
-            return
-        # The upgrade routes SYS through the worker (which emits 16 kHz). That only lines up with
-        # the SYS chunker, already reading _rates["SYS"], when the helper's own rate is the target,
-        # which the frozen --sample-rate 16000 contract guarantees. If it ever is not, keep the
-        # native-SYS fallback rather than swap a rate under a running chunker.
-        if helper.rate != TARGET_RATE:
-            return
-        try:
-            from . import aec as _aec
-            if not _aec.available():
-                return
-            from .aec_live import LiveAEC
-            new = LiveAEC(
-                self._native_rates["MIC"], helper.rate,
-                on_near=lambda x: self._append_16k("MIC", x),
-                on_far=lambda x: self._append_16k("SYS", x),
-                bypass=not self.aec,
-                agc=self.agc,
-            )
-            new.start()   # builds the APM + worker thread; raises here if the lib is broken
-        except Exception as e:
-            print(f"[aec] could not engage echo cancellation after the permission grant "
-                  f"({e}); system audio continues without it", flush=True)
-            return
-        # Commit: swap to the new worker (atomic pointer write) so mic callbacks and SYS blocks
-        # both route to it, mark SYS as 16 kHz (a no-op given the 16 kHz helper), THEN stop the
-        # old worker so it flushes its near tail into the 16 kHz mic buffer and exits.
-        self._live_aec = new
-        self._rates["SYS"] = TARGET_RATE
-        try:
-            old.stop()
-        except Exception:
-            pass
-        print(f"[aec] live echo canceller engaged after the permission grant "
-              f"({'active' if self.aec else 'bypassed, ready to toggle on'})", flush=True)
 
     def _on_sys_failed(self):
         """Reader-thread callback for an UNEXPECTED post-'started' SYS end (EOF/exit, desync, or
