@@ -1001,6 +1001,11 @@ def status():
             avail, active = STATE.capture.aec_state()
             resp["aec_live_available"] = avail
             resp["aec_live_active"] = active
+            # H1: system-audio capture health, one of 'disabled'|'pending'|'active'|
+            # 'permission_denied'|'failed'. Read defensively: a capture backend that does not
+            # expose this yet (or a mock in tests) reports as 'active' so the UI never raises a
+            # false warning. The live screen banners only on the last two values.
+            resp["sys_state"] = getattr(STATE.capture, "sys_state", "active")
         if STATE.stopping and STATE.engine is not None:
             resp["pending"] = STATE.engine.pending()
         return resp
