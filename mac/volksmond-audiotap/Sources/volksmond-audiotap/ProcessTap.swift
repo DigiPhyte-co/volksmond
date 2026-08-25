@@ -65,6 +65,15 @@ final class ProcessTap {
         }
         tapID = newTapID
 
+        // Transactional from here on (finding M2): the tap now exists, so if ANY later
+        // step throws (reading the UID, creating the aggregate, validating the stream
+        // format, creating the IO proc) we must tear down what we have already acquired
+        // before propagating, or the tap/aggregate would leak in the OS. stop() undoes
+        // the tap, aggregate and IO proc in the correct reverse order and is idempotent,
+        // so the caller and the shutdown path may still call it again harmlessly.
+        var committed = false
+        defer { if !committed { stop() } }
+
         // 2. Read the tap's UID so we can reference it from the aggregate device.
         let tapUID = try readTapUID(tapID)
 
@@ -124,6 +133,9 @@ final class ProcessTap {
             throw TapError.createIOProc(ioStatus)
         }
         ioProcID = procID
+
+        // All resources acquired: commit so the rollback defer above becomes a no-op.
+        committed = true
     }
 
     // Start audio flowing. Callbacks begin immediately, so onInput must be set and
