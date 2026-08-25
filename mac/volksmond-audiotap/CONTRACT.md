@@ -136,7 +136,9 @@ STATS seq=<int> dropped=<int> host_ms=<int>
   non-decreasing.
 - `dropped`: total frames dropped so far because the internal ring overflowed (the
   consumer drained stdout slower than audio arrived). `seq - dropped` is the number of
-  frames that reached stdout. A non-zero and rising `dropped` means the consumer is
+  frames accepted into the writer without overflow, NOT necessarily the number already
+  written to stdout: some may still be queued or in the writer's scratch buffer, and a
+  write can fail after dequeue. A non-zero and rising `dropped` means the consumer is
   not keeping up.
 - `host_ms`: a monotonic host-clock timestamp in milliseconds (derived from
   `mach_absolute_time`). Not wall-clock and not comparable across processes; only
