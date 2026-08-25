@@ -187,6 +187,11 @@ class CaptureBase:
         self._t0 = None
         self._t0_init = t0
         self._workers = []
+        # Serialises start()'s worker-engagement decision + commit + chunker snapshot against a
+        # backend that registers a source LATE from another thread (the macOS deferred system-
+        # audio permission grant). Re-entrant; Windows registers everything before start() and
+        # never contends it (so this is a no-op there).
+        self._lifecycle_lock = threading.RLock()
         self._levels = {}         # source -> (peak, rms), latest input level for a live meter
         self._sys_ring = None     # optional transcribe.EnergyRing, fed raw SYS energy for the echo veto
         self._mic_ring = None     # optional transcribe.EnergyRing, fed RAW (pre-APM) MIC energy
@@ -241,16 +246,17 @@ class CaptureBase:
 
         On macOS the system-audio TCC grant often lands AFTER start() has committed a
         mic-only AGC worker (the common Mac case). Rather than leave echo cancellation
-        unavailable for the whole meeting, the macOS backend then rebuilds that worker in
-        place into a MIC+SYS echo-cancelling one (see
-        `capture_mac._maybe_engage_aec_after_grant`), so has_far becomes true and this
-        function routes SYS through the worker for the rest of the session. That in-place
-        upgrade is a deliberate, accepted tradeoff (a tiny swap-boundary glitch buys real
-        AEC) and is safe because the helper's SYS rate is already 16 kHz, so no live
-        buffer's rate changes. The base/Windows path performs no such mid-flight rebuild and
-        relies purely on this routing; and if the macOS upgrade cannot run (LiveKit binding
-        missing, rebuild fails), SYS simply stays on the native path (still captured +
-        metered, AEC unavailable, as aec_state() reports)."""
+        unavailable for the whole meeting, the macOS backend then attaches a far end to that
+        SAME running worker IN PLACE (LiveAEC.attach_far, see
+        `capture_mac._maybe_engage_aec_after_grant`): no worker swap, so the mic stream keeps
+        flowing through one queue uninterrupted (no lost or reordered mic audio), and has_far
+        flips true so this function routes SYS through the worker for the rest of the session.
+        That in-place attach is a deliberate, accepted tradeoff and is safe because the helper's
+        SYS rate is already 16 kHz, so no live buffer's rate changes. The base/Windows path
+        never attaches late and relies purely on this routing; and if the macOS upgrade cannot
+        run (no mic worker because AGC is off, or the LiveKit binding is missing), SYS simply
+        stays on the native path (still captured + metered, AEC unavailable, as aec_state()
+        reports)."""
         return la is not None and (source == "MIC" or getattr(la, "has_far", True))
 
     def _ingest_block(self, source, arr):
@@ -317,7 +323,15 @@ class CaptureBase:
     def start(self):
         self._t0 = self._t0_init if self._t0_init is not None else time.monotonic()
         self._open_sources()
+        # Worker-engagement decision + commit + chunker snapshot under the lifecycle lock: a
+        # backend can register a source LATE from another thread (the macOS deferred system-audio
+        # grant), so this serialises against it - no registration slips between the want_aec
+        # decision and the worker commit, and self._buffers is never mutated while it is being
+        # snapshotted for the chunker loop. Windows registers before start() and never contends it.
+        with self._lifecycle_lock:
+            self._engage_worker_and_start_chunkers()
 
+    def _engage_worker_and_start_chunkers(self):
         # Live echo cancellation + mic auto-gain: the APM worker engages whenever both a mic and
         # a system loopback opened (AEC needs the loopback as the far-end reference), and ALSO on
         # a mic-only session when AGC is on (AGC-only worker, nothing to cancel against). When the

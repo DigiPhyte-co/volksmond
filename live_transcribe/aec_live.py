@@ -83,6 +83,7 @@ class LiveAEC:
         self._main_retried = False   # one AEC-only rebuild attempt after a mid-stream main-APM failure
         self._pump_warned = False    # last-resort worker guard has logged (once per session)
         self._dropped = 0
+        self._far_pending = None     # far_rate awaiting an in-place far-end attach (attach_far)
 
     # -- producer side (PortAudio callback threads) --------------------------------------------
     def push_near(self, mono_native):
@@ -96,6 +97,20 @@ class LiveAEC:
             q.put_nowait(np.asarray(block, dtype=np.float32))
         except queue.Full:
             self._dropped += 1   # worker fell behind (should never happen at ~100x real-time)
+
+    def attach_far(self, far_rate, on_far):
+        """Add a far end (echo cancellation) to a RUNNING AGC-only worker IN PLACE, with no
+        swap - the near (mic) stream keeps flowing through the same queue, so no mic block is
+        lost or reordered. Used when the system-audio permission grant lands mid-session (the
+        macOS deferred grant). The far resampler + main echo-cancelling APM are built on the
+        worker thread at the next pump (which solely owns the APM); push_far may be called
+        immediately (far frames buffer in the far queue until then). No-op if a far end already
+        exists. Called from the capture layer's grant thread, not the worker."""
+        if self.has_far:
+            return
+        self._on_far = on_far
+        self._far_pending = far_rate   # picked up by the worker thread in _pump
+        self.has_far = True            # capture layer now routes far blocks to push_far (buffered)
 
     # -- worker ---------------------------------------------------------------------------------
     def start(self):
@@ -160,7 +175,42 @@ class LiveAEC:
         except Exception as e:
             print(f"[aec] live audio worker flush error ({e})", flush=True)
 
+    def _apply_far_attach(self):
+        """Worker-thread half of attach_far (the worker solely owns the APM): build the far
+        resampler + the main echo-cancelling APM so the near end is cancelled and the far end
+        informs the canceller. Fail open (far still passes through, near stays AGC-only) if the
+        APM will not build. Runs at the top of the first _pump after attach_far, before the drain
+        below picks up any buffered far frames."""
+        far_rate = self._far_pending
+        self._far_pending = None
+        self._far_rs = None if far_rate in (None, TARGET_RATE) else soxr.ResampleStream(
+            far_rate, TARGET_RATE, 1, dtype="float32")
+        try:
+            from livekit.rtc.apm import AudioProcessingModule
+            self._apm = AudioProcessingModule(echo_cancellation=True, noise_suppression=False,
+                                              high_pass_filter=False, auto_gain_control=self.agc)
+        except Exception as e:
+            if self.agc:
+                # The AGC flag may be the poison; retry AEC-only (mirrors start()'s build fallback).
+                try:
+                    self._apm = AudioProcessingModule(echo_cancellation=True, noise_suppression=False,
+                                                      high_pass_filter=False, auto_gain_control=False)
+                    self.agc = False
+                    self.aec_capable = True
+                    print(f"[aec] echo canceller attached without mic auto-gain ({e})", flush=True)
+                    return
+                except Exception:
+                    pass
+            self._apm = None
+            self.aec_capable = False
+            print(f"[aec] could not attach echo cancellation after the grant ({e}); "
+                  "system audio continues without it", flush=True)
+            return
+        self.aec_capable = True
+
     def _pump(self, flush=False):
+        if self._far_pending is not None:
+            self._apply_far_attach()   # in-place far-end attach (attach_far), worker-thread side
         far_new = self._drain(self._far_q, self._far_rs)
         near_new = self._drain(self._near_q, self._near_rs)
         if flush:   # flush soxr's internal latency so the last few ms are not lost

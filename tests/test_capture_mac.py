@@ -526,10 +526,31 @@ class _FakeHelper:
 
     def begin(self):
         self.began = True
+        ev = getattr(self, "_events", None)
+        if ev is not None:
+            ev.append("begin")
 
     def stop(self):
         self.stopped = True
         self._started.set()
+
+
+class _FakeWorker:
+    """Stand-in for a running LiveAEC worker, to drive the late-grant in-place attach path
+    without LiveKit. Records attach_far so a test can prove the worker is upgraded IN PLACE
+    (same object, no swap)."""
+
+    def __init__(self, has_far=False):
+        self.has_far = has_far
+        self.bypass = True
+        self.attached = None   # (far_rate, on_far) once attach_far is called
+        self._events = None
+
+    def attach_far(self, far_rate, on_far):
+        self.attached = (far_rate, on_far)
+        self.has_far = True
+        if self._events is not None:
+            self._events.append("attach_far")
 
 
 def test_open_system_tap_waiting_defers_registration():
@@ -650,6 +671,159 @@ def test_await_system_tap_teardown_is_not_a_failure():
     assert cap.sys_state == "pending", cap.sys_state   # unchanged, not 'failed'
     assert "SYS" not in cap._buffers
     print("  OK  _await_system_tap: a teardown-driven wake is not treated as a SYS failure (H1)")
+
+
+# ---- late-grant AEC engage: ordering, in-place attach, gate timeout --------
+
+def test_await_opens_gate_before_upgrade():
+    # Fix 1: begin() (open the frame gate) MUST happen before the AEC engage, so a slow engage
+    # can never delay begin() past the reader's ~5s gate deadline (which would get the helper
+    # reaped while the UI still reports 'active').
+    events = []
+    cap = capture_mac.AudioCapture()
+    cap._t0 = 0.0
+    worker = _FakeWorker(has_far=False)
+    worker._events = events
+    cap._live_aec = worker
+    fake = _FakeHelper(capture_mac.START_WAITING)   # rate = 16000 = TARGET_RATE
+    fake._events = events
+    fake.signal_started()
+    try:
+        cap._await_system_tap(fake, capture_mac.Path("fake/volksmond-audiotap"))
+        assert events == ["begin", "attach_far"], events   # gate opened BEFORE the engage
+        assert cap._live_aec is worker                      # attached in place, not swapped
+    finally:
+        cap._stop_event.set()
+    print("  OK  _await_system_tap: opens the gate BEFORE the AEC engage (Fix 1)")
+
+
+def test_gate_timeout_fires_failure():
+    # Fix 1: if begin() is never called, the reader's post-'started' gate wait times out and must
+    # surface a SYS failure (fire on_failed), never silently die while the UI still says 'active'.
+    header = (b'{"format":"f32le","rate":16000,"channels":1}\n'
+              b'{"event":"started"}\n')
+    failed = threading.Event()
+    orig = capture_mac._GATE_TIMEOUT_S
+    capture_mac._GATE_TIMEOUT_S = 0.2
+    try:
+        h = capture_mac._AudioTapHelper("audiotap", on_frame=lambda a: None, on_failed=failed.set)
+        h._proc = _FakeProc(header)   # handshake only; we deliberately never call begin()
+        h._reader_thread = threading.Thread(target=h._run, daemon=True)
+        h._reader_thread.start()
+        assert h._ready.wait(2.0)
+        assert failed.wait(2.0), "on_failed did not fire on a post-started gate timeout"
+    finally:
+        capture_mac._GATE_TIMEOUT_S = orig
+    print("  OK  helper: a post-'started' gate timeout fires on_failed (Fix 1)")
+
+
+def test_maybe_engage_attaches_in_place_no_swap():
+    # Fix 2: the late-grant engage attaches a far end to the SAME running worker (attach_far) - no
+    # swap - so the mic stream is never handed off and no mic block can be lost or reordered.
+    cap = capture_mac.AudioCapture()
+    cap._t0 = 0.0
+    cap._register_source("SYS", 16000, 1)   # as the grant path registers it before engaging
+    worker = _FakeWorker(has_far=False)
+    cap._live_aec = worker
+    fake = _FakeHelper(capture_mac.START_STARTED)   # rate = 16000
+    cap._maybe_engage_aec_after_grant(fake)
+    assert cap._live_aec is worker, "worker was swapped; must attach in place (Fix 2)"
+    assert worker.attached is not None and worker.attached[0] == 16000
+    assert worker.has_far is True
+    assert worker.bypass is (not cap.aec)   # bypass reflects the session's AEC choice
+    print("  OK  _maybe_engage: attaches the far end in place, no worker swap (Fix 2)")
+
+
+def test_maybe_engage_noop_when_worker_already_has_far():
+    # Fix 3: if start() already committed a MIC+SYS worker (SYS registered before its decision),
+    # the attach is a no-op (already echo-capable).
+    cap = capture_mac.AudioCapture()
+    worker = _FakeWorker(has_far=True)
+    cap._live_aec = worker
+    cap._maybe_engage_aec_after_grant(_FakeHelper(capture_mac.START_STARTED))
+    assert worker.attached is None   # not attached again
+    print("  OK  _maybe_engage: no-op when the worker already has a far end (Fix 3)")
+
+
+def test_maybe_engage_noop_when_no_worker():
+    # Fix 3: no mic worker (AGC off / binding missing) -> nothing to attach to (documented
+    # native-SYS fallback); must not raise.
+    cap = capture_mac.AudioCapture()
+    cap._live_aec = None
+    cap._maybe_engage_aec_after_grant(_FakeHelper(capture_mac.START_STARTED))
+    assert cap._live_aec is None
+    print("  OK  _maybe_engage: no-op (no crash) when there is no worker to attach to (Fix 3)")
+
+
+def test_liveaec_attach_far_state():
+    # Fix 2 (aec_live): attach_far on an AGC-only worker sets up far routing with NO swap; the
+    # APM build is deferred to the worker thread (not exercised here - LiveKit is absent). This
+    # only touches LiveAEC.__init__ + attach_far, neither of which imports livekit.
+    from live_transcribe.aec_live import LiveAEC
+    la = LiveAEC(16000, None, on_near=lambda x: None, on_far=None, bypass=True, agc=True)
+    assert la.has_far is False and la.aec_capable is False and la._far_pending is None
+    sink = lambda x: None
+    la.attach_far(16000, sink)
+    assert la.has_far is True
+    assert la._far_pending == 16000
+    assert la._on_far is sink
+    la.attach_far(48000, lambda x: None)   # idempotent: a second attach is a no-op
+    assert la._far_pending == 16000
+    print("  OK  LiveAEC.attach_far: sets far routing in place, idempotent (Fix 2)")
+
+
+def test_start_snapshot_under_lifecycle_lock():
+    # Fix 4: base start() takes _lifecycle_lock around the worker-decision + chunker snapshot -
+    # the SAME lock the macOS grant thread uses for _register_source - so a late registration can
+    # never mutate self._buffers mid-snapshot ('dict changed size during iteration'). Deterministic
+    # proof: while start() is inside its locked section, a probe that also takes the lock cannot.
+    from live_transcribe.capture_core import CaptureBase
+
+    class _Cap(CaptureBase):
+        def _open_sources(self):
+            self._register_source("MIC", 16000, 1)
+
+        def _close_sources(self):
+            pass
+
+        def _chunker(self, source):
+            pass   # no-op: spawned chunker threads just exit
+
+    cap = _Cap(agc=False)   # agc off -> no worker; start() goes straight to snapshot + spawn
+    real = cap._lifecycle_lock
+    inside = threading.Event()
+    proceed = threading.Event()
+    probe = {"blocked": None}
+
+    class _Probe:
+        def __enter__(self):
+            real.acquire()
+            inside.set()
+            proceed.wait(2.0)
+            return self
+
+        def __exit__(self, *a):
+            real.release()
+
+    cap._lifecycle_lock = _Probe()
+
+    def probing():
+        assert inside.wait(2.0)
+        got = real.acquire(blocking=False)   # start() holds it via _Probe -> must fail
+        probe["blocked"] = not got
+        if got:
+            real.release()
+        proceed.set()
+
+    t = threading.Thread(target=probing, daemon=True)
+    t.start()
+    try:
+        cap.start()
+        t.join(2.0)
+    finally:
+        cap._stop_event.set()
+    assert probe["blocked"] is True, "start() did not hold _lifecycle_lock during its snapshot"
+    print("  OK  start(): worker-decision + chunker snapshot run under _lifecycle_lock (Fix 4)")
 
 
 # ---- devices_mac -----------------------------------------------------------
@@ -801,6 +975,13 @@ TESTS = [
     test_open_system_tap_failed_denied_sets_state_and_raises,
     test_await_system_tap_denial_after_wait_sets_state,
     test_await_system_tap_teardown_is_not_a_failure,
+    test_await_opens_gate_before_upgrade,
+    test_gate_timeout_fires_failure,
+    test_maybe_engage_attaches_in_place_no_swap,
+    test_maybe_engage_noop_when_worker_already_has_far,
+    test_maybe_engage_noop_when_no_worker,
+    test_liveaec_attach_far_state,
+    test_start_snapshot_under_lifecycle_lock,
     test_list_ui_devices_shape,
     test_merge_default_absent_multiple_mics,
     test_merge_default_absent_single_mic,
