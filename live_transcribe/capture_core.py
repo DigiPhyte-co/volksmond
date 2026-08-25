@@ -235,14 +235,22 @@ class CaptureBase:
         MIC always routes to a live worker. SYS routes to it ONLY when the worker was
         built with a far end (has_far): an AGC-only worker (mic-only start, far_rate=None)
         has no far pipeline (no main APM, no on_far sink), so pushing far blocks at it
-        would silently DISCARD them. That happens for real on macOS when the system-audio
-        TCC grant lands after start() committed a mic-only AGC worker: those late SYS
-        blocks must instead take the native buffer path (registered at native rate by the
-        deferred-permission handshake), exactly as a no-worker session would. Chosen over
-        an in-place worker upgrade: rebuilding the worker mid-flight would have to swap
-        MIC's buffer rate and resampler state under audio callbacks, a much riskier move
-        for the same audible result (SYS captured + metered; AEC stays honestly
-        unavailable for the session, as aec_state() already reports)."""
+        would silently DISCARD them; such SYS blocks take the native buffer path instead
+        (registered at native rate by the deferred-permission handshake), exactly as a
+        no-worker session would. This return logic is unchanged and shared by every backend.
+
+        On macOS the system-audio TCC grant often lands AFTER start() has committed a
+        mic-only AGC worker (the common Mac case). Rather than leave echo cancellation
+        unavailable for the whole meeting, the macOS backend then rebuilds that worker in
+        place into a MIC+SYS echo-cancelling one (see
+        `capture_mac._maybe_engage_aec_after_grant`), so has_far becomes true and this
+        function routes SYS through the worker for the rest of the session. That in-place
+        upgrade is a deliberate, accepted tradeoff (a tiny swap-boundary glitch buys real
+        AEC) and is safe because the helper's SYS rate is already 16 kHz, so no live
+        buffer's rate changes. The base/Windows path performs no such mid-flight rebuild and
+        relies purely on this routing; and if the macOS upgrade cannot run (LiveKit binding
+        missing, rebuild fails), SYS simply stays on the native path (still captured +
+        metered, AEC unavailable, as aec_state() reports)."""
         return la is not None and (source == "MIC" or getattr(la, "has_far", True))
 
     def _ingest_block(self, source, arr):
