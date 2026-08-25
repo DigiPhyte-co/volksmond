@@ -176,6 +176,12 @@ function freshLive() {
     // ({old_size, new_size, recording}), or null. Server-owned, like silenceNudge: set when a
     // CPU session auto-downgrades to a lighter model to stay live.
     struggleNudge: null,
+    // System-audio capture health, mirrored from /api/status ('active'|'disabled'|'pending'|
+    // 'permission_denied'|'failed'), or null before the first poll. Unlike the nudges above this
+    // is a continuous capture-health signal, not a one-shot server event, so dismissing its
+    // banner is purely local: sysAudioDismissedFor holds the value already dismissed, and the
+    // banner returns if sys_state later changes to a different bad value.
+    sysState: null, sysAudioDismissedFor: null,
     // Server-owned latched flag: true once recording is, or has ever been, active this session.
     // Latched (never clears on stop) so the record affordances stay hidden after a stop, which
     // prevents a stop-then-restart that would clobber the session WAV.
@@ -1262,6 +1268,12 @@ function render() {
   if (S.live.struggleNudge && S.route === "live") {
     APP.appendChild(struggleBanner());
   }
+  // System audio not being captured (denied or failed): same live-screen-only reasoning, and
+  // dismissible locally since there is nothing server-side to acknowledge (see sysState comment
+  // in freshLive). codex H1.
+  if (sysAudioWarn(S.live.sysState) && S.live.sysAudioDismissedFor !== S.live.sysState && S.route === "live") {
+    APP.appendChild(sysAudioBanner());
+  }
   if (S.toast) {
     APP.appendChild(el("div", { class: "toast-wrap" }, el("div", { class: "toast" + (S.toast.err ? " err" : ""), text: S.toast.msg })));
   }
@@ -1787,6 +1799,10 @@ function refreshSilence() {
     if (rec !== S.live.recording) { S.live.recording = rec; changed = true; }
     var rs = !!st.recording_started;
     if (rs !== S.live.recordingStarted) { S.live.recordingStarted = rs; changed = true; }
+    // H1: system-audio capture health. Absent (file/record-only sessions never set it server-side)
+    // is treated the same as "active" so it never renders a stale warning.
+    var ss = st.sys_state || null;
+    if (ss !== S.live.sysState) { S.live.sysState = ss; changed = true; }
     // t0-capture: also adopt model readiness / load error here as a slower self-healing backstop to
     // the 1.5s readiness poll (which stops once ready), so a lost poll cannot leave the chip stuck.
     if (adoptReadiness(st)) changed = true;
@@ -1916,6 +1932,37 @@ function struggleBanner() {
       ]),
       // The corner X is the same as Keep going: dismiss this session's banner without muting.
       el("button", { class: "btn ghost sm", style: { flex: "0 0 auto", padding: "6px" }, onclick: function () { dismissStruggle("dismiss"); }, title: "Dismiss" }, icon("x", 14)),
+    ]));
+}
+
+/* ── system audio not captured (codex H1) ─────────────────── */
+// sys_state comes from the capture object via /api/status ('disabled'|'pending'|'active'|
+// 'permission_denied'|'failed'); only the last two mean the meeting is missing the other side of
+// the call, so only those two warn. 'disabled' (no loopback device chosen) and 'pending' (still
+// opening) are normal, silent states, same as 'active'.
+function sysAudioWarn(s) { return s === "permission_denied" || s === "failed"; }
+// Local-only dismiss: unlike the silence/struggle nudges this is not a one-shot server event to
+// acknowledge, it is a continuous health reading, so there is nothing to POST. Recording the
+// dismissed VALUE (not just true/false) means a later change to a different bad state still warns.
+function dismissSysAudioWarning() {
+  S.live.sysAudioDismissedFor = S.live.sysState;
+  render();
+}
+// Same floating-card shape and inject point as silenceBanner()/struggleBanner(), title static,
+// body varies: permission_denied gets the extra "how to fix it" sentence, failed does not (nothing
+// the user can do about it mid-meeting beyond knowing the other side is missing).
+function sysAudioBanner() {
+  var body = S.live.sysState === "permission_denied"
+    ? "System audio isn't being captured, so only your microphone is being recorded. The other side of the call won't be in the transcript. You can allow it in System Settings > Privacy & Security, then restart the meeting."
+    : "System audio isn't being captured, so only your microphone is being recorded. The other side of the call won't be in the transcript.";
+  return el("div", { style: { position: "fixed", top: "16px", left: "50%", transform: "translateX(-50%)", zIndex: "60", maxWidth: "460px", width: "calc(100% - 32px)" } },
+    el("div", { class: "card", style: { padding: "14px 16px", display: "flex", gap: "12px", alignItems: "flex-start", borderColor: "var(--warn)", boxShadow: "0 10px 34px rgba(0,0,0,0.20)" } }, [
+      el("div", { class: "tone-tile warn", style: { width: "34px", height: "34px", flex: "0 0 auto" } }, icon("alert", 17)),
+      el("div", { class: "grow" }, [
+        el("div", { style: { fontWeight: "600", fontSize: "13.5px" }, text: "System audio isn't being captured" }),
+        el("p", { class: "ink-3", style: { fontSize: "11.5px", margin: "4px 0 0" }, text: body }),
+      ]),
+      el("button", { class: "btn ghost sm", style: { flex: "0 0 auto", padding: "6px" }, onclick: dismissSysAudioWarning, title: "Dismiss" }, icon("x", 14)),
     ]));
 }
 
@@ -4227,6 +4274,7 @@ function adoptRunning(status) {
   S.live.loopbackDevice = status.loopback_device != null ? status.loopback_device : null;
   S.live.aecAvailable = !!status.aec_live_available;
   S.live.aecActive = !!status.aec_live_active;
+  S.live.sysState = status.sys_state || null;   // system-audio capture health at reload time
   // /api/status does not carry the recording stem; the server derives it from the transcript
   // path (output_path minus ".md"), so reconstruct it for the record-only finish flow.
   S.live.audioStem = (status.recording_started && status.output_path) ? status.output_path.replace(/\.md$/, "") : null;

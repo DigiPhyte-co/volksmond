@@ -750,6 +750,12 @@ window.VM_I18N = {
     "Recording from here. Earlier audio is not saved.": "Neem van hier af op. Vroeëre klank word nie gestoor nie.",
     "Could not start recording.": "Kon nie opname begin nie.",
     "Won't warn again": "Sal nie weer waarsku nie",
+    // System audio not captured (live screen banner, denied or failed): codex H1
+    "System audio isn't being captured": "Stelselklank word nie vasgevang nie",
+    "System audio isn't being captured, so only your microphone is being recorded. The other side of the call won't be in the transcript.":
+      "Stelselklank word nie vasgevang nie, net jou mikrofoon. Die ander kant van die oproep sal nie in die transkripsie wees nie.",
+    "System audio isn't being captured, so only your microphone is being recorded. The other side of the call won't be in the transcript. You can allow it in System Settings > Privacy & Security, then restart the meeting.":
+      "Stelselklank word nie vasgevang nie, net jou mikrofoon. Die ander kant van die oproep sal nie in die transkripsie wees nie. Jy kan dit toelaat in Stelselinstellings > Privaatheid en sekuriteit, en dan die vergadering herbegin.",
     "Warn me when the model can't keep up": "Waarsku my wanneer die model nie kan byhou nie",
     "On a slower computer, Volksmond drops to a lighter, faster model to stay live. When it does, it tells you so you can record and re-transcribe at full accuracy afterward.":
       "Op 'n stadiger rekenaar val Volksmond terug na 'n ligter, vinniger model om lewendig te bly. Wanneer dit gebeur, sê dit vir jou sodat jy kan opneem en daarna teen volle akkuraatheid kan hertranskribeer.",
