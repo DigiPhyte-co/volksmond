@@ -104,10 +104,14 @@ if [ "$MAKE_DMG" = "1" ]; then
     SETTINGS="$(mktemp -t volksmond-dmg-XXXX.py)"
     cat > "$SETTINGS" <<'PYEOF'
 # Minimal dmgbuild settings: the .app plus a drag-to-install Applications symlink.
-# `app` is injected via -D app=<path>.
-files = [app]
+# The .app path is injected via `-D app=<path>`; dmgbuild exposes -D values in the
+# `defines` dict (NOT as bare globals), so read it from there.
+import os.path
+application = defines["app"]
+appname = os.path.basename(application)
+files = [application]
 symlinks = {"Applications": "/Applications"}
-icon_locations = {"Volksmond.app": (140, 120), "Applications": (400, 120)}
+icon_locations = {appname: (140, 120), "Applications": (400, 120)}
 window_rect = ((200, 200), (560, 320))
 PYEOF
     "$PY" -m dmgbuild -s "$SETTINGS" -D app="$APP" "Volksmond $VER" "$DMG"
