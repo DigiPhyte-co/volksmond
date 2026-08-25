@@ -4,16 +4,21 @@ import os
 
 // Resampler converts each captured block from the device format (system rate,
 // stereo, float32) to the contracted output format (target rate, mono or stereo,
-// interleaved float32 LE) and writes it as one PCM frame on stdout.
+// interleaved float32 LE) and hands it to the FrameStreamer as one PCM frame.
 //
-// It runs synchronously on the Core Audio IO thread. That keeps the helper simple
-// (no ring buffer, no cross-thread hand-off): the only consumer is a pipe that the
-// Python side drains continuously, and since we are capturing rather than playing,
-// a brief stall would delay data, never glitch anything the user hears.
+// It runs synchronously on the Core Audio IO thread. Conversion happens here, but
+// the converted bytes are only COPIED into the streamer's bounded ring buffer and
+// the callback returns immediately: it never writes to stdout and never blocks
+// (finding H2). A separate writer thread drains the ring and performs the framed
+// stdout writes, so a slow reader on the pipe cannot stall the realtime audio thread.
 final class Resampler {
     private let converter: AVAudioConverter
     private let outputChannels: Int
     private let outputBuffer: AVAudioPCMBuffer
+
+    // Ring-buffer sink drained by a dedicated writer thread. Set before the gate is
+    // opened, so it is always non-nil once frames actually flow through process().
+    var sink: FrameStreamer?
 
     // Start gate. Audio callbacks begin the instant AudioDeviceStart runs, which is
     // before we have emitted the "started" control line. Blocks captured before the
@@ -86,10 +91,12 @@ final class Resampler {
         guard frames > 0 else { return }
 
         // Interleaved single-buffer layout: one contiguous run of
-        // frames * channels float32 samples. Copy the raw bytes for the frame.
+        // frames * channels float32 samples. Hand the raw bytes to the ring buffer and
+        // return: NO Data allocation and NO stdout write on this realtime thread. The
+        // streamer memcpys the bytes under a lock it never holds across a blocking
+        // write, so this stays wait-free with respect to slow I/O (finding H2).
         let byteCount = frames * outputChannels * MemoryLayout<Float>.size
         guard let mData = outputBuffer.audioBufferList.pointee.mBuffers.mData else { return }
-        let payload = Data(bytes: mData, count: byteCount)
-        StdoutWriter.shared.writeFrame(payload)
+        sink?.enqueue(mData, byteCount)
     }
 }

@@ -75,26 +75,27 @@ final class StdoutWriter {
         writeAllLocked(Array(line.utf8))
     }
 
-    // Emit one PCM frame: a uint32 LE byte count followed by that many bytes of
-    // interleaved float32 LE samples.
-    func writeFrame(_ payload: Data) {
+    // Emit one PCM frame from a raw byte buffer: a uint32 LE byte count followed by
+    // that many bytes of interleaved float32 LE samples. Called ONLY from the
+    // FrameStreamer writer thread, never from the realtime audio callback (finding
+    // H2): the audio callback copies into the ring and returns, and this (possibly
+    // blocking) write drains the ring off that thread.
+    func writeFrameRaw(_ base: UnsafeRawPointer, _ count: Int) {
         lock.lock()
         defer { lock.unlock() }
-        var header = UInt32(payload.count).littleEndian
+        var header = UInt32(count).littleEndian
         withUnsafeBytes(of: &header) { headerBytes in
-            writeAllLocked(Array(headerBytes))
-        }
-        payload.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            if let base = raw.baseAddress {
-                writeAllRawLocked(base, raw.count)
+            if let hb = headerBytes.baseAddress {
+                writeAllRawLocked(hb, headerBytes.count)
             }
         }
+        writeAllRawLocked(base, count)
     }
 
     // Robust write-all over an array of bytes. Retries on EINTR. If the reader has
-    // gone away (EPIPE), the consumer closed the pipe, which we treat as a clean
-    // stop: this can run on the realtime audio thread, so we REQUEST shutdown and
-    // let the main thread tear down, never exit() from here.
+    // gone away (EPIPE), the consumer closed the pipe, which we treat as a clean stop:
+    // this runs on the writer thread (frames) or the main thread (control lines), so we
+    // REQUEST shutdown and let the main thread tear down, never exit() from here.
     private func writeAllLocked(_ bytes: [UInt8]) {
         bytes.withUnsafeBytes { raw in
             if let base = raw.baseAddress {
@@ -116,14 +117,14 @@ final class StdoutWriter {
                 if err == EINTR { continue }
                 if err == EPIPE {
                     // Consumer closed the read end. Do NOT exit() or stop the tap from
-                    // here: this may be the realtime audio thread, where that can
-                    // deadlock. Request an orderly shutdown; the main loop tears down
-                    // the tap and exits 0. SIGPIPE itself is ignored in main().
+                    // here: stopping Core Audio off the main thread can deadlock. Request
+                    // an orderly shutdown; the main loop tears down the tap/streamer and
+                    // exits 0. SIGPIPE itself is ignored in main().
                     ShutdownCoordinator.shared.request(ExitCode.cleanStop.rawValue)
                     return
                 }
                 // Any other write error is unrecoverable for a streaming helper. Route
-                // through the same request path (no exit() from a possible audio thread).
+                // through the same request path (no exit()/teardown off the main thread).
                 logStderr("fatal: stdout write failed (errno \(err))")
                 ShutdownCoordinator.shared.request(ExitCode.cleanStop.rawValue)
                 return

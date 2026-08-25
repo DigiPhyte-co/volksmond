@@ -18,6 +18,7 @@ signal(SIGPIPE, SIG_IGN)
 var didShutDown = false
 let shutdownLock = NSLock()
 var activeTap: ProcessTap?
+var activeStreamer: FrameStreamer?
 func shutdown(_ code: ExitCode) {
     shutdownLock.lock()
     if didShutDown {
@@ -26,9 +27,14 @@ func shutdown(_ code: ExitCode) {
     }
     didShutDown = true
     let tapToStop = activeTap
+    let streamerToStop = activeStreamer
     shutdownLock.unlock()
     logStderr("stopping")
+    // Preserve teardown order: stop PRODUCING first (device -> IO proc -> aggregate ->
+    // tap, inside ProcessTap.stop()), THEN drain and flush the writer thread so the
+    // frames already buffered in the ring are written out rather than dropped.
     tapToStop?.stop()
+    streamerToStop?.stop()
     exit(code.rawValue)
 }
 
@@ -45,6 +51,42 @@ termSource.resume()
 let intSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: signalQueue)
 intSource.setEventHandler { shutdown(.cleanStop) }
 intSource.resume()
+
+// Additive shutdown path (CONTRACT.md section 4): a parent that launches the helper
+// with its stdin connected to a PIPE can request shutdown simply by closing that pipe.
+// A dedicated reader thread blocks on stdin and, on EOF, runs the SAME orderly
+// teardown as SIGTERM (exit 0). This complements, and never replaces, the signal
+// handling above. Installed early (like the signal sources) so an stdin-close during
+// the first-run permission wait still exits cleanly. Guarded to a pipe/socket so a dev
+// run from a terminal, or stdin from /dev/null or a redirected file (all of which
+// report EOF immediately), cannot self-terminate the helper at launch. Bytes written
+// to stdin are ignored; only EOF is meaningful.
+func stdinIsShutdownPipe() -> Bool {
+    var st = stat()
+    guard fstat(0, &st) == 0 else { return false }
+    // Normalise to Int: st_mode is mode_t (UInt16) while S_IF* import as Int32, so
+    // masking them directly would be a type mismatch.
+    let type = Int(st.st_mode) & Int(S_IFMT)
+    return type == Int(S_IFIFO) || type == Int(S_IFSOCK)
+}
+
+if stdinIsShutdownPipe() {
+    let stdinThread = Thread {
+        var buffer = [UInt8](repeating: 0, count: 256)
+        while true {
+            let n = read(0, &buffer, buffer.count)
+            if n > 0 { continue }                    // not part of the contract; ignore
+            if n < 0 && errno == EINTR { continue }  // interrupted syscall; retry
+            logStderr(n == 0
+                ? "stdin closed by parent; shutting down"
+                : "stdin read error (errno \(errno)); shutting down")
+            shutdown(.cleanStop)
+            return
+        }
+    }
+    stdinThread.name = "com.digiphyte.volksmond.audiotap.stdin"
+    stdinThread.start()
+}
 
 let args = Array(CommandLine.arguments.dropFirst())
 
@@ -91,10 +133,14 @@ do {
 } catch let error as TapError {
     StdoutWriter.shared.writeControlLine(Control.error(code: "tap_failed", message: error.message))
     logStderr("exiting: \(error.message)")
+    // prepare() already rolls back its own partial state (finding M2); call stop()
+    // here too for an explicit, idempotent teardown at the failure site.
+    tap.stop()
     exit(ExitCode.tapFailed.rawValue)
 } catch {
     StdoutWriter.shared.writeControlLine(Control.error(code: "tap_failed", message: "\(error)"))
     logStderr("exiting: \(error)")
+    tap.stop()
     exit(ExitCode.tapFailed.rawValue)
 }
 
@@ -105,6 +151,19 @@ guard let inputFormat = tap.inputFormat,
     tap.stop()
     exit(ExitCode.tapFailed.rawValue)
 }
+
+// The frame streamer decouples the realtime audio callback from stdout: the callback
+// only copies converted PCM into its bounded ring buffer, and a dedicated writer thread
+// performs the (possibly blocking) framed stdout writes (finding H2). Publish it under
+// the lock so a SIGTERM / stdin-close arriving now tears it down cleanly as well. It is
+// started before begin(), but no PCM reaches stdout before "started": the resampler's
+// gate (opened below) keeps process() from enqueuing anything until then.
+let streamer = FrameStreamer(outputChannels: config.channels)
+shutdownLock.lock()
+activeStreamer = streamer
+shutdownLock.unlock()
+resampler.sink = streamer
+streamer.start()
 
 tap.onInput = { buffer in
     resampler.process(buffer)
@@ -119,6 +178,7 @@ do {
     StdoutWriter.shared.writeControlLine(Control.error(code: "tap_failed", message: error.message))
     logStderr("exiting: \(error.message)")
     tap.stop()
+    streamer.stop()
     exit(ExitCode.tapFailed.rawValue)
 }
 // "started" MUST precede the first PCM frame; after it, stdout carries only binary

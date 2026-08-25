@@ -104,29 +104,75 @@ After `{"event":"started"}`, stdout is a continuous stream of frames:
   bytes per frame and never assume a fixed frame size.
 - Frames continue until the stream ends (clean stop, section 4) at which point
   stdout reaches EOF.
+- Backpressure: internally the helper buffers frames in a small bounded ring and
+  drains it on a dedicated writer thread, so a slow reader can never stall the
+  realtime audio callback. If the consumer reads stdout slower than audio is produced
+  for long enough, the ring overflows and the helper DROPS whole frames (oldest first)
+  to bound latency and memory. This does not change the wire format: every frame that
+  IS delivered remains intact and correctly length-prefixed, and drops only ever fall
+  on frame boundaries (never a partial frame). Drops are counted and reported out of
+  band on the STATS line (section 3.1); the consumer should drain stdout promptly.
 
 ## 3. stderr (frozen intent)
 
 Human-readable diagnostics only, one line per message, each prefixed
 `[volksmond-audiotap] `. Never machine-parsed. Safe to log or discard. Nothing on
-stderr is part of the protocol.
+stderr is part of the stdout protocol.
+
+### 3.1 STATS diagnostics line (additive, stderr only)
+
+As an ADDITIVE, optional diagnostics channel that NEVER touches stdout or the audio
+frame format, the helper emits a single-line throughput/health report to stderr at
+most about once per second, and immediately whenever it drops a frame (section 2.2
+backpressure). The line is plain ASCII and is emitted VERBATIM, i.e. WITHOUT the
+`[volksmond-audiotap] ` prefix, so a consumer can match it on the exact `STATS `
+prefix:
+
+```
+STATS seq=<int> dropped=<int> host_ms=<int>
+```
+
+- `seq`: total PCM frames the helper has produced (resampled) since start. Monotonic,
+  non-decreasing.
+- `dropped`: total frames dropped so far because the internal ring overflowed (the
+  consumer drained stdout slower than audio arrived). `seq - dropped` is the number of
+  frames that reached stdout. A non-zero and rising `dropped` means the consumer is
+  not keeping up.
+- `host_ms`: a monotonic host-clock timestamp in milliseconds (derived from
+  `mach_absolute_time`). Not wall-clock and not comparable across processes; only
+  differences between STATS lines from the same run are meaningful.
+
+Parsing STATS is OPTIONAL. A consumer that ignores stderr entirely is unaffected, and
+this line never appears on stdout and never alters the binary frame format in section
+2.2. It is the ONLY machine-readable line on stderr; every other stderr line keeps the
+`[volksmond-audiotap] ` prefix and is free-form.
 
 ## 4. Shutdown and exit codes (frozen)
 
 The helper stops on:
 - SIGTERM or SIGINT: tears down the tap and aggregate device, stops writing, exits 0.
 - stdout reader closes (write returns EPIPE): treated as a clean stop, exits 0.
+- stdin EOF (additive): if the consumer launches the helper with its stdin connected
+  to a PIPE and later closes that pipe, the resulting EOF is treated as a shutdown
+  request IDENTICAL to SIGTERM (tears down the tap/aggregate, drains and flushes the
+  frames already buffered, exits 0). This is an additive convenience so a parent can
+  stop the helper without POSIX signals; it never replaces SIGTERM/SIGINT, which keep
+  working unchanged. The helper only watches stdin when it is a pipe or socket, so a
+  dev run from a terminal, or stdin taken from `/dev/null` or a redirected file (which
+  report EOF immediately), does NOT self-terminate the helper at launch. Any bytes the
+  consumer writes to stdin are ignored; only the EOF is meaningful.
 
 | Code | Meaning |
 |---|---|
-| `0` | Clean stop (SIGTERM/SIGINT, or consumer closed stdout). |
+| `0` | Clean stop (SIGTERM/SIGINT, consumer closed stdout, or consumer closed the stdin pipe). |
 | `2` | Permission denied (TCC audio-capture not granted). Preceded by the `permission_denied` event. |
 | `3` | Tap creation failed: pre-14.4 API, aggregate/IO-proc failure, or unusable device format. Preceded by the `error`/`tap_failed` event. |
 | `64` | Decision (EX_USAGE): bad command-line arguments. Emitted before any stdout protocol output; the production caller never triggers it. |
 
-To stop the helper cleanly, the consumer sends SIGTERM and reads stdout to EOF. The
-consumer should NOT expect a trailing JSON line at shutdown (the data phase is pure
-binary; a trailing JSON line would corrupt the stream, so there is none).
+To stop the helper cleanly, the consumer sends SIGTERM (or, equivalently, closes the
+helper's stdin pipe) and reads stdout to EOF. The consumer should NOT expect a
+trailing JSON line at shutdown (the data phase is pure binary; a trailing JSON line
+would corrupt the stream, so there is none).
 
 ## 5. Permission behaviour (frozen intent, hardware-verified later)
 
