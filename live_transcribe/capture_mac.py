@@ -485,8 +485,16 @@ class _AudioTapHelper:
                 # 'other' (UNKNOWN control event): tolerate and ignore for forward
                 # compatibility (already logged on stderr).
 
-            # Gate: wait for the consumer to register the SYS source.
+            # Gate: wait for the consumer to register the SYS source and open the frame gate.
+            # This is post-'started': if the gate never opens (the consumer failed to call
+            # begin() in time), treat it as a SYS failure so the UI is not left reporting
+            # 'active' on a helper we are about to reap (H1/Fix 1). A clean stop() also opens
+            # the gate; skip the failure path then.
             if not self._go.wait(_GATE_TIMEOUT_S):
+                if not self._stop_event.is_set():
+                    print(f"{self._log_prefix} audiotap gate not opened within {_GATE_TIMEOUT_S:g}s; "
+                          "system audio stopped, the microphone continues.", flush=True)
+                    self._notify_failed()
                 return
 
             # Phase 2: stream length-prefixed PCM frames.
@@ -606,11 +614,11 @@ class AudioCapture(CaptureBase):
         # flowing), 'permission_denied', 'failed'. The web layer reads it as
         # getattr(capture, 'sys_state', 'active'); updated at each transition below.
         self.sys_state = "disabled"
-        # Serialises the deferred SYS registration + chunker creation against the base start()
-        # chunker loop, and guards the one-chunker-per-source claim (M1). Re-entrant so the
-        # await path can hold it across _register_source + _ensure_chunker in one critical section.
-        self._sys_lifecycle_lock = threading.RLock()
-        self._chunker_running = set()   # sources with a live chunker (one-per-source dedup, M1)
+        # One-chunker-per-source dedup (M1): the base start() chunker loop and the deferred
+        # permission-wait path can both spawn a SYS chunker; the first to claim its source runs.
+        # The lock that guards this claim AND serialises deferred SYS registration against the
+        # base start() worker-decision + chunker snapshot is CaptureBase._lifecycle_lock.
+        self._chunker_running = set()   # sources with a live chunker
 
     def _open_sources(self):
         # Transactional: on ANY failure, stop/close everything opened so far (a
@@ -757,75 +765,54 @@ class AudioCapture(CaptureBase):
         # has both a buffer and a drainer. Under the lifecycle lock so this cannot race the
         # base start() chunker loop into two SYS chunkers (M1). start() already spawned the
         # MIC chunker; SYS registered late needs its own (start() only saw MIC).
-        with self._sys_lifecycle_lock:
+        with self._lifecycle_lock:
             self._register_source("SYS", helper.rate, helper.channels)
             self._ensure_chunker("SYS")
-        # Best-effort: upgrade a mic-only (AGC-only) processing worker to an echo-cancelling
-        # MIC+SYS worker now the far end exists, so AEC is available for the rest of the
-        # meeting instead of staying off (H3). No-op (documented native-SYS fallback) when
-        # there is no worker, the binding is missing, or the rebuild fails. Done outside the
-        # lifecycle lock: it may build/stop a worker (slow) and must not block chunker entry.
+        # Open the gate and report 'active' IMMEDIATELY, BEFORE the (possibly slower) AEC engage
+        # below (Fix 1): the reader only waits ~5s at the gate, so a slow engage must never delay
+        # begin() or the helper is reaped while the UI still says 'active'. Frames start flowing to
+        # the native SYS buffer now; the in-place far-end attach then routes them through the worker
+        # with no gap. Set 'active' before begin() so a near-instant post-'started' EOF (via
+        # on_failed -> 'failed') is not overwritten back to 'active'.
+        self.sys_state = "active"
+        helper.begin()
         self._maybe_engage_aec_after_grant(helper)
-        self.sys_state = "active"   # set before begin() (see _open_system_tap) so a fast
-        helper.begin()              # post-'started' EOF flipping 'failed' is not overwritten.
         print(f"[SYS] system-audio tap started via {path.name} "
               f"@ {helper.rate} Hz x{helper.channels}ch (after permission grant)",
               flush=True)
 
     def _maybe_engage_aec_after_grant(self, helper):
-        """Upgrade a live mic-only AGC worker to an echo-cancelling MIC+SYS worker after a late
-        system-audio grant, so echo cancellation works for the rest of the meeting rather than
-        staying off (H3). Best-effort and fully reversible to the pre-grant behaviour:
+        """Engage echo cancellation after a late system-audio grant by attaching a far end to the
+        RUNNING mic-only AGC worker IN PLACE (LiveAEC.attach_far) - NO worker swap, so the mic
+        stream keeps flowing through the same queue and no mic block is lost or reordered (Fix 2).
+        has_far flips true, so _worker_takes then routes SYS through the worker; the worker builds
+        the echo canceller on its own thread and buffered far frames flow once it is ready.
 
-        Returns without changing anything (leaving the documented native-SYS + AGC-only path,
-        see capture_core._worker_takes) when there is no worker to upgrade, it already has a far
-        end, the LiveKit binding is absent, or the rebuild raises. Only ever ADDS echo
-        cancellation; it never makes a working session worse.
+        Best-effort and reversible to the documented native-SYS path (see capture_core.
+        _worker_takes): a no-op when there is no mic worker to attach to (AGC off, or the LiveKit
+        binding was missing so start() built none), it already has a far end (start() built a
+        MIC+SYS worker because SYS was registered before its decision), or the helper rate is not
+        the 16 kHz target (a rate swap under the running SYS chunker would be unsafe).
 
-        Safe here because the helper's SYS rate is the 16 kHz target, so no live buffer's rate is
-        swapped: the mic buffer is already 16 kHz (the AGC worker flipped it at start()), and the
-        new worker emits 16 kHz for both ends. The new worker is started and swapped in BEFORE the
-        old one is stopped, so mic blocks route to a live worker throughout (a stray block landing
-        on the just-stopped old worker is dropped, the same tiny gap start()'s AEC engagement
-        accepts)."""
-        old = self._live_aec
-        # Only a live AGC-only worker (mic-only start that engaged AGC) can be upgraded. No worker
-        # (AGC off / binding missing) or one that already has a far end -> nothing to do.
-        if old is None or getattr(old, "has_far", True):
-            return
-        # The upgrade routes SYS through the worker (which emits 16 kHz). That only lines up with
-        # the SYS chunker, already reading _rates["SYS"], when the helper's own rate is the target,
-        # which the frozen --sample-rate 16000 contract guarantees. If it ever is not, keep the
-        # native-SYS fallback rather than swap a rate under a running chunker.
-        if helper.rate != TARGET_RATE:
-            return
-        try:
-            from . import aec as _aec
-            if not _aec.available():
+        Under the lifecycle lock so it is serialised with the base start() worker decision (Fix 3):
+        whichever ran first, AEC ends up engaged - either start() already committed a MIC+SYS
+        worker (this no-ops on has_far), or it committed the AGC-only worker this now attaches to.
+        attach_far only sets a few fields, so holding the lock here is cheap."""
+        with self._lifecycle_lock:
+            la = self._live_aec
+            # No mic worker to attach to, or it already has a far end -> nothing to do here.
+            if la is None or getattr(la, "has_far", True):
                 return
-            from .aec_live import LiveAEC
-            new = LiveAEC(
-                self._native_rates["MIC"], helper.rate,
-                on_near=lambda x: self._append_16k("MIC", x),
-                on_far=lambda x: self._append_16k("SYS", x),
-                bypass=not self.aec,
-                agc=self.agc,
-            )
-            new.start()   # builds the APM + worker thread; raises here if the lib is broken
-        except Exception as e:
-            print(f"[aec] could not engage echo cancellation after the permission grant "
-                  f"({e}); system audio continues without it", flush=True)
-            return
-        # Commit: swap to the new worker (atomic pointer write) so mic callbacks and SYS blocks
-        # both route to it, mark SYS as 16 kHz (a no-op given the 16 kHz helper), THEN stop the
-        # old worker so it flushes its near tail into the 16 kHz mic buffer and exits.
-        self._live_aec = new
-        self._rates["SYS"] = TARGET_RATE
-        try:
-            old.stop()
-        except Exception:
-            pass
-        print(f"[aec] live echo canceller engaged after the permission grant "
+            # attach_far routes SYS through the worker, which emits 16 kHz; that lines up with the
+            # SYS chunker (already reading _rates["SYS"]) only when the helper's own rate is the
+            # target, which the frozen --sample-rate 16000 contract guarantees. If it ever is not,
+            # keep the native-SYS fallback rather than swap a rate under a running chunker.
+            if helper.rate != TARGET_RATE:
+                return
+            self._rates["SYS"] = TARGET_RATE
+            la.attach_far(helper.rate, lambda x: self._append_16k("SYS", x))
+            la.bypass = not self.aec
+        print(f"[aec] echo cancellation engaging after the permission grant "
               f"({'active' if self.aec else 'bypassed, ready to toggle on'})", flush=True)
 
     def _on_sys_failed(self):
@@ -849,7 +836,7 @@ class AudioCapture(CaptureBase):
         # the base start() loop and the deferred permission-wait path can both spawn a SYS
         # chunker if the grant lands mid-startup (M1). The first thread to claim the source runs
         # the shared chunker; any duplicate returns immediately (it is still joined in stop()).
-        with self._sys_lifecycle_lock:
+        with self._lifecycle_lock:
             if source in self._chunker_running:
                 return
             self._chunker_running.add(source)
