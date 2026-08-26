@@ -44,9 +44,14 @@ datas, binaries, hiddenimports = [], [], []
 # pythonnet for the .NET pywebview backend) and PLUS sounddevice (Core Audio MIC capture,
 # bundles its own PortAudio dylib). faster_whisper/ctranslate2 = the CPU int8 ASR engine;
 # uvicorn = the local server; llama_cpp = the Metal-enabled summary engine; webview =
-# pywebview (Cocoa/WebKit backend on mac); livekit = the WebRTC APM echo canceller.
+# pywebview (Cocoa/WebKit backend on mac); livekit = the WebRTC APM echo canceller;
+# mlx + mlx_whisper = the Metal ASR backend (WP-M6; the requirements.txt marker makes
+# them darwin-arm64 only). collect_all MUST capture mlx's Metal shader library
+# (mlx/lib/*.metallib; MLX fails to initialise without it) and mlx_whisper's tokenizer
+# asset files; mac-release.yml asserts both in the built bundle. If the metallib assert
+# ever fails on the runner, add an explicit datas entry for mlx/lib/*.metallib here.
 for pkg in ("faster_whisper", "ctranslate2", "uvicorn", "sounddevice",
-            "llama_cpp", "webview", "livekit"):
+            "llama_cpp", "webview", "livekit", "mlx", "mlx_whisper"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
@@ -120,7 +125,10 @@ a = Analysis(
     datas=datas,
     hiddenimports=hiddenimports,
     # Heavy/irrelevant stacks (retranscribe runs in a separate env); tkinter isn't needed (the
-    # native window uses pywebview's own file dialog). PLUS the Windows-only backends, which must
+    # native window uses pywebview's own file dialog). torch stays excluded even though
+    # mlx-whisper declares it as a dependency: mlx_whisper imports torch only in its checkpoint
+    # convert path, never at transcribe runtime, and bundling torch would balloon the app.
+    # PLUS the Windows-only backends, which must
     # be physically absent from the mac bundle: pyaudiowpatch (WASAPI), pythonnet/clr_loader (the
     # .NET pywebview backend; mac uses pyobjc), and pywin32 (the Outlook COM calendar, which
     # outlook_local.py imports lazily and already feature-gates off on non-Windows).
