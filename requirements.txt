@@ -10,6 +10,13 @@
 faster-whisper==1.2.1
 ctranslate2==4.7.2
 
+# macOS ASR backend (Apple Silicon only): mlx-whisper runs Whisper on the Apple GPU
+# via Metal. BOTH marker guards are required (mlx targets Apple Silicon; this line
+# must never select on Windows or Intel builds). Transitively pulls `mlx` (upstream
+# floor is mlx>=0.11, unpinned; resolves to mlx 0.32.2 as of 2026-08-27) plus torch.
+# Imported lazily, so the app runs identically without it on other platforms.
+mlx-whisper==0.4.3; sys_platform == "darwin" and platform_machine == "arm64"
+
 # Audio capture (Windows): PyAudio fork with WASAPI loopback support.
 # `sounddevice` doesn't expose loopback; `soundcard` advertises it but returns
 # silence on many Windows audio configurations (confirmed on Sean's Realtek
