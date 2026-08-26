@@ -4,8 +4,13 @@
 # Hugging Face writes (all HF repos read are public).
 name: mac-mlx-convert
 
+# push trigger is scoped to this branch: a workflow_dispatch-only workflow
+# that is absent from the default branch never gets registered by GitHub, so
+# gh workflow run returns 404. The push trigger registers it and runs it.
 on:
   workflow_dispatch:
+  push:
+    branches: [mac-mlx-convert]
 
 jobs:
   convert-and-eval:
