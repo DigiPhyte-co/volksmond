@@ -110,6 +110,27 @@ def test_present_false_when_download_model_raises():
     print("  OK  _present() treats any probe error as not-present (fail-safe, FIX 2)")
 
 
+def test_ct2_rule_unchanged_by_mlx_shape():
+    # WP-M3 guard: the MLX additions must not loosen the ct2 model.bin rule. An MLX-shaped
+    # snapshot (config.json + a big weights.safetensors, NO model.bin) satisfies the MLX
+    # probe yet still reads not-present for a ct2 repo id.
+    orig_dl = voicedl._download_model
+    with tempfile.TemporaryDirectory() as snap:
+        try:
+            _write(os.path.join(snap, "config.json"), 500)
+            _write(os.path.join(snap, "weights.safetensors"), voicedl._MIN_MODEL_BIN_BYTES + 4096)
+            voicedl._download_model = lambda model, local_only=False: snap
+            assert voicedl._snapshot_has_weights(snap) is False, \
+                "the ct2 rule must still demand model.bin, whatever else is in the dir"
+            assert voicedl._present("small") is False, \
+                "an MLX-shaped snapshot must stay not-present for a ct2 repo id"
+            assert voicedl._snapshot_has_mlx_weights(snap) is True, \
+                "sanity: the same dir DOES satisfy the MLX rule (the rules are disjoint)"
+        finally:
+            voicedl._download_model = orig_dl
+    print("  OK  the ct2 model.bin rule is unchanged: an MLX-shaped dir is not ct2-present")
+
+
 def test_snapshot_has_weights_edge_cases():
     # _snapshot_has_weights is the shared guard: falsy path, non-dir, and a directory-named model.bin
     # all fail safe to False.
@@ -127,6 +148,7 @@ if __name__ == "__main__":
              test_fluister_present_falls_back_to_repo_probe,
              test_present_false_when_model_bin_missing_in_valid_snapshot,
              test_present_false_when_download_model_raises,
+             test_ct2_rule_unchanged_by_mlx_shape,
              test_snapshot_has_weights_edge_cases)
     failures = 0
     for fn in tests:
