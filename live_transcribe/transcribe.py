@@ -173,6 +173,12 @@ TIER_CONFIG = {
     # adaptive ladder downgrades it there), but the best-accuracy choice for an
     # uploaded recording / post-meeting pass, where there is no real-time constraint.
     "cpu-large":  {"model": "large-v3",       "device": "cpu",  "compute_type": "int8"},
+    # MLX tiers: the Apple GPU (Metal) via mlx-whisper, macOS arm64 only. Deliberately
+    # NOT in __main__.TIER_CHOICES, so the Windows CLI/env surface is untouched; only
+    # resolve_tier_engine emits them, and only on darwin-arm64. compute_type is nominal
+    # here (the MLX repo holds its own precision) but keeps the cache key disambiguated.
+    "mlx":        {"model": "large-v3",       "device": "mlx",  "compute_type": "fp16"},
+    "mlx-turbo":  {"model": "large-v3-turbo", "device": "mlx",  "compute_type": "fp16"},
 }
 
 
@@ -194,6 +200,18 @@ _WARM = {"state": "idle", "tier": None, "model": None}   # state: idle|warming|r
 
 
 def _build_model(model_name, device, compute_type, cpu_threads):
+    if device == "mlx":
+        # Apple Metal via the mlx-whisper adapter. Imported lazily so Windows (where the
+        # mlx packages have no wheels and are never installed) pays nothing for this
+        # branch. compute_type/cpu_threads have no MLX equivalent; the repo's own
+        # precision applies. The adapter does its own local-first snapshot resolve,
+        # mirroring the local_files_only contract below.
+        from . import mlxbackend
+        repo = mlxbackend.mlx_model_for(model_name)
+        if repo is None:
+            raise ValueError(f"{model_name!r} has no MLX form (see mlxbackend.MLX_REPOS); "
+                             "use a ct2 CPU tier for this model")
+        return mlxbackend.MlxWhisperModel(repo)
     kw = dict(device=device, compute_type=compute_type)
     if device == "cpu":
         kw["cpu_threads"] = cpu_threads
@@ -1169,6 +1187,10 @@ class Engine:
         # warmed model makes Begin instant. See load_model / warm_up_async above.
         self.model = load_model(self.model_name, cfg["device"], cfg["compute_type"], cpu_threads=cpu_threads)
         self._is_cpu = cfg["device"] == "cpu"
+        # The actual compute backend ("cuda"/"cpu"/"mlx"), kept alongside _is_cpu so the
+        # web layer can report the device honestly instead of reconstructing it. _is_cpu
+        # stays the ladder gate: mlx is not CPU, so the RTF downgrade never fires on it.
+        self._device = cfg["device"]
         self._compute_type = cfg["compute_type"]
         self._cpu_threads = cpu_threads
         self._rtf = deque(maxlen=DOWNGRADE_WINDOW)  # recent real-time factors (CPU downgrade)
