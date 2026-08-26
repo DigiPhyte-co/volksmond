@@ -335,7 +335,8 @@ def resolve_tier(quality, device="auto", language=None, engine="auto"):
 
 
 def default_chunk_seconds(tier):
-    return 8 if tier.startswith("gpu") else 15
+    # mlx tiers are GPU-class (Apple Metal): same snappy chunk size as CUDA.
+    return 8 if tier.startswith(("gpu", "mlx")) else 15
 
 
 def default_output_path():
