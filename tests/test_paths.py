@@ -124,6 +124,29 @@ def test_cudadl_gate_non_windows():
             pass
         assert "ctranslate2" not in sys.modules, "a gated probe imported ctranslate2"
         assert cudadl._PROBE == {}, "a gated probe still cached a hardware result"
+        # accel's probes obey the same discipline: calling every one of them on
+        # this faked darwin must import neither mlx nor mlx_whisper (find_spec
+        # only), and must not backdoor a ctranslate2 import via cudadl either.
+        # platform.machine is stubbed too: the real one runs platform.uname(),
+        # which takes the posix path under the patched sys.platform and would
+        # poison platform._uname_cache for the rest of the process.
+        import platform as _platform
+        from live_transcribe import accel
+        orig_machine = _platform.machine
+        try:
+            _platform.machine = lambda: "arm64"
+            accel._PROBE.clear()
+            accel.mlx_supported()
+            accel.mlx_ready()
+            accel.asr_backend("auto")
+            accel.summary_gpu_ready()
+            accel.summary_vram_mb()
+        finally:
+            _platform.machine = orig_machine
+        for heavy in ("mlx", "mlx_whisper", "ctranslate2"):
+            assert heavy not in sys.modules, f"an accel probe imported {heavy}"
+        assert cudadl._PROBE == {}, "an accel probe cached a cudadl hardware result"
+        accel._PROBE.clear()
     finally:
         sys.platform = orig_platform
         importlib.reload(cudadl)                      # restore real (win32) behaviour
