@@ -130,11 +130,144 @@ def test_wrapper_unchanged_for_existing_callers():
     print("  OK  resolve_tier wrapper returns just the tier and matches resolve_tier_engine()[0]")
 
 
+def test_mlx_auto_ladder():
+    # WP-M4 / D6: on darwin-arm64 with mlx-whisper ready (accel stubbed), "auto" runs the honesty
+    # ladder: (1) downloaded MLX model -> mlx tier; (2) downloaded ct2 size -> today's CPU logic;
+    # (3) cross-family, the other family's MLX first then its ct2; (4) nothing -> ambitious MLX pick.
+    from live_transcribe import accel as _accel
+    orig = (_cudadl.cuda_ready, M._downloaded_sizes, M._cpu_auto_tier, _accel.asr_backend)
+    _cudadl.cuda_ready = lambda: False
+    _accel.asr_backend = lambda pref="auto": "cpu" if pref == "cpu" else "mlx"
+    try:
+        M._cpu_auto_tier = lambda: "cpu-mid"
+        # (1) af + the Fluister MLX turbo downloaded -> mlx-turbo, no crossing.
+        M._downloaded_sizes = lambda fam: {"large-v3-turbo"} if fam == "fluister" else set()
+        assert M.resolve_tier_engine("auto", "auto", "af") == ("mlx-turbo", None)
+        # (1) en + the stock MLX large-v3 downloaded -> mlx.
+        M._downloaded_sizes = lambda fam: {"large-v3"} if fam == "whisper" else set()
+        assert M.resolve_tier_engine("auto", "auto", "en") == ("mlx", None)
+        # (2) af + only a ct2 medium downloaded -> today's CPU answer, verbatim.
+        M._downloaded_sizes = lambda fam: {"medium"} if fam == "fluister" else set()
+        assert M.resolve_tier_engine("auto", "auto", "af") == ("cpu-mid", None)
+        # (3) af, fluister EMPTY, whisper's MLX model downloaded -> cross to whisper on mlx.
+        M._downloaded_sizes = lambda fam: {"large-v3"} if fam == "whisper" else set()
+        assert M.resolve_tier_engine("auto", "auto", "af") == ("mlx", "whisper")
+        # (3) MLX beats ct2 within the crossed family: whisper has BOTH -> mlx, not cpu.
+        M._downloaded_sizes = lambda fam: {"large-v3", "small"} if fam == "whisper" else set()
+        assert M.resolve_tier_engine("auto", "auto", "af") == ("mlx", "whisper")
+        # (3) crossed family with only ct2 -> its CPU tier, override still set.
+        M._downloaded_sizes = lambda fam: {"small"} if fam == "whisper" else set()
+        assert M.resolve_tier_engine("auto", "auto", "af") == ("cpu", "whisper")
+        # (4) NOTHING downloaded anywhere -> the ambitious MLX pick (download is legitimate).
+        M._downloaded_sizes = lambda fam: set()
+        assert M.resolve_tier_engine("auto", "auto", "af") == ("mlx-turbo", None)
+        assert M.resolve_tier_engine("auto", "auto", "en") == ("mlx", None)
+        # SA language (Swivuriso): the existing CPU behaviour, never an mlx tier, never crossed.
+        M._downloaded_sizes = lambda fam: {"large-v3"} if fam == "whisper" else set()
+        assert M.resolve_tier_engine("auto", "auto", "zu") == ("cpu-mid", None)
+        # A forced CPU device never reaches the mlx branch.
+        M._downloaded_sizes = lambda fam: {"large-v3-turbo"} if fam == "fluister" else set()
+        assert M.resolve_tier_engine("auto", "cpu", "af") == ("cpu-strong", None)
+    finally:
+        _cudadl.cuda_ready, M._downloaded_sizes, M._cpu_auto_tier, _accel.asr_backend = orig
+    print("  OK  mlx auto: D6 ladder (downloaded MLX, ct2 fallback, cross-family MLX-first, ambitious MLX, zu on CPU)")
+
+
+def test_mlx_explicit_quality():
+    # WP-M4 / D6: an EXPLICIT size with an MLX form resolves to its mlx tier; a size with no MLX
+    # form resolves to today's CPU tier for that size (honest: MLX cannot provide it).
+    from live_transcribe import accel as _accel
+    from live_transcribe import transcribe as _T
+    orig = (_cudadl.cuda_ready, M._downloaded_sizes, _accel.asr_backend, _T.resolve_model)
+    _cudadl.cuda_ready = lambda: False
+    _accel.asr_backend = lambda pref="auto": "cpu" if pref == "cpu" else "mlx"
+    M._downloaded_sizes = lambda fam: set()
+    try:
+        # en + explicit large-v3 -> stock large-v3, which has an MLX form -> mlx.
+        assert M.resolve_tier_engine("large-v3", "auto", "en") == ("mlx", None)
+        # en + explicit large-v3-turbo -> STOCK turbo has no MLX form -> today's CPU tier.
+        assert M.resolve_tier_engine("large-v3-turbo", "auto", "en") == ("cpu-strong", None)
+        # Explicit medium: no MLX form for any family -> today's CPU tier.
+        assert M.resolve_tier_engine("medium", "auto", "af") == ("cpu-mid", None)
+        assert M.resolve_tier_engine("small", "auto", "en") == ("cpu", None)
+        # af + explicit large-v3-turbo resolves to the Fluister turbo repo, which HAS an MLX form
+        # (resolve_model stubbed to the hosted repo id, so a dev machine's local ct2 dir cannot
+        # shadow the answer; a real local dir misses the map and honestly lands on the CPU).
+        _T.resolve_model = lambda size, language, engine="auto": ("digiphyte/fluister-turbo", "fluister")
+        assert M.resolve_tier_engine("large-v3-turbo", "auto", "af") == ("mlx-turbo", None)
+        # af + explicit large-v3 -> the Fluister large-v3 repo has no MLX form -> cpu-large.
+        _T.resolve_model = lambda size, language, engine="auto": ("digiphyte/fluister-large-v3", "fluister")
+        assert M.resolve_tier_engine("large-v3", "auto", "af") == ("cpu-large", None)
+    finally:
+        _cudadl.cuda_ready, M._downloaded_sizes, _accel.asr_backend, _T.resolve_model = orig
+    print("  OK  mlx explicit: mapped sizes -> mlx tiers, non-mapped sizes -> today's CPU tiers")
+
+
+def test_mlx_chunk_seconds_and_tier_choices():
+    # mlx tiers are GPU-class for chunking, and are NOT reachable from the CLI/env surface.
+    assert M.default_chunk_seconds("mlx-turbo") == 8
+    assert M.default_chunk_seconds("mlx") == 8
+    assert M.default_chunk_seconds("cpu-mid") == 15
+    assert "mlx" not in M.TIER_CHOICES and "mlx-turbo" not in M.TIER_CHOICES
+    print("  OK  default_chunk_seconds: mlx tiers are GPU-class (8 s); mlx tiers absent from TIER_CHOICES")
+
+
+def test_windows_regression_sweep():
+    # WP-M4 hard constraint: with accel reporting "cpu"/"cuda" (every non-Mac machine), resolution
+    # is byte-identical to today for the full parametrised matrix. Expected values are PINNED
+    # literals, not recomputed, so a behaviour change here cannot hide.
+    from live_transcribe import accel as _accel
+    orig = (_cudadl.cuda_ready, M._downloaded_sizes, M._cpu_auto_tier, _accel.asr_backend)
+    try:
+        M._cpu_auto_tier = lambda: "cpu-mid"
+        for cuda in (False, True):
+            _cudadl.cuda_ready = (lambda: True) if cuda else (lambda: False)
+            _accel.asr_backend = (lambda pref="auto": "cpu" if pref == "cpu" else "cuda") if cuda \
+                else (lambda pref="auto": "cpu")
+            if cuda:
+                cases = [
+                    (("auto", "auto", "af"), {"fluister": {"medium"}}, ("gpu-medium", None)),
+                    (("auto", "auto", "af"), {"whisper": {"large-v3"}}, ("gpu", "whisper")),
+                    (("auto", "auto", "en"), {"fluister": {"small"}}, ("gpu-small", "fluister")),
+                    (("auto", "auto", "af"), {}, ("gpu-turbo", None)),
+                    (("auto", "auto", "en"), {}, ("gpu", None)),
+                    (("auto", "auto", "zu"), {"whisper": {"large-v3"}}, ("gpu", None)),
+                    (("medium", "auto", "af"), {}, ("gpu-medium", None)),
+                    (("large-v3", "auto", "en"), {}, ("gpu", None)),
+                    (("large-v3-turbo", "auto", "en"), {}, ("gpu-turbo", None)),
+                ]
+            else:
+                cases = [
+                    (("auto", "auto", "af"), {"fluister": {"medium"}}, ("cpu-mid", None)),
+                    (("auto", "cpu", "af"), {"fluister": {"large-v3"}}, ("cpu-large", None)),
+                    (("auto", "auto", "af"), {"whisper": {"small"}}, ("cpu", "whisper")),
+                    (("auto", "cpu", "af"), {"whisper": {"large-v3"}}, ("cpu-large", "whisper")),
+                    (("auto", "auto", "af"), {}, ("cpu-mid", None)),
+                    (("auto", "auto", "en"), {}, ("cpu-mid", None)),
+                    (("auto", "cpu", "zu"), {"whisper": {"large-v3"}}, ("cpu-mid", None)),
+                    (("medium", "auto", "af"), {}, ("cpu-mid", None)),
+                    (("small", "cpu", "en"), {}, ("cpu", None)),
+                    (("large-v3", "cpu", "en"), {}, ("cpu-large", None)),
+                    (("large-v3-turbo", "auto", "en"), {}, ("cpu-strong", None)),
+                ]
+            for args, downloaded, want in cases:
+                M._downloaded_sizes = lambda fam, d=downloaded: set(d.get(fam, set()))
+                got = M.resolve_tier_engine(*args)
+                assert got == want, (cuda, args, downloaded, got, want)
+    finally:
+        _cudadl.cuda_ready, M._downloaded_sizes, M._cpu_auto_tier, _accel.asr_backend = orig
+    print("  OK  regression sweep: cpu/cuda resolution byte-identical to today's pinned outputs")
+
+
 if __name__ == "__main__":
     tests = (test_gpu_matrix,
              test_cpu_matrix,
              test_explicit_engine_pref_is_never_crossed,
-             test_wrapper_unchanged_for_existing_callers)
+             test_wrapper_unchanged_for_existing_callers,
+             test_mlx_auto_ladder,
+             test_mlx_explicit_quality,
+             test_mlx_chunk_seconds_and_tier_choices,
+             test_windows_regression_sweep)
     failures = 0
     for fn in tests:
         try:

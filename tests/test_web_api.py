@@ -915,6 +915,135 @@ def test_reconfigure_keeps_user_language():
     print("  OK  reconfigure: tier-only change on a zu session keeps language zu + family swivuriso (decode token stays auto)")
 
 
+def test_reconfigure_reads_engine_device():
+    # WP-M4 / D8: reconfigure reads engine._device instead of reconstructing the device from
+    # _is_cpu. An mlx session's quality change loads with device "mlx" when the new size has an
+    # MLX form and follows the resolved tier (device + compute) onto the CPU when it does not;
+    # a legacy engine object without _device still resolves "cpu"/"cuda" from _is_cpu.
+    from live_transcribe import transcribe as T
+
+    class _FakeEngine:
+        _is_cpu = False
+        _device = "mlx"
+        _compute_type = "fp16"
+        _cpu_threads = 4
+        size = "large-v3-turbo"
+        language = "en"
+        engine = "auto"
+        family = "whisper"
+
+        def __init__(self):
+            self.changes = []
+
+        def request_change(self, **kw):
+            self.changes.append(kw)
+
+    st = webapp.STATE
+    saved = (st.running, st.transcribing, st.stopping, st.source_kind, st.engine,
+             st.language, st.tier, st.model, st.family)
+    loads, resolves = [], []
+    orig_load, orig_resolve = T.load_model, webapp.resolve_tier
+
+    def _fake_load(name, device, compute, cpu_threads=8):
+        loads.append((name, device, compute))
+        return object()
+
+    def _run(fake, tier_key, resolved_tier):
+        st.running, st.transcribing, st.stopping = True, True, False
+        st.source_kind, st.engine = "live", fake
+        st.language, st.tier, st.model, st.family = "en", "mlx-turbo", "large-v3-turbo", "whisper"
+        webapp.resolve_tier = lambda q, device, lang, eng: resolves.append((q, device)) or resolved_tier
+        r = client.post("/api/reconfigure", json={"tier": tier_key})
+        assert r.status_code == 200, r.text
+
+    try:
+        T.load_model = _fake_load
+        # mlx session, new size has an MLX form (resolver lands on the "mlx" tier) -> load on "mlx",
+        # compute kept (both tiers are fp16), and the resolver was asked with device "auto" (an mlx
+        # session may land on mlx OR cpu; only a cpu session pins "cpu").
+        _run(_FakeEngine(), "large-v3", "mlx")
+        assert loads[-1] == ("large-v3", "mlx", "fp16"), loads
+        assert resolves[-1] == ("large-v3", "auto"), resolves
+        # mlx session, new size has NO MLX form (resolver lands on a cpu tier) -> load on "cpu"
+        # with the tier's compute type, not the mlx engine's fp16.
+        _run(_FakeEngine(), "medium", "cpu-mid")
+        assert loads[-1] == ("medium", "cpu", "int8"), loads
+        # Legacy engine without _device: today's reconstruction from _is_cpu.
+        legacy = _FakeEngine()
+        del legacy.__class__._device        # class attr; remove for the legacy shape
+        try:
+            _run(legacy, "large-v3", "gpu")
+            assert loads[-1][1] == "cuda", loads       # _is_cpu False -> cuda
+            legacy2 = _FakeEngine()
+            legacy2._is_cpu = True
+            _run(legacy2, "medium", "cpu-mid")
+            assert loads[-1][1] == "cpu", loads        # _is_cpu True -> cpu
+            assert resolves[-1] == ("medium", "cpu"), resolves
+        finally:
+            _FakeEngine._device = "mlx"
+    finally:
+        T.load_model, webapp.resolve_tier = orig_load, orig_resolve
+        (st.running, st.transcribing, st.stopping, st.source_kind, st.engine,
+         st.language, st.tier, st.model, st.family) = saved
+    print("  OK  reconfigure: engine._device drives the load (mlx kept, mlx->cpu swaps compute, legacy _is_cpu fallback)")
+
+
+def test_preflight_device_mlx():
+    # WP-M4: _preflight_device surfaces the accel backend honestly: cuda -> "gpu", mlx -> "mlx",
+    # cpu -> "cpu", and a forced cpu pref never asks the probe.
+    from live_transcribe import accel as _accel
+    orig = _accel.asr_backend
+    try:
+        _accel.asr_backend = lambda pref="auto": "mlx"
+        assert webapp._preflight_device("auto") == "mlx"
+        assert webapp._preflight_device("cpu") == "cpu"
+        _accel.asr_backend = lambda pref="auto": "cuda"
+        assert webapp._preflight_device("auto") == "gpu"
+        _accel.asr_backend = lambda pref="auto": "cpu"
+        assert webapp._preflight_device("auto") == "cpu"
+    finally:
+        _accel.asr_backend = orig
+    print("  OK  _preflight_device: cuda->gpu, mlx->mlx, cpu->cpu, forced cpu short-circuits")
+
+
+def test_download_plan_uses_asr_download_target():
+    # WP-M4 / D7: the download plan (and so the pre-start modal and Begin) names the model via
+    # voicedl.asr_download_target, so a ready Mac sees the MLX repo. WP-M3 provides the function;
+    # stub it here (this tree may predate it), and pin that without it the plan is today's.
+    from live_transcribe import voicedl as V
+    from live_transcribe import transcribe as T
+    had = hasattr(V, "asr_download_target")
+    orig = getattr(V, "asr_download_target", None)
+
+    def _fake_target(family, size):
+        if (family, size) == ("whisper", "large-v3"):
+            return "mlx-community/whisper-large-v3-mlx"
+        if (family, size) == ("fluister", "large-v3-turbo"):
+            return "digiphyte/fluister-turbo-mlx"
+        return T.FLUISTER_REPOS.get(size) if family == "fluister" else size
+
+    try:
+        V.asr_download_target = _fake_target
+        plan = webapp._resolve_download_plan("mlx", "en", "auto")
+        assert plan["target"] == "mlx-community/whisper-large-v3-mlx", plan
+        assert plan["size"] == "large-v3" and plan["family"] == "whisper", plan
+        assert plan["approx_bytes"] > 0, plan     # repo key missing -> falls back to the size entry
+        # Unmapped sizes keep today's targets even with the helper present.
+        plan2 = webapp._resolve_download_plan("cpu-mid", "en", "auto")
+        assert plan2["target"] == "medium", plan2
+        # Without WP-M3's helper the wrapper answers with today's targets (Windows unchanged).
+        del V.asr_download_target
+        plan3 = webapp._resolve_download_plan("cpu-mid", "en", "auto")
+        assert plan3["target"] == "medium", plan3
+        assert webapp._asr_download_target("fluister", "large-v3-turbo") == "digiphyte/fluister-turbo"
+    finally:
+        if had:
+            V.asr_download_target = orig
+        elif hasattr(V, "asr_download_target"):
+            del V.asr_download_target
+    print("  OK  download plan: routes through voicedl.asr_download_target (MLX repo named; ct2 targets unchanged without it)")
+
+
 def test_aec_live_reports_persistence():
     # Review wave 1, F7: /api/aec-live must keep working when the settings file cannot be
     # written (the live toggle already took effect on the engine), but must report it via
@@ -1603,6 +1732,9 @@ if __name__ == "__main__":
                test_feed_raw_mic_routing,
                test_reconfigure_session_gated,
                test_reconfigure_keeps_user_language,
+               test_reconfigure_reads_engine_device,
+               test_preflight_device_mlx,
+               test_download_plan_uses_asr_download_target,
                test_aec_live_reports_persistence,
                test_warm_up,
                test_summarise_accepts_instruction,

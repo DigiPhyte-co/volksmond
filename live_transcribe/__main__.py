@@ -173,7 +173,12 @@ def _downloaded_sizes(family):
             if family == "fluister":
                 present = voicedl.fluister_present(size)
             else:
-                target = size
+                # voicedl.asr_download_target (WP-M3) points the mapped sizes at their MLX
+                # repos on a ready Mac; everywhere else it returns the stock size, so on
+                # Windows this is exactly today's probe. getattr keeps the defensive
+                # empty-set contract against an older voicedl.
+                _target_for = getattr(voicedl, "asr_download_target", None)
+                target = _target_for(family, size) if _target_for else size
                 present = bool(target and voicedl._present(target))
             if present:
                 out.add(size)
@@ -207,6 +212,41 @@ def _gpu_tier_for_family(family):
     downloaded size is usable."""
     size = _best_downloaded_size(family)
     return _QUALITY_TO_GPU_TIER.get(size, "gpu") if size else None
+
+
+# Each usable family has exactly ONE MLX model (D3/D6): Fluister's tuned large-v3-turbo and stock
+# Whisper's large-v3. These are the mlx TIER_CONFIG tiers "auto" may emit on darwin-arm64.
+_MLX_TIER_FOR_FAMILY = {"fluister": "mlx-turbo", "whisper": "mlx"}
+# EXPLICIT quality sizes that CAN have an MLX form (still subject to the concrete model id
+# mapping in mlxbackend.MLX_REPOS; e.g. stock large-v3-turbo has no MLX form, Fluister's does).
+_MLX_TIER_FOR_SIZE = {"large-v3-turbo": "mlx-turbo", "large-v3": "mlx"}
+
+
+def _mlx_tier_for_family(family):
+    """The mlx tier for a usable family WHEN its single MLX model is actually DOWNLOADED (D6
+    step 1), else None. Presence rides on _downloaded_sizes: on a ready Mac voicedl reports
+    the mapped sizes via their MLX repos (asr_download_target), so this is the honest probe."""
+    tier = _MLX_TIER_FOR_FAMILY.get(family)
+    if not tier:
+        return None
+    from . import transcribe
+    size = transcribe.TIER_CONFIG[tier]["model"]
+    return tier if size in _downloaded_sizes(family) else None
+
+
+def _mlx_tier_for_quality(quality, language, engine):
+    """The mlx tier for an EXPLICIT quality size, or None when the concrete model the session's
+    family loads at that size has no MLX form (mlxbackend.MLX_REPOS). None sends the caller to
+    today's CPU tier for that size: honest, the user asked for a size MLX cannot provide."""
+    tier = _MLX_TIER_FOR_SIZE.get(quality)
+    if not tier:
+        return None
+    try:
+        from . import transcribe, mlxbackend
+        model_id, _fam = transcribe.resolve_model(quality, language, engine)
+        return tier if mlxbackend.mlx_model_for(model_id) else None
+    except Exception:
+        return None
 
 
 def _cpu_within_ceiling_tier(family):
@@ -263,7 +303,12 @@ def resolve_tier_engine(quality, device="auto", language=None, engine="auto"):
          ladder protects real-time) - this is handled inside step 2's _cpu_tier_for_family.
       5. When NOTHING usable is downloaded anywhere, fall back to today's ambitious best-size pick
          (Afrikaans -> turbo, English -> large-v3), which then legitimately downloads. Swivuriso is one
-         nominal model and is never crossed off - an SA session prefers it and downloads it."""
+         nominal model and is never crossed off - an SA session prefers it and downloads it.
+
+    On an Apple-silicon Mac with mlx-whisper installed (accel.asr_backend == "mlx"), the same honesty
+    ordering runs with the Apple GPU first (D6): downloaded MLX model -> mlx tier; else downloaded ct2
+    size -> today's CPU logic; else cross-family (MLX first); else the ambitious MLX pick. An explicit
+    size with no MLX form takes today's CPU tier; Swivuriso always takes the existing CPU path."""
     explicit = bool(quality) and quality != "auto"
     eng = (engine or "auto").lower()
     explicit_family = eng in ("fluister", "whisper", "swivuriso")
@@ -285,6 +330,44 @@ def resolve_tier_engine(quality, device="auto", language=None, engine="auto"):
             gpu_ready = cudadl.cuda_ready()
         except Exception:
             gpu_ready = False
+
+    # Apple-silicon Macs (darwin-arm64 with mlx-whisper installed): the D6 honesty ladder. This
+    # branch is unreachable anywhere else: accel.asr_backend returns "mlx" only when the device is
+    # not forced to CPU, CUDA is not usable AND accel.mlx_ready() (which requires darwin-arm64),
+    # so Windows resolution below stays byte-identical.
+    mlx_backend = False
+    if not gpu_ready and device != "cpu":
+        try:
+            from . import accel
+            mlx_backend = accel.asr_backend(device) == "mlx"
+        except Exception:
+            mlx_backend = False
+    if mlx_backend:
+        if explicit:
+            t = _mlx_tier_for_quality(quality, language, engine)
+            if t:
+                return t, None
+            # No MLX form for this explicit size: fall through to today's CPU tier for it.
+        elif fam in _USABLE_FAMILIES:
+            # (1) The family's single MLX model is downloaded -> its mlx tier.
+            t = _mlx_tier_for_family(fam)
+            if t:
+                return t, None
+            # (2) Else a usable ct2 size is downloaded -> today's CPU logic verbatim.
+            t = _cpu_tier_for_family(fam)
+            if t:
+                return t, None
+            # (3) Else cross families: the other family's MLX model first, then its ct2 downloads.
+            if allow_cross:
+                for xfam in _USABLE_FAMILIES:
+                    if xfam != fam:
+                        xt = _mlx_tier_for_family(xfam) or _cpu_tier_for_family(xfam)
+                        if xt:
+                            return xt, xfam
+            # (4) Nothing downloaded anywhere -> the ambitious MLX pick; that download is
+            # legitimate and gets real progress (WP-M3).
+            return _MLX_TIER_FOR_FAMILY[fam], None
+        # Swivuriso / unknown family: always the existing CPU path (fall through).
 
     if gpu_ready:
         # Do NOT route through pick_tier() here: it honours the SA_LIVE_TIER env override (a CLI-only
