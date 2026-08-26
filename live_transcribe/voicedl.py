@@ -25,8 +25,9 @@ import shutil
 import threading
 from pathlib import Path
 
-from . import config
+from . import accel, config
 from .__main__ import pick_tier
+from .mlxbackend import MLX_REPOS
 from .transcribe import (TIER_CONFIG, FLUISTER_REPOS,
                          SWIVURISO_REPO, SWIVURISO_LOCAL, SWIVURISO_LANGS, swivuriso_available)
 
@@ -39,6 +40,9 @@ _SIZES = {
     "medium":         1_530_000_000,
     "large-v3-turbo": 1_620_000_000,
     "large-v3":       3_090_000_000,
+    # MLX (Apple Metal) form of stock large-v3 (fp16). Only ever the download target on
+    # darwin-arm64 with the MLX runtime installed; keyed by repo id, never offered on Windows.
+    "mlx-community/whisper-large-v3-mlx": 3_090_000_000,
 }
 # The four quality tiers shown to the user (and on the meeting screen), lowest ->
 # highest accuracy: Fast=small, Balanced=medium, High quality=large-v3-turbo,
@@ -64,7 +68,16 @@ _FLUISTER_SIZES = {
     "large-v3-turbo":   819_000_000,
     "medium":           774_000_000,
     "small":            250_000_000,
+    # MLX (Apple Metal) form of Fluister turbo. Only ever the download target on darwin-arm64
+    # with the MLX runtime installed; keyed by repo id, never offered on Windows.
+    # TODO(sean): fp16-sized placeholder pending the fp16 vs q8 publishing call.
+    "digiphyte/fluister-turbo-mlx": 1_600_000_000,
 }
+
+# The MLX repo ids (values of mlxbackend.MLX_REPOS, the single source of truth for which
+# models have an MLX form). Membership here is how the download/presence/delete/update
+# paths tell an MLX target from a ct2 one.
+_MLX_TARGETS = frozenset(MLX_REPOS.values())
 
 # The Fluister version shipped with THIS build. Used as the floor for a model that is in the cache
 # but has no install record yet (downloaded before version tracking existed), so a later manifest
@@ -191,6 +204,55 @@ def _present(model):
     return _snapshot_has_weights(path)
 
 
+def _snapshot_has_mlx_weights(path):
+    """MLX twin of _snapshot_has_weights: True iff `path` (a resolved snapshot dir) holds a
+    non-trivial MLX weight file (weights.safetensors or weights.npz over the same size floor)
+    plus config.json. NEVER used for a ct2 repo: the ct2 model.bin rule stays exactly
+    _snapshot_has_weights. Fail-safe: any missing/tiny/degenerate input or error -> False."""
+    try:
+        if not path or not os.path.isdir(path):
+            return False
+        if not os.path.isfile(os.path.join(path, "config.json")):
+            return False
+        for name in ("weights.safetensors", "weights.npz"):
+            wp = os.path.join(path, name)
+            if os.path.isfile(wp) and os.path.getsize(wp) > _MIN_MODEL_BIN_BYTES:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _mlx_present(repo):
+    """True iff the MLX repo is fully cached (weights + config verified, no network), i.e.
+    Begin will not have to download. Same partial-cache trap and fail-safe stance as
+    _present, with the MLX file-set rule instead of model.bin."""
+    try:
+        from huggingface_hub import snapshot_download
+        path = snapshot_download(repo, local_files_only=True)
+    except Exception:
+        return False
+    return _snapshot_has_mlx_weights(path)
+
+
+def asr_download_target(family, size):
+    """The model id downloads/presence/delete/updates should target for this (family, size)
+    on THIS machine: the MLX repo when the Mac MLX runtime is ready (accel.mlx_ready) and
+    the pair has an MLX form (mlxbackend.MLX_REPOS, the single source of truth), else
+    today's ct2 target for that family/size, unchanged. `family` is "fluister" (size maps
+    through FLUISTER_REPOS) or "whisper" (size IS the ct2 model id). On Windows mlx_ready()
+    is always False, so this always returns the ct2 answer. Pure routing: no network."""
+    if family == "fluister":
+        ct2 = FLUISTER_REPOS.get(size)
+    else:
+        ct2 = size
+    if ct2 and accel.mlx_ready():
+        mlx = MLX_REPOS.get(ct2)
+        if mlx:
+            return mlx
+    return ct2
+
+
 def fluister_present(size, repo=None):
     """True iff the Fluister model for `size` is ready to load without a download: a local ct2 build dir
     exists (exactly what resolve_model will load on a dev machine / SA_LIVE_AF_MODEL override), OR the
@@ -204,7 +266,9 @@ def fluister_present(size, repo=None):
             return True
     except Exception:
         pass
-    repo = repo or FLUISTER_REPOS.get(size)
+    repo = repo or asr_download_target("fluister", size)
+    if repo in _MLX_TARGETS:
+        return _mlx_present(repo)
     return bool(repo and _present(repo))
 
 
@@ -375,6 +439,19 @@ def start_download(model):
     model resolves to done immediately without re-fetching."""
     if model not in _SIZES:
         raise ValueError("Unknown model")
+    target = asr_download_target("whisper", model)
+    if target in _MLX_TARGETS:
+        # MLX form (darwin-arm64 only): same one-slot _STATE machinery, the MLX repo as
+        # `repo` so progress polling / the stall detector / the on-disk floor all work.
+        total = _SIZES.get(target, _SIZES[model])
+        with _LOCK:
+            if _STATE["state"] == "downloading":
+                raise RuntimeError("A model is already downloading.")
+            _STATE.update({"state": "downloading", "model": model, "repo": target,
+                           "kind": "whisper", "version": None, "revision": None,
+                           "downloaded": 0, "total": total, "error": None})
+        threading.Thread(target=_run_mlx, args=(target, "", None, total), daemon=True).start()
+        return
     with _LOCK:
         if _STATE["state"] == "downloading":
             raise RuntimeError("A model is already downloading.")
@@ -386,11 +463,16 @@ def start_download(model):
 
 def delete(model):
     """Remove a downloaded voice model from the cache to free space (re-downloadable later). `model`
-    is a Whisper size (small/medium/...), a Fluister repo id (digiphyte/fluister-*), or the Swivuriso
-    repo id. Refuses while any download is running. Only ever removes a cache folder for one of our
-    known models, never an arbitrary path; also clears the recorded install version for our models."""
+    is a Whisper size (small/medium/...), a Fluister repo id (digiphyte/fluister-*), an MLX repo id
+    (mlxbackend.MLX_REPOS values), or the Swivuriso repo id. Refuses while any download is running.
+    Only ever removes a cache folder for one of our known models, never an arbitrary path; also
+    clears the recorded install version for our models."""
     fluister_repos = set(FLUISTER_REPOS.values())
-    if model in _SIZES:
+    if model in _MLX_TARGETS:
+        # MLX repo ids are known models too. Checked BEFORE _SIZES (the MLX ids also carry
+        # approx sizes there) so an MLX repo id is never mangled through _repo_id.
+        dirs = [_repo_dir(model)]
+    elif model in _SIZES:
         dirs = [_repo_dir(_repo_id(model))]
     elif model in fluister_repos:
         dirs = [_repo_dir(model)]
@@ -410,7 +492,7 @@ def delete(model):
                 # Surface the failure (e.g. a Windows file lock) instead of reporting a
                 # silent success that did not actually free any space.
                 raise RuntimeError(f"Could not remove the model files: {e}")
-    if model in fluister_repos or model == SWIVURISO_REPO:
+    if model in fluister_repos or model == SWIVURISO_REPO or model in _MLX_TARGETS:
         _forget_installed(model)
 
 
@@ -425,6 +507,40 @@ def _run(model):
         # reads, so the first Begin loads without a network round-trip. faster-whisper
         # (via HuggingFace) verifies each file as it goes.
         _download_model(model, local_only=False)
+        _set(state="done", downloaded=total)
+    except Exception as e:
+        _set(state="error", error=str(e))
+
+
+# ── MLX (Apple Metal) repos: download + worker ─────────────────────────────
+# Additive twins of the ct2 path above. _download_model and _download_ctx (the Store-cert
+# surface) are untouched: an MLX repo cannot go through faster-whisper's download_model
+# because its allow_patterns fetch only the ct2 file set and would miss the MLX weights.
+
+def _download_mlx_repo(repo):
+    """Fetch (or refresh) one MLX repo snapshot with real-progress reporting: hf's
+    snapshot_download with our byte-harvesting tqdm passed explicitly, inside
+    _download_ctx() so the Xet backend is forced off for the duration (granular HTTP
+    chunks; the ctx's faster_whisper tqdm swap is a no-op here because the class is
+    passed directly, the shared Xet-off half is the part that matters)."""
+    from huggingface_hub import snapshot_download
+    with _download_ctx():
+        return snapshot_download(repo, tqdm_class=_progress_tqdm_cls())
+
+
+def _run_mlx(repo, revision, version, total):
+    """MLX twin of _run_fluister: sync the repo's main ref (snapshot_download re-fetches
+    only changed files), verify the manifest pin when one is named, and record versioned
+    installs (a blank `version` means an unversioned upstream repo; nothing is recorded).
+    Same _STATE contract as the ct2 workers."""
+    try:
+        _download_mlx_repo(repo)
+        got = _ref_main_sha(repo)
+        if revision and revision not in ("main", "") and got and got != revision:
+            _set(state="error", error="The downloaded model did not match the published version. Please try again later.")
+            return
+        if version:
+            record_installed(repo, version, got or revision)
         _set(state="done", downloaded=total)
     except Exception as e:
         _set(state="error", error=str(e))
@@ -501,14 +617,21 @@ def fluister_catalogue():
     working local build no longer reads as "download first"; the update flow still manages the HF repo."""
     rec = _installed_versions()
     out = []
-    for size, repo in FLUISTER_REPOS.items():
+    for size in FLUISTER_REPOS:
+        # The per-machine target: the MLX repo on darwin-arm64 with MLX ready and a mapped
+        # size, else the ct2 repo exactly as before (always, on Windows).
+        repo = asr_download_target("fluister", size)
         present = fluister_present(size, repo)
+        if repo in _MLX_TARGETS:
+            approx = _FLUISTER_SIZES.get(repo, 0)
+        else:
+            approx = _FLUISTER_SIZES.get(size, 0)
         out.append({
             "size": size,
             "repo": repo,
             "present": present,
             "installed_version": _effective_version(repo, present, rec),
-            "approx_bytes": _FLUISTER_SIZES.get(size, 0),
+            "approx_bytes": approx,
             "size_on_disk": _dir_size(_repo_dir(repo)) if present else 0,
         })
     return out
@@ -574,6 +697,26 @@ def model_update_status(manifest):
             "approx_bytes": man.get("approx_bytes") or _FLUISTER_SIZES.get(size, 0),
             "update_available": _vtuple(latest) > _vtuple(installed or ""),
         })
+    # The MLX form of our versioned models rides the same manifest channel, keyed by its own
+    # repo id, when it is installed locally (never a nag about a model you do not have).
+    for size, ct2_repo in FLUISTER_REPOS.items():
+        mlx_repo = MLX_REPOS.get(ct2_repo)
+        if not mlx_repo or not _mlx_present(mlx_repo):
+            continue
+        man = by_repo.get(mlx_repo)
+        if not man or not man.get("version"):
+            continue
+        installed = _effective_version(mlx_repo, True, rec)
+        latest = str(man.get("version"))
+        updates.append({
+            "size": size,
+            "repo": mlx_repo,
+            "installed": installed,
+            "latest": latest,
+            "revision": man.get("revision") or "",
+            "approx_bytes": man.get("approx_bytes") or _FLUISTER_SIZES.get(mlx_repo, 0),
+            "update_available": _vtuple(latest) > _vtuple(installed or ""),
+        })
     # Swivuriso (one credited third-party model) rides the same channel once hosted + versioned.
     sv_present = swivuriso_available() or _present(SWIVURISO_REPO)
     sv_man = by_repo.get(SWIVURISO_REPO)
@@ -598,7 +741,9 @@ def start_fluister_update(size):
     network action) to learn the version + pinned revision. Raises ValueError (unknown size / not in
     the manifest), RuntimeError (a download is already running), or a network error (let the caller
     map it to 502)."""
-    repo = FLUISTER_REPOS.get(size)
+    # The per-machine target (MLX repo on a ready Mac, else the ct2 repo), so the update the
+    # user applies is the update to the model this machine actually loads.
+    repo = asr_download_target("fluister", size)
     if not repo:
         raise ValueError("Unknown model")
     man = None
@@ -610,14 +755,19 @@ def start_fluister_update(size):
         raise ValueError("That model is not in the update manifest.")
     version = str(man.get("version") or "")
     revision = man.get("revision") or ""
-    total = man.get("approx_bytes") or _FLUISTER_SIZES.get(size, 0)
+    if repo in _MLX_TARGETS:
+        total = man.get("approx_bytes") or _FLUISTER_SIZES.get(repo, 0)
+        worker = _run_mlx
+    else:
+        total = man.get("approx_bytes") or _FLUISTER_SIZES.get(size, 0)
+        worker = _run_fluister
     with _LOCK:
         if _STATE["state"] == "downloading":
             raise RuntimeError("A model is already downloading.")
         _STATE.update({"state": "downloading", "model": size, "repo": repo, "kind": "fluister",
                        "version": version, "revision": revision,
                        "downloaded": 0, "total": total, "error": None})
-    threading.Thread(target=_run_fluister, args=(repo, revision, version, total), daemon=True).start()
+    threading.Thread(target=worker, args=(repo, revision, version, total), daemon=True).start()
 
 
 def _run_fluister(repo, revision, version, total):
@@ -664,14 +814,19 @@ def start_fluister_download(size):
     records the build baseline version). For installing a size from the model card; the manifest-driven
     newer-version path is start_fluister_update. Raises ValueError (unknown size) or RuntimeError (a
     download is already running)."""
-    repo = FLUISTER_REPOS.get(size)
+    repo = asr_download_target("fluister", size)
     if not repo:
         raise ValueError("Unknown model")
-    total = _FLUISTER_SIZES.get(size, 0)
+    if repo in _MLX_TARGETS:
+        total = _FLUISTER_SIZES.get(repo, 0)
+        worker = _run_mlx
+    else:
+        total = _FLUISTER_SIZES.get(size, 0)
+        worker = _run_fluister
     with _LOCK:
         if _STATE["state"] == "downloading":
             raise RuntimeError("A model is already downloading.")
         _STATE.update({"state": "downloading", "model": size, "repo": repo, "kind": "fluister",
                        "version": _FLUISTER_BASELINE, "revision": "",
                        "downloaded": 0, "total": total, "error": None})
-    threading.Thread(target=_run_fluister, args=(repo, "", _FLUISTER_BASELINE, total), daemon=True).start()
+    threading.Thread(target=worker, args=(repo, "", _FLUISTER_BASELINE, total), daemon=True).start()
