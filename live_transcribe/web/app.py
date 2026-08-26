@@ -3142,12 +3142,13 @@ def get_features():
 def models_status():
     """Which summary model is installed (the Whisper model is handled by the tier).
 
-    summary_gpu_capable is True only when an NVIDIA GPU is present AND this build's
-    llama.cpp can offload to it (the CPU-only wheel cannot), so the UI shows a GPU/CPU
-    choice for summaries only when it would actually do something."""
-    from .. import summarise as _summarise, cudadl
+    summary_gpu_capable is True only when a usable GPU is present (NVIDIA on Windows,
+    Apple silicon's Metal on a Mac) AND this build's llama.cpp can offload to it (the
+    CPU-only wheel cannot), so the UI shows a GPU/CPU choice for summaries only when
+    it would actually do something."""
+    from .. import summarise as _summarise, accel
     try:
-        gpu_capable = bool(cudadl.gpu_present() and _summarise.gpu_offload_supported())
+        gpu_capable = bool(accel.summary_gpu_ready() and _summarise.gpu_offload_supported())
     except Exception:
         gpu_capable = False
     return {
@@ -3664,16 +3665,17 @@ class SummariseRequest(BaseModel):
 
 def _generate_summary(model_path, transcript, instruction, language, notes=None):
     """Run the local summariser, preferring the GPU when it is usable, falling back to CPU."""
-    from .. import summarise as _summarise, cudadl
-    # GPU only when: the user has not forced CPU, an NVIDIA GPU is present, this build's
-    # llama.cpp can offload (the CPU wheel cannot), and the model fits in VRAM with headroom.
+    from .. import summarise as _summarise, accel
+    # GPU only when: the user has not forced CPU, a usable GPU is present (NVIDIA on
+    # Windows, Metal on Apple silicon), this build's llama.cpp can offload (the CPU
+    # wheel cannot), and the model fits in the GPU memory budget with headroom.
     device = (config.load().get("summary_device") or "auto").strip().lower()
     n_gpu_layers = 0
-    if (device != "cpu" and _summarise.gpu_offload_supported() and cudadl.gpu_present()
-            and _summarise.fits_on_gpu(model_path, cudadl.vram_mb())):
+    if (device != "cpu" and _summarise.gpu_offload_supported() and accel.summary_gpu_ready()
+            and _summarise.fits_on_gpu(model_path, accel.summary_vram_mb())):
         n_gpu_layers = -1
     print(f"[summarise] device={device!r} offload={_summarise.gpu_offload_supported()} "
-          f"gpu_present={cudadl.gpu_present()} vram={cudadl.vram_mb()} -> n_gpu_layers={n_gpu_layers}", flush=True)
+          f"gpu_ready={accel.summary_gpu_ready()} vram={accel.summary_vram_mb()} -> n_gpu_layers={n_gpu_layers}", flush=True)
 
     def _run(layers):
         s = _summarise.Summariser(model_path, n_gpu_layers=layers)
