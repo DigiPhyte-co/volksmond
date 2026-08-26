@@ -92,3 +92,14 @@ transcribe-cli.bat
 
 # AEC test recordings + spike scripts (POPIA: contains real voice audio; local-only)
 AEC Recordings/
+
+# Announcement sends are PRIVATE (public repo + POPIA). The scripts carry internal
+# infrastructure detail (the signups KV namespace id, Doppler project names, the sending
+# address) and the logs carry subscriber email addresses. Neither is ever committed.
+SEND-*.ps1
+sent-*.log
+
+# Partner Center / Microsoft Store submission paperwork: certification reports name
+# reviewer findings and internal identifiers. Matches the copy in store-assets/ too.
+Volksmond certification report*.pdf
+cert-report-*.zip
