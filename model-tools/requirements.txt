@@ -1,0 +1,10 @@
+# Pinned deps for the mac-mlx-convert workflow (macos-15 arm64, Python 3.12).
+# mlx-whisper pulls in: mlx, numba, numpy, tqdm, more-itertools, tiktoken,
+# huggingface_hub, scipy. faster-whisper pulls in: ctranslate2, tokenizers,
+# onnxruntime, av. Full resolved set is recorded in the CI log via pip freeze.
+mlx-whisper==0.4.3
+torch==2.8.0
+faster-whisper==1.2.1
+datasets==3.6.0
+soundfile==0.13.1
+scipy==1.15.3

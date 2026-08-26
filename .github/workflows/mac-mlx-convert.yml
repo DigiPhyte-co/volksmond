@@ -1,0 +1,66 @@
+# Convert digiphyte/fluister-turbo-transformers to MLX (fp16 + 8-bit) and
+# evaluate Afrikaans + English WER against the production ct2 int8 baseline,
+# on a free Apple Silicon runner. Manual trigger only. No secrets used, no
+# Hugging Face writes (all HF repos read are public).
+name: mac-mlx-convert
+
+on:
+  workflow_dispatch:
+
+jobs:
+  convert-and-eval:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: model-tools/requirements.txt
+
+      - name: Cache Hugging Face downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-cache-mlx-convert-v1
+
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r model-tools/requirements.txt
+          echo "::group::pip freeze (full resolved set)"
+          pip freeze
+          echo "::endgroup::"
+
+      - name: Convert to MLX (fp16 + q8)
+        run: python model-tools/convert_fluister_mlx.py --out-dir mlx-models
+
+      - name: Evaluate WER (af + en) vs ct2 baseline
+        run: |
+          python model-tools/eval_fluister_mlx.py \
+            --fp16-dir mlx-models/fluister-turbo-mlx-fp16 \
+            --q8-dir mlx-models/fluister-turbo-mlx-q8 \
+            --n 20 \
+            --out eval-results.md
+
+      - name: Upload eval results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: eval-results.md
+          if-no-files-found: ignore
+
+      - name: Upload MLX q8 model
+        uses: actions/upload-artifact@v4
+        with:
+          name: fluister-turbo-mlx-q8
+          path: mlx-models/fluister-turbo-mlx-q8
+
+      - name: Upload MLX fp16 model
+        uses: actions/upload-artifact@v4
+        with:
+          name: fluister-turbo-mlx-fp16
+          path: mlx-models/fluister-turbo-mlx-fp16
