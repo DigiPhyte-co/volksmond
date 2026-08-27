@@ -524,7 +524,7 @@ def main():
     # to replay here (capture starts after the model is loaded), so any deep queue from now on is a
     # real fault. With no on_struggle listener the CLI surfaces it as the transcript notice alone,
     # which is the only channel it has.
-    engine.struggle_armed = True
+    engine.arm_struggle()
 
     # Optional raw-audio recorder. Tapped BEFORE the engine queue so the
     # recording stays complete even if transcription drops chunks under load -

@@ -1417,6 +1417,11 @@ def test_session_count_bumped_on_transcription_branch_finalise():
     stopped = {"capture": False}
 
     class _GatedEngine:
+        def arm_struggle(self):
+            # The real Engine arms its 'cannot hold real time' warning here, at the
+            # publish point. Modelled so a missing wire-up fails loudly.
+            self.struggle_armed = True
+
         def pending(self):
             return 0
 
@@ -1466,6 +1471,11 @@ def test_transcription_drain_finalises_without_a_capture():
     gate = _th.Event()
 
     class _GatedEngine:
+        def arm_struggle(self):
+            # The real Engine arms its 'cannot hold real time' warning here, at the
+            # publish point. Modelled so a missing wire-up fails loudly.
+            self.struggle_armed = True
+
         def pending(self):
             return 0
 

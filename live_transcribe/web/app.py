@@ -2195,10 +2195,10 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
                     # rather than the catch-up replay above (during which the warning would have burned
                     # its one-shot ratchet on a callback _on_gpu_struggle then rejects, since
                     # STATE.engine was not yet this engine, leaving the real starvation silent for the
-                    # rest of the meeting). Assignment, not a method call: same wiring pattern as
-                    # on_downgrade/on_struggle, and the engine takes its own baseline queue depth from
-                    # here, so the backlog this replay just handed it is not read as growth.
-                    engine.struggle_armed = True
+                    # rest of the meeting). The call is what resets the engine's evidence too: it drops
+                    # the catch-up's queue-depth history and re-baselines on the backlog this replay
+                    # just handed it, so a DRAINING inherited queue is never read as growth.
+                    engine.arm_struggle()
                     STATE.preparing = False
                     STATE.pending_audio = None
                     STATE.preparing_engine = None

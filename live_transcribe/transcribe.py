@@ -1238,19 +1238,14 @@ class Engine:
                                                # short-lived thread: it is raised from the worker AND
                                                # from the real-time capture thread, neither of which
                                                # may pay for what the listener does.
-        self.struggle_armed = False            # set True by the OWNER (assigned like on_downgrade,
-                                               # never a method call: every fake engine in the test
-                                               # suite gets attribute assignment for free) once the
-                                               # session is genuinely live, i.e. this engine is the
-                                               # published session engine and the audio captured
-                                               # while the model loaded has been replayed. Until
-                                               # then the queue is deep BY DESIGN and that backlog
-                                               # is the expected catch-up, never a fault.
+        self.struggle_armed = False            # False until the OWNER calls arm_struggle(): until
+                                               # the session is genuinely live the queue is deep BY
+                                               # DESIGN (the catch-up replay), which is not a fault
         self._struggle_warned = False          # one-shot ratchet, guarded by _struggle_lock because
                                                # the worker and the capture thread can both trip it
         self._struggle_lock = threading.Lock()
         self._struggle_notice_due = False      # the worker owes the transcript a STRUGGLE_NOTICE
-        self._struggle_arm_depth = None        # queue depth inherited at arming (see on_chunk)
+        self._struggle_floor = QUEUE_MAXSIZE   # LOWEST queue depth seen since arming (see on_chunk)
         self._pending_hist = deque(maxlen=DOWNGRADE_WINDOW)   # queue depth at recent completions
         self._pending_mic = []                # [(release_monotonic, Segment)] held by MIC_PUBLISH_DELAY
         self.sys_env = None                   # optional EnergyRing (far end) -> enables the MIC echo veto
@@ -1408,15 +1403,25 @@ class Engine:
                       f"(total dropped: {self._dropped})", flush=True)
             return False
         # Producer-side safety net, on the REAL-TIME capture thread: a queue this deep is loss that
-        # has not happened yet. Measured against the depth we inherited at arming, because a long
-        # first-run model load can hand us a queue that is already near full and draining healthily;
-        # only growth BEYOND that is evidence. _trip_struggle does almost nothing here (see there).
+        # has not happened yet, and unlike the worker's window it needs no completed chunk, so it
+        # still warns when transcription is so slow the queue fills before four of them finish.
+        #
+        # _struggle_floor is the LOWEST depth seen since arming, so it self-corrects: a session
+        # handed a near-full queue by the catch-up replay starts with a high floor that falls as
+        # the backlog drains, and one handed an empty queue is watchful immediately.
+        #
+        # The alarm needs the floor to have reached a healthy depth first, which is what keeps a
+        # DRAINING inherited backlog quiet. MIC and SYS arrive in pairs, so depth oscillates up 2
+        # and down as it descends; a plain "deeper than the floor" test would fire the moment a
+        # healthy drain passed back up through the high-water mark. Once the floor is genuinely low
+        # the queue has demonstrably been kept, and climbing to STRUGGLE_QUEUE_HIGH from there is
+        # minutes of losing ground, never jitter. _trip_struggle does almost nothing here (see there).
         depth = self._queue.qsize()
         if self.struggle_armed:
-            if self._struggle_arm_depth is None:
-                self._struggle_arm_depth = depth
-            elif depth >= STRUGGLE_QUEUE_HIGH and depth > self._struggle_arm_depth:
-                self._trip_struggle(f"queue at {depth}/{QUEUE_MAXSIZE}")
+            if depth < self._struggle_floor:
+                self._struggle_floor = depth
+            elif depth >= STRUGGLE_QUEUE_HIGH and self._struggle_floor <= BACKPRESSURE_BEAM_THRESHOLD:
+                self._trip_struggle(f"queue at {depth}/{QUEUE_MAXSIZE}, floor {self._struggle_floor}")
         return True
 
     def set_initial_prompt(self, prompt):
@@ -1620,6 +1625,31 @@ class Engine:
             except Exception as e:
                 print(f"[engine] on_downgrade callback error: {e}", flush=True)
 
+    def arm_struggle(self):
+        """Arm the "cannot hold real time" warning. The owner calls this ONCE, at the moment the
+        session becomes genuinely live: this engine is the published session engine and the audio
+        captured while the model loaded has been replayed into it.
+
+        A method rather than a flag because arming is a three-part RESET that must not be seen
+        half-done. The pre-arm evidence has to go with it:
+
+          * _pending_hist is cleared, or the catch-up's own climbing depths survive into the
+            post-arm window and a queue that is actually DRAINING reads as growth. That false
+            warning would then spend the one-shot ratchet and silence the real starvation later.
+          * _struggle_floor is snapshotted from the queue as it stands, so the producer net starts
+            from the backlog it inherited rather than from an optimistic zero.
+          * struggle_armed goes last, so no path can observe the flag with stale evidence behind it.
+
+        Under _struggle_lock, which is the same lock the trip takes. The worker appends to
+        _pending_hist without it, so at most the sample it is computing at this instant can land
+        after the clear; that one is the depth AT arming, which is exactly what a first sample
+        should be. Idempotent, but a second call would re-baseline, so call it once.
+        """
+        with self._struggle_lock:
+            self._pending_hist.clear()
+            self._struggle_floor = self._queue.qsize()
+            self.struggle_armed = True
+
     def _trip_struggle(self, why):
         """Fire the one-shot "cannot hold real time" warning. Called from BOTH the transcription
         worker and the real-time audio capture thread (on_chunk), so it must do almost nothing.
@@ -1648,19 +1678,27 @@ class Engine:
                 return
             self._struggle_warned = True
             self._struggle_notice_due = True
-        print(f"[engine] cannot hold real time on {self._device} ({why}); warning the user",
-              flush=True)
         cb = self.on_struggle
-        if cb is None:
-            return
+        msg = f"[engine] cannot hold real time on {self._device} ({why}); warning the user"
 
         def _fire():
+            # The diagnostic print lives HERE, not on the caller: a redirected or stalled stdout
+            # (a frozen build with no console, a full pipe) would otherwise block the audio thread.
+            print(msg, flush=True)
+            if cb is None:
+                return
             try:
                 cb()
             except Exception as e:
                 print(f"[engine] on_struggle callback error: {e}", flush=True)
 
-        threading.Thread(target=_fire, daemon=True, name="struggle-cb").start()
+        try:
+            threading.Thread(target=_fire, daemon=True, name="struggle-cb").start()
+        except Exception:
+            # Thread exhaustion, and nothing else, reaches here. It must not escape into the
+            # capture callback: the transcript notice is already owed above, so the warning still
+            # reaches the user through the transcript even when no thread could be started.
+            pass
 
     def _maybe_warn_gpu_struggle(self, t_start):
         """Worker-side half of the warning: the queue is deep AND still growing.

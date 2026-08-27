@@ -80,11 +80,11 @@ def _stub_engine(size="medium", family="whisper", adaptive=True, is_cpu=True, rt
     eng.subscribers = []
     eng.on_downgrade = None
     eng.on_struggle = None
-    eng.struggle_armed = armed
+    eng.struggle_armed = False
     eng._struggle_warned = False
     eng._struggle_lock = threading.Lock()
     eng._struggle_notice_due = False
-    eng._struggle_arm_depth = None
+    eng._struggle_floor = transcribe.QUEUE_MAXSIZE
     eng._pending_hist = deque(maxlen=transcribe.DOWNGRADE_WINDOW)
     eng._dropped = 0
     eng._busy = False
@@ -92,6 +92,8 @@ def _stub_engine(size="medium", family="whisper", adaptive=True, is_cpu=True, rt
     eng._queue = queue.Queue(maxsize=transcribe.QUEUE_MAXSIZE)
     for i in range(pending):
         eng._queue.put(("SYS", [], float(i)))
+    if armed:
+        eng.arm_struggle()   # the real method, so its floor snapshot + window reset are exercised
     _fill_rtf(eng, rtf)
     return eng
 
@@ -378,20 +380,81 @@ def test_producer_warns_on_the_high_water_mark_and_on_the_first_drop():
     assert list(eng._pending_hist) == [], "this must not need a completed chunk"
     assert eng._dropped == 0, "the high-water warning must land BEFORE any drop"
     assert _wait_fired(fired) == [1], fired
-    # (b) a session handed a nearly full queue by the catch-up replay: the high-water mark is
-    # already inside the inherited baseline, so it must NOT fire on that alone, only on real loss.
-    eng2 = _stub_engine(is_cpu=False, device="cuda")
-    eng2.on_chunk("SYS", [], 0.0)                       # first chunk takes the arming baseline
-    eng2._struggle_arm_depth = transcribe.QUEUE_MAXSIZE  # ...as if the replay had left it full
+    # (b) a session handed a FULL queue by the catch-up replay and starved from the first second,
+    # so the floor never falls to a healthy depth: the high-water mark stays quiet (that depth is
+    # the inherited backlog, not growth) but the first real drop still warns.
+    eng2 = _stub_engine(is_cpu=False, device="cuda", armed=False)
+    for i in range(transcribe.QUEUE_MAXSIZE):
+        eng2._queue.put(("SYS", [], float(i)))
+    eng2.arm_struggle()                                  # ...armed with the queue already full
+    assert eng2._struggle_floor == transcribe.QUEUE_MAXSIZE
     fired2 = []
     eng2.on_struggle = lambda: fired2.append(1)
-    while eng2._queue.qsize() < transcribe.QUEUE_MAXSIZE:
-        eng2.on_chunk("SYS", [], 1.0)
-    assert eng2._struggle_warned is False, "an inherited catch-up backlog raised the high-water alarm"
-    assert eng2.on_chunk("SYS", [], 2.0) is False, "the queue should be full now"
+    assert eng2.on_chunk("SYS", [], 2.0) is False, "the queue should be full"
     assert eng2._dropped == 1 and eng2._struggle_warned is True, "the first real drop must warn"
     assert _wait_fired(fired2) == [1], fired2
     print("  OK  the producer net trips at the high-water mark and, regardless, on the first drop")
+
+
+def test_arming_resets_the_window_so_a_draining_catch_up_cannot_warn():
+    """H1 shape 1: the catch-up leaves a CLIMBING depth history behind it. If those samples survived
+    into the post-arm window, one more (falling) sample would still read newest-deep-and-above-oldest
+    and warn, on a queue that is recovering. Worse, that false warning spends the one-shot ratchet,
+    so the real starvation later in the meeting would be silent. Arming must clear the evidence."""
+    eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
+    for depth in (20, 22, 24, 26):          # the replay's own climb, as the worker sampled it
+        eng._pending_hist.append(depth)
+    for i in range(26):
+        eng._queue.put(("SYS", [], float(i)))
+    eng.arm_struggle()
+    assert list(eng._pending_hist) == [], "arming left the pre-arm samples in the growth window"
+    assert eng._struggle_floor == 26, eng._struggle_floor
+    fired = []
+    eng.on_struggle = lambda: fired.append(1)
+    for depth in (25, 24, 23, 22, 21):      # ...and now it drains, as a healthy card does
+        eng._pending_hist.append(depth)
+        eng._maybe_warn_gpu_struggle(1.0)
+    assert eng._struggle_warned is False, "a draining queue warned off the catch-up's own history"
+    assert fired == []
+    # The ratchet was never spent, so a genuine starvation later still warns.
+    _drive(eng, rtf=4.0, sources=2, completions=10)
+    assert eng._struggle_warned is True, "the real starvation was silenced by the earlier window"
+    print("  OK  arming clears the pre-arm window: a draining catch-up stays silent and keeps the ratchet")
+
+
+def test_a_draining_inherited_queue_survives_paired_arrivals_then_warns_on_real_growth():
+    """H1 shapes 2 and 3. MIC and SYS arrive in PAIRS, so depth steps up 2 and down as a backlog
+    descends. A baseline latched once (or a bare "deeper than the floor" test) fires the moment a
+    healthy drain passes back through the high-water mark; and a baseline stuck at the queue ceiling
+    disables the producer net for the whole session. The running floor plus the healthy-once
+    condition answers both: quiet all the way down, watchful once the queue is genuinely kept."""
+    eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
+    for i in range(transcribe.QUEUE_MAXSIZE):        # the pathological start: inherited FULL
+        eng._queue.put(("SYS", [], float(i)))
+    eng.arm_struggle()
+    assert eng._struggle_floor == transcribe.QUEUE_MAXSIZE
+    fired = []
+    eng.on_struggle = lambda: fired.append(1)
+    # A healthy card: three completions per arriving MIC+SYS pair, so the queue walks down THROUGH
+    # the high-water mark with the depth bouncing up 2 on every pair.
+    while eng._queue.qsize() > 3:
+        for _ in range(3):
+            try:
+                eng._queue.get_nowait()
+            except queue.Empty:
+                break
+        eng.on_chunk("MIC", [], 0.0)
+        eng.on_chunk("SYS", [], 0.0)
+    assert eng._struggle_warned is False, "a draining inherited backlog raised the high-water alarm"
+    assert eng._struggle_floor <= transcribe.BACKPRESSURE_BEAM_THRESHOLD, eng._struggle_floor
+    # Now the card goes bad. The queue refills fast: fewer than four completions, so ONLY the
+    # producer net can catch this, and it must, because the baseline self-corrected on the way down.
+    while eng._queue.qsize() < transcribe.STRUGGLE_QUEUE_HIGH:
+        eng.on_chunk("SYS", [], 9.0)
+    assert eng._struggle_warned is True, "the producer net stayed disabled after the inherited backlog"
+    assert eng._dropped == 0, "and it must still land before the first drop"
+    assert _wait_fired(fired) == [1], fired
+    print("  OK  a full inherited queue drains quietly through the mark, then real growth warns")
 
 
 def test_catch_up_backlog_does_not_consume_the_warning():
@@ -409,8 +472,9 @@ def test_catch_up_backlog_does_not_consume_the_warning():
     assert eng._struggle_warned is False, "the catch-up replay spent the one-shot warning"
     assert fired == [], fired
     # Now the session goes live. The next drop must still warn: the ratchet was never spent. (The
-    # first chunk after arming only takes the inherited-depth baseline, by design, so feed a few.)
-    eng.struggle_armed = True
+    # queue is still full here, so the high-water mark is inside the inherited baseline and it is
+    # the drop path that speaks, which is exactly the guarantee under test.)
+    eng.arm_struggle()
     eng.on_struggle = lambda: fired.append(1)
     dropped_before = eng._dropped
     for i in range(3):
@@ -812,6 +876,8 @@ if __name__ == "__main__":
              test_two_channel_session_losing_ground_at_rtf_0_6_warns,
              test_mic_only_session_with_a_transient_backlog_does_not_warn,
              test_producer_warns_on_the_high_water_mark_and_on_the_first_drop,
+             test_arming_resets_the_window_so_a_draining_catch_up_cannot_warn,
+             test_a_draining_inherited_queue_survives_paired_arrivals_then_warns_on_real_growth,
              test_catch_up_backlog_does_not_consume_the_warning,
              test_the_warning_is_inert_on_cpu_and_on_a_file_import,
              test_the_warning_fires_once_per_session_and_survives_a_raising_callback,
