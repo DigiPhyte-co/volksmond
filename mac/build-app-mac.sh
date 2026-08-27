@@ -51,6 +51,19 @@ echo "==> Installing dependencies (pip cache keeps repeat installs fast)"
 "$PY" -m pip install -r requirements.txt
 "$PY" -m pip install pyinstaller dmgbuild
 
+# --- App icon (volksmond.icns) ----------------------------------------------------------
+# build-icon.py grew a macOS target alongside the existing Windows .ico one: it writes
+# volksmond.icns at the repo root, which volksmond-mac.spec picks up automatically (it
+# checks os.path.exists("volksmond.icns")). Generated fresh on every build, NOT committed
+# (unlike volksmond.ico): a binary in this OneDrive-synced git tree is churn, and Pillow's
+# ICNS output is deterministic from the brand mark, so regenerating is cheap and reliable.
+# Pillow is a build-only tool, not a runtime dependency, so it is installed here rather
+# than added to requirements.txt.
+echo "==> Generating macOS app icon (volksmond.icns)"
+"$PY" -m pip install Pillow
+"$PY" build-icon.py
+[ -f "$ROOT/volksmond.icns" ] || { echo "ERROR: build-icon.py did not produce volksmond.icns" >&2; exit 1; }
+
 # --- Swift SYS-capture helper (WP-B) ---------------------------------------------------
 # Compile mac/volksmond-audiotap (its own SwiftPM package) and hand the binary to the spec via
 # VOLKSMOND_AUDIOTAP_BIN. Not fatal if absent (WP-B may not have landed): the spec then builds a

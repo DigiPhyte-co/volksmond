@@ -52,6 +52,10 @@ Thumbs.db
 Volksmond-Setup-*.exe
 # CI-built macOS release artifacts (large; published via release.ps1 -MacDmg, never committed)
 Volksmond-*.dmg
+# The macOS app icon (build-icon.py's icns target). Generated fresh by mac/build-app-mac.sh
+# (locally and in CI) right before PyInstaller runs; unlike volksmond.ico it is NOT committed,
+# so it never churns in this OneDrive-synced git tree.
+/volksmond.icns
 # The real Partner Center identity values (public repo; only identity.sample.json is committed),
 # and any locally packed Store package (large; built by msix\build-msix.ps1 outside the repo).
 msix/identity.json
