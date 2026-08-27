@@ -216,6 +216,19 @@ window.VM_I18N = {
 
     // Live screen
     "Finishing": "Maak klaar",
+    "Finishing, {n} chunk left": "Maak klaar, {n} stuk oor",
+    "Finishing, {n} chunks left": "Maak klaar, {n} stukke oor",
+
+    // WP-2a: what the screen says once the microphone is shut but the backlog is still being
+    // transcribed. The point of these lines is that they are plain and unambiguous, so keep the
+    // Afrikaans just as plain: the mic is off, nothing more goes into the file, what is on disk
+    // is safe, and the only thing left is transcribing what was said before Stop.
+    "Microphone off. Nothing more is being recorded.":
+      "Mikrofoon af. Niks word meer opgeneem nie.",
+    "The audio from this meeting is already saved on this computer. Volksmond is only transcribing what was said before you pressed Stop.":
+      "Die klank van hierdie vergadering is reeds op hierdie rekenaar gestoor. Volksmond transkribeer net wat gesê is voordat jy Stop gedruk het.",
+    "The audio from this meeting is already saved on this computer. Volksmond is finishing the file.":
+      "Die klank van hierdie vergadering is reeds op hierdie rekenaar gestoor. Volksmond maak die lêer klaar.",
     "Listening": "Luister",
     "Saved": "Gestoor",
     "Model on this device": "Model op die toestel",
@@ -286,6 +299,9 @@ window.VM_I18N = {
       "Neem skoon op. Geen transkripsie word nou gemaak nie. Wanneer jy stop, kan jy dit hier transkribeer.",
     "Stop recording": "Stop opname",
     "Saving": "Stoor",
+    "Recording stopped": "Opname gestop",
+    "Saving the audio file. Nothing more is being recorded.":
+      "Stoor die klanklêer. Niks word meer opgeneem nie.",
     "Recording saved.": "Opname gestoor.",
     "Transcribe this recording now?": "Transkribeer hierdie opname nou?",
     "Volksmond will read the file and write it out. Slower than live, but more accurate. You can keep working while it runs. Stays on this computer.":

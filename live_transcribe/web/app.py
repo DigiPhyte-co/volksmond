@@ -1001,6 +1001,14 @@ def status():
         resp = {
             "running": True,
             "stopping": STATE.stopping,
+            # Is the microphone actually open RIGHT NOW? None of the three flags around it answer
+            # that: `running` only means a session object exists (true through the whole drain),
+            # `stopping` only means a finalisation was asked for (it says nothing about which parts
+            # of it have finished), and `recording` means "this session writes a WAV". Derived from
+            # STATE.capture, which every finalise path nulls the instant it stops the capture, so
+            # there is no second boolean to fall out of step. A file transcription has no capture
+            # and correctly reports False.
+            "capturing": STATE.capture is not None,
             "recording": STATE.recording,
             "transcribing": STATE.transcribing,
             "source_kind": STATE.source_kind,
@@ -2969,6 +2977,32 @@ def stop(what: str = "all"):
                 cap.stop()
         except Exception:
             pass
+        # Stop means stop. The microphone is shut as of the line above, so the session must SAY so
+        # at once instead of keeping every "recording" signal lit for the length of the ASR backlog
+        # (a contended GPU made that 20+ minutes, and the user reasonably believed the room was
+        # still being taped). Same rule the what="recording" branch above already follows, applied
+        # to the full stop:
+        #   * recording=False so /api/status stops asserting it. The frontend alone cannot fix this:
+        #     the 10 s status poll re-asserts whatever the server says within one tick.
+        #   * capture=None, which is what publishes capturing=False. `capturing` is DERIVED from
+        #     STATE.capture rather than kept as a second boolean, so there is only one field that
+        #     can be wrong, and the what="transcription" finalise already nulls it exactly this way.
+        #     /api/levels keys off the same field, so the meters go to zero for free.
+        # Nothing else between here and reset() is observable by the UI, so this is the moment.
+        with STATE.lock:
+            STATE.recording = False
+            STATE.capture = None
+        # Close the recorder HERE, before the drain, not after it. The recorder is tapped BEFORE the
+        # engine queue (sinks.AudioRecorder), so once cap.stop() has returned it has no data
+        # dependency on the ASR backlog whatsoever: gating it behind the drain only meant the two
+        # per-source WAVs sat unfolded, with no single stereo <stem>.wav on disk, for as long as
+        # transcription took. Moved, not duplicated - close() is idempotent, but one call site is
+        # one place to reason about - and rec.last_error is still read after the drain below.
+        try:
+            if rec is not None:
+                rec.close()
+        except Exception:
+            pass
         if preparing_case:
             # Model still catching up: cap.stop() above flushed the final chunk into pending_audio (the
             # engine is unpublished, so _feed buffers it). Wait for the builder to RELEASE the private
@@ -2993,11 +3027,6 @@ def stop(what: str = "all"):
         try:
             if md_sink is not None:
                 md_sink.close()
-        except Exception:
-            pass
-        try:
-            if rec is not None:
-                rec.close()
         except Exception:
             pass
         err = (md_sink.last_error if md_sink else None) or (rec.last_error if rec else None)
