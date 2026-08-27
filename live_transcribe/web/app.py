@@ -1467,10 +1467,12 @@ def _asr_download_target(family, size):
 
 def _asr_approx_bytes(family, size, target):
     """Rough on-disk bytes for the download target: the repo-keyed entry when voicedl knows the MLX
-    repo (WP-M3 adds those), else the existing size-keyed entry (exactly today's answer)."""
+    repo (WP-M3 adds those; stock MLX repos live in _MLX_SIZES, kept out of _SIZES so the download
+    API allow-list stays size-keyed, codex L1), else the existing size-keyed entry (today's answer)."""
     from .. import voicedl
     sizes = voicedl._FLUISTER_SIZES if family == "fluister" else voicedl._SIZES
-    return sizes.get(target) or sizes.get(size, 0)
+    mlx_sizes = getattr(voicedl, "_MLX_SIZES", {})
+    return mlx_sizes.get(target) or sizes.get(target) or sizes.get(size, 0)
 
 
 def _downloaded_alternatives(exclude_family, exclude_size):

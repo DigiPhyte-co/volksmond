@@ -340,7 +340,7 @@ def test_stock_large_v3_routes_by_readiness():
         voicedl.start_download("large-v3")
         p = voicedl.progress()
         assert p["repo"] == WHISPER_LARGE_MLX and p["kind"] == "whisper", p
-        assert p["total"] == voicedl._SIZES[WHISPER_LARGE_MLX], p
+        assert p["total"] == voicedl._MLX_SIZES[WHISPER_LARGE_MLX], p
         assert _wait_state("done", "error") == "done", voicedl.progress()
         assert voicedl.config.data["installed_models"] == {}, \
             "an unversioned upstream MLX repo must not be version-recorded"
@@ -367,6 +367,24 @@ def test_stock_large_v3_routes_by_readiness():
         voicedl.accel, voicedl._run = orig_accel, orig_run
         _reset_state()
     print("  OK  stock large-v3 downloads target MLX only on a ready Mac, ct2 otherwise")
+
+
+def test_start_download_rejects_mlx_repo_ids():
+    # codex L1: the Windows API surface is size-keyed. A direct /api/voice-model/download
+    # request naming an MLX repo id must be refused on EVERY platform: the MLX route is only
+    # ever taken by asr_download_target mapping a stock SIZE on a ready Mac, never by
+    # accepting the repo id itself (that would start a raw MLX snapshot download on Windows).
+    for bad in (WHISPER_LARGE_MLX, FLUISTER_TURBO_MLX):
+        try:
+            voicedl.start_download(bad)
+            assert False, f"start_download accepted the MLX repo id {bad!r}"
+        except ValueError:
+            pass
+    # The allow-list is exactly the stock size keys; no repo id ever sneaks in.
+    assert all("/" not in k for k in voicedl._SIZES), voicedl._SIZES
+    # delete() still knows the MLX ids (they are real caches to be freed); only START is gated.
+    assert WHISPER_LARGE_MLX in voicedl._MLX_TARGETS
+    print("  OK  start_download() refuses MLX repo ids; _SIZES stays a pure size allow-list")
 
 
 def test_fluister_catalogue_targets_mlx_when_ready():
@@ -472,6 +490,7 @@ if __name__ == "__main__":
              test_download_mlx_repo_xet_off_and_progress_tqdm,
              test_mlx_download_state_transitions_mirror_ct2,
              test_stock_large_v3_routes_by_readiness,
+             test_start_download_rejects_mlx_repo_ids,
              test_fluister_catalogue_targets_mlx_when_ready,
              test_model_update_status_considers_mlx_repo,
              test_start_fluister_update_targets_mlx_when_ready)

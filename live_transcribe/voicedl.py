@@ -40,9 +40,13 @@ _SIZES = {
     "medium":         1_530_000_000,
     "large-v3-turbo": 1_620_000_000,
     "large-v3":       3_090_000_000,
-    # MLX (Apple Metal) form of stock large-v3 (fp16). Only ever the download target on
-    # darwin-arm64 with the MLX runtime installed; keyed by repo id, never offered on Windows.
-    "mlx-community/whisper-large-v3-mlx": 3_090_000_000,
+}
+# Approx on-disk sizes of the stock MLX (Apple Metal) repos, keyed by repo id. Kept OUT of
+# _SIZES on purpose (codex L1): _SIZES doubles as start_download's accepted-model allow-list,
+# and the Windows API surface must not accept an MLX repo id (start_download routes the mapped
+# stock SIZES onto these repos on a ready Mac; the repo id itself is never a valid request).
+_MLX_SIZES = {
+    "mlx-community/whisper-large-v3-mlx": 3_090_000_000,   # fp16 form of stock large-v3
 }
 # The four quality tiers shown to the user (and on the meeting screen), lowest ->
 # highest accuracy: Fast=small, Balanced=medium, High quality=large-v3-turbo,
@@ -463,7 +467,7 @@ def start_download(model):
     if target in _MLX_TARGETS:
         # MLX form (darwin-arm64 only): same one-slot _STATE machinery, the MLX repo as
         # `repo` so progress polling / the stall detector / the on-disk floor all work.
-        total = _SIZES.get(target, _SIZES[model])
+        total = _MLX_SIZES.get(target) or _SIZES[model]
         _claim_slot({"state": "downloading", "model": model, "repo": target,
                      "kind": "whisper", "version": None, "revision": None,
                      "downloaded": 0, "total": total, "error": None})
@@ -483,8 +487,9 @@ def delete(model):
     clears the recorded install version for our models."""
     fluister_repos = set(FLUISTER_REPOS.values())
     if model in _MLX_TARGETS:
-        # MLX repo ids are known models too. Checked BEFORE _SIZES (the MLX ids also carry
-        # approx sizes there) so an MLX repo id is never mangled through _repo_id.
+        # MLX repo ids are known models too. Checked BEFORE _SIZES so an MLX repo id is
+        # never mangled through _repo_id (their approx sizes live in _MLX_SIZES /
+        # _FLUISTER_SIZES, deliberately outside start_download's _SIZES allow-list).
         dirs = [_repo_dir(model)]
     elif model in _SIZES:
         dirs = [_repo_dir(_repo_id(model))]
