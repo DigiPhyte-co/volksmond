@@ -1375,7 +1375,12 @@ class Engine:
         ("cpu"/"cuda"/"mlx"), so a cross-backend swap (mlx <-> cpu on a Mac) updates the engine's
         device identity together with the model; None keeps the current values (every same-device
         swap, which is all Windows ever does). A second request before the worker applies the first
-        simply replaces it."""
+        simply replaces it.
+
+        Known limitation (pre-existing, all platforms including Windows): rapid overlapping
+        reconfigure requests can transiently desync STATE.* from the engine, because each API
+        thread publishes its own view while the worker applies only the LAST queued change
+        between chunks. Accepted as-is; no request/worker generation tags here."""
         with self._change_lock:
             self._pending_change = {
                 "language": language, "engine": engine,
