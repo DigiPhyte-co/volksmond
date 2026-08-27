@@ -84,8 +84,8 @@ def _stub_engine(size="medium", family="whisper", adaptive=True, is_cpu=True, rt
     eng._struggle_warned = False
     eng._struggle_lock = threading.Lock()
     eng._struggle_notice_due = False
-    eng._struggle_floor = transcribe.QUEUE_MAXSIZE
     eng._pending_hist = deque(maxlen=transcribe.DOWNGRADE_WINDOW)
+    eng._arrival_hist = deque(maxlen=transcribe.STRUGGLE_ARRIVAL_WINDOW)
     eng._dropped = 0
     eng._busy = False
     eng._stop = threading.Event()
@@ -93,7 +93,7 @@ def _stub_engine(size="medium", family="whisper", adaptive=True, is_cpu=True, rt
     for i in range(pending):
         eng._queue.put(("SYS", [], float(i)))
     if armed:
-        eng.arm_struggle()   # the real method, so its floor snapshot + window reset are exercised
+        eng.arm_struggle()   # the real method, so its locked window reset is what tests run against
     _fill_rtf(eng, rtf)
     return eng
 
@@ -112,22 +112,26 @@ def _wait_fired(fired, want=1, timeout=3.0):
     return list(fired)
 
 
-def _drive(eng, rtf, sources=2, chunk_secs=8.0, completions=80, backlog=0):
+def _drive(eng, rtf, sources=2, chunk_secs=8.0, completions=80, backlog=0, arm=False, fired=None):
     """Deterministic model of a live session's queue: no real time, no audio, no model.
 
     Each completed transcription costs chunk_secs*rtf seconds of wall clock, during which each of
     `sources` capture streams produces one chunk every chunk_secs. Chunks go in through the real
     on_chunk (so the producer-side net is exercised) and every completion samples the depth and
-    calls the worker-side check, exactly as _run does. `backlog` seeds a transient one first.
+    calls the worker-side check, exactly as _run does. `backlog` seeds an INHERITED queue first,
+    the way the catch-up replay leaves one behind; pass arm=True to arm after seeding it, which is
+    the real order of events. Every sample goes through the engine's own locked evaluation.
 
     This is the arithmetic the whole design turns on: with two sources, arrivals are 2 per
     chunk-length while the worker manages 1/rtf of them, so the queue grows whenever rtf > 0.5;
     with one source it grows only past 1.0.
     """
-    fired = []
+    fired = [] if fired is None else fired
     eng.on_struggle = lambda: fired.append(1)
     for i in range(backlog):
-        eng.on_chunk("SYS", [], float(i))
+        eng._queue.put_nowait(("SYS", [], float(i)))     # inherited, not arriving
+    if arm:
+        eng.arm_struggle()
     arrivals, t = 0.0, 0.0
     for _ in range(completions):
         service = chunk_secs * rtf
@@ -135,14 +139,17 @@ def _drive(eng, rtf, sources=2, chunk_secs=8.0, completions=80, backlog=0):
         while arrivals >= 1.0:
             eng.on_chunk("SYS", [], t)
             arrivals -= 1.0
+            if eng._struggle_warned:
+                return fired     # stop AT the warning, so _dropped tells us what it cost
         try:
             eng._queue.get_nowait()          # this completion
         except queue.Empty:
             pass
         eng._busy = True                     # as _run samples it: the in-flight chunk counts
-        eng._pending_hist.append(eng.pending())
-        eng._maybe_warn_gpu_struggle(t)
+        eng._maybe_warn_gpu_struggle()
         eng._busy = False
+        if eng._struggle_warned:
+            return fired
         t += service
     return fired
 
@@ -366,137 +373,165 @@ def test_mic_only_session_with_a_transient_backlog_does_not_warn():
     print("  OK  a mic-only session at RTF 0.6 drains its transient backlog in silence")
 
 
-def test_producer_warns_on_the_high_water_mark_and_on_the_first_drop():
-    """H3: under severe starvation the queue fills before four transcriptions complete, so the
-    worker-side window can arrive after audio is already lost. The producer side does not wait for
-    it: it trips at the high-water mark, and unconditionally on the first real drop."""
-    # (a) high-water, with nothing completed at all: no RTF window, no depth samples.
-    eng = _stub_engine(is_cpu=False, device="cuda")
-    fired = []
-    eng.on_struggle = lambda: fired.append(1)
-    for i in range(transcribe.STRUGGLE_QUEUE_HIGH + 1):
-        eng.on_chunk("SYS", [], float(i))
-    assert eng._struggle_warned is True, "the high-water mark never tripped"
-    assert list(eng._pending_hist) == [], "this must not need a completed chunk"
-    assert eng._dropped == 0, "the high-water warning must land BEFORE any drop"
-    assert _wait_fired(fired) == [1], fired
-    # (b) a session handed a FULL queue by the catch-up replay and starved from the first second,
-    # so the floor never falls to a healthy depth: the high-water mark stays quiet (that depth is
-    # the inherited backlog, not growth) but the first real drop still warns.
-    eng2 = _stub_engine(is_cpu=False, device="cuda", armed=False)
+def test_producer_warns_from_any_inherited_depth():
+    """H2: the producer net must not have a precondition that a moderate backlog can fail.
+
+    An earlier "the floor must first reach a healthy depth" gate disabled this net for every
+    session armed above that depth, which is every session handed a backlog by a slow model load.
+    Worked through at RTF 4 from depth 16, the queue exhausts in ~70 s while four worker
+    completions take ~128 s, so neither path spoke and the first DROP became the warning. The
+    trend window has no precondition: growth is growth, whatever depth it starts from.
+    """
+    for seed in (7, 16, 23, 30, 32):
+        eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
+        fired = _drive(eng, rtf=4.0, sources=2, completions=40, backlog=seed, arm=True)
+        assert eng._struggle_warned is True, f"inherited {seed}: starved and never warned"
+        assert _wait_fired(fired) == [1], (seed, fired)
+        if seed <= 23:
+            # There was still room to warn inside, so it must have landed before any loss.
+            assert eng._dropped == 0, f"inherited {seed}: warned only after losing audio"
+        else:
+            # Armed with the queue all but full: the trend window cannot fill before the queue
+            # does, so the unconditional first-drop path is what speaks. Documented, not ideal.
+            assert eng._dropped >= 1, f"inherited {seed}: expected the drop path to be the warning"
+    print("  OK  the producer net warns from any inherited depth (7/16/23 before a single drop)")
+
+
+def test_producer_warns_when_a_partial_drain_reverses():
+    """The other half of H2's shape: an inherited backlog that drains PARTWAY and then reverses.
+    A one-shot baseline (or a floor that had not reached a healthy depth) left the net asleep for
+    the rest of the session; a trend window simply sees the reversal."""
+    for seed in (16, 23, 30, 32):
+        eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
+        fired = []
+        _drive(eng, rtf=0.1, sources=2, completions=12, backlog=seed, arm=True, fired=fired)
+        assert eng._struggle_warned is False, f"inherited {seed}: the healthy drain warned"
+        drained = eng._queue.qsize()
+        assert drained < seed, f"inherited {seed}: the queue did not drain ({drained})"
+        _drive(eng, rtf=4.0, sources=2, completions=40, fired=fired)
+        assert eng._struggle_warned is True, f"inherited {seed}: the reversal was never caught"
+        assert _wait_fired(fired) == [1], (seed, fired)
+        assert eng._dropped == 0, f"inherited {seed}: the reversal warning came after loss"
+    print("  OK  a partial drain that reverses warns, from every inherited depth, before any loss")
+
+
+def test_a_healthy_drain_from_a_deep_backlog_stays_silent():
+    """The false positive the trend window has to avoid: an inherited backlog on a healthy card.
+    It descends THROUGH the high-water mark, and the per-source chunker threads pick their own
+    silence boundaries so depths jitter by a chunk or two on the way down. Newest below oldest is
+    what makes that safe, with no gate and no baseline."""
+    eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
+    fired = _drive(eng, rtf=0.1, sources=2, completions=60, backlog=30, arm=True)
+    assert eng._struggle_warned is False, "a draining inherited backlog raised the alarm"
+    assert fired == [] and eng._dropped == 0
+    assert eng._queue.qsize() == 0, f"the backlog should have drained: {eng._queue.qsize()}"
+    print("  OK  a deep inherited backlog draining on a healthy card stays silent")
+
+
+def test_producer_warns_on_the_first_drop_without_any_window():
+    """Loss needs no trend. Neither window may be a precondition for reporting audio that is
+    already gone."""
+    eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
     for i in range(transcribe.QUEUE_MAXSIZE):
-        eng2._queue.put(("SYS", [], float(i)))
-    eng2.arm_struggle()                                  # ...armed with the queue already full
-    assert eng2._struggle_floor == transcribe.QUEUE_MAXSIZE
-    fired2 = []
-    eng2.on_struggle = lambda: fired2.append(1)
-    assert eng2.on_chunk("SYS", [], 2.0) is False, "the queue should be full"
-    assert eng2._dropped == 1 and eng2._struggle_warned is True, "the first real drop must warn"
-    assert _wait_fired(fired2) == [1], fired2
-    print("  OK  the producer net trips at the high-water mark and, regardless, on the first drop")
-
-
-def test_arming_resets_the_window_so_a_draining_catch_up_cannot_warn():
-    """H1 shape 1: the catch-up leaves a CLIMBING depth history behind it. If those samples survived
-    into the post-arm window, one more (falling) sample would still read newest-deep-and-above-oldest
-    and warn, on a queue that is recovering. Worse, that false warning spends the one-shot ratchet,
-    so the real starvation later in the meeting would be silent. Arming must clear the evidence."""
-    eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
-    for depth in (20, 22, 24, 26):          # the replay's own climb, as the worker sampled it
-        eng._pending_hist.append(depth)
-    for i in range(26):
-        eng._queue.put(("SYS", [], float(i)))
-    eng.arm_struggle()
-    assert list(eng._pending_hist) == [], "arming left the pre-arm samples in the growth window"
-    assert eng._struggle_floor == 26, eng._struggle_floor
+        eng._queue.put_nowait(("SYS", [], float(i)))
+    eng.arm_struggle()                       # armed with the queue already full
     fired = []
     eng.on_struggle = lambda: fired.append(1)
-    for depth in (25, 24, 23, 22, 21):      # ...and now it drains, as a healthy card does
-        eng._pending_hist.append(depth)
-        eng._maybe_warn_gpu_struggle(1.0)
-    assert eng._struggle_warned is False, "a draining queue warned off the catch-up's own history"
-    assert fired == []
-    # The ratchet was never spent, so a genuine starvation later still warns.
-    _drive(eng, rtf=4.0, sources=2, completions=10)
-    assert eng._struggle_warned is True, "the real starvation was silenced by the earlier window"
-    print("  OK  arming clears the pre-arm window: a draining catch-up stays silent and keeps the ratchet")
+    assert eng.on_chunk("SYS", [], 1.0) is False, "the queue should be full"
+    assert eng._dropped == 1 and eng._struggle_warned is True, "the first real drop must warn"
+    assert list(eng._arrival_hist) == [] and list(eng._pending_hist) == [], "no window was needed"
+    assert _wait_fired(fired) == [1], fired
+    print("  OK  the first dropped chunk warns outright, with neither window filled")
 
 
-def test_a_draining_inherited_queue_survives_paired_arrivals_then_warns_on_real_growth():
-    """H1 shapes 2 and 3. MIC and SYS arrive in PAIRS, so depth steps up 2 and down as a backlog
-    descends. A baseline latched once (or a bare "deeper than the floor" test) fires the moment a
-    healthy drain passes back through the high-water mark; and a baseline stuck at the queue ceiling
-    disables the producer net for the whole session. The running floor plus the healthy-once
-    condition answers both: quiet all the way down, watchful once the queue is genuinely kept."""
+def test_pre_arm_evidence_can_never_spend_the_warning():
+    """H1. The worker used to evaluate its window OUTSIDE the lock and only take it to claim the
+    ratchet, so this interleaving spent the one-shot warning on wholly pre-arm evidence: worker
+    passes its checks on the catch-up's history, arm_struggle() clears and arms, worker resumes and
+    claims. (It could also index a deque the clear had just emptied.) Sampling, verdict and claim
+    now happen in ONE acquisition, so the interleaving does not exist."""
+    # (a) the semantics: a full pre-arm window is discarded, so the next sample cannot claim on it.
     eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
-    for i in range(transcribe.QUEUE_MAXSIZE):        # the pathological start: inherited FULL
-        eng._queue.put(("SYS", [], float(i)))
+    for d in (20, 22, 24, 26):
+        eng._pending_hist.append(d)
+    for d in range(24, 32):
+        eng._arrival_hist.append(d)
     eng.arm_struggle()
-    assert eng._struggle_floor == transcribe.QUEUE_MAXSIZE
-    fired = []
-    eng.on_struggle = lambda: fired.append(1)
-    # A healthy card: three completions per arriving MIC+SYS pair, so the queue walks down THROUGH
-    # the high-water mark with the depth bouncing up 2 on every pair.
-    while eng._queue.qsize() > 3:
-        for _ in range(3):
+    assert list(eng._pending_hist) == [] and list(eng._arrival_hist) == [], "arming kept stale evidence"
+    eng._maybe_warn_gpu_struggle()
+    assert eng._struggle_warned is False, "one post-arm sample claimed the warning"
+    # (b) the race itself, hammered: arming against evaluation, with the pre-arm window primed to
+    # trip. Whichever wins the lock, the answer is the same, and nothing may raise.
+    errors = []
+    for _ in range(200):
+        e = _stub_engine(is_cpu=False, device="cuda", armed=False)
+        for d in (20, 22, 24, 26):
+            e._pending_hist.append(d)
+        ready = threading.Barrier(2)
+
+        def arm():
             try:
-                eng._queue.get_nowait()
-            except queue.Empty:
-                break
-        eng.on_chunk("MIC", [], 0.0)
-        eng.on_chunk("SYS", [], 0.0)
-    assert eng._struggle_warned is False, "a draining inherited backlog raised the high-water alarm"
-    assert eng._struggle_floor <= transcribe.BACKPRESSURE_BEAM_THRESHOLD, eng._struggle_floor
-    # Now the card goes bad. The queue refills fast: fewer than four completions, so ONLY the
-    # producer net can catch this, and it must, because the baseline self-corrected on the way down.
-    while eng._queue.qsize() < transcribe.STRUGGLE_QUEUE_HIGH:
-        eng.on_chunk("SYS", [], 9.0)
-    assert eng._struggle_warned is True, "the producer net stayed disabled after the inherited backlog"
-    assert eng._dropped == 0, "and it must still land before the first drop"
-    assert _wait_fired(fired) == [1], fired
-    print("  OK  a full inherited queue drains quietly through the mark, then real growth warns")
+                ready.wait(timeout=5.0)
+                e.arm_struggle()
+            except Exception as ex:
+                errors.append(repr(ex))
+
+        def evaluate():
+            try:
+                ready.wait(timeout=5.0)
+                e._maybe_warn_gpu_struggle()
+            except Exception as ex:
+                errors.append(repr(ex))
+
+        ts = [threading.Thread(target=arm), threading.Thread(target=evaluate)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(5.0)
+        assert e._struggle_warned is False, "pre-arm evidence claimed the one-shot warning"
+    assert errors == [], errors[:3]
+    print("  OK  pre-arm evidence can never claim the warning, however arming interleaves")
 
 
-def test_catch_up_backlog_does_not_consume_the_warning():
-    """H1: the callback is attached before the buffered-audio replay, during which the queue is deep
-    BY DESIGN. If the warning tripped there it would burn its one-shot ratchet on a callback the web
-    layer rejects (STATE.engine is not yet this engine), leaving the real starvation silent for the
-    whole meeting. Nothing may fire before the owner arms it."""
-    eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
-    fired = []
+def test_concurrent_producers_cannot_corrupt_the_window_or_double_spend():
+    """M1: MIC and SYS reach on_chunk from independent chunker threads (capture_core starts one per
+    source), so the depth window and the ratchet are touched concurrently. A read-then-write pair
+    outside the lock could lose an update; everything is inside one lock now. The warning must be
+    delivered exactly once no matter how the two threads interleave."""
+    eng = _stub_engine(is_cpu=False, device="cuda")
+    fired, errors = [], []
     eng.on_struggle = lambda: fired.append(1)
-    for i in range(transcribe.QUEUE_MAXSIZE + 8):        # fill it, then drop 8: the worst catch-up
-        eng.on_chunk("SYS", [], float(i))
-    _drive(eng, rtf=4.0, sources=2, completions=12)      # and grind, still unarmed
-    assert eng._dropped >= 8, eng._dropped
-    assert eng._struggle_warned is False, "the catch-up replay spent the one-shot warning"
-    assert fired == [], fired
-    # Now the session goes live. The next drop must still warn: the ratchet was never spent. (The
-    # queue is still full here, so the high-water mark is inside the inherited baseline and it is
-    # the drop path that speaks, which is exactly the guarantee under test.)
-    eng.arm_struggle()
-    eng.on_struggle = lambda: fired.append(1)
-    dropped_before = eng._dropped
-    for i in range(3):
-        eng.on_chunk("SYS", [], 999.0 + i)
-    assert eng._dropped > dropped_before, "the queue should still be losing chunks here"
-    assert eng._struggle_warned is True, "the warning never fired after arming"
-    assert _wait_fired(fired) == [1], fired
-    print("  OK  an unarmed catch-up never warns and never spends the ratchet; arming restores it")
+    ready = threading.Barrier(2)
+
+    def producer(src):
+        try:
+            ready.wait(timeout=5.0)
+            for i in range(200):
+                eng.on_chunk(src, [], float(i))
+        except Exception as e:
+            errors.append(repr(e))
+
+    ts = [threading.Thread(target=producer, args=(s,)) for s in ("MIC", "SYS")]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(10.0)
+    assert errors == [], errors
+    assert len(eng._arrival_hist) <= eng._arrival_hist.maxlen, list(eng._arrival_hist)
+    assert eng._struggle_warned is True, "400 chunks into a 32-slot queue and nothing warned"
+    assert _wait_fired(fired) == [1], f"the one-shot warning was delivered {len(fired)} times"
+    print("  OK  two concurrent producers: window intact, ratchet spent exactly once, no errors")
 
 
 def test_the_warning_is_inert_on_cpu_and_on_a_file_import():
-    # _trip_struggle is the single gate both detectors go through, so testing it directly is the
-    # strongest form: if it refuses here, no path can warn.
+    # _struggle_evaluate is the single gate both sampling points go through, so testing it directly
+    # is the strongest form: if it refuses here, no path can warn.
     for label, kw in (("cpu", {"is_cpu": True, "device": "cpu"}),
                       ("file import", {"is_cpu": False, "device": "cuda", "adaptive": False}),
                       ("not yet armed", {"is_cpu": False, "device": "cuda", "armed": False})):
         eng = _stub_engine(**kw)
-        fired = []
-        eng.on_struggle = lambda: fired.append(1)
-        eng._trip_struggle("test")
-        assert eng._struggle_warned is False, f"{label}: must not warn"
-        assert eng._struggle_notice_due is False and fired == [], f"{label}: must stay silent"
+        assert eng._struggle_evaluate(forced="test") is None, f"{label}: claimed the warning"
+        assert eng._struggle_warned is False and eng._struggle_notice_due is False, label
     # A CPU session grinding badly is the ladder's job (_maybe_downgrade), never this warning.
     cpu = _stub_engine(is_cpu=True, device="cpu")
     _drive(cpu, rtf=4.0, sources=2, completions=20)
@@ -508,8 +543,8 @@ def test_the_warning_fires_once_per_session_and_survives_a_raising_callback():
     eng = _stub_engine(is_cpu=False, device="cuda")
     fired = []
     eng.on_struggle = lambda: fired.append(1)
-    eng._trip_struggle("first")
-    eng._trip_struggle("second")          # a second cause (producer after worker, say)
+    eng._deliver_struggle(eng._struggle_evaluate(forced="first"))
+    eng._deliver_struggle(eng._struggle_evaluate(forced="second"))   # a second cause, later
     assert _wait_fired(fired, want=1) == [1], f"fired more than once: {fired}"
     assert eng._struggle_warned is True
     # A raising callback runs on its own thread: it cannot reach the caller, and must not stop the
@@ -522,20 +557,20 @@ def test_the_warning_fires_once_per_session_and_survives_a_raising_callback():
         raise RuntimeError("callback exploded")
 
     eng2.on_struggle = boom
-    eng2._trip_struggle("boom")           # must not raise
+    eng2._deliver_struggle(eng2._struggle_evaluate(forced="boom"))   # must not raise
     assert ran.wait(3.0), "the callback never ran"
     assert eng2._struggle_warned is True and eng2._struggle_notice_due is True
     # A None callback (CLI, tests) is a no-op: the notice is still owed, nothing raises.
     eng3 = _stub_engine(is_cpu=False, device="cuda")
-    eng3._trip_struggle("no listener")
+    eng3._deliver_struggle(eng3._struggle_evaluate(forced="no listener"))
     assert eng3._struggle_warned is True and eng3._struggle_notice_due is True
     print("  OK  fires once per session; a raising or absent callback is harmless")
 
 
 def test_the_struggle_callback_never_blocks_its_caller():
-    """M1: the real callback reads settings from disk and calls notify.show(), whose first backend
-    initialisation can block for seconds. It is raised from the sole transcription worker AND from
-    the real-time capture thread, so neither may wait on it."""
+    """M1 of round 2: the real callback reads settings from disk and calls notify.show(), whose
+    first backend initialisation can block for seconds. It is raised from the sole transcription
+    worker AND from the real-time capture thread, so neither may wait on it."""
     eng = _stub_engine(is_cpu=False, device="cuda")
     entered, release = threading.Event(), threading.Event()
 
@@ -546,7 +581,7 @@ def test_the_struggle_callback_never_blocks_its_caller():
     eng.on_struggle = slow_cb
     try:
         t0 = time.monotonic()
-        eng._trip_struggle("test")
+        eng._deliver_struggle(eng._struggle_evaluate(forced="test"))
         trip_elapsed = time.monotonic() - t0
         assert entered.wait(3.0), "the callback never ran on its own thread"
         # ...and with the listener still stuck, the audio thread's next chunk is unaffected.
@@ -560,25 +595,51 @@ def test_the_struggle_callback_never_blocks_its_caller():
     print("  OK  a blocked notification backend delays neither the trip nor the next chunk")
 
 
+def test_the_callback_is_delivered_even_when_stdout_is_broken():
+    """M2: the diagnostic print used to run BEFORE the callback and outside its guard, so a stdout
+    that raises (a windowed build's log sink failing) killed the delivery thread and the user never
+    got the banner or the toast. Delivery comes first now, and the print is guarded."""
+    eng = _stub_engine(is_cpu=False, device="cuda")
+    fired = []
+    eng.on_struggle = lambda: fired.append(1)
+
+    class _BrokenStdout:
+        def write(self, *a, **k):
+            raise OSError("stdout is gone")
+
+        def flush(self, *a, **k):
+            raise OSError("stdout is gone")
+
+    saved = sys.stdout
+    try:
+        sys.stdout = _BrokenStdout()
+        eng._deliver_struggle(eng._struggle_evaluate(forced="test"))
+        got = _wait_fired(fired)
+    finally:
+        sys.stdout = saved
+    assert got == [1], "a broken stdout swallowed the warning delivery"
+    print("  OK  the listener is still called when stdout raises on every write")
+
+
 def test_the_notice_is_emitted_by_the_worker_never_by_the_capture_thread():
     """_fanout is worker-thread-only: its subscribers write the transcript file and the SSE stream.
-    A trip raised on the capture thread must therefore only leave the notice OWED, and the worker
+    A claim made on the capture thread must therefore only leave the notice OWED, and the worker
     must emit it on its next chunk, through _emit_notice and never _route (a synthetic line must
     not enter RecentEmissions or SysTextRing)."""
     eng = _worker_engine(device="cuda", chunks=2)
     seen, routed = [], []
     eng.subscribe(lambda seg: seen.append(seg))
     eng._route = lambda seg: routed.append(seg)
-    eng._trip_struggle("from the capture thread")
+    eng._deliver_struggle(eng._struggle_evaluate(forced="from the capture thread"))
     assert eng._struggle_notice_due is True
-    assert seen == [], "the trip fanned out a segment off the worker thread"
+    assert seen == [], "the claim fanned out a segment off the worker thread"
     eng._run()
     assert len(seen) == 1, [s.text for s in seen]
     assert seen[0].text == transcribe.STRUGGLE_NOTICE, seen[0].text
     assert seen[0].source == "SYS", seen[0].source
     assert eng._struggle_notice_due is False, "the notice was left owed after being emitted"
     assert routed == [], "a synthetic line must never go through _route"
-    print("  OK  the notice is owed by the trip and emitted once by the worker, never via _route")
+    print("  OK  the notice is owed by the claim and emitted once by the worker, never via _route")
 
 
 # --- 2. the _on_downgrade handler (web/app.py) -----------------------------
@@ -875,13 +936,16 @@ if __name__ == "__main__":
              test_worker_records_rtf_on_a_non_cpu_engine_and_a_draining_backlog_never_warns,
              test_two_channel_session_losing_ground_at_rtf_0_6_warns,
              test_mic_only_session_with_a_transient_backlog_does_not_warn,
-             test_producer_warns_on_the_high_water_mark_and_on_the_first_drop,
-             test_arming_resets_the_window_so_a_draining_catch_up_cannot_warn,
-             test_a_draining_inherited_queue_survives_paired_arrivals_then_warns_on_real_growth,
-             test_catch_up_backlog_does_not_consume_the_warning,
+             test_producer_warns_from_any_inherited_depth,
+             test_producer_warns_when_a_partial_drain_reverses,
+             test_a_healthy_drain_from_a_deep_backlog_stays_silent,
+             test_producer_warns_on_the_first_drop_without_any_window,
+             test_pre_arm_evidence_can_never_spend_the_warning,
+             test_concurrent_producers_cannot_corrupt_the_window_or_double_spend,
              test_the_warning_is_inert_on_cpu_and_on_a_file_import,
              test_the_warning_fires_once_per_session_and_survives_a_raising_callback,
              test_the_struggle_callback_never_blocks_its_caller,
+             test_the_callback_is_delivered_even_when_stdout_is_broken,
              test_the_notice_is_emitted_by_the_worker_never_by_the_capture_thread,
              test_handler_publishes_once_and_updates_in_place,
              test_handler_guards_stopping_and_a_stale_engine,

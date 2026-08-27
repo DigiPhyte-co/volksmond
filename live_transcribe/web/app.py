@@ -737,8 +737,8 @@ def _silence_signal():
 #        medium->small->base->tiny) because it cannot hold real time, so transcription silently
 #        gets rougher. Swivuriso is a single fixed model and never downgrades.
 #   GPU: there is no ladder to step down, so the engine warns instead (transcribe.Engine's
-#        _trip_struggle, raised either by the growing-queue check on the worker or by the
-#        producer-side high-water/first-drop net) when a live cuda/mlx session stops keeping up.
+#        _struggle_evaluate, sampling the queue at completions on the worker and at arrivals on
+#        the capture threads) when a live cuda/mlx session stops keeping up.
 #        Measured incident: other programs were sharing the card, Volksmond fell behind and
 #        dropped 350+ chunks with no warning at all. The copy stays hedged about the cause: the
 #        signal is queue depth, which cannot name the program responsible.
