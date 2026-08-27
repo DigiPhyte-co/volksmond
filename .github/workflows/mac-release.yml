@@ -174,6 +174,22 @@ jobs:
           #   security find-identity -v -p codesigning "$KEYCHAIN"  should list APPLE_SIGNING_IDENTITY.
           echo "Signing certificate imported into an ephemeral keychain."
 
+      # MLX wheel smoke (plan WP-M6): fail fast on any mlx wheel or requirements-marker mistake
+      # minutes before the slow PyInstaller build. A throwaway venv installs the exact mlx-whisper
+      # pin from requirements.txt (its marker is darwin-arm64 only, which this runner is) and
+      # imports the Metal runtime. Runs in BOTH modes; shares the pip cache above.
+      - name: MLX wheel smoke (pre-build, fail fast)
+        run: |
+          set -euo pipefail
+          PIN="$(grep -Eo '^mlx-whisper==[0-9][0-9.]*' requirements.txt || true)"
+          if [ -z "$PIN" ]; then
+            echo "::error title=MLX smoke::No mlx-whisper pin found in requirements.txt."
+            exit 1
+          fi
+          python -m venv "$RUNNER_TEMP/mlx-smoke"
+          "$RUNNER_TEMP/mlx-smoke/bin/pip" install --quiet "$PIN"
+          "$RUNNER_TEMP/mlx-smoke/bin/python" -c "import mlx_whisper, mlx.core; print('MLX smoke OK: mlx_whisper and mlx.core import cleanly ($PIN)')"
+
       # The build driver (WP-E's mac/build-app-mac.sh): venv + pip install (requirements.txt, which WP-C
       # makes mac-safe via platform markers) + PyInstaller against volksmond-mac.spec + dmgbuild. It is the
       # local-Mac mirror of CI, so CI just calls it with the right environment.
@@ -205,9 +221,10 @@ jobs:
 
       # Post-build bundle verification (codex review finding L2): assert dist/Volksmond.app is
       # well-formed right after the build, before we go hunting for a DMG to rename. The structural
-      # checks (helper present + executable, app binary present, .app/Info.plist shape) hold in BOTH
-      # modes. The codesign/entitlement checks only make sense once a real Developer ID signature
-      # exists (an ad-hoc/unsigned build fails --verify by design), so those are gated to release mode.
+      # checks (helper present + executable, app binary present, .app/Info.plist shape, MLX runtime
+      # packaging per plan WP-M6) hold in BOTH modes. The codesign/entitlement checks only make sense
+      # once a real Developer ID signature exists (an ad-hoc/unsigned build fails --verify by design),
+      # so those are gated to release mode.
       - name: Verify built bundle (post-build asserts)
         run: |
           set -euo pipefail
@@ -237,6 +254,50 @@ jobs:
           echo "    app binary OK: $EXE"
           echo "    helper OK: $HELPER"
 
+          # MLX runtime packaging (plan WP-M6). MLX fails to initialise without its Metal shader
+          # library, and collect_all missing it is the known packaging gotcha, so assert it
+          # structurally in both modes.
+          echo "==> Asserting MLX runtime packaging (plan WP-M6)"
+          METALLIBS="$(find "$APP" -name '*.metallib' -type f | wc -l | tr -d ' ')"
+          if [ "$METALLIBS" -eq 0 ]; then
+            echo "::error title=Bundle check::No *.metallib found under $APP. MLX cannot initialise without its Metal shader library; add an explicit datas entry for mlx/lib/*.metallib in volksmond-mac.spec."
+            exit 1
+          fi
+          for PKG in mlx mlx_whisper; do
+            if [ -z "$(find "$APP" -type d -name "$PKG" -print -quit)" ]; then
+              echo "::error title=Bundle check::Package directory '$PKG' not found inside $APP (collect_all in volksmond-mac.spec did not capture it)."
+              exit 1
+            fi
+          done
+          TIKTOKENS="$(find "$APP" -path '*mlx_whisper*' -name '*.tiktoken' -type f | wc -l | tr -d ' ')"
+          if [ "$TIKTOKENS" -eq 0 ]; then
+            echo "::error title=Bundle check::mlx_whisper tokenizer assets (*.tiktoken) missing from $APP."
+            exit 1
+          fi
+          echo "    MLX runtime OK ($METALLIBS metallib file(s); mlx + mlx_whisper dirs and tokenizer assets present)"
+
+          # Frozen import smoke (codex L2): the structural asserts above only prove files
+          # exist. This runs the built app binary itself with VOLKSMOND_SMOKE=mlx, which
+          # imports mlx.core + mlx_whisper inside the frozen interpreter (torch is excluded
+          # from the bundle, so this also proves mlx_whisper imports without it) and exits
+          # 1 on darwin-arm64 if the import fails. Asserting the OK line guards against an
+          # older entry point that would ignore the env var and exit 0 some other way.
+          echo "==> Frozen MLX import smoke (VOLKSMOND_SMOKE=mlx)"
+          set +e
+          SMOKE_OUT="$(VOLKSMOND_SMOKE=mlx "$EXE" 2>&1)"
+          SMOKE_RC=$?
+          set -e
+          printf '%s\n' "$SMOKE_OUT"
+          if [ "$SMOKE_RC" -ne 0 ]; then
+            echo "::error title=Bundle check::Frozen MLX smoke exited $SMOKE_RC. The bundle cannot import mlx.core/mlx_whisper (see output above)."
+            exit 1
+          fi
+          if ! printf '%s' "$SMOKE_OUT" | grep -q "MLX SMOKE OK"; then
+            echo "::error title=Bundle check::Frozen MLX smoke did not print 'MLX SMOKE OK' (entry point ignored VOLKSMOND_SMOKE?)."
+            exit 1
+          fi
+          echo "    frozen MLX import smoke OK"
+
           if [ "$MODE" = "release" ]; then
             echo "==> Asserting Developer ID signature + entitlements (release mode)"
             codesign --verify --strict "$HELPER" || {
@@ -247,6 +308,9 @@ jobs:
               echo "::error title=Bundle check::codesign --verify --deep --strict failed for $APP"
               exit 1
             }
+            # These entitlements are load-bearing for MLX too (plan WP-M6): Metal JIT compilation
+            # needs allow-unsigned-executable-memory and disable-library-validation. Do not drop
+            # them when revisiting the entitlement set.
             ENTS="$(codesign -d --entitlements :- "$EXE" 2>/dev/null)"
             for KEY in com.apple.security.device.audio-input \
                        com.apple.security.cs.allow-unsigned-executable-memory \

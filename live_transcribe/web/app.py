@@ -1305,6 +1305,10 @@ def reconfigure(req: ReconfigureRequest):
             raise HTTPException(status_code=409, detail="Changing the language or model is only available during a live transcription.")
         engine = STATE.engine
         cur_is_cpu = engine._is_cpu
+        # D8: the engine carries its concrete device ("cpu"/"cuda"/"mlx"). Legacy engine
+        # objects without _device keep the old _is_cpu reconstruction, which can never
+        # say "mlx" (mlx engines always have _device).
+        cur_device = getattr(engine, "_device", None) or ("cpu" if cur_is_cpu else "cuda")
         compute = engine._compute_type
         threads = engine._cpu_threads
         cur_size = engine.size
@@ -1333,14 +1337,30 @@ def reconfigure(req: ReconfigureRequest):
     new_tier = None
     new_size = cur_size
     if change_model or family_change:
+        device_str = cur_device
         if data.get("tier"):
-            # A quality change: map the key to a size on THIS device (never flip CPU<->GPU live).
-            new_tier = resolve_tier(data["tier"], "cpu" if cur_is_cpu else "auto", new_lang, new_engine_pref)
+            # A quality change: map the key to a size on THIS device (never flip CPU<->GPU live on
+            # Windows). An mlx session resolves with "auto" so the new size lands back on mlx when
+            # it has an MLX form and on the CPU otherwise; live mlx <-> cpu swaps are ordinary
+            # serial-worker model reloads on a Mac (D8), so the load device (and its compute type)
+            # follows the resolved tier there.
+            new_tier = resolve_tier(data["tier"], "cpu" if cur_device == "cpu" else "auto", new_lang, new_engine_pref)
             new_size = transcribe.TIER_CONFIG[new_tier]["model"]
         else:
             new_size = cur_size                   # engine/family-only change: keep the running size
+            if cur_device == "mlx":
+                # A language/engine change on an MLX session can leave the kept size with no MLX
+                # form for the NEW family (Fluister turbo -> English resolves STOCK turbo, which
+                # is unmapped; English large-v3 -> Fluister resolves fluister-large-v3, also
+                # unmapped), so loading it on "mlx" would raise. Re-resolve the kept size for the
+                # new (language, engine) so the load lands on mlx when mapped and on the CPU
+                # otherwise (codex H2). Windows never enters here: cur_device is cpu/cuda.
+                new_tier = resolve_tier(cur_size, "auto", new_lang, new_engine_pref)
+        if cur_device == "mlx" and new_tier is not None:
+            device_str = transcribe.TIER_CONFIG[new_tier]["device"]
+            if device_str != "mlx":
+                compute = transcribe.TIER_CONFIG[new_tier]["compute_type"]
         model_name, family = transcribe.resolve_model(new_size, new_lang, new_engine_pref)
-        device_str = "cpu" if cur_is_cpu else "cuda"
         try:
             model = transcribe.load_model(model_name, device_str, compute, cpu_threads=threads)
         except Exception as e:
@@ -1355,8 +1375,15 @@ def reconfigure(req: ReconfigureRequest):
         # other explicit code is forced as-is (see transcribe.decode_language).
         eff_family = family if family is not None else cur_family
         decode_lang = transcribe.decode_language(eff_family, new_lang)
+        # With a model swap, also hand over the backend it was built on so the engine's
+        # device identity (_device/_is_cpu/_compute_type) moves with the model: an
+        # mlx -> cpu change must enable the CPU downgrade ladder and make the NEXT
+        # reconfigure resolve from "cpu", not a stale "mlx" (codex M1). On Windows
+        # device_str always equals the engine's current device, so this is a no-op there.
         engine.request_change(language=decode_lang, engine=new_engine_pref,
-                              model=model, model_name=model_name, size=new_size, family=family)
+                              model=model, model_name=model_name, size=new_size, family=family,
+                              device=(device_str if model is not None else None),
+                              compute_type=(compute if model is not None else None))
         # Only a request that actually carries a language change may rewrite the session's
         # canonical language; a tier/engine-only change keeps it exactly as the user chose it.
         if change_lang:
@@ -1411,15 +1438,41 @@ class PreflightRequest(BaseModel):
 
 
 def _preflight_device(device_pref):
-    """The honest processor Begin will use: 'cpu' when forced or no usable CUDA, else 'gpu'. Surfaced
-    so the modal's size/label/time match reality even on a frozen build with no GPU libs."""
+    """The honest processor Begin will use: 'cpu' when forced or no usable accelerator, 'gpu' for
+    CUDA, 'mlx' for the Apple GPU (darwin-arm64 with mlx-whisper). Surfaced so the modal's
+    size/label/time match reality even on a frozen build with no GPU libs."""
     if device_pref == "cpu":
         return "cpu"
     try:
-        from .. import cudadl
-        return "gpu" if cudadl.cuda_ready() else "cpu"
+        from .. import accel
+        backend = accel.asr_backend(device_pref)     # "cuda" | "mlx" | "cpu"
+        return "gpu" if backend == "cuda" else backend
     except Exception:
         return "cpu"
+
+
+def _asr_download_target(family, size):
+    """The honest voicedl download target for (family, size): the MLX repo on a ready Mac for the
+    mapped pairs (voicedl.asr_download_target, WP-M3), else today's ct2 target. The getattr guard
+    keeps every caller working against an older voicedl, where the answer IS today's target."""
+    from .. import voicedl
+    fn = getattr(voicedl, "asr_download_target", None)
+    if fn is not None:
+        try:
+            return fn(family, size)
+        except Exception:
+            pass
+    return transcribe.FLUISTER_REPOS.get(size) if family == "fluister" else size
+
+
+def _asr_approx_bytes(family, size, target):
+    """Rough on-disk bytes for the download target: the repo-keyed entry when voicedl knows the MLX
+    repo (WP-M3 adds those; stock MLX repos live in _MLX_SIZES, kept out of _SIZES so the download
+    API allow-list stays size-keyed, codex L1), else the existing size-keyed entry (today's answer)."""
+    from .. import voicedl
+    sizes = voicedl._FLUISTER_SIZES if family == "fluister" else voicedl._SIZES
+    mlx_sizes = getattr(voicedl, "_MLX_SIZES", {})
+    return mlx_sizes.get(target) or sizes.get(target) or sizes.get(size, 0)
 
 
 def _downloaded_alternatives(exclude_family, exclude_size):
@@ -1441,10 +1494,34 @@ def _downloaded_alternatives(exclude_family, exclude_size):
                 continue
             if family == exclude_family and size == exclude_size:
                 continue
-            target = transcribe.FLUISTER_REPOS.get(size) if family == "fluister" else size
-            approx = (voicedl._FLUISTER_SIZES if family == "fluister" else voicedl._SIZES).get(size, 0)
+            target = _asr_download_target(family, size)
+            approx = _asr_approx_bytes(family, size, target)
             out.append({"size": size, "family": family, "label": _QUALITY_LABEL.get(size, size),
                         "model": target, "approx_bytes": approx, "quality_note": notes.get(family, "")})
+    # The MLX store (codex M3 residual): _downloaded_sizes is deliberately ct2-only, so on a
+    # ready Mac the mapped MLX models are offered from their OWN store when actually cached
+    # (an MLX-only download is instantly usable via the mlx tiers). Deduped against the ct2
+    # entries above (same family+size). On Windows accel.mlx_ready() is always False, so the
+    # list is byte-identical there; any failure changes nothing (best-effort, like the rest).
+    try:
+        from .. import accel
+        from ..mlxbackend import MLX_REPOS
+        if accel.mlx_ready():
+            fl_size = {repo: size for size, repo in transcribe.FLUISTER_REPOS.items()}
+            seen = {(e["family"], e["size"]) for e in out}
+            for ct2_id, repo in MLX_REPOS.items():
+                family = "fluister" if ct2_id in fl_size else "whisper"
+                size = fl_size.get(ct2_id, ct2_id)
+                if (family, size) in seen or (family == exclude_family and size == exclude_size):
+                    continue
+                if not voicedl._mlx_present(repo):
+                    continue
+                approx = (voicedl._FLUISTER_SIZES.get(repo) if family == "fluister"
+                          else getattr(voicedl, "_MLX_SIZES", {}).get(repo)) or 0
+                out.append({"size": size, "family": family, "label": _QUALITY_LABEL.get(size, size),
+                            "model": repo, "approx_bytes": approx, "quality_note": notes.get(family, "")})
+    except Exception:
+        pass
     # Swivuriso is one model at a nominal size; list it as an INSTANT switch only when it is actually
     # cached on disk (a local ct2 build, or the hosted repo already downloaded). swivuriso_available()
     # is ~always True (the repo is hosted), so it must NOT gate this list, or the modal would advertise
@@ -1560,7 +1637,8 @@ def _resolve_download_plan(tier, language, engine_pref):
     network-free (voicedl._present is a local-cache probe). Returns a dict:
       model  - the concrete id to display/track (a Whisper size, a Fluister/Swivuriso repo, or a
                local ct2 path on a dev machine),
-      target - the voicedl download target (a size for stock Whisper, a repo id for Fluister/Swivuriso),
+      target - the voicedl download target (a size for stock Whisper, a repo id for Fluister/
+               Swivuriso, or the MLX repo id on a ready Mac for the mapped sizes),
       family - "fluister" | "whisper" | "swivuriso",
       size   - the stock size key (from the tier),
       label  - the human quality label ("Fast"/"Balanced"/...),
@@ -1569,15 +1647,12 @@ def _resolve_download_plan(tier, language, engine_pref):
     from .. import voicedl
     size = transcribe.TIER_CONFIG.get(tier, {}).get("model", "small")
     model_id, family = transcribe.resolve_model(size, language, engine_pref)
-    if family == "fluister":
-        target = transcribe.FLUISTER_REPOS.get(size)
-        approx = voicedl._FLUISTER_SIZES.get(size, 0)
-    elif family == "swivuriso":
+    if family == "swivuriso":
         target = transcribe.SWIVURISO_REPO
         approx = voicedl._SWIVURISO_SIZE
-    else:   # whisper (stock)
-        target = size
-        approx = voicedl._SIZES.get(size, 0)
+    else:   # fluister / whisper: the honest target, an MLX repo on a ready Mac (WP-M3)
+        target = _asr_download_target(family, size)
+        approx = _asr_approx_bytes(family, size, target)
     # A local ct2 build (dev machine SA_LIVE_AF_MODEL / an af-lora-* or swivuriso dir) is present even
     # though its HF repo is not cached; treat an existing local model dir as present so we never trigger
     # a spurious repo download over a working local build.
@@ -1612,6 +1687,25 @@ def _start_model_download(family, size):
     except Exception as e:
         print(f"[start] could not begin model download ({family}/{size}): {e}", flush=True)
         return False
+
+
+def _download_owner_repo(plan):
+    """The HuggingFace cache repo voicedl.progress()['repo'] will report for THIS plan's download,
+    used by the prepare polling loop to tell OUR download from a foreign one. Fluister/Swivuriso
+    targets and any explicit org/repo id (an MLX target on a ready Mac) already ARE the cache repo
+    voicedl records; only a bare stock-Whisper SIZE name resolves through voicedl._repo_id.
+    Mangling an MLX repo id through _repo_id would produce a name that never matches the recorded
+    repo, so our own download would read as foreign and die on the foreign-slot timeout (codex M2).
+    Best-effort: any error falls back to the raw target (an older/stub voicedl records no repo and
+    is trusted via the loop's None check)."""
+    from .. import voicedl
+    target = plan.get("target")
+    try:
+        if plan.get("family") in ("fluister", "swivuriso") or "/" in (target or ""):
+            return target
+        return voicedl._repo_id(target)
+    except Exception:
+        return target
 
 
 def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_sink, browser_sink):
@@ -1715,11 +1809,7 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
         # Identify OUR target by its cache repo so we never read a foreign download's bytes/done/error as
         # ours and then try to load a model that is still missing (P1-5). progress()["repo"] is the repo
         # folder being measured; a stub/older voicedl with no repo is trusted (None).
-        try:
-            target_repo = (plan["target"] if plan["family"] in ("fluister", "swivuriso")
-                           else voicedl._repo_id(plan["target"]))
-        except Exception:
-            target_repo = plan["target"]
+        target_repo = _download_owner_repo(plan)
         if not _start_model_download(plan["family"], plan["size"]):
             _fail("Could not start the transcription model download. Check your connection and try again.")
             return
@@ -3142,12 +3232,13 @@ def get_features():
 def models_status():
     """Which summary model is installed (the Whisper model is handled by the tier).
 
-    summary_gpu_capable is True only when an NVIDIA GPU is present AND this build's
-    llama.cpp can offload to it (the CPU-only wheel cannot), so the UI shows a GPU/CPU
-    choice for summaries only when it would actually do something."""
-    from .. import summarise as _summarise, cudadl
+    summary_gpu_capable is True only when a usable GPU is present (NVIDIA on Windows,
+    Apple silicon's Metal on a Mac) AND this build's llama.cpp can offload to it (the
+    CPU-only wheel cannot), so the UI shows a GPU/CPU choice for summaries only when
+    it would actually do something."""
+    from .. import summarise as _summarise, accel
     try:
-        gpu_capable = bool(cudadl.gpu_present() and _summarise.gpu_offload_supported())
+        gpu_capable = bool(accel.summary_gpu_ready() and _summarise.gpu_offload_supported())
     except Exception:
         gpu_capable = False
     return {
@@ -3664,16 +3755,17 @@ class SummariseRequest(BaseModel):
 
 def _generate_summary(model_path, transcript, instruction, language, notes=None):
     """Run the local summariser, preferring the GPU when it is usable, falling back to CPU."""
-    from .. import summarise as _summarise, cudadl
-    # GPU only when: the user has not forced CPU, an NVIDIA GPU is present, this build's
-    # llama.cpp can offload (the CPU wheel cannot), and the model fits in VRAM with headroom.
+    from .. import summarise as _summarise, accel
+    # GPU only when: the user has not forced CPU, a usable GPU is present (NVIDIA on
+    # Windows, Metal on Apple silicon), this build's llama.cpp can offload (the CPU
+    # wheel cannot), and the model fits in the GPU memory budget with headroom.
     device = (config.load().get("summary_device") or "auto").strip().lower()
     n_gpu_layers = 0
-    if (device != "cpu" and _summarise.gpu_offload_supported() and cudadl.gpu_present()
-            and _summarise.fits_on_gpu(model_path, cudadl.vram_mb())):
+    if (device != "cpu" and _summarise.gpu_offload_supported() and accel.summary_gpu_ready()
+            and _summarise.fits_on_gpu(model_path, accel.summary_vram_mb())):
         n_gpu_layers = -1
     print(f"[summarise] device={device!r} offload={_summarise.gpu_offload_supported()} "
-          f"gpu_present={cudadl.gpu_present()} vram={cudadl.vram_mb()} -> n_gpu_layers={n_gpu_layers}", flush=True)
+          f"gpu_ready={accel.summary_gpu_ready()} vram={accel.summary_vram_mb()} -> n_gpu_layers={n_gpu_layers}", flush=True)
 
     def _run(layers):
         s = _summarise.Summariser(model_path, n_gpu_layers=layers)

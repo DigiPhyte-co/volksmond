@@ -173,6 +173,12 @@ TIER_CONFIG = {
     # adaptive ladder downgrades it there), but the best-accuracy choice for an
     # uploaded recording / post-meeting pass, where there is no real-time constraint.
     "cpu-large":  {"model": "large-v3",       "device": "cpu",  "compute_type": "int8"},
+    # MLX tiers: the Apple GPU (Metal) via mlx-whisper, macOS arm64 only. Deliberately
+    # NOT in __main__.TIER_CHOICES, so the Windows CLI/env surface is untouched; only
+    # resolve_tier_engine emits them, and only on darwin-arm64. compute_type is nominal
+    # here (the MLX repo holds its own precision) but keeps the cache key disambiguated.
+    "mlx":        {"model": "large-v3",       "device": "mlx",  "compute_type": "fp16"},
+    "mlx-turbo":  {"model": "large-v3-turbo", "device": "mlx",  "compute_type": "fp16"},
 }
 
 
@@ -194,6 +200,19 @@ _WARM = {"state": "idle", "tier": None, "model": None}   # state: idle|warming|r
 
 
 def _build_model(model_name, device, compute_type, cpu_threads):
+    if device == "mlx":
+        # Apple Metal via the mlx-whisper adapter. Imported lazily so Windows (where the
+        # mlx packages have no wheels and are never installed) pays nothing for this
+        # branch. compute_type/cpu_threads have no MLX equivalent; the repo's own
+        # precision applies. The adapter resolves the snapshot LOCAL-ONLY and raises
+        # when the repo is not cached (stricter than the ct2 fallback below): an MLX
+        # download must only ever happen through voicedl, never inside mlx-whisper.
+        from . import mlxbackend
+        repo = mlxbackend.mlx_model_for(model_name)
+        if repo is None:
+            raise ValueError(f"{model_name!r} has no MLX form (see mlxbackend.MLX_REPOS); "
+                             "use a ct2 CPU tier for this model")
+        return mlxbackend.MlxWhisperModel(repo)
     kw = dict(device=device, compute_type=compute_type)
     if device == "cpu":
         kw["cpu_threads"] = cpu_threads
@@ -1169,6 +1188,10 @@ class Engine:
         # warmed model makes Begin instant. See load_model / warm_up_async above.
         self.model = load_model(self.model_name, cfg["device"], cfg["compute_type"], cpu_threads=cpu_threads)
         self._is_cpu = cfg["device"] == "cpu"
+        # The actual compute backend ("cuda"/"cpu"/"mlx"), kept alongside _is_cpu so the
+        # web layer can report the device honestly instead of reconstructing it. _is_cpu
+        # stays the ladder gate: mlx is not CPU, so the RTF downgrade never fires on it.
+        self._device = cfg["device"]
         self._compute_type = cfg["compute_type"]
         self._cpu_threads = cpu_threads
         self._rtf = deque(maxlen=DOWNGRADE_WINDOW)  # recent real-time factors (CPU downgrade)
@@ -1339,7 +1362,8 @@ class Engine:
         self.initial_prompt = prompt
         self._rebuild_prompt_leak(prompt, self.language)
 
-    def request_change(self, *, language, engine, model=None, model_name=None, size=None, family=None):
+    def request_change(self, *, language, engine, model=None, model_name=None, size=None, family=None,
+                       device=None, compute_type=None):
         """Queue a live language and/or model change, applied by the worker between chunks.
 
         Pass `model` (a WhisperModel the CALLER already built via load_model, off the worker, so
@@ -1347,11 +1371,21 @@ class Engine:
         the model; omit them to keep the current model and change only the decode language - instant,
         no reload, and the right move for a bilingual meeting on a both-capable model. `language` is
         the next decode language (None == auto-detect, "af"/"en" otherwise); the prompt is recomposed
-        for it. A second request before the worker applies the first simply replaces it."""
+        for it. `device`/`compute_type` (with `model`) record the backend the new model was BUILT on
+        ("cpu"/"cuda"/"mlx"), so a cross-backend swap (mlx <-> cpu on a Mac) updates the engine's
+        device identity together with the model; None keeps the current values (every same-device
+        swap, which is all Windows ever does). A second request before the worker applies the first
+        simply replaces it.
+
+        Known limitation (pre-existing, all platforms including Windows): rapid overlapping
+        reconfigure requests can transiently desync STATE.* from the engine, because each API
+        thread publishes its own view while the worker applies only the LAST queued change
+        between chunks. Accepted as-is; no request/worker generation tags here."""
         with self._change_lock:
             self._pending_change = {
                 "language": language, "engine": engine,
                 "model": model, "model_name": model_name, "size": size, "family": family,
+                "device": device, "compute_type": compute_type,
             }
 
     def request_loop_history_reset(self):
@@ -1390,6 +1424,17 @@ class Engine:
             self.size = ch["size"]
             self.family = ch["family"]
             self.is_fluister = ch["family"] == "fluister"
+            # A cross-backend swap (mlx <-> cpu on a Mac) must move the engine's device
+            # identity WITH the model: _is_cpu gates the CPU adaptive downgrade ladder,
+            # and _device/_compute_type drive the next reconfigure's resolution and any
+            # downgrade reload. Applied here on the worker thread together with the model
+            # (single writer), so model and device identity can never be torn. None (the
+            # only value Windows callers ever pass) keeps the current backend untouched.
+            if ch.get("device"):
+                self._device = ch["device"]
+                self._is_cpu = ch["device"] == "cpu"
+            if ch.get("compute_type"):
+                self._compute_type = ch["compute_type"]
         self.initial_prompt = _compose_prompt(self.language, self._user_prompt)
         self._rebuild_prompt_leak(self._user_prompt, self.language)
         self._recent.clear()  # a model/language flip legitimately changes output style

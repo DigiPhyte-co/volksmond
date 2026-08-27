@@ -46,9 +46,34 @@ def _redirect_windowed_output():
         sys.stderr = sink
 
 
+def _mlx_smoke():
+    """CI-only frozen smoke (VOLKSMOND_SMOKE=mlx): prove THIS frozen bundle can import the MLX
+    runtime (mlx.core + mlx_whisper) without torch, which the mac spec excludes. mac-release.yml
+    runs the built .app binary with the env var set and asserts the OK line; a bundle where
+    collect_all missed a piece fails here in seconds instead of at the first Mac transcription.
+    Exit code: 0 with 'MLX SMOKE OK' on success; on a platform that ships no MLX (Windows,
+    Intel Macs) a failed import prints SKIP and exits 0; on darwin-arm64 (the shipped Mac
+    bundle) a failed import is a packaging bug and exits 1. Never runs unless the env var is
+    set, so shipped behaviour on every platform is untouched."""
+    import platform
+    try:
+        import mlx.core        # noqa: F401  (the Metal runtime; needs its .metallib packaged)
+        import mlx_whisper     # noqa: F401  (the ASR backend; must import WITHOUT torch)
+    except Exception as e:
+        if sys.platform == "darwin" and platform.machine() == "arm64":
+            print(f"MLX SMOKE FAIL: {e!r}")
+            return 1
+        print(f"MLX SMOKE SKIP (no MLX runtime on this platform): {e!r}")
+        return 0
+    print("MLX SMOKE OK")
+    return 0
+
+
 if __name__ == "__main__":
     # Redirect first so a windowed build has a valid stdout/stderr, then import:
     # any import-time failure in the app is then captured in the crash log too.
     _redirect_windowed_output()
+    if os.environ.get("VOLKSMOND_SMOKE") == "mlx":
+        sys.exit(_mlx_smoke())
     from live_transcribe.desktop import main
     sys.exit(main(sys.argv[1:]))
