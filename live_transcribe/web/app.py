@@ -736,10 +736,12 @@ def _silence_signal():
 #   CPU: the session auto-downgrades (transcribe.Engine._maybe_downgrade, ladder
 #        medium->small->base->tiny) because it cannot hold real time, so transcription silently
 #        gets rougher. Swivuriso is a single fixed model and never downgrades.
-#   GPU: there is no ladder to step down, so the engine warns instead
-#        (transcribe.Engine._maybe_warn_gpu_struggle) when a live cuda/mlx session is
-#        sustained-slow AND its queue is backing up. Measured incident: other programs were
-#        sharing the card, Volksmond fell behind and dropped 350+ chunks with no warning at all.
+#   GPU: there is no ladder to step down, so the engine warns instead (transcribe.Engine's
+#        _trip_struggle, raised either by the growing-queue check on the worker or by the
+#        producer-side high-water/first-drop net) when a live cuda/mlx session stops keeping up.
+#        Measured incident: other programs were sharing the card, Volksmond fell behind and
+#        dropped 350+ chunks with no warning at all. The copy stays hedged about the cause: the
+#        signal is queue depth, which cannot name the program responsible.
 # Either way: a one-time banner (STATE.struggle_nudge, polled via /api/status) plus a single
 # Windows toast, with the offer to start recording so the meeting can be re-transcribed at full
 # accuracy afterwards. Neither path changes what the engine does; both only make it visible, and
@@ -841,10 +843,13 @@ def _on_gpu_struggle(engine):
         STATE.struggle_notified = True
     if fire_toast:
         from .. import notify
+        # Hedged on purpose, and matched to the banner and the transcript notice: the engine
+        # measures queue depth and inference time, which cannot tell another program apart from
+        # thermal throttling, memory pressure or a slow configuration. Claim only what was seen.
         notify.show("Volksmond is struggling to keep up",
-                    "Another program is using your graphics card, so Volksmond is falling behind "
-                    "and some audio may not be transcribed. Open Volksmond to record the meeting "
-                    "and re-transcribe it at full accuracy later.",
+                    "Your graphics card is unusually busy or slow, so Volksmond is falling behind "
+                    "and some audio may not be transcribed. Another program may be using it. Open "
+                    "Volksmond to record the meeting and re-transcribe it at full accuracy later.",
                     tag="struggle", on_click=notify.focus_app)
     return published
 
@@ -2185,6 +2190,15 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
                     # preparing/model_ready were already settled at phase-1 end; this only completes the
                     # backlog->live ordering flip. The private handle is dropped now STATE.engine owns it.
                     STATE.engine = engine
+                    # Arm the "cannot keep up" warning HERE and nowhere earlier: from this instant the
+                    # engine is the session's, _feed feeds it directly, and a deep queue is a fault
+                    # rather than the catch-up replay above (during which the warning would have burned
+                    # its one-shot ratchet on a callback _on_gpu_struggle then rejects, since
+                    # STATE.engine was not yet this engine, leaving the real starvation silent for the
+                    # rest of the meeting). Assignment, not a method call: same wiring pattern as
+                    # on_downgrade/on_struggle, and the engine takes its own baseline queue depth from
+                    # here, so the backlog this replay just handed it is not read as growth.
+                    engine.struggle_armed = True
                     STATE.preparing = False
                     STATE.pending_audio = None
                     STATE.preparing_engine = None

@@ -1917,10 +1917,11 @@ function struggleBanner() {
   // the copy. (Same condition that hides the standalone footer button.)
   var hasRec = !!(S.live.recording || S.live.recordingStarted);
   // Only the copy branches on the reason; the card, the actions and the dismiss are one surface.
-  // A gpu-busy warning is a prediction ("if it stays behind"), not a completed change, so it does
-  // not gain a recording variant: the record offer below is still the whole remedy.
+  // A gpu-busy warning does not gain a recording variant: the record offer below is still the whole
+  // remedy either way. It also stays hedged about the cause, because all the server measured was
+  // queue depth and inference time, which cannot tell another program apart from throttling.
   var body = (S.live.struggleNudge && S.live.struggleNudge.reason) === "gpu-busy"
-    ? "Another program is using your graphics card, so Volksmond is falling behind. If it stays behind, some audio will not be transcribed."
+    ? "Your graphics card is unusually busy or slow, so Volksmond is falling behind. Another program may be using it."
     : hasRec
       ? "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Your recording can be re-transcribed at full accuracy afterward."
       : "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Record now and re-transcribe at full accuracy afterward.";
