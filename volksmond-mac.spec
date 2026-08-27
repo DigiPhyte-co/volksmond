@@ -179,6 +179,13 @@ app = BUNDLE(
         "LSMinimumSystemVersion": "14.4",
         "LSApplicationCategoryType": "public.app-category.productivity",
         "NSHighResolutionCapable": True,
+        # One copy only. Without this, opening the app again while it runs lets LaunchServices
+        # start a second, fully independent process: second Dock tile, second window, second
+        # server, two copies fighting over the mic, the GPU and the sessions folder (field
+        # report, 2026-08-27). desktop.py's claim_port() is the guard that actually holds the
+        # line (it covers Windows too, and a second copy started by any other route); this key
+        # stops the second launch before it ever runs Python.
+        "LSMultipleInstancesProhibited": True,
         # TCC prompts. The user sees these exact strings; keep them POPIA-honest and specific.
         "NSMicrophoneUsageDescription":
             "Volksmond transcribes your microphone locally on this Mac. Audio never leaves the device.",
