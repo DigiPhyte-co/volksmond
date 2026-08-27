@@ -135,6 +135,39 @@ def test_mlx_present_probes_local_cache_only():
     print("  OK  _mlx_present() probes the local cache only and fails safe on any error")
 
 
+def test_present_dispatches_by_repo_kind():
+    # WP-M4's presence probes (_downloaded_sizes whisper branch, _resolve_download_plan) call
+    # voicedl._present(target) directly, where target can be an MLX repo id on a ready Mac.
+    # _present must answer honestly for those ids: judged by the MLX file-set rule, with
+    # faster-whisper's downloader never consulted; every other id keeps the ct2 model.bin rule.
+    import huggingface_hub as hf
+    orig_dl, orig_hf = voicedl._download_model, hf.snapshot_download
+    with tempfile.TemporaryDirectory() as snap:
+        _write(os.path.join(snap, "config.json"), 500)
+        _write(os.path.join(snap, "weights.safetensors"), voicedl._MIN_MODEL_BIN_BYTES + 4096)
+        try:
+            def never(model, local_only=False):
+                raise AssertionError("_download_model must not be consulted for an MLX repo id")
+            voicedl._download_model = never
+            hf.snapshot_download = lambda repo, **kw: snap
+            assert voicedl._present(WHISPER_LARGE_MLX) is True, \
+                "a fully cached MLX repo must read present through _present"
+            assert voicedl._present(FLUISTER_TURBO_MLX) is True
+            # A truncated MLX cache stays not-present (fail-safe intact through the dispatch).
+            _write(os.path.join(snap, "weights.safetensors"), 1000)
+            assert voicedl._present(WHISPER_LARGE_MLX) is False, \
+                "a truncated MLX cache must stay not-present"
+            # A ct2 id still goes through _download_model + the model.bin rule: the same
+            # MLX-shaped dir (config + weights, no model.bin) is NOT ct2-present.
+            _write(os.path.join(snap, "weights.safetensors"), voicedl._MIN_MODEL_BIN_BYTES + 4096)
+            voicedl._download_model = lambda model, local_only=False: snap
+            assert voicedl._present("small") is False, \
+                "the ct2 model.bin rule must be untouched by the MLX dispatch"
+        finally:
+            voicedl._download_model, hf.snapshot_download = orig_dl, orig_hf
+    print("  OK  _present() dispatches MLX repo ids to the MLX rule; the ct2 rule is untouched")
+
+
 def test_asr_download_target_ct2_when_not_ready():
     # Windows reality: accel.mlx_ready() is always False, so every answer is today's ct2
     # target. Pinned with an explicit fake so the test is deterministic everywhere.
@@ -432,6 +465,7 @@ def test_start_fluister_update_targets_mlx_when_ready():
 if __name__ == "__main__":
     tests = (test_snapshot_has_mlx_weights_shapes,
              test_mlx_present_probes_local_cache_only,
+             test_present_dispatches_by_repo_kind,
              test_asr_download_target_ct2_when_not_ready,
              test_asr_download_target_mlx_when_ready,
              test_delete_mlx_repo_removes_only_that_dir,

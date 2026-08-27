@@ -196,7 +196,14 @@ def _present(model):
     as refs/main + a snapshots/<hash>/ dir survive, WITHOUT verifying the files are complete ("we can't
     check if all the files are actually there"). So a partial/interrupted download (model.bin missing or
     truncated) would otherwise read as present here and then fail to load at Begin. Verify a non-trivial
-    model.bin under the returned snapshot dir before trusting it; any error -> not present (fail-safe)."""
+    model.bin under the returned snapshot dir before trusting it; any error -> not present (fail-safe).
+
+    Dispatches by repo kind: an MLX repo id (mlxbackend.MLX_REPOS values) is judged by the MLX
+    file-set rule (_mlx_present), never by faster-whisper's downloader or the model.bin rule,
+    so callers that probe a target id directly (_downloaded_sizes, _resolve_download_plan) get
+    an honest answer for MLX targets too. Every other id keeps the ct2 rule exactly."""
+    if model in _MLX_TARGETS:
+        return _mlx_present(model)
     try:
         path = _download_model(model, local_only=True)
     except Exception:
