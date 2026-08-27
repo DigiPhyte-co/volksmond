@@ -183,7 +183,9 @@ def test_delete_holds_slot_against_concurrent_download_start():
             voicedl._hub_cache = lambda: Path(cache)
             voicedl.config = _FakeConfig()
             voicedl.shutil = _types.SimpleNamespace(rmtree=racing_rmtree)
-            voicedl._set(state="done")     # a finished download's terminal state must survive
+            # A finished UNRELATED download's terminal state must survive the delete (the
+            # deleted repo's own stale "done" is cleared instead; pinned by the next test).
+            voicedl._set(state="done", model="medium", repo="digiphyte/fluister-medium")
             voicedl.delete("digiphyte/fluister-small")
         finally:
             voicedl._hub_cache, voicedl.shutil = orig_hub, orig_shutil
@@ -193,8 +195,48 @@ def test_delete_holds_slot_against_concurrent_download_start():
         assert not os.path.exists(repo_dir), "the delete itself must still complete"
         assert voicedl._STATE["state"] == "done", \
             "the pre-delete terminal state must be restored after the removal"
-        voicedl._set(state="idle")
+        voicedl._set(state="idle", model=None, repo=None)
     print("  OK  delete() holds the slot as 'deleting'; no download can start into a dying cache")
+
+
+def test_delete_clears_stale_done_for_deleted_repo():
+    # codex M4 residual: after deleting the repo _STATE still names from its finished download,
+    # "done" must NOT be restored. The Begin poll treats state=="done" for OUR repo as download
+    # completion; with the files just deleted that stale done would send _build_model down its
+    # network-allowed ct2 fallback (an unconsented, progress-less download). Deleting an
+    # UNRELATED repo keeps the terminal state (pinned above).
+    from pathlib import Path
+
+    class _FakeConfig:
+        data = {"installed_models": {}}
+        def load(self):
+            return dict(self.data)
+        def update(self, kw):
+            self.data.update(kw)
+
+    orig_hub, orig_cfg = voicedl._hub_cache, voicedl.config
+    with tempfile.TemporaryDirectory() as cache:
+        try:
+            voicedl._hub_cache = lambda: Path(cache)
+            voicedl.config = _FakeConfig()
+            # Same repo: its own finished-download state is stale the moment the files go.
+            os.makedirs(os.path.join(cache, "models--digiphyte--fluister-small"))
+            voicedl._set(state="done", model="small", repo="digiphyte/fluister-small")
+            voicedl.delete("digiphyte/fluister-small")
+            assert voicedl._STATE["state"] == "idle", \
+                "deleting the repo named in _STATE must clear its stale 'done' to idle"
+            # Stock size: _STATE records the RESOLVED repo id (_repo_id), delete is called with
+            # the size; the dir comparison must still recognise them as the same cache.
+            small_repo = voicedl._repo_id("small")
+            os.makedirs(os.path.join(cache, "models--" + small_repo.replace("/", "--")))
+            voicedl._set(state="done", model="small", repo=small_repo)
+            voicedl.delete("small")
+            assert voicedl._STATE["state"] == "idle", \
+                "a stock-size delete must clear the stale 'done' recorded under its _repo_id"
+        finally:
+            voicedl._hub_cache, voicedl.config = orig_hub, orig_cfg
+            voicedl._set(state="idle", model=None, repo=None)
+    print("  OK  delete() clears a stale 'done' for the removed repo (unrelated terminal states kept)")
 
 
 if __name__ == "__main__":
@@ -204,7 +246,8 @@ if __name__ == "__main__":
              test_present_false_when_download_model_raises,
              test_ct2_rule_unchanged_by_mlx_shape,
              test_snapshot_has_weights_edge_cases,
-             test_delete_holds_slot_against_concurrent_download_start)
+             test_delete_holds_slot_against_concurrent_download_start,
+             test_delete_clears_stale_done_for_deleted_repo)
     failures = 0
     for fn in tests:
         try:

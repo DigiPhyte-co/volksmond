@@ -504,7 +504,7 @@ def delete(model):
     # releasing before rmtree left a window where a starter could claim the slot and download
     # into the cache being removed under it. Every starter (_claim_slot) refuses while a delete
     # runs; the previous terminal state (idle/done/error) is restored afterwards so a finished
-    # download's progress state is not clobbered by an unrelated delete.
+    # download's progress state is not clobbered by an UNRELATED delete.
     with _LOCK:
         if _STATE["state"] == "downloading":
             raise RuntimeError("A model is downloading. Wait for it to finish.")
@@ -524,7 +524,19 @@ def delete(model):
     finally:
         with _LOCK:
             if _STATE["state"] == "deleting":
-                _STATE["state"] = prev_state
+                # Restoring the previous terminal state is only safe for an UNRELATED repo. A
+                # restored "done" still naming the repo we just removed would satisfy the Begin
+                # poll's state=="done" completion check (web/app.py) while the files are gone,
+                # sending _build_model down its network-allowed ct2 fallback: an unconsented,
+                # progress-less download (codex M4 residual). Clear to idle whenever
+                # _STATE["repo"] maps to a cache dir this delete touched, including after a
+                # failed/partial removal, when "done" is equally untrue.
+                stale = True
+                try:
+                    stale = bool(_STATE.get("repo")) and _repo_dir(_STATE["repo"]) in dirs
+                except Exception:
+                    pass   # cannot judge -> stale stays True (fail-safe: idle, never a stale done)
+                _STATE["state"] = "idle" if stale else prev_state
     if model in fluister_repos or model == SWIVURISO_REPO or model in _MLX_TARGETS:
         _forget_installed(model)
 
