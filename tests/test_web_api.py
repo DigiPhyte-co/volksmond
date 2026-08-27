@@ -988,6 +988,54 @@ def test_reconfigure_reads_engine_device():
     print("  OK  reconfigure: engine._device drives the load (mlx kept, mlx->cpu swaps compute, legacy _is_cpu fallback)")
 
 
+def test_download_owner_match_for_mlx_repo():
+    # codex M2: the prepare polling loop identifies OUR download by comparing
+    # progress()["repo"] against the plan target's cache repo. An MLX target is an explicit
+    # org/repo id and must be used AS-IS: mangling it through voicedl._repo_id produced
+    # "Systran/faster-whisper-mlx-community/whisper-large-v3-mlx", which never matches the
+    # repo voicedl records, so our own download read as foreign and died on the 180 s
+    # foreign-slot timeout. Stock ct2 sizes still resolve through _repo_id (Windows
+    # byte-identical); Fluister/Swivuriso targets stay as-is as before.
+    import threading as _threading
+    import time
+    from live_transcribe import voicedl as V
+    from live_transcribe import transcribe as T
+    mlx_repo = "mlx-community/whisper-large-v3-mlx"
+    # 1. The helper's mapping, all three target kinds.
+    assert webapp._download_owner_repo({"family": "whisper", "target": mlx_repo}) == mlx_repo
+    assert webapp._download_owner_repo({"family": "whisper", "target": "small"}) == V._repo_id("small")
+    assert webapp._download_owner_repo(
+        {"family": "fluister", "target": "digiphyte/fluister-turbo"}) == "digiphyte/fluister-turbo"
+    assert webapp._download_owner_repo(
+        {"family": "swivuriso", "target": T.SWIVURISO_REPO}) == T.SWIVURISO_REPO
+    # 2. The polling loop's owner expression against the REAL _STATE machinery: start a
+    # (faked) MLX download of stock large-v3 on a ready Mac and prove the loop would read
+    # it as OURS, not foreign.
+    import types as _types
+    orig_accel, orig_dl = V.accel, V._download_mlx_repo
+    gate = _threading.Event()
+    try:
+        V.accel = _types.SimpleNamespace(mlx_ready=lambda: True)
+        V._download_mlx_repo = lambda repo: gate.wait(5) and "snap"
+        V.start_download("large-v3")
+        prog = V.progress()
+        assert prog["state"] == "downloading" and prog["repo"] == mlx_repo, prog
+        target_repo = webapp._download_owner_repo({"family": "whisper", "target": mlx_repo})
+        assert prog.get("repo") in (None, target_repo), \
+            "the polling loop must read our MLX download as OURS (owner match)"
+        # And the OLD mangling provably mismatches (the bug this pins against).
+        assert prog.get("repo") not in (None, V._repo_id(mlx_repo))
+    finally:
+        gate.set()
+        deadline = time.time() + 5
+        while V.progress()["state"] == "downloading" and time.time() < deadline:
+            time.sleep(0.01)
+        V.accel, V._download_mlx_repo = orig_accel, orig_dl
+        V._set(state="idle", model=None, repo=None, kind=None,
+               version=None, revision=None, downloaded=0, total=0, error=None)
+    print("  OK  prepare-loop owner match: MLX repo id used as-is (ct2 sizes still via _repo_id)")
+
+
 def test_reconfigure_family_change_on_mlx_reresolves():
     # codex H2: a language/engine change WITHOUT a tier on an MLX session keeps the size but
     # must re-resolve the backend for the NEW family: Fluister turbo -> English resolves STOCK

@@ -1663,6 +1663,25 @@ def _start_model_download(family, size):
         return False
 
 
+def _download_owner_repo(plan):
+    """The HuggingFace cache repo voicedl.progress()['repo'] will report for THIS plan's download,
+    used by the prepare polling loop to tell OUR download from a foreign one. Fluister/Swivuriso
+    targets and any explicit org/repo id (an MLX target on a ready Mac) already ARE the cache repo
+    voicedl records; only a bare stock-Whisper SIZE name resolves through voicedl._repo_id.
+    Mangling an MLX repo id through _repo_id would produce a name that never matches the recorded
+    repo, so our own download would read as foreign and die on the foreign-slot timeout (codex M2).
+    Best-effort: any error falls back to the raw target (an older/stub voicedl records no repo and
+    is trusted via the loop's None check)."""
+    from .. import voicedl
+    target = plan.get("target")
+    try:
+        if plan.get("family") in ("fluister", "swivuriso") or "/" in (target or ""):
+            return target
+        return voicedl._repo_id(target)
+    except Exception:
+        return target
+
+
 def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_sink, browser_sink):
     """Build the transcription Engine off the request thread (t0-capture), then attach it to the
     already-capturing session and replay everything held since Begin, IN ORDER and with zero drops.
@@ -1764,11 +1783,7 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
         # Identify OUR target by its cache repo so we never read a foreign download's bytes/done/error as
         # ours and then try to load a model that is still missing (P1-5). progress()["repo"] is the repo
         # folder being measured; a stub/older voicedl with no repo is trusted (None).
-        try:
-            target_repo = (plan["target"] if plan["family"] in ("fluister", "swivuriso")
-                           else voicedl._repo_id(plan["target"]))
-        except Exception:
-            target_repo = plan["target"]
+        target_repo = _download_owner_repo(plan)
         if not _start_model_download(plan["family"], plan["size"]):
             _fail("Could not start the transcription model download. Check your connection and try again.")
             return
