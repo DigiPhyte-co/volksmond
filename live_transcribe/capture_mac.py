@@ -936,16 +936,17 @@ class AudioCapture(CaptureBase):
         # Join the deferred permission-wait thread, if any: helper.stop() above set the
         # stop flag, so its wait_started returns False and it exits without registering.
         #
+        #
         # But only if the wait had not ALREADY returned. _await_system_tap does not re-check for
-        # shutdown between wait_started() and _register_source("SYS") + _ensure_chunker("SYS"),
-        # so a grant that lands in that instant can create a chunker after stop() has snapshotted
-        # _workers, and that chunker would never be joined. This join is bounded, so we cannot
-        # simply wait it out; we REPORT it instead, which fails safe: an unconfirmed stop makes
-        # nothing claim the microphone is off and leaves the recorder open until the end.
-        # RESIDUAL, deliberately not fixed here (it needs a stopping latch re-checked inside
-        # _await_system_tap under the lifecycle lock, which is a capture-lifecycle change and is
-        # tracked as its own macOS item): the late thread can still register a source. This makes
-        # that case honest and harmless, not impossible.
+        # shutdown between wait_started() and _register_source("SYS") + _ensure_chunker("SYS"), so
+        # a grant landing in that instant can create a chunker after stop() has snapshotted
+        # _workers, and that chunker would never be joined. The join is bounded, so we cannot
+        # simply wait it out; we REPORT it instead, and the only consequence of the False is that
+        # the app keeps saying "Stopping" rather than asserting the microphone is off. Honest, and
+        # on this path that is all it needs to be.
+        # RESIDUAL, deliberately not fixed here (it wants a stopping latch re-checked inside
+        # _await_system_tap under the lifecycle lock, which is a capture-lifecycle change tracked
+        # as its own macOS item): the late thread can still register a source.
         if self._sys_await_thread is not None:
             try:
                 self._sys_await_thread.join(timeout=3.0)

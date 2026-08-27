@@ -270,24 +270,6 @@ class CaptureBase:
         """Take one float32 block, shaped (frames, channels), from a backend's
         audio thread: level calc, energy-ring feed (MIC + SYS), AEC routing, and
         the under-lock re-check before appending to the chunk buffer."""
-        # Shutdown signalled: drop the block, at the ENTRY, before any of it is used. Once the
-        # stop event is set the chunkers are flushing and exiting, so nothing is left to consume
-        # what this would append: a block accepted here is lost anyway, and on a source that
-        # failed to close it is lost while the abandoned buffer keeps growing (hundreds of MB
-        # over a long drain). One check at the top, so every path below it is covered at once:
-        # the meter, the energy rings, the APM push and the MIC_RAW side channel, not just the
-        # plain buffer append. _append_16k applies exactly the same rule on the worker side.
-        #
-        # This is also what makes stop()'s confirmation SOUND rather than hopeful. Some teardowns
-        # (the macOS helper's reader join, the deferred permission thread) are bounded waits that
-        # can in principle return with a thread still alive; this turns every such residual from
-        # "late audio may still arrive" into "late audio is dropped", which is what the caller
-        # needs before it may finalise the recording early.
-        #
-        # Audio captured BEFORE the stop is untouched: it is already in the buffer, and each
-        # chunker flushes its whole remaining buffer on the way out (see _chunker).
-        if self._stop_event.is_set():
-            return
         # Cheap per-block level for the live meter (peak + RMS, 0..1). A single
         # dict assignment, so the reader (levels()) never sees a torn value.
         # When the APM worker takes this source the meter is fed from _append_16k
@@ -437,25 +419,31 @@ class CaptureBase:
             self._workers.append(t)
 
     def stop(self):
-        """Shut the capture down. Returns True only when that is CONFIRMED complete.
+        """Shut the capture down. Returns True when that is CONFIRMED complete, False otherwise.
 
-        Confirmed is the conjunction of three things, and it means exactly one guarantee: no
-        further on_chunk call can happen for this session.
-          1. _close_sources() reported success, so every stream/helper actually closed (and on
-             macOS no deferred permission thread is still running that could register a new
-             source and a new chunker behind our back);
+        The answer is EVIDENCE for a claim the app makes to the user ("the microphone is off"),
+        not a licence to finalise anything early: nothing on disk depends on it. Confirmed is the
+        conjunction of what this class can actually check:
+          1. _close_sources() reported success, so every source it can check closed (and on macOS
+             no deferred permission thread is still running that could register a new source and
+             a new chunker behind our back);
           2. _release_backend() reported success;
           3. every thread in _workers joined, so each chunker has already made its final flush
              into on_chunk. That join has always been bounded; a worker that outlived its window
              used to pass silently.
-        That guarantee is what lets a caller finalise the recording immediately instead of
-        waiting out the ASR backlog, so it has to be earned rather than assumed.
+        A False costs only a screen that keeps saying "Stopping" instead of asserting the
+        microphone is off, which is the honest outcome when we cannot tell.
 
-        Never raises. A half-finished shutdown still has to set the stop event (which is what
-        makes the chunkers flush and what makes _ingest_block and _append_16k drop late audio
-        instead of piling it into buffers nobody reads) and still has to release the backend, and
-        the caller needs an answer it can act on, not an exception it can only swallow. Every
-        failure is printed and folded into a False return.
+        KNOWN GAP, macOS: _AudioTapHelper.stop() reports nothing, so (1) there covers the mic
+        stream but not the system-audio helper subprocess. Deliberately not chased: a confirmed
+        stop still means every chunker joined, so a block from a lingering helper would land in a
+        buffer with no drainer and reach neither the recording nor the transcript.
+
+        Never raises. A half-finished shutdown still has to set the stop event (it is what makes
+        the chunkers flush and exit) and still has to release the backend, and the caller needs an
+        answer it can act on rather than an exception it can only swallow. Before this, a raised
+        _close_sources() skipped both, leaving the chunkers running for the life of the process
+        and PortAudio never terminated. Every failure is printed and folded into a False return.
         """
         # Stop the input streams first (no more native blocks arrive), then drain the AEC worker
         # into the chunk buffers, and only then signal the chunkers to flush - otherwise the

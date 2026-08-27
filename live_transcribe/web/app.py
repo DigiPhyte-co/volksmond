@@ -2819,49 +2819,57 @@ def _bump_session_count():
 
 
 def _confirm_capture_stopped(cap):
-    """Stop `cap` and answer the one question a finalise turns on: is capture CONFIRMED finished,
-    so no further chunk can reach _feed? Returns (confirmed, error_or_None).
+    """Stop `cap`, and decide whether the app has earned the right to SAY the microphone is off.
+    Returns None when it has, or a short message for the user when it has not.
 
-    CaptureBase.stop() reports it (every source closed, the backend released, every chunker joined,
-    and on macOS no deferred permission thread still running). Only a literal True counts: a capture
-    object that does not report is treated as unconfirmed, because a wrong "confirmed" loses the
-    last seconds of the meeting or claims a microphone is off while it is open, and a wrong
-    "unconfirmed" costs nothing beyond the behaviour this all started from. No capture at all (a
-    failed device switch can leave a running session with none) is trivially confirmed.
+    This is evidence for a claim, not a safety barrier. Nothing on disk depends on the answer: the
+    recording is finalised after the drain either way. What depends on it is what the screen
+    asserts, and asserting "microphone off, nothing more is being recorded" while a microphone may
+    still be open is the original trust bug inverted, and worse than it.
+
+    CaptureBase.stop() supplies the evidence: every source it can check closed, the backend
+    released, and every chunker joined. Only a literal True counts. A capture object that does not
+    report is treated as unconfirmed, which costs nothing but a screen that keeps saying "Stopping".
+    No capture at all (a failed device switch can leave a running session with none) is trivially
+    confirmed: there is no microphone open to lie about.
+
+    KNOWN GAP, macOS: _AudioTapHelper.stop() reports nothing, so a True there is evidence about the
+    microphone stream and the chunkers, not about the system-audio helper subprocess. The practical
+    exposure is small, because a confirmed stop means every chunker joined, so a late block from a
+    lingering helper lands in a buffer with no drainer and reaches neither the recording nor the
+    transcript. Tracked as its own platform item.
 
     Confirmed: clear STATE.recording, drop STATE.capture (which is what publishes capturing=False)
     and stamp STATE.capture_ended_at, together under STATE.lock.
 
-    Unconfirmed: change NONE of those. Claiming the microphone is off while audio may still be
-    flowing is the original trust bug inverted, and worse than it. The reason is published on
-    STATE.sink_error straight away rather than held until the session ends: the finalise can take
-    twenty minutes, and the user needs to know WHY the recording indicator is still lit while it is
-    still lit, not once it no longer matters."""
+    Unconfirmed: change NONE of those, so the UI keeps showing "Stopping" rather than a claim it
+    cannot support, and publish the reason on STATE.sink_error straight away. Immediately, not at
+    the end: the finalise can take twenty minutes, and the user needs to know why the indicator is
+    still lit WHILE it is still lit. sink_error survives reset(), so the notice is also what tells
+    them, once the app is idle again, that the stop was never confirmed."""
     if cap is None:
         with STATE.lock:
             STATE.recording = False
             STATE.capture = None
             STATE.capture_ended_at = datetime.now()
-        return True, None
+        return None
     error = None
-    confirmed = False
     try:
-        confirmed = cap.stop() is True
-        if not confirmed:
-            error = ("Could not confirm that audio capture had fully stopped, so Volksmond kept "
-                     "showing it as live. The meeting was still saved.")
+        if cap.stop() is True:
+            with STATE.lock:
+                STATE.recording = False
+                STATE.capture = None
+                STATE.capture_ended_at = datetime.now()
+            return None
+        error = ("Volksmond could not confirm that audio capture stopped. Your meeting was saved. "
+                 "If you want to be certain the microphone is released, close Volksmond.")
     except Exception as e:
-        error = f"Could not stop audio capture cleanly ({e}). The meeting was still saved."
-    if confirmed:
-        with STATE.lock:
-            STATE.recording = False
-            STATE.capture = None
-            STATE.capture_ended_at = datetime.now()
-        return True, None
+        error = (f"Volksmond could not stop audio capture cleanly ({e}). Your meeting was saved. "
+                 "If you want to be certain the microphone is released, close Volksmond.")
     print(f"[stop] capture shutdown unconfirmed: {error}", flush=True)
     with STATE.lock:
         STATE.sink_error = error
-    return False, error
+    return error
 
 
 @app.post("/api/stop")
@@ -2989,7 +2997,7 @@ def stop(what: str = "all"):
                     # Same confirmation state machine as the what="all" stop: "stop transcription,
                     # then stop recording" ends the session through here, so it must not be able to
                     # make a claim that path refuses to make. Outside STATE.lock: stop() can block.
-                    _cap_ok, _cap_err = _confirm_capture_stopped(cap_to_stop)
+                    _cap_err = _confirm_capture_stopped(cap_to_stop)
                     # This branch IS the end of the session (transcription was stopped
                     # first, recording stopped while we drained), so it must count like
                     # any other finalise. Deliberately NOT conditional on there being a
@@ -3038,43 +3046,18 @@ def stop(what: str = "all"):
         # the tail of the session is captured, not discarded. Runs off the request
         # thread and without holding STATE.lock because it can take a while.
         #
-        # Everything below hangs off ONE question: is capture shutdown CONFIRMED complete, so no
-        # further chunk can reach _feed? _confirm_capture_stopped owns the whole state machine
-        # (see its docstring) including publishing the failure immediately, so both finalise paths
-        # answer it the same way and neither can drift into a claim the other refuses to make.
+        # The stop is announced from here, but it is a CLAIM about the microphone, not a licence
+        # to finalise anything early: _confirm_capture_stopped only decides whether the app may
+        # say "the microphone is off" (see its docstring). The recording itself is closed after
+        # the drain, exactly where it always was, so nothing on disk depends on this answer.
         #
-        # Confirmed means "stop means stop" can be said out loud: the session stops asserting
-        # recording (the frontend alone cannot fix that, the 10 s status poll re-asserts whatever
-        # the server says within one tick), capturing goes false, and the clock is stamped so the
-        # UI can freeze it at the meeting's REAL length instead of at whenever it noticed.
-        # Unconfirmed keeps every one of those lit and says why.
-        confirmed, capture_error = _confirm_capture_stopped(cap)
-        if not confirmed:
-            print("[stop] finalising the recording after the drain (pre-WP-2a order) so a late "
-                  "chunk cannot be lost", flush=True)
+        # Confirmed: the session stops asserting recording (the frontend alone cannot fix that,
+        # the 10 s status poll re-asserts whatever the server says within one tick), capturing
+        # goes false, and the clock is stamped so the UI can freeze it at the meeting's REAL
+        # length rather than at whenever the page happened to notice. Unconfirmed: every one of
+        # those stays lit, the screen says "Stopping" instead, and the reason is published.
+        capture_error = _confirm_capture_stopped(cap)
 
-        def _close_recording():
-            """Finalise the recording (closes both channels and folds them into the single stereo
-            <stem>.wav). Called from ONE of the two positions below, never both."""
-            try:
-                if rec is not None:
-                    rec.close()
-            except Exception:
-                pass
-
-        # Confirmed: close the recorder HERE, before the drain. The recorder is tapped BEFORE the
-        # engine queue (sinks.AudioRecorder), so with capture proven finished it has no data
-        # dependency on the ASR backlog whatsoever; gating it behind the drain only meant the two
-        # per-source WAVs sat unfolded, with no single stereo <stem>.wav on disk, for as long as
-        # transcription took. Unconfirmed: it waits at its original position after the drain, so a
-        # chunker still in flight has until the end of the session to deliver.
-        #
-        # Precisely: no audio captured BEFORE the stop can be lost either way (each chunker flushes
-        # its whole remaining buffer as it exits). Audio arriving AFTER it is dropped at
-        # _ingest_block rather than piled into a buffer whose chunker has already gone, which is
-        # both what the user asked for by pressing Stop and the only way to bound the memory.
-        if confirmed:
-            _close_recording()
         if preparing_case:
             # Model still catching up: cap.stop() above flushed the final chunk into pending_audio (the
             # engine is unpublished, so _feed buffers it). Wait for the builder to RELEASE the private
@@ -3101,8 +3084,17 @@ def stop(what: str = "all"):
                 md_sink.close()
         except Exception:
             pass
-        if not confirmed:
-            _close_recording()   # the deferred, pre-WP-2a position; a late chunk has had until now
+        # The recording is finalised (both channels closed, then folded into the single stereo
+        # <stem>.wav) HERE, after the drain. Moving it ahead of the drain would hand the user the
+        # combined file minutes sooner, but only safely if capture were guaranteed finished, and
+        # buying that guarantee means an in-flight producer barrier on the real-time audio path
+        # plus teardown reporting the macOS helper cannot give. Not worth it for a few minutes:
+        # WP-2b lets the user end the drain on demand, which shortens the wait without any of it.
+        try:
+            if rec is not None:
+                rec.close()
+        except Exception:
+            pass
         # A capture-shutdown failure leads: it is the one error that says the screen may not have
         # been telling the whole truth, and the sink errors below are about files that were saved.
         err = (capture_error or (md_sink.last_error if md_sink else None)
