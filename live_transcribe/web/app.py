@@ -1346,12 +1346,20 @@ def reconfigure(req: ReconfigureRequest):
             # follows the resolved tier there.
             new_tier = resolve_tier(data["tier"], "cpu" if cur_device == "cpu" else "auto", new_lang, new_engine_pref)
             new_size = transcribe.TIER_CONFIG[new_tier]["model"]
-            if cur_device == "mlx":
-                device_str = transcribe.TIER_CONFIG[new_tier]["device"]
-                if device_str != "mlx":
-                    compute = transcribe.TIER_CONFIG[new_tier]["compute_type"]
         else:
             new_size = cur_size                   # engine/family-only change: keep the running size
+            if cur_device == "mlx":
+                # A language/engine change on an MLX session can leave the kept size with no MLX
+                # form for the NEW family (Fluister turbo -> English resolves STOCK turbo, which
+                # is unmapped; English large-v3 -> Fluister resolves fluister-large-v3, also
+                # unmapped), so loading it on "mlx" would raise. Re-resolve the kept size for the
+                # new (language, engine) so the load lands on mlx when mapped and on the CPU
+                # otherwise (codex H2). Windows never enters here: cur_device is cpu/cuda.
+                new_tier = resolve_tier(cur_size, "auto", new_lang, new_engine_pref)
+        if cur_device == "mlx" and new_tier is not None:
+            device_str = transcribe.TIER_CONFIG[new_tier]["device"]
+            if device_str != "mlx":
+                compute = transcribe.TIER_CONFIG[new_tier]["compute_type"]
         model_name, family = transcribe.resolve_model(new_size, new_lang, new_engine_pref)
         try:
             model = transcribe.load_model(model_name, device_str, compute, cpu_threads=threads)

@@ -988,6 +988,78 @@ def test_reconfigure_reads_engine_device():
     print("  OK  reconfigure: engine._device drives the load (mlx kept, mlx->cpu swaps compute, legacy _is_cpu fallback)")
 
 
+def test_reconfigure_family_change_on_mlx_reresolves():
+    # codex H2: a language/engine change WITHOUT a tier on an MLX session keeps the size but
+    # must re-resolve the backend for the NEW family: Fluister turbo -> English resolves STOCK
+    # turbo (no MLX form) and must load on the CPU with the tier's compute type, not raise from
+    # load_model(..., "mlx"). A family change whose target IS mapped stays on mlx. On a cpu/cuda
+    # session nothing re-resolves (Windows byte-identical).
+    from live_transcribe import transcribe as T
+
+    class _FakeEngine:
+        _is_cpu = False
+        _device = "mlx"
+        _compute_type = "fp16"
+        _cpu_threads = 4
+        size = "large-v3-turbo"
+        language = None
+        engine = "auto"
+        family = "fluister"
+
+        def __init__(self):
+            self.changes = []
+
+        def request_change(self, **kw):
+            self.changes.append(kw)
+
+    st = webapp.STATE
+    saved = (st.running, st.transcribing, st.stopping, st.source_kind, st.engine,
+             st.language, st.tier, st.model, st.family)
+    loads, resolves = [], []
+    orig_load, orig_resolve = T.load_model, webapp.resolve_tier
+
+    def _fake_load(name, device, compute, cpu_threads=8):
+        loads.append((name, device, compute))
+        return object()
+
+    def _run(fake, body, resolved_tier):
+        st.running, st.transcribing, st.stopping = True, True, False
+        st.source_kind, st.engine = "live", fake
+        st.language, st.tier, st.model, st.family = "af", "mlx-turbo", "digiphyte/fluister-turbo", "fluister"
+        webapp.resolve_tier = (lambda q, device, lang, eng:
+                               resolves.append((q, device, lang, eng)) or resolved_tier)
+        r = client.post("/api/reconfigure", json=body)
+        assert r.status_code == 200, r.text
+        return fake
+
+    try:
+        T.load_model = _fake_load
+        # af Fluister turbo on mlx -> language-only switch to en: family flips to whisper, size
+        # kept, but stock turbo has no MLX form; the resolver (stubbed to today's cpu-strong
+        # answer) must drive the load onto the CPU with int8, asked for the KEPT size on "auto".
+        _run(_FakeEngine(), {"language": "en"}, "cpu-strong")
+        assert resolves[-1] == ("large-v3-turbo", "auto", "en", "auto"), resolves
+        assert loads[-1] == ("large-v3-turbo", "cpu", "int8"), loads
+        # engine-only switch whose target IS mapped stays on mlx, compute kept.
+        fake = _FakeEngine()
+        fake.family = "whisper"
+        fake.size = "large-v3"
+        _run(fake, {"engine": "fluister"}, "mlx-turbo")
+        assert loads[-1][1] == "mlx" and loads[-1][2] == "fp16", loads
+        # cpu session: a family change must NOT re-resolve (today's Windows path, device kept).
+        cpu_fake = _FakeEngine()
+        cpu_fake._is_cpu, cpu_fake._device, cpu_fake._compute_type = True, "cpu", "int8"
+        n_resolves = len(resolves)
+        _run(cpu_fake, {"language": "en"}, "cpu-strong")
+        assert len(resolves) == n_resolves, "cpu session must not re-resolve on a family change"
+        assert loads[-1][1] == "cpu", loads
+    finally:
+        T.load_model, webapp.resolve_tier = orig_load, orig_resolve
+        (st.running, st.transcribing, st.stopping, st.source_kind, st.engine,
+         st.language, st.tier, st.model, st.family) = saved
+    print("  OK  reconfigure: MLX family change re-resolves the kept size (cpu fallback / mlx kept; cpu sessions untouched)")
+
+
 def test_preflight_device_mlx():
     # WP-M4: _preflight_device surfaces the accel backend honestly: cuda -> "gpu", mlx -> "mlx",
     # cpu -> "cpu", and a forced cpu pref never asks the probe.
