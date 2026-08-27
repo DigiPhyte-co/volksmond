@@ -216,6 +216,10 @@ window.VM_I18N = {
 
     // Live screen
     "Finishing": "Maak klaar",
+    // WP-2a: the honest in-between. From pressing Stop until the server confirms the microphone
+    // actually closed the screen says "Stopping", never "Finishing" (which would imply the
+    // meeting is already over) and never a recording indicator.
+    "Stopping": "Stop tans",
     "Finishing, {n} chunk left": "Maak klaar, {n} stuk oor",
     "Finishing, {n} chunks left": "Maak klaar, {n} stukke oor",
 

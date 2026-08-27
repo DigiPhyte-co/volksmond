@@ -70,20 +70,32 @@ class AudioCapture(CaptureBase):
             )
 
     def _close_sources(self):
+        """Stop and close every stream; True only if they all closed. The per-stream exception is
+        still swallowed, because one stuck device must never skip the teardown of the others, but
+        it is no longer DISCARDED: stop() turns this answer into whether the app may tell the user
+        the microphone is off, and a close that silently failed made that claim unearned."""
+        ok = True
         for s in self._streams:
             try:
                 s.stop_stream()
                 s.close()
-            except Exception:
-                pass
+            except Exception as e:
+                ok = False
+                print(f"[capture] could not close an input stream: {e}", flush=True)
+        return ok
 
     def _release_backend(self):
-        if self._pa is not None:
-            try:
-                self._pa.terminate()
-            except Exception:
-                pass
-            self._pa = None
+        """Terminate PortAudio; True on success, or when there is nothing left to release."""
+        if self._pa is None:
+            return True
+        ok = True
+        try:
+            self._pa.terminate()
+        except Exception as e:
+            ok = False
+            print(f"[capture] could not terminate the audio backend: {e}", flush=True)
+        self._pa = None
+        return ok
 
     def _open_stream(self, source, info):
         rate = int(info["defaultSampleRate"])

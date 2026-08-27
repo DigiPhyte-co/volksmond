@@ -7,16 +7,29 @@ up, kept the meters moving, had not folded the stereo <stem>.wav, and refused to
 session. For a product sold on "local only, nothing leaves your machine", a recording indicator
 that lies is the worst possible bug.
 
-These pin the four halves of the fix, with no audio device and no model:
+The fix says the truth EARLY, and the tests come in two layers, because saying it early is only
+safe if capture shutdown is genuinely finished rather than merely attempted.
+
+Layer 1, the web layer's behaviour once it has an answer:
   (a) STATE.recording goes False when CAPTURE stops, not when the session finally resets;
-  (b) /api/status publishes `capturing`, and it reads False while `stopping` and `running` are
-      both still True (the 10 s status poll is what used to re-assert the lie);
+  (b) /api/status publishes `capturing` (and `capture_ended_at`), reading False while `stopping`
+      and `running` are both still True (the 10 s status poll is what used to re-assert the lie);
   (c) the recorder is closed, and the stereo fold is on disk, BEFORE the engine drain finishes,
       because the recorder is tapped ahead of the engine queue and owes the backlog nothing;
-  (d) a session with no recorder at all still stops cleanly.
+  (d) an UNCONFIRMED shutdown claims none of that: it keeps every indicator lit, defers the close
+      so a late chunker's tail is still folded in, and publishes why, at once;
+  (e) both finalise paths (what="all" and the transcription drain) answer the same way;
+  (f) a session with no recorder at all still stops cleanly.
+
+Layer 2, the contract that licenses all of it: CaptureBase.stop() returns True only when every
+source closed, the backend released, and every chunker joined, and blocks arriving after the stop
+event are rejected at _ingest_block instead of piling into buffers whose chunker has exited. The
+platform backends used to swallow and discard their own close failures, so a try/except around
+stop() confirmed precisely nothing; these test the reporting rather than the branch it feeds.
 
 Everything is stubbed: STATE is hand-set and restored, the engine is a fake whose stop(drain=True)
-blocks on a gate so the "still draining" window can be inspected, and the one real object is an
+blocks on a gate so the "still draining" window can be inspected, the capture contract runs against
+a device-free CaptureBase subclass with scriptable hooks, and the one real object is an
 AudioRecorder writing into a temp folder (so the fold under test is the actual fold).
 
 Run:  python tests/test_stop_means_stop.py   (from the project root; exit 0 = pass)
@@ -37,6 +50,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from fastapi.testclient import TestClient
 
+from live_transcribe import capture_core
 from live_transcribe.sinks import AudioRecorder
 from live_transcribe.web import app as webapp
 from live_transcribe.web.app import CSRF_TOKEN, app
@@ -102,9 +116,26 @@ class LateFlushCapture:
         return False, False
 
 
-class ExplodingCapture:
-    """Shutdown that fails outright. The microphone may well still be open, so nothing downstream
-    is allowed to state that it is closed."""
+class FailingCapture:
+    """Shutdown that fails and SAYS so, which is the production contract: CaptureBase.stop() does
+    not raise, it returns False. The microphone may well still be open, so nothing downstream is
+    allowed to state that it is closed."""
+
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+        return False
+
+    def aec_state(self):
+        return False, False
+
+
+class RaisingCapture:
+    """Shutdown that raises. CaptureBase.stop() is written never to do this, so the web layer must
+    not DEPEND on that: a raise has to reach the same unconfirmed conclusion, not a 500 and a
+    session stuck in `stopping` for ever. Belt and braces on a boundary, not a model of a backend."""
 
     def stop(self):
         raise OSError("the audio device would not release")
@@ -418,7 +449,7 @@ def test_failed_capture_stop_never_claims_the_microphone_is_off():
     saved = _save_state()
     gate = threading.Event()
     try:
-        cap = ExplodingCapture()
+        cap = RaisingCapture()
         eng = GatedEngine(gate)
         rec = LoggingRecorder([])
         _arm_live_session(engine=eng, capture=cap, recorder=rec)
@@ -480,6 +511,223 @@ def test_idle_status_states_capturing_false():
     print("  OK  the idle /api/status states capturing=False rather than omitting it")
 
 
+def test_transcription_finalise_uses_the_same_confirmation():
+    # "Stop transcription, then stop recording" ends the session through the OTHER finalise path,
+    # which used to null STATE.capture BEFORE stopping and ignore the result. That published
+    # capturing=false on a microphone nothing had confirmed closed, and threw away the only handle
+    # that could have inspected or retried it: the same trust bug, through the back door.
+    saved = _save_state()
+    st = webapp.STATE
+    try:
+        cap = FailingCapture()
+        st.running = True
+        st.stopping = True          # transcription already stopped; its drain is what finalises
+        st.transcribing = False
+        st.recording = False        # recording stopped while we drained, so this IS the end
+        st.recording_started = True
+        st.source_kind = "live"
+        st.engine = None
+        st.capture = cap
+        st.recorder = None
+        st.md_sink = None
+        st.output_path = None
+        st.session_counted = True
+        st.sink_error = None
+        st.capture_ended_at = None
+        st.started_at = datetime.now()
+        cap_ok, cap_err = webapp._confirm_capture_stopped(st.capture)
+        assert cap_ok is False, "an unconfirmed stop reported success"
+        assert cap_err, "an unconfirmed stop produced no message"
+        assert st.capture is cap, "the capture handle was dropped despite an unconfirmed stop"
+        assert client.get("/api/status").json()["capturing"] is True, \
+            "status claimed the microphone was off after an unconfirmed stop"
+        # M1: published straight away, not held back until the session ends. The drain that follows
+        # can run for twenty minutes, and the user needs to know why the indicator is still lit
+        # WHILE it is still lit.
+        assert st.sink_error == cap_err, f"the failure was not published immediately: {st.sink_error!r}"
+        assert client.get("/api/status").json()["sink_error"] == cap_err, \
+            "the failure is not visible on /api/status during the actionable window"
+        # And the confirmed case does drop the handle and stamp the clock.
+        st.capture = FakeCapture()
+        ok2, err2 = webapp._confirm_capture_stopped(st.capture)
+        assert ok2 is True and err2 is None, (ok2, err2)
+        assert st.capture is None and st.capture_ended_at is not None
+    finally:
+        _restore_state(saved)
+    print("  OK  the transcription finalise path confirms capture the same way, and publishes at once")
+
+
+def test_transcription_finalise_surfaces_a_failed_capture_stop_end_to_end():
+    # The same defect driven through the real endpoint rather than the helper: stop transcription,
+    # stop recording while it drains, and let the drain finalise the session. That path used to
+    # call cap.stop() and discard the result entirely, so a shutdown that failed ended the session
+    # silently, with the transcript reporting nothing wrong.
+    saved = _save_state()
+    gate = threading.Event()
+    st = webapp.STATE
+    try:
+        cap = FailingCapture()
+        eng = GatedEngine(gate)
+        _arm_live_session(engine=eng, capture=cap, recorder=None, recording=True)
+        r = client.post("/api/stop?what=transcription")
+        assert r.status_code == 200, r.text
+        assert wait_until(lambda: eng.stopped_drain is None and st.stopping), "the drain never started"
+        st.recording = False        # the user stops recording too, so the drain must finalise
+        gate.set()
+        assert wait_until(lambda: not st.running), "the transcription drain never finalised"
+        assert cap.stopped is True, "the capture was never stopped"
+        assert st.sink_error and "confirm" in st.sink_error, \
+            f"a failed capture stop ended the session silently: {st.sink_error!r}"
+        assert st.capture_ended_at is None, "an unconfirmed stop stamped a capture end"
+    finally:
+        gate.set()
+        _restore_state(saved)
+    print("  OK  a failed capture stop is surfaced through the transcription finalise path too")
+
+
+# --- the capture contract itself ------------------------------------------------------------
+# Everything above tests the WEB layer's branch selection. These test the thing it branches on.
+# CaptureBase.stop()'s True is the entire licence for finalising a recording before the ASR
+# backlog has drained, so it has to be earned against real hooks and real threads, not asserted.
+
+
+class _ProbeCapture(capture_core.CaptureBase):
+    """A CaptureBase with no devices. The hooks are scriptable, because the failures that matter
+    are exactly the ones the platform backends used to swallow and discard."""
+
+    def __init__(self, close_ok=True, close_raises=False, release_ok=True, **kw):
+        kw.setdefault("agc", False)     # MIC-only with agc off never engages the APM worker
+        super().__init__(**kw)
+        self.close_ok = close_ok
+        self.close_raises = close_raises
+        self.release_ok = release_ok
+
+    def _open_sources(self):
+        self._register_source("MIC", capture_core.TARGET_RATE, 1)
+
+    def _close_sources(self):
+        if self.close_raises:
+            raise OSError("device busy")
+        return self.close_ok
+
+    def _release_backend(self):
+        return self.release_ok
+
+
+def _probe(**kw):
+    cap = _ProbeCapture(chunk_seconds=1, on_chunk=lambda *a: None, **kw)
+    cap.start()
+    return cap
+
+
+def test_capture_stop_confirms_only_when_every_part_succeeded():
+    # The barrier's truth table. Before this, both platform _close_sources() caught and discarded
+    # every close exception internally, so the try/except around the call never saw a failure and
+    # stop() returned True whatever had happened: the confirmation was decorative.
+    healthy = _probe()
+    assert healthy.stop() is True, "a healthy shutdown must confirm"
+
+    bad_close = _probe(close_ok=False)
+    assert bad_close.stop() is False, "a reported close failure must NOT confirm"
+
+    raising_close = _probe(close_raises=True)
+    assert raising_close.stop() is False, "a raised close failure must NOT confirm"
+    assert raising_close._stop_event.is_set(), (
+        "a raised close must still set the stop event, or the chunkers never flush and late "
+        "blocks are never rejected")
+
+    bad_release = _probe(release_ok=False)
+    assert bad_release.stop() is False, "a reported backend-release failure must NOT confirm"
+    print("  OK  CaptureBase.stop() confirms only when close AND release both report success")
+
+
+def test_capture_stop_does_not_confirm_while_a_chunker_is_still_alive():
+    # The join has always been bounded (BLOCK_SECONDS + 1.5) and a worker outliving it used to pass
+    # silently. That is exactly the case where the final chunk may not have reached on_chunk yet,
+    # so finalising the recording there would lose the last seconds of the meeting.
+    cap = _probe()
+    release = threading.Event()
+    lingering = threading.Thread(target=lambda: release.wait(30.0), daemon=True, name="chunker-LINGER")
+    lingering.start()
+    cap._workers.append(lingering)
+    try:
+        assert cap.stop() is False, "a chunker still alive after its join must NOT confirm"
+    finally:
+        release.set()
+        lingering.join(5.0)
+    print("  OK  CaptureBase.stop() does not confirm while a chunker outlives its join window")
+
+
+def test_blocks_arriving_after_stop_are_rejected_at_ingest():
+    # Only _append_16k used to check the stop event, and nothing calls that on the native path.
+    # _ingest_block kept appending after the chunkers had flushed and exited, so on a source that
+    # genuinely failed to close the buffers grew for the whole drain with no consumer (hundreds of
+    # MB over twenty minutes), and the "no worse than before" claim for that path was simply false.
+    cap = _probe()
+    block = np.ones((160, 1), dtype=np.float32)
+    cap._ingest_block("MIC", block)
+    assert cap._buffer_counts["MIC"] == 160, "a pre-stop block should be buffered"
+    cap.stop()
+    for _ in range(5):
+        cap._ingest_block("MIC", block)
+    assert cap._buffer_counts["MIC"] == 0, (
+        "post-stop blocks were buffered behind an exited chunker "
+        f"({cap._buffer_counts['MIC']} samples)")
+    print("  OK  blocks arriving after stop are rejected at _ingest_block, not piled up")
+
+
+def test_post_stop_rejection_covers_the_apm_push_and_the_raw_mic_channel():
+    # The guard sits at the ENTRY of _ingest_block precisely so it covers every downstream path at
+    # once, not just the plain buffer append: the APM push and the MIC_RAW side channel a live-AEC
+    # recording uses are both past it. Wired the way start() wires them when the worker engages.
+    pushed = []
+
+    class _FakeAPM:
+        has_far = True
+        aec_capable = True
+        agc = False
+
+        def push_near(self, mono):
+            pushed.append(("near", len(mono)))
+
+        def push_far(self, mono):
+            pushed.append(("far", len(mono)))
+
+        def stop(self):
+            pass
+
+    cap = _probe()
+    cap._register_source("MIC_RAW", capture_core.TARGET_RATE, 1)
+    cap._live_aec = _FakeAPM()
+    block = np.ones((160, 1), dtype=np.float32)
+    cap._ingest_block("MIC", block)
+    assert pushed == [("near", 160)], f"the pre-stop block should reach the APM, got {pushed}"
+    assert cap._buffer_counts["MIC_RAW"] == 160, "the pre-stop block should reach MIC_RAW"
+    cap.stop()
+    cap._ingest_block("MIC", block)
+    cap._ingest_block("SYS", block)
+    assert pushed == [("near", 160)], f"a post-stop block still reached the APM: {pushed}"
+    assert cap._buffer_counts["MIC_RAW"] == 160, "a post-stop block still reached MIC_RAW"
+    print("  OK  the post-stop rejection covers the APM push and the MIC_RAW side channel too")
+
+
+def test_audio_captured_before_the_stop_is_still_flushed():
+    # The other half of the drop rule, and what keeps it honest: rejecting late blocks must not eat
+    # what was already captured. Each chunker flushes its whole remaining buffer as it exits, so a
+    # confirmed stop means "everything up to Stop has reached on_chunk", which is precisely the
+    # guarantee the early recorder close depends on.
+    got = []
+    cap = _ProbeCapture(chunk_seconds=60, on_chunk=lambda src, a, t: got.append((src, len(a))))
+    cap.start()
+    # Two seconds, far under the 60 s chunk size, so nothing emits until the shutdown flush.
+    cap._ingest_block("MIC", np.ones((2 * RATE, 1), dtype=np.float32))
+    assert got == [], "nothing should have been emitted before the stop"
+    assert cap.stop() is True, "the probe shutdown should confirm"
+    assert len(got) == 1, f"the buffered audio was not flushed on shutdown: {got}"
+    assert got[0] == ("MIC", 2 * RATE), f"the flush was not the whole buffer: {got}"
+    print("  OK  audio captured before the stop is still flushed through on_chunk")
+
+
 if __name__ == "__main__":
     tests = [
         test_recording_goes_false_at_capture_stop_not_at_reset,
@@ -492,6 +740,13 @@ if __name__ == "__main__":
         test_failed_capture_stop_never_claims_the_microphone_is_off,
         test_capture_ended_at_is_server_owned,
         test_idle_status_states_capturing_false,
+        test_transcription_finalise_uses_the_same_confirmation,
+        test_transcription_finalise_surfaces_a_failed_capture_stop_end_to_end,
+        test_capture_stop_confirms_only_when_every_part_succeeded,
+        test_capture_stop_does_not_confirm_while_a_chunker_is_still_alive,
+        test_blocks_arriving_after_stop_are_rejected_at_ingest,
+        test_post_stop_rejection_covers_the_apm_push_and_the_raw_mic_channel,
+        test_audio_captured_before_the_stop_is_still_flushed,
     ]
     failed = 0
     for t in tests:

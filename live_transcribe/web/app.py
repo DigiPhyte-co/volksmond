@@ -2818,6 +2818,52 @@ def _bump_session_count():
         print(f"[session-count] could not record completed session: {e}", flush=True)
 
 
+def _confirm_capture_stopped(cap):
+    """Stop `cap` and answer the one question a finalise turns on: is capture CONFIRMED finished,
+    so no further chunk can reach _feed? Returns (confirmed, error_or_None).
+
+    CaptureBase.stop() reports it (every source closed, the backend released, every chunker joined,
+    and on macOS no deferred permission thread still running). Only a literal True counts: a capture
+    object that does not report is treated as unconfirmed, because a wrong "confirmed" loses the
+    last seconds of the meeting or claims a microphone is off while it is open, and a wrong
+    "unconfirmed" costs nothing beyond the behaviour this all started from. No capture at all (a
+    failed device switch can leave a running session with none) is trivially confirmed.
+
+    Confirmed: clear STATE.recording, drop STATE.capture (which is what publishes capturing=False)
+    and stamp STATE.capture_ended_at, together under STATE.lock.
+
+    Unconfirmed: change NONE of those. Claiming the microphone is off while audio may still be
+    flowing is the original trust bug inverted, and worse than it. The reason is published on
+    STATE.sink_error straight away rather than held until the session ends: the finalise can take
+    twenty minutes, and the user needs to know WHY the recording indicator is still lit while it is
+    still lit, not once it no longer matters."""
+    if cap is None:
+        with STATE.lock:
+            STATE.recording = False
+            STATE.capture = None
+            STATE.capture_ended_at = datetime.now()
+        return True, None
+    error = None
+    confirmed = False
+    try:
+        confirmed = cap.stop() is True
+        if not confirmed:
+            error = ("Could not confirm that audio capture had fully stopped, so Volksmond kept "
+                     "showing it as live. The meeting was still saved.")
+    except Exception as e:
+        error = f"Could not stop audio capture cleanly ({e}). The meeting was still saved."
+    if confirmed:
+        with STATE.lock:
+            STATE.recording = False
+            STATE.capture = None
+            STATE.capture_ended_at = datetime.now()
+        return True, None
+    print(f"[stop] capture shutdown unconfirmed: {error}", flush=True)
+    with STATE.lock:
+        STATE.sink_error = error
+    return False, error
+
+
 @app.post("/api/stop")
 def stop(what: str = "all"):
     """Stop the session, or part of it.
@@ -2934,14 +2980,16 @@ def stop(what: str = "all"):
                         # is left running, so finalise. Stop capture OUTSIDE the lock
                         # (it can block), then reset the session.
                         should_finalise = True
+                        # Take the handle but do NOT drop it here. Nulling it before the stop is
+                        # what published capturing=False on a microphone that had not been
+                        # confirmed closed, and left nothing to inspect or retry with if the
+                        # shutdown failed. _confirm_capture_stopped drops it only on success.
                         cap_to_stop = STATE.capture
-                        STATE.capture = None
-                if cap_to_stop is not None:
-                    try:
-                        cap_to_stop.stop()
-                    except Exception:
-                        pass
                 if should_finalise:
+                    # Same confirmation state machine as the what="all" stop: "stop transcription,
+                    # then stop recording" ends the session through here, so it must not be able to
+                    # make a claim that path refuses to make. Outside STATE.lock: stop() can block.
+                    _cap_ok, _cap_err = _confirm_capture_stopped(cap_to_stop)
                     # This branch IS the end of the session (transcription was stopped
                     # first, recording stopped while we drained), so it must count like
                     # any other finalise. Deliberately NOT conditional on there being a
@@ -2953,7 +3001,10 @@ def stop(what: str = "all"):
                     # what="all" cannot double-count.
                     _bump_session_count()
                     with STATE.lock:
-                        saved_err = STATE.sink_error
+                        # A capture-shutdown failure leads: it is the one error saying the screen
+                        # may not have been telling the whole truth. _confirm_capture_stopped has
+                        # already published it, so saved_err carries it through the reset.
+                        saved_err = _cap_err or STATE.sink_error
                         STATE.reset()
                         STATE.sink_error = saved_err
 
@@ -2987,49 +3038,20 @@ def stop(what: str = "all"):
         # the tail of the session is captured, not discarded. Runs off the request
         # thread and without holding STATE.lock because it can take a while.
         #
-        # Everything below hangs off ONE question: is capture shutdown CONFIRMED complete?
-        # CaptureBase.stop() answers it (sources closed without error AND every chunker joined,
-        # so its final partial chunk has already reached _feed). Only a definite True counts:
-        # a capture object that does not report is treated as unconfirmed, because guessing
-        # "confirmed" wrongly loses the last seconds of the meeting, and guessing "unconfirmed"
-        # wrongly costs nothing but the old behaviour.
-        capture_error = None
-        confirmed = False
-        try:
-            # No capture at all (a failed device switch can leave a running session with none)
-            # is trivially confirmed: there is no microphone open and nothing can feed anything.
-            confirmed = True if cap is None else (cap.stop() is True)
-            if cap is not None and not confirmed:
-                capture_error = ("Could not confirm that audio capture had fully stopped. "
-                                 "The meeting was still saved.")
-        except Exception as e:
-            capture_error = f"Could not stop audio capture cleanly ({e}). The meeting was still saved."
-        if confirmed:
-            # Stop means stop. The microphone is shut and PROVEN shut, so the session must say so
-            # at once instead of keeping every "recording" signal lit for the length of the ASR
-            # backlog (a contended GPU made that 20+ minutes, and the user reasonably believed the
-            # room was still being taped). Same rule the what="recording" branch above already
-            # follows, applied to the full stop:
-            #   * recording=False so /api/status stops asserting it. The frontend alone cannot fix
-            #     this: the 10 s status poll re-asserts whatever the server says within one tick.
-            #   * capture=None, which is what publishes capturing=False. `capturing` is DERIVED
-            #     from STATE.capture rather than kept as a second boolean, so there is only one
-            #     field that can be wrong, and the what="transcription" finalise already nulls it
-            #     exactly this way. /api/levels keys off the same field, so the meters zero for free.
-            #   * capture_ended_at so the UI can freeze the clock at the meeting's REAL length
-            #     rather than at whenever the page happened to notice.
-            # Nothing else between here and reset() is observable by the UI, so this is the moment.
-            with STATE.lock:
-                STATE.recording = False
-                STATE.capture = None
-                STATE.capture_ended_at = datetime.now()
-        else:
-            # UNCONFIRMED: we do not know the microphone is closed, so we must not say it is. The
-            # inverse of the original bug (claiming the mic is off while audio still flows) is
-            # worse than the original, so this path deliberately keeps the old, noisy truth: the
-            # pill stays lit, the recorder stays open, and the error above is surfaced at the end.
-            print("[stop] capture shutdown unconfirmed; finalising the recording after the drain "
-                  "(pre-WP-2a order) so a late chunk cannot be lost", flush=True)
+        # Everything below hangs off ONE question: is capture shutdown CONFIRMED complete, so no
+        # further chunk can reach _feed? _confirm_capture_stopped owns the whole state machine
+        # (see its docstring) including publishing the failure immediately, so both finalise paths
+        # answer it the same way and neither can drift into a claim the other refuses to make.
+        #
+        # Confirmed means "stop means stop" can be said out loud: the session stops asserting
+        # recording (the frontend alone cannot fix that, the 10 s status poll re-asserts whatever
+        # the server says within one tick), capturing goes false, and the clock is stamped so the
+        # UI can freeze it at the meeting's REAL length instead of at whenever it noticed.
+        # Unconfirmed keeps every one of those lit and says why.
+        confirmed, capture_error = _confirm_capture_stopped(cap)
+        if not confirmed:
+            print("[stop] finalising the recording after the drain (pre-WP-2a order) so a late "
+                  "chunk cannot be lost", flush=True)
 
         def _close_recording():
             """Finalise the recording (closes both channels and folds them into the single stereo
@@ -3044,8 +3066,13 @@ def stop(what: str = "all"):
         # engine queue (sinks.AudioRecorder), so with capture proven finished it has no data
         # dependency on the ASR backlog whatsoever; gating it behind the drain only meant the two
         # per-source WAVs sat unfolded, with no single stereo <stem>.wav on disk, for as long as
-        # transcription took. Unconfirmed: it waits at its original position after the drain, which
-        # is strictly no worse than the behaviour this work package started from.
+        # transcription took. Unconfirmed: it waits at its original position after the drain, so a
+        # chunker still in flight has until the end of the session to deliver.
+        #
+        # Precisely: no audio captured BEFORE the stop can be lost either way (each chunker flushes
+        # its whole remaining buffer as it exits). Audio arriving AFTER it is dropped at
+        # _ingest_block rather than piled into a buffer whose chunker has already gone, which is
+        # both what the user asked for by pressing Stop and the only way to bound the memory.
         if confirmed:
             _close_recording()
         if preparing_case:

@@ -938,16 +938,16 @@ async function doStop(what) {
       );
       return;
     }
-    // what === "all". Capture is shut on the server within milliseconds of this POST, but the
-    // backlog can take many minutes to transcribe, so the pill goes NOW: the same line the
-    // "recording" branch above uses. Leaving it lit told a user his private conversation was still
-    // going into the file for twenty minutes after he stopped. The 1.1 s poll below then adopts the
-    // server's own capturing=false, which is what freezes the clock and drops the meters.
-    // Optimistic, not authoritative: in the rare case where the server CANNOT confirm the capture
-    // shut down it keeps reporting recording=true, and the 10 s reconcile in refreshSilence puts
-    // the pill back. That is the honest outcome, and it is the same self-healing rule that block
-    // already applies to every other server-owned recording state.
-    S.live.stopping = true; S.live.recording = false; render();
+    // what === "all". Deliberately sets `stopping` and NOTHING else. Clearing S.live.recording
+    // here would be the client asserting the microphone is off before anything had confirmed it,
+    // which is the same unearned claim the server-side barrier exists to prevent, just moved into
+    // the page: a shutdown that then failed would show the pill falsely dark until the 10 s
+    // reconcile caught up. `stopping` renders its own distinct "Stopping" state (see liveView), so
+    // the pulsing red pill still goes at once without anything claiming more than it knows.
+    // adoptCapture, driven by the server's capturing=false plus its capture-end stamp, is what
+    // clears recording, freezes the clock and drops the meters. Being a beat slower to tell the
+    // truth is fine; being fast and wrong is the bug this whole work package is about.
+    S.live.stopping = true; render();
     pollStatus(
       function (st) { return !st.running; },
       function (st) { gotoFinish(resp.output_path, st && st.sink_error); },
@@ -984,9 +984,9 @@ async function stopRecordOnly() {
   try {
     var resp = await api.post("/api/stop?what=all");
     var stem = S.live.audioStem;
-    // Same honesty rule as the full stop above: the microphone shuts immediately, the stereo fold
-    // of a long recording does not, so nothing on screen may keep pulsing record-red meanwhile.
-    S.live.stopping = true; S.live.recording = false; render();
+    // Same rule as the full stop above: `stopping` only. The record-only screen renders its own
+    // "Stopping" state from it, and the server's confirmation is what says the mic is off.
+    S.live.stopping = true; render();
     pollStatus(function (st) { return !st.running; }, function (st) {
       teardownLive();
       S.live.running = false; S.live.stopping = false;
@@ -1781,6 +1781,9 @@ function stopReadinessPoll() { if (readinessTimer) { clearInterval(readinessTime
 // (an older server, or the !running shape) rather than guessing. Returns true if anything changed.
 function adoptCapture(st) {
   if (!st || st.capturing !== false || S.live.captureEndedAt) return false;
+  // Never latch off a session that has already ended: the idle status also reports capturing
+  // false, and the caller is about to hand over to the finish screen anyway.
+  if (st.running === false) return false;
   // A file transcription never opens a microphone, so capturing is false for its ENTIRE run.
   // Latching there would freeze a healthy import's clock and put "Finishing" in the sidebar
   // while it is working normally. The field only carries meaning for a live source.
@@ -2483,7 +2486,10 @@ function liveView() {
   // model-load failure shows a clear but non-alarming chip; capture/recording carry on regardless.
   var fail = liveFailureMsg();
   var statusChip;
-  if (S.live.stopping) statusChip = el("span", { class: "chip warn" }, [el("span", { class: "dot" }), el("span", { id: "live-status-text", text: "Finishing" })]);
+  // "Stopping" until capture is confirmed shut, "Finishing" after. Not cosmetic: "Finishing"
+  // implies the meeting is over and only the transcript is outstanding, which is not yet known
+  // to be true. The chunk countdown replaces this text in place (see doStop) once it is.
+  if (S.live.stopping) statusChip = el("span", { class: "chip warn" }, [el("span", { class: "dot" }), el("span", { id: "live-status-text", text: S.live.captureEndedAt ? "Finishing" : "Stopping" })]);
   else if (S.live.transcribing && fail) statusChip = el("span", { class: "chip warn" }, [icon("alert", 12), el("span", { text: "Transcription unavailable" })]);
   else if (S.live.transcribing && !S.live.modelReady) statusChip = el("span", { class: "chip prep" }, [el("span", { class: "dot" }), el("span", { text: "Preparing transcription model" })]);
   else if (S.live.transcribing) statusChip = el("span", { class: "chip rec" }, [el("span", { class: "dot" }), el("span", { text: "Listening" })]);
@@ -2530,11 +2536,17 @@ function liveView() {
   // never recorded, a standalone "Record from here" button (for "I forgot to record") that starts
   // recording mid-session. recordingStarted is latched, so once a session has recorded the button
   // stays gone (a restart would clobber the WAV). Independent of the banner; both call recordFromHere().
-  // Neither survives a stop: S.live.recording is cleared the moment capture ends (so the pulsing
-  // red pill goes, which is the whole point of WP-2a), and the record offer is a dead end while
-  // stopping (/api/record-from-here refuses it) as well as a contradiction of the strip above.
+  // Three states, in the order they actually occur, and none of them overstates what is known:
+  //   stopping, not yet confirmed -> "Stopping". The pulsing red pill goes the instant Stop is
+  //     pressed (that is the WP-2a fix) but nothing yet says the microphone is off, because
+  //     nothing yet knows: a shutdown can fail, and a falsely dark indicator is the worse lie.
+  //   confirmed off -> nothing here at all; the strip above carries the plain statement.
+  //   recording -> the pill, as before.
+  // The record offer also goes while stopping: /api/record-from-here refuses during a stop, so it
+  // is a dead affordance as well as a contradiction of everything else on the screen.
   var recSlot;
-  if (S.live.recording) recSlot = el("span", { class: "rec-ind" }, [el("i"), "Recording audio"]);
+  if (S.live.stopping && !S.live.captureEndedAt) recSlot = el("span", { class: "chip warn" }, [el("span", { class: "dot" }), el("span", { text: "Stopping" })]);
+  else if (S.live.recording) recSlot = el("span", { class: "rec-ind" }, [el("i"), "Recording audio"]);
   else if (S.live.transcribing && !S.live.recordingStarted && !S.live.stopping) recSlot = el("button", { class: "btn sm record", onclick: function () { recordFromHere(); } }, [icon("dot", 12), "Record from here"]);
   else recSlot = null;
 
@@ -2557,9 +2569,10 @@ function liveView() {
 /* ── record only ──────────────────────────────────────────── */
 function recordOnlyView() {
   if (S.live.running) {
-    // Same rule as the live screen: once the microphone is shut, every record-red signal here (the
-    // chip, the big pulsing blob, the strip) has to go, even though the wait is only as long as the
-    // stereo fold takes rather than a whole ASR backlog.
+    // Same three states as the live screen. micOff is CONFIRMED shut (the server said so), which
+    // is when every record-red signal here (the chip, the big pulsing blob, the strip) has to go.
+    // Between pressing Stop and that confirmation the blob deliberately keeps pulsing, because the
+    // microphone genuinely may still be open; only the chip changes, to say a stop is under way.
     var micOff = !!S.live.captureEndedAt;
     recTimerEl = el("div", { class: "rec-timer", text: liveElapsed() });
     var header = el("div", { class: "live-header" }, [
@@ -2569,7 +2582,9 @@ function recordOnlyView() {
       ]),
       el("div", { class: "right" }, micOff
         ? el("span", { class: "chip warn" }, [el("span", { class: "dot" }), "Saving"])
-        : el("span", { class: "chip rec" }, [el("span", { class: "dot" }), "Recording"])),
+        : S.live.stopping
+          ? el("span", { class: "chip warn" }, [el("span", { class: "dot" }), "Stopping"])
+          : el("span", { class: "chip rec" }, [el("span", { class: "dot" }), "Recording"])),
     ]);
     var body = el("div", { class: "live-body" }, el("div", { class: "rec-stage" }, [
       el("div", { class: "rec-pulse" + (micOff ? " finishing" : "") }, el("div", { class: "core" }, el("i"))),
