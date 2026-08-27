@@ -125,6 +125,11 @@ class _State:
         self.md_sink: Optional[sinks.MarkdownSink] = None
         self.browser_sink: Optional[BrowserSink] = None
         self.started_at: Optional[datetime] = None
+        # The moment capture shutdown was CONFIRMED (see the what="all" stop), or None while the
+        # microphone is still open. Published so the UI can freeze the session clock at the
+        # meeting's real length: a page reloaded fifteen minutes into a long drain has no way to
+        # work this out for itself and would otherwise stamp the reload as the end of the meeting.
+        self.capture_ended_at: Optional[datetime] = None
         self.tier: Optional[str] = None
         self.model: Optional[str] = None
         self.family: Optional[str] = None    # "fluister" | "whisper" | "swivuriso", for the lean engine label
@@ -216,6 +221,7 @@ class _State:
         self.md_sink = None
         self.browser_sink = None
         self.started_at = None
+        self.capture_ended_at = None
         self.tier = None
         self.model = None
         self.family = None
@@ -995,8 +1001,11 @@ def index():
 def status():
     with STATE.lock:
         if not STATE.running:
-            return {"running": False, "stopping": False, "sink_error": STATE.sink_error,
-                    "notice": STATE.notice}
+            # `capturing` is stated here too, rather than left out: it is presented as the
+            # authoritative answer to "is the microphone open", and an idle app answering that
+            # with an absent key would make every reader special-case the shape.
+            return {"running": False, "stopping": False, "capturing": False,
+                    "sink_error": STATE.sink_error, "notice": STATE.notice}
         live_err = STATE.md_sink.last_error if STATE.md_sink else None
         resp = {
             "running": True,
@@ -1005,10 +1014,15 @@ def status():
             # that: `running` only means a session object exists (true through the whole drain),
             # `stopping` only means a finalisation was asked for (it says nothing about which parts
             # of it have finished), and `recording` means "this session writes a WAV". Derived from
-            # STATE.capture, which every finalise path nulls the instant it stops the capture, so
-            # there is no second boolean to fall out of step. A file transcription has no capture
-            # and correctly reports False.
+            # STATE.capture, which every finalise path nulls the instant it CONFIRMS the capture
+            # stopped, so there is no second boolean to fall out of step. A file transcription has
+            # no capture and correctly reports False (which is why the UI ignores this field for
+            # a file source: there it is false for the whole run, and means nothing).
             "capturing": STATE.capture is not None,
+            # When capture shutdown was confirmed (ISO, local, same clock as started_at), or null
+            # while it is still open. The UI freezes the session clock here rather than at its own
+            # "when I noticed", which a reload mid-drain would otherwise put minutes too late.
+            "capture_ended_at": STATE.capture_ended_at.isoformat() if STATE.capture_ended_at else None,
             "recording": STATE.recording,
             "transcribing": STATE.transcribing,
             "source_kind": STATE.source_kind,
@@ -2972,37 +2986,68 @@ def stop(what: str = "all"):
         # queue), THEN drain everything already queued before closing the file, so
         # the tail of the session is captured, not discarded. Runs off the request
         # thread and without holding STATE.lock because it can take a while.
+        #
+        # Everything below hangs off ONE question: is capture shutdown CONFIRMED complete?
+        # CaptureBase.stop() answers it (sources closed without error AND every chunker joined,
+        # so its final partial chunk has already reached _feed). Only a definite True counts:
+        # a capture object that does not report is treated as unconfirmed, because guessing
+        # "confirmed" wrongly loses the last seconds of the meeting, and guessing "unconfirmed"
+        # wrongly costs nothing but the old behaviour.
+        capture_error = None
+        confirmed = False
         try:
-            if cap is not None:
-                cap.stop()
-        except Exception:
-            pass
-        # Stop means stop. The microphone is shut as of the line above, so the session must SAY so
-        # at once instead of keeping every "recording" signal lit for the length of the ASR backlog
-        # (a contended GPU made that 20+ minutes, and the user reasonably believed the room was
-        # still being taped). Same rule the what="recording" branch above already follows, applied
-        # to the full stop:
-        #   * recording=False so /api/status stops asserting it. The frontend alone cannot fix this:
-        #     the 10 s status poll re-asserts whatever the server says within one tick.
-        #   * capture=None, which is what publishes capturing=False. `capturing` is DERIVED from
-        #     STATE.capture rather than kept as a second boolean, so there is only one field that
-        #     can be wrong, and the what="transcription" finalise already nulls it exactly this way.
-        #     /api/levels keys off the same field, so the meters go to zero for free.
-        # Nothing else between here and reset() is observable by the UI, so this is the moment.
-        with STATE.lock:
-            STATE.recording = False
-            STATE.capture = None
-        # Close the recorder HERE, before the drain, not after it. The recorder is tapped BEFORE the
-        # engine queue (sinks.AudioRecorder), so once cap.stop() has returned it has no data
-        # dependency on the ASR backlog whatsoever: gating it behind the drain only meant the two
+            # No capture at all (a failed device switch can leave a running session with none)
+            # is trivially confirmed: there is no microphone open and nothing can feed anything.
+            confirmed = True if cap is None else (cap.stop() is True)
+            if cap is not None and not confirmed:
+                capture_error = ("Could not confirm that audio capture had fully stopped. "
+                                 "The meeting was still saved.")
+        except Exception as e:
+            capture_error = f"Could not stop audio capture cleanly ({e}). The meeting was still saved."
+        if confirmed:
+            # Stop means stop. The microphone is shut and PROVEN shut, so the session must say so
+            # at once instead of keeping every "recording" signal lit for the length of the ASR
+            # backlog (a contended GPU made that 20+ minutes, and the user reasonably believed the
+            # room was still being taped). Same rule the what="recording" branch above already
+            # follows, applied to the full stop:
+            #   * recording=False so /api/status stops asserting it. The frontend alone cannot fix
+            #     this: the 10 s status poll re-asserts whatever the server says within one tick.
+            #   * capture=None, which is what publishes capturing=False. `capturing` is DERIVED
+            #     from STATE.capture rather than kept as a second boolean, so there is only one
+            #     field that can be wrong, and the what="transcription" finalise already nulls it
+            #     exactly this way. /api/levels keys off the same field, so the meters zero for free.
+            #   * capture_ended_at so the UI can freeze the clock at the meeting's REAL length
+            #     rather than at whenever the page happened to notice.
+            # Nothing else between here and reset() is observable by the UI, so this is the moment.
+            with STATE.lock:
+                STATE.recording = False
+                STATE.capture = None
+                STATE.capture_ended_at = datetime.now()
+        else:
+            # UNCONFIRMED: we do not know the microphone is closed, so we must not say it is. The
+            # inverse of the original bug (claiming the mic is off while audio still flows) is
+            # worse than the original, so this path deliberately keeps the old, noisy truth: the
+            # pill stays lit, the recorder stays open, and the error above is surfaced at the end.
+            print("[stop] capture shutdown unconfirmed; finalising the recording after the drain "
+                  "(pre-WP-2a order) so a late chunk cannot be lost", flush=True)
+
+        def _close_recording():
+            """Finalise the recording (closes both channels and folds them into the single stereo
+            <stem>.wav). Called from ONE of the two positions below, never both."""
+            try:
+                if rec is not None:
+                    rec.close()
+            except Exception:
+                pass
+
+        # Confirmed: close the recorder HERE, before the drain. The recorder is tapped BEFORE the
+        # engine queue (sinks.AudioRecorder), so with capture proven finished it has no data
+        # dependency on the ASR backlog whatsoever; gating it behind the drain only meant the two
         # per-source WAVs sat unfolded, with no single stereo <stem>.wav on disk, for as long as
-        # transcription took. Moved, not duplicated - close() is idempotent, but one call site is
-        # one place to reason about - and rec.last_error is still read after the drain below.
-        try:
-            if rec is not None:
-                rec.close()
-        except Exception:
-            pass
+        # transcription took. Unconfirmed: it waits at its original position after the drain, which
+        # is strictly no worse than the behaviour this work package started from.
+        if confirmed:
+            _close_recording()
         if preparing_case:
             # Model still catching up: cap.stop() above flushed the final chunk into pending_audio (the
             # engine is unpublished, so _feed buffers it). Wait for the builder to RELEASE the private
@@ -3029,7 +3074,12 @@ def stop(what: str = "all"):
                 md_sink.close()
         except Exception:
             pass
-        err = (md_sink.last_error if md_sink else None) or (rec.last_error if rec else None)
+        if not confirmed:
+            _close_recording()   # the deferred, pre-WP-2a position; a late chunk has had until now
+        # A capture-shutdown failure leads: it is the one error that says the screen may not have
+        # been telling the whole truth, and the sink errors below are about files that were saved.
+        err = (capture_error or (md_sink.last_error if md_sink else None)
+               or (rec.last_error if rec else None))
         with STATE.lock:
             STATE.reset()
             STATE.sink_error = err

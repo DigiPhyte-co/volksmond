@@ -28,6 +28,7 @@ import tempfile
 import threading
 import time
 import wave
+from datetime import datetime
 from pathlib import Path
 
 # Make `import live_transcribe` work when run as a plain script.
@@ -57,7 +58,9 @@ def wait_until(pred, timeout=10.0):
 
 
 class FakeCapture:
-    """Device-free capture: records that stop() ran and when, opens nothing."""
+    """Device-free capture whose stop() CONFIRMS shutdown, like a healthy CaptureBase: sources
+    closed without error and every chunker joined. Only a literal True counts as confirmed, so
+    returning it here is load-bearing rather than decoration."""
 
     def __init__(self, log=None):
         self.stopped = False
@@ -67,6 +70,44 @@ class FakeCapture:
         self.stopped = True
         if self._log is not None:
             self._log.append("capture.stop")
+        return True
+
+    def aec_state(self):
+        return False, False
+
+
+class LateFlushCapture:
+    """The window CaptureBase's bounded join leaves open: stop() reports False (a chunker outlived
+    its join timeout) and that chunker's final chunk reaches _feed only AFTER stop() returned.
+    Closing the recorder on the way past would drop the last seconds of the meeting."""
+
+    def __init__(self, tail, tail_in):
+        self.stopped = False
+        self._tail = tail
+        self._tail_in = tail_in
+
+    def stop(self):
+        self.stopped = True
+
+        def _late_worker():
+            time.sleep(0.05)
+            webapp._feed("MIC", self._tail, 1.0)
+            webapp._feed("SYS", self._tail, 1.0)
+            self._tail_in.set()
+
+        threading.Thread(target=_late_worker, daemon=True, name="late-chunker").start()
+        return False
+
+    def aec_state(self):
+        return False, False
+
+
+class ExplodingCapture:
+    """Shutdown that fails outright. The microphone may well still be open, so nothing downstream
+    is allowed to state that it is closed."""
+
+    def stop(self):
+        raise OSError("the audio device would not release")
 
     def aec_state(self):
         return False, False
@@ -85,6 +126,9 @@ class GatedEngine:
 
     def pending(self):
         return 3
+
+    def on_chunk(self, source, audio, t_start, block=False, timeout=None):
+        return True     # a late chunker's tail still reaches the engine as well as the recorder
 
     def stop(self, drain=False, timeout=None):
         if self._log is not None:
@@ -112,14 +156,16 @@ def _save_state():
     st = webapp.STATE
     return (st.running, st.stopping, st.recording, st.recording_started, st.transcribing,
             st.source_kind, st.engine, st.capture, st.recorder, st.md_sink, st.output_path,
-            st.session_counted, st.sink_error, st.started_at, st.silence_stop, st.silence_watch)
+            st.session_counted, st.sink_error, st.started_at, st.silence_stop, st.silence_watch,
+            st.capture_ended_at)
 
 
 def _restore_state(saved):
     st = webapp.STATE
     (st.running, st.stopping, st.recording, st.recording_started, st.transcribing,
      st.source_kind, st.engine, st.capture, st.recorder, st.md_sink, st.output_path,
-     st.session_counted, st.sink_error, st.started_at, st.silence_stop, st.silence_watch) = saved
+     st.session_counted, st.sink_error, st.started_at, st.silence_stop, st.silence_watch,
+     st.capture_ended_at) = saved
 
 
 def _arm_live_session(engine=None, capture=None, recorder=None, recording=True):
@@ -141,6 +187,8 @@ def _arm_live_session(engine=None, capture=None, recorder=None, recording=True):
     st.sink_error = None
     st.silence_stop = None
     st.silence_watch = None
+    st.capture_ended_at = None
+    st.started_at = datetime.now()
 
 
 def test_recording_goes_false_at_capture_stop_not_at_reset():
@@ -316,6 +364,122 @@ def test_repeated_stop_during_the_drain_is_still_a_no_op():
     print("  OK  a second /api/stop?what=all during the drain is still an idempotent no-op")
 
 
+def test_a_late_chunker_tail_still_reaches_the_recording():
+    # The safety barrier for the early close. CaptureBase joins each chunker with a bounded timeout
+    # and a slow one can outlive it, so cap.stop() can return with the final chunk still in flight.
+    # Harmless while the recorder was closed minutes later after the drain; closing it early would
+    # turn it into silent loss of the last seconds of the meeting, which is the very class of bug
+    # this work package exists to remove. So an unconfirmed stop DEFERS the close to its original
+    # position, and the tail must land in the fold. A real AudioRecorder, so the tail is asserted
+    # on disk in frames, not in mock calls.
+    saved = _save_state()
+    gate = threading.Event()
+    tail_in = threading.Event()
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        tone = (0.3 * np.sin(2 * np.pi * 440.0 * np.arange(RATE, dtype=np.float32) / RATE)).astype(np.float32)
+        cap = LateFlushCapture(tone, tail_in)
+        eng = GatedEngine(gate)
+        stem = tmp / "2026-08-27-130000-late-tail"
+        rec = AudioRecorder(stem)
+        rec.on_chunk("MIC", tone, 0.0)      # the first second, delivered before Stop
+        rec.on_chunk("SYS", tone, 0.0)
+        _arm_live_session(engine=eng, capture=cap, recorder=rec)
+        assert client.post("/api/stop?what=all").status_code == 200
+        assert tail_in.wait(10.0), "the late chunker never delivered its final chunk"
+        # Unconfirmed, so nothing may claim the microphone is off and the recorder must still be open.
+        st = client.get("/api/status").json()
+        assert st["capturing"] is True, f"an unconfirmed stop claimed the mic was closed: {st}"
+        assert st["recording"] is True, f"an unconfirmed stop claimed recording had ended: {st}"
+        assert st["capture_ended_at"] is None, f"an unconfirmed stop stamped a capture end: {st}"
+        assert not (tmp / (stem.name + ".wav")).exists(), "the fold happened before the tail landed"
+        gate.set()
+        assert wait_until(lambda: not webapp.STATE.running), "the stop never finalised"
+        folded = tmp / (stem.name + ".wav")
+        assert folded.is_file(), "the deferred close never folded the recording"
+        with wave.open(str(folded), "rb") as r:
+            frames = r.getnframes()
+        # One second from before Stop plus the one-second tail placed at t=1.0.
+        assert frames >= 2 * RATE, f"the late tail was lost from the recording ({frames} frames)"
+        assert webapp.STATE.sink_error and "confirm" in webapp.STATE.sink_error, \
+            f"an unconfirmed capture stop was not surfaced: {webapp.STATE.sink_error!r}"
+    finally:
+        gate.set()
+        _restore_state(saved)
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("  OK  an unconfirmed capture stop defers the close, so a late chunker's tail is kept")
+
+
+def test_failed_capture_stop_never_claims_the_microphone_is_off():
+    # The original trust bug inverted, and worse. If shutdown raised, the native streams may still
+    # be open and speech after Stop can still reach the transcript; a screen stating "microphone
+    # off, nothing more is being recorded" would then be lying in the dangerous direction. So a
+    # failed stop keeps saying what it can defend, and surfaces the failure.
+    saved = _save_state()
+    gate = threading.Event()
+    try:
+        cap = ExplodingCapture()
+        eng = GatedEngine(gate)
+        rec = LoggingRecorder([])
+        _arm_live_session(engine=eng, capture=cap, recorder=rec)
+        assert client.post("/api/stop?what=all").status_code == 200
+        assert wait_until(lambda: client.get("/api/status").json().get("stopping") is True)
+        st = client.get("/api/status").json()
+        assert st["capturing"] is True, f"a failed capture stop still claimed the mic was off: {st}"
+        assert st["recording"] is True, f"a failed capture stop still cleared recording: {st}"
+        assert st["capture_ended_at"] is None, f"a failed capture stop stamped a capture end: {st}"
+        assert rec.closed == 0, "the recording was finalised despite an unconfirmed capture stop"
+        gate.set()
+        assert wait_until(lambda: not webapp.STATE.running), "the stop never finalised"
+        assert rec.closed == 1, "the deferred close never ran"
+        assert webapp.STATE.sink_error and "audio device would not release" in webapp.STATE.sink_error, \
+            f"the capture failure was not surfaced: {webapp.STATE.sink_error!r}"
+    finally:
+        gate.set()
+        _restore_state(saved)
+    print("  OK  a failed capture stop never claims the microphone is off, and is surfaced")
+
+
+def test_capture_ended_at_is_server_owned():
+    # The clock has to freeze at the meeting's real length. A page reloaded fifteen minutes into a
+    # drain cannot work that out for itself, so the server stamps the moment and publishes it.
+    saved = _save_state()
+    gate = threading.Event()
+    try:
+        cap = FakeCapture()
+        eng = GatedEngine(gate)
+        _arm_live_session(engine=eng, capture=cap, recorder=None, recording=False)
+        assert client.get("/api/status").json()["capture_ended_at"] is None, \
+            "a live session already carries a capture end"
+        assert client.post("/api/stop?what=all").status_code == 200
+        assert wait_until(lambda: client.get("/api/status").json().get("capture_ended_at")), \
+            "capture_ended_at was never published"
+        ended = datetime.fromisoformat(client.get("/api/status").json()["capture_ended_at"])
+        assert ended >= webapp.STATE.started_at, "capture ended before the session started"
+        assert abs((datetime.now() - ended).total_seconds()) < 30, f"capture_ended_at is not recent: {ended}"
+        gate.set()
+        assert wait_until(lambda: not webapp.STATE.running), "the stop never finalised"
+        assert webapp.STATE.capture_ended_at is None, "capture_ended_at survived the session reset"
+    finally:
+        gate.set()
+        _restore_state(saved)
+    print("  OK  capture_ended_at is stamped by the server at the confirmed stop, and cleared on reset")
+
+
+def test_idle_status_states_capturing_false():
+    # `capturing` is presented as the authoritative answer to "is the microphone open". An idle app
+    # answering that with an absent key would make every reader special-case the response shape.
+    saved = _save_state()
+    try:
+        webapp.STATE.running = False
+        st = client.get("/api/status").json()
+        assert st["running"] is False, st
+        assert st["capturing"] is False, f"the idle status omits or misreports capturing: {st}"
+    finally:
+        _restore_state(saved)
+    print("  OK  the idle /api/status states capturing=False rather than omitting it")
+
+
 if __name__ == "__main__":
     tests = [
         test_recording_goes_false_at_capture_stop_not_at_reset,
@@ -324,6 +488,10 @@ if __name__ == "__main__":
         test_recorder_closed_once_before_the_drain,
         test_stop_with_no_recorder_finalises_cleanly,
         test_repeated_stop_during_the_drain_is_still_a_no_op,
+        test_a_late_chunker_tail_still_reaches_the_recording,
+        test_failed_capture_stop_never_claims_the_microphone_is_off,
+        test_capture_ended_at_is_server_owned,
+        test_idle_status_states_capturing_false,
     ]
     failed = 0
     for t in tests:

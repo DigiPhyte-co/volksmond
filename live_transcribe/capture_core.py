@@ -412,19 +412,47 @@ class CaptureBase:
             self._workers.append(t)
 
     def stop(self):
+        """Shut the capture down. Returns True only when that is CONFIRMED complete.
+
+        Confirmed means both halves: the sources closed without error (so no native block can
+        arrive again) AND every chunker worker joined (so its final partial chunk has already
+        been handed to on_chunk). The join has always been bounded, and a worker that outlives
+        its window used to pass silently; the caller now learns about it, because whether the
+        last few seconds of the meeting have landed decides whether it is safe to finalise the
+        recording immediately or must wait until the end of the session.
+
+        Never raises. A half-finished shutdown still has to set the stop event (it is what makes
+        the chunkers flush and what makes a late _append_16k drop rather than pile up behind
+        them) and still has to release the backend, and the caller needs an answer it can act on,
+        not an exception it can only swallow. Failures are printed and reported as False.
+        """
         # Stop the input streams first (no more native blocks arrive), then drain the AEC worker
         # into the chunk buffers, and only then signal the chunkers to flush - otherwise the
         # AEC could emit its tail after the chunkers had already flushed, losing the last words.
-        self._close_sources()
+        confirmed = True
+        try:
+            self._close_sources()
+        except Exception as e:
+            confirmed = False
+            print(f"[capture] could not close the input sources cleanly: {e}", flush=True)
         if self._live_aec is not None:
             try:
                 self._live_aec.stop()
             except Exception:
                 pass
         self._stop_event.set()
-        self._release_backend()
+        try:
+            self._release_backend()
+        except Exception as e:
+            confirmed = False
+            print(f"[capture] could not release the audio backend: {e}", flush=True)
         for w in self._workers:
             w.join(timeout=BLOCK_SECONDS + 1.5)
+            if w.is_alive():
+                confirmed = False
+                print(f"[capture] {w.name} did not finish within its join window; its final chunk "
+                      f"may still be in flight", flush=True)
+        return confirmed
 
     # ---- shared plumbing ------------------------------------------------
 

@@ -943,6 +943,10 @@ async function doStop(what) {
     // "recording" branch above uses. Leaving it lit told a user his private conversation was still
     // going into the file for twenty minutes after he stopped. The 1.1 s poll below then adopts the
     // server's own capturing=false, which is what freezes the clock and drops the meters.
+    // Optimistic, not authoritative: in the rare case where the server CANNOT confirm the capture
+    // shut down it keeps reporting recording=true, and the 10 s reconcile in refreshSilence puts
+    // the pill back. That is the honest outcome, and it is the same self-healing rule that block
+    // already applies to every other server-owned recording state.
     S.live.stopping = true; S.live.recording = false; render();
     pollStatus(
       function (st) { return !st.running; },
@@ -1777,7 +1781,21 @@ function stopReadinessPoll() { if (readinessTimer) { clearInterval(readinessTime
 // (an older server, or the !running shape) rather than guessing. Returns true if anything changed.
 function adoptCapture(st) {
   if (!st || st.capturing !== false || S.live.captureEndedAt) return false;
-  S.live.captureEndedAt = Date.now();   // freezes liveElapsed() at the meeting's real length
+  // A file transcription never opens a microphone, so capturing is false for its ENTIRE run.
+  // Latching there would freeze a healthy import's clock and put "Finishing" in the sidebar
+  // while it is working normally. The field only carries meaning for a live source.
+  if (st.source_kind === "file" || S.live.sourceKind === "file") return false;
+  // Freeze the clock at the SERVER's capture-end moment, not at "when this page noticed". About a
+  // second apart in the normal case, but a page reloaded fifteen minutes into a long drain would
+  // otherwise report a meeting fifteen minutes longer than it was. Fall back to now only when the
+  // server supplied nothing usable (an older build, or an unparseable value: NaN is falsy, and a
+  // falsy captureEndedAt would silently un-latch everything below).
+  // Also reject an end that lands BEFORE the start: both are stamped from the same server clock,
+  // so that means the clock itself moved (an NTP step, a DST change) and the difference is not a
+  // meeting length. Showing 00:00 for a real meeting is worse than being a second late.
+  var endedAt = st.capture_ended_at ? new Date(st.capture_ended_at).getTime() : NaN;
+  var startedAt = S.live.startedAt ? new Date(S.live.startedAt).getTime() : 0;
+  S.live.captureEndedAt = endedAt >= startedAt ? endedAt : Date.now();
   S.live.recording = false;             // the pill is bound to this; the mic is shut, so it goes
   stopLevels();                         // the meters must not sit frozen on their last painted peak
   return true;
