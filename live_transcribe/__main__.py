@@ -153,9 +153,12 @@ _CPU_AUTO_ORDER = ["small", "medium"]
 
 
 def _downloaded_sizes(family):
-    """The set of model SIZES actually cached on disk for `family`, via voicedl's REAL per-size
-    on-disk check (voicedl._present), never the always-true fluister_available()/swivuriso_available()
-    flags. Whisper checks the stock size name; Fluister checks its HuggingFace repo id.
+    """The set of model SIZES with a usable CT2 copy cached on disk for `family`, via voicedl's REAL
+    per-size on-disk check (voicedl._present), never the always-true fluister_available()/
+    swivuriso_available() flags. Whisper checks the stock size name; Fluister checks its HuggingFace
+    repo id. This is deliberately the CT2 store ONLY: the CPU/GPU ladders it feeds load ct2 models,
+    so an MLX-only download must not make a size read as CPU-usable, and a cached ct2 copy must stay
+    visible on a ready Mac (MLX presence is probed separately by _mlx_tier_for_family; codex M3).
 
     Defensive by contract: any failure (voicedl import, a raising probe, an unknown family) yields an
     EMPTY set, so resolve_tier falls back to today's biggest-size behaviour and never crashes on the
@@ -169,17 +172,14 @@ def _downloaded_sizes(family):
         for size in order:
             # Fluister presence must reflect what resolve_model actually loads: a local ct2 build dir
             # counts, not only a cached HF repo (fluister_present), so a local build is not treated as
-            # "needs download" on the auto-pick / instant-switch paths. Whisper checks the stock size name.
+            # "needs download" on the auto-pick / instant-switch paths. The ct2 repo is passed
+            # explicitly so a ready Mac cannot re-route the probe to the MLX store (on Windows
+            # fluister_present resolves the same repo itself, so this is exactly today's probe).
+            # Whisper checks the stock size name (the ct2 cache), byte-identical to today.
             if family == "fluister":
-                present = voicedl.fluister_present(size)
+                present = voicedl.fluister_present(size, transcribe.FLUISTER_REPOS.get(size))
             else:
-                # voicedl.asr_download_target (WP-M3) points the mapped sizes at their MLX
-                # repos on a ready Mac; everywhere else it returns the stock size, so on
-                # Windows this is exactly today's probe. getattr keeps the defensive
-                # empty-set contract against an older voicedl.
-                _target_for = getattr(voicedl, "asr_download_target", None)
-                target = _target_for(family, size) if _target_for else size
-                present = bool(target and voicedl._present(target))
+                present = voicedl._present(size)
             if present:
                 out.add(size)
         return out
@@ -224,14 +224,22 @@ _MLX_TIER_FOR_SIZE = {"large-v3-turbo": "mlx-turbo", "large-v3": "mlx"}
 
 def _mlx_tier_for_family(family):
     """The mlx tier for a usable family WHEN its single MLX model is actually DOWNLOADED (D6
-    step 1), else None. Presence rides on _downloaded_sizes: on a ready Mac voicedl reports
-    the mapped sizes via their MLX repos (asr_download_target), so this is the honest probe."""
+    step 1), else None. Probes the EXACT MLX repo (voicedl._mlx_present), never the ct2 store:
+    a cached ct2 copy or a local build dir must not make the MLX model read as downloaded, and
+    an MLX-only download must be found even when no ct2 copy exists (codex M3). Defensive: any
+    failure reads as not-downloaded, so the ladder falls through to the ct2/ambitious steps."""
     tier = _MLX_TIER_FOR_FAMILY.get(family)
     if not tier:
         return None
-    from . import transcribe
-    size = transcribe.TIER_CONFIG[tier]["model"]
-    return tier if size in _downloaded_sizes(family) else None
+    try:
+        from . import transcribe, voicedl
+        from .mlxbackend import MLX_REPOS
+        size = transcribe.TIER_CONFIG[tier]["model"]
+        ct2 = transcribe.FLUISTER_REPOS.get(size) if family == "fluister" else size
+        repo = MLX_REPOS.get(ct2)
+        return tier if repo and voicedl._mlx_present(repo) else None
+    except Exception:
+        return None
 
 
 def _mlx_tier_for_quality(quality, language, engine):

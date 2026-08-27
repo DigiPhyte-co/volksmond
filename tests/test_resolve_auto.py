@@ -134,43 +134,62 @@ def test_mlx_auto_ladder():
     # WP-M4 / D6: on darwin-arm64 with mlx-whisper ready (accel stubbed), "auto" runs the honesty
     # ladder: (1) downloaded MLX model -> mlx tier; (2) downloaded ct2 size -> today's CPU logic;
     # (3) cross-family, the other family's MLX first then its ct2; (4) nothing -> ambitious MLX pick.
+    # TWO stores are modelled (codex M3): _downloaded_sizes is the CT2 store only, and the MLX
+    # store is voicedl._mlx_present keyed by the exact MLX repo id, exactly like production.
     from live_transcribe import accel as _accel
-    orig = (_cudadl.cuda_ready, M._downloaded_sizes, M._cpu_auto_tier, _accel.asr_backend)
+    from live_transcribe import voicedl as _V
+    FL_MLX = "digiphyte/fluister-turbo-mlx"
+    WH_MLX = "mlx-community/whisper-large-v3-mlx"
+    orig = (_cudadl.cuda_ready, M._downloaded_sizes, M._cpu_auto_tier, _accel.asr_backend,
+            _V._mlx_present)
     _cudadl.cuda_ready = lambda: False
     _accel.asr_backend = lambda pref="auto": "cpu" if pref == "cpu" else "mlx"
+    mlx_store = set()   # of MLX repo ids "on disk"
+    _V._mlx_present = lambda repo: repo in mlx_store
     try:
         M._cpu_auto_tier = lambda: "cpu-mid"
-        # (1) af + the Fluister MLX turbo downloaded -> mlx-turbo, no crossing.
-        M._downloaded_sizes = lambda fam: {"large-v3-turbo"} if fam == "fluister" else set()
+        # (1) af + the Fluister MLX turbo downloaded (no ct2 anywhere) -> mlx-turbo, no crossing.
+        M._downloaded_sizes = lambda fam: set()
+        mlx_store = {FL_MLX}
         assert M.resolve_tier_engine("auto", "auto", "af") == ("mlx-turbo", None)
         # (1) en + the stock MLX large-v3 downloaded -> mlx.
-        M._downloaded_sizes = lambda fam: {"large-v3"} if fam == "whisper" else set()
+        mlx_store = {WH_MLX}
         assert M.resolve_tier_engine("auto", "auto", "en") == ("mlx", None)
-        # (2) af + only a ct2 medium downloaded -> today's CPU answer, verbatim.
+        # (2) af + only a ct2 medium downloaded (MLX store empty) -> today's CPU answer, verbatim.
+        mlx_store = set()
         M._downloaded_sizes = lambda fam: {"medium"} if fam == "fluister" else set()
         assert M.resolve_tier_engine("auto", "auto", "af") == ("cpu-mid", None)
-        # (3) af, fluister EMPTY, whisper's MLX model downloaded -> cross to whisper on mlx.
+        # (2, codex M3) a cached CT2 copy of the MAPPED size with NO MLX download must land on
+        # the CPU ladder (never claim the MLX model is downloaded, never re-download).
+        M._downloaded_sizes = lambda fam: {"large-v3-turbo"} if fam == "fluister" else set()
+        assert M.resolve_tier_engine("auto", "auto", "af") == ("cpu-strong", None)
         M._downloaded_sizes = lambda fam: {"large-v3"} if fam == "whisper" else set()
+        assert M.resolve_tier_engine("auto", "auto", "en") == ("cpu-large", None)
+        # (3) af, fluister EMPTY, whisper's MLX model downloaded -> cross to whisper on mlx.
+        M._downloaded_sizes = lambda fam: set()
+        mlx_store = {WH_MLX}
         assert M.resolve_tier_engine("auto", "auto", "af") == ("mlx", "whisper")
         # (3) MLX beats ct2 within the crossed family: whisper has BOTH -> mlx, not cpu.
-        M._downloaded_sizes = lambda fam: {"large-v3", "small"} if fam == "whisper" else set()
+        M._downloaded_sizes = lambda fam: {"small"} if fam == "whisper" else set()
         assert M.resolve_tier_engine("auto", "auto", "af") == ("mlx", "whisper")
         # (3) crossed family with only ct2 -> its CPU tier, override still set.
-        M._downloaded_sizes = lambda fam: {"small"} if fam == "whisper" else set()
+        mlx_store = set()
         assert M.resolve_tier_engine("auto", "auto", "af") == ("cpu", "whisper")
         # (4) NOTHING downloaded anywhere -> the ambitious MLX pick (download is legitimate).
         M._downloaded_sizes = lambda fam: set()
         assert M.resolve_tier_engine("auto", "auto", "af") == ("mlx-turbo", None)
         assert M.resolve_tier_engine("auto", "auto", "en") == ("mlx", None)
         # SA language (Swivuriso): the existing CPU behaviour, never an mlx tier, never crossed.
+        mlx_store = {FL_MLX, WH_MLX}
         M._downloaded_sizes = lambda fam: {"large-v3"} if fam == "whisper" else set()
         assert M.resolve_tier_engine("auto", "auto", "zu") == ("cpu-mid", None)
-        # A forced CPU device never reaches the mlx branch.
+        # A forced CPU device never reaches the mlx branch (ct2 turbo on disk -> cpu-strong).
         M._downloaded_sizes = lambda fam: {"large-v3-turbo"} if fam == "fluister" else set()
         assert M.resolve_tier_engine("auto", "cpu", "af") == ("cpu-strong", None)
     finally:
-        _cudadl.cuda_ready, M._downloaded_sizes, M._cpu_auto_tier, _accel.asr_backend = orig
-    print("  OK  mlx auto: D6 ladder (downloaded MLX, ct2 fallback, cross-family MLX-first, ambitious MLX, zu on CPU)")
+        (_cudadl.cuda_ready, M._downloaded_sizes, M._cpu_auto_tier, _accel.asr_backend,
+         _V._mlx_present) = orig
+    print("  OK  mlx auto: D6 ladder over TWO stores (MLX repo probe vs ct2 sizes; divergent stores honest)")
 
 
 def test_mlx_explicit_quality():
