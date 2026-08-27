@@ -988,6 +988,54 @@ def test_reconfigure_reads_engine_device():
     print("  OK  reconfigure: engine._device drives the load (mlx kept, mlx->cpu swaps compute, legacy _is_cpu fallback)")
 
 
+def test_downloaded_alternatives_include_mlx_store():
+    # codex M3 residual: _downloaded_sizes is ct2-only, so the pre-start instant-alternatives
+    # list must ALSO offer the mapped MLX models from their own store (voicedl._mlx_present)
+    # on a ready Mac, with the repo id as model and the repo-keyed approx bytes. Deduped
+    # against a ct2 entry of the same family+size, exclusion honoured, and with MLX not
+    # ready (Windows) the list is byte-identical to the ct2-only one.
+    from live_transcribe import __main__ as M
+    from live_transcribe import accel as _accel
+    from live_transcribe import voicedl as V
+    FL_MLX = "digiphyte/fluister-turbo-mlx"
+    WH_MLX = "mlx-community/whisper-large-v3-mlx"
+    orig = (M._downloaded_sizes, _accel.mlx_ready, V._mlx_present)
+    try:
+        M._downloaded_sizes = lambda fam: set()
+        _accel.mlx_ready = lambda: True
+        V._mlx_present = lambda repo: repo in {FL_MLX, WH_MLX}
+        out = webapp._downloaded_alternatives(None, None)
+        entries = {(e["family"], e["size"]): e for e in out}
+        fl = entries[("fluister", "large-v3-turbo")]
+        assert fl["model"] == FL_MLX and fl["label"] == "High quality", fl
+        assert fl["approx_bytes"] == V._FLUISTER_SIZES[FL_MLX], fl
+        wh = entries[("whisper", "large-v3")]
+        assert wh["model"] == WH_MLX and wh["label"] == "Best", wh
+        assert wh["approx_bytes"] == V._MLX_SIZES[WH_MLX], wh
+        # Only the CACHED MLX models are offered.
+        V._mlx_present = lambda repo: repo == FL_MLX
+        keys = {(e["family"], e["size"]) for e in webapp._downloaded_alternatives(None, None)}
+        assert ("whisper", "large-v3") not in keys and ("fluister", "large-v3-turbo") in keys
+        # The excluded (family, size) pair is skipped like the ct2 entries.
+        V._mlx_present = lambda repo: repo in {FL_MLX, WH_MLX}
+        keys = {(e["family"], e["size"]) for e in webapp._downloaded_alternatives("whisper", "large-v3")}
+        assert ("whisper", "large-v3") not in keys and ("fluister", "large-v3-turbo") in keys
+        # Dedupe: a ct2 copy of the same family+size already lists it once, never twice.
+        M._downloaded_sizes = lambda fam: {"large-v3"} if fam == "whisper" else set()
+        out3 = webapp._downloaded_alternatives(None, None)
+        assert sum(1 for e in out3 if (e["family"], e["size"]) == ("whisper", "large-v3")) == 1
+        # MLX not ready (every Windows machine): no MLX entries, list is the ct2-only answer.
+        _accel.mlx_ready = lambda: False
+        M._downloaded_sizes = lambda fam: set()
+        base = webapp._downloaded_alternatives(None, None)
+        assert not any(e["model"] in (FL_MLX, WH_MLX) for e in base), base
+        assert all(e["family"] == "swivuriso" for e in base), \
+            "with nothing ct2-downloaded and MLX not ready only a cached Swivuriso may appear"
+    finally:
+        M._downloaded_sizes, _accel.mlx_ready, V._mlx_present = orig
+    print("  OK  instant-alternatives offer cached MLX models on a ready Mac (deduped, excluded, Windows identical)")
+
+
 def test_download_owner_match_for_mlx_repo():
     # codex M2: the prepare polling loop identifies OUR download by comparing
     # progress()["repo"] against the plan target's cache repo. An MLX target is an explicit

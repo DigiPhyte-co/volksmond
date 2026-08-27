@@ -1498,6 +1498,30 @@ def _downloaded_alternatives(exclude_family, exclude_size):
             approx = _asr_approx_bytes(family, size, target)
             out.append({"size": size, "family": family, "label": _QUALITY_LABEL.get(size, size),
                         "model": target, "approx_bytes": approx, "quality_note": notes.get(family, "")})
+    # The MLX store (codex M3 residual): _downloaded_sizes is deliberately ct2-only, so on a
+    # ready Mac the mapped MLX models are offered from their OWN store when actually cached
+    # (an MLX-only download is instantly usable via the mlx tiers). Deduped against the ct2
+    # entries above (same family+size). On Windows accel.mlx_ready() is always False, so the
+    # list is byte-identical there; any failure changes nothing (best-effort, like the rest).
+    try:
+        from .. import accel
+        from ..mlxbackend import MLX_REPOS
+        if accel.mlx_ready():
+            fl_size = {repo: size for size, repo in transcribe.FLUISTER_REPOS.items()}
+            seen = {(e["family"], e["size"]) for e in out}
+            for ct2_id, repo in MLX_REPOS.items():
+                family = "fluister" if ct2_id in fl_size else "whisper"
+                size = fl_size.get(ct2_id, ct2_id)
+                if (family, size) in seen or (family == exclude_family and size == exclude_size):
+                    continue
+                if not voicedl._mlx_present(repo):
+                    continue
+                approx = (voicedl._FLUISTER_SIZES.get(repo) if family == "fluister"
+                          else getattr(voicedl, "_MLX_SIZES", {}).get(repo)) or 0
+                out.append({"size": size, "family": family, "label": _QUALITY_LABEL.get(size, size),
+                            "model": repo, "approx_bytes": approx, "quality_note": notes.get(family, "")})
+    except Exception:
+        pass
     # Swivuriso is one model at a nominal size; list it as an INSTANT switch only when it is actually
     # cached on disk (a local ct2 build, or the hosted repo already downloaded). swivuriso_available()
     # is ~always True (the repo is hosted), so it must NOT gate this list, or the modal would advertise
