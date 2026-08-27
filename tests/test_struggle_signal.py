@@ -37,7 +37,9 @@ config.load/update (monkeypatched) and STATE (hand-set and restored).
 Run:  python tests/test_struggle_signal.py   (from the project root; exit 0 = pass)
 """
 import os
+import heapq
 import queue
+import random
 import sys
 import threading
 import time
@@ -152,6 +154,65 @@ def _drive(eng, rtf, sources=2, chunk_secs=8.0, completions=80, backlog=0, arm=F
             return fired
         t += service
     return fired
+
+
+def _simulate_chunkers(eng, rtf, backlog=0, seed=0, horizon=900.0, p_silence=0.8, sources=("MIC", "SYS")):
+    """Event-driven simulation of the REAL chunker behaviour, on virtual time.
+
+    _drive above feeds a fixed number of 8 s arrivals per completion, which is smooth enough to
+    hide how the windows behave at the margin. capture_core is not smooth: one thread per source
+    (:408), each waiting for 8 s of audio, cutting at the last silence in the final 2 s and
+    CARRYING the tail forward (:531), or force-cutting at 1.5x (12 s) when it finds no silence. So
+    emissions run 6 to 12 s, the two sources drift in and out of phase, and service time is
+    proportional to each chunk's own duration.
+
+    Returns a dict: warned, at (virtual seconds), dropped, end/start depth, and the mean span of an
+    8-arrival window, which is what STRUGGLE_ARRIVAL_WINDOW is sized against.
+    """
+    rng = random.Random(seed)
+    for i in range(backlog):
+        eng._queue.put_nowait(("SYS", [], float(i)))
+    eng.arm_struggle()
+    fired = []
+    eng.on_struggle = lambda: fired.append(1)
+    tails = {s: 0.0 for s in sources}
+    events = [(rng.uniform(0.0, 6.0), s, "arrive") for s in sources]   # independent phases
+    heapq.heapify(events)
+    busy, warned_at, arrivals = False, None, []
+    while events:
+        t, who, kind = heapq.heappop(events)
+        if t > horizon:
+            break
+        if kind == "arrive":
+            need = 8.0 - tails[who]
+            if rng.random() < p_silence:
+                cut = rng.uniform(6.0, 8.0)          # silence boundary inside the last 2 s
+                dur, tails[who] = cut, 8.0 - cut
+            else:
+                dur, tails[who] = 12.0, 0.0          # force cut at 1.5x
+                need += 4.0
+            eng.on_chunk(who, [0.0] * int(dur * 16000), t)
+            arrivals.append(t)
+            heapq.heappush(events, (t + need, who, "arrive"))
+        else:
+            eng._busy = False
+            eng._maybe_warn_gpu_struggle()
+            busy = False
+        if not busy and not eng._queue.empty():
+            try:
+                _src, audio, _ts = eng._queue.get_nowait()
+            except queue.Empty:
+                audio = None
+            if audio is not None:
+                busy = True
+                eng._busy = True
+                heapq.heappush(events, (t + (len(audio) / 16000.0) * rtf, who, "done"))
+        if fired and warned_at is None:
+            warned_at = t
+    spans = [arrivals[i + 7] - arrivals[i] for i in range(max(0, len(arrivals) - 7))]
+    return dict(warned=bool(fired), at=warned_at, dropped=eng._dropped, start=backlog,
+                end=eng._queue.qsize(), span=(sum(spans) / len(spans)) if spans else 0.0,
+                worst_span=min(spans) if spans else 0.0)
 
 
 class _SlowModel:
@@ -373,14 +434,22 @@ def test_mic_only_session_with_a_transient_backlog_does_not_warn():
     print("  OK  a mic-only session at RTF 0.6 drains its transient backlog in silence")
 
 
-def test_producer_warns_from_any_inherited_depth():
-    """H2: the producer net must not have a precondition that a moderate backlog can fail.
+def test_producer_warns_from_any_inherited_depth_and_at_the_ceiling_only_on_the_drop():
+    """H2, plus the one shape that is deliberately allowed to warn late.
 
     An earlier "the floor must first reach a healthy depth" gate disabled this net for every
     session armed above that depth, which is every session handed a backlog by a slow model load.
     Worked through at RTF 4 from depth 16, the queue exhausts in ~70 s while four worker
     completions take ~128 s, so neither path spoke and the first DROP became the warning. The
-    trend window has no precondition: growth is growth, whatever depth it starts from.
+    trend window has no precondition: growth is growth, whatever depth it starts from. Seeds 7, 16
+    and 23 therefore all warn with nothing dropped.
+
+    Seeds 30 and 32 assert the opposite, and that is ACCEPTED, chosen rather than missed: armed
+    that close to the 32-slot ceiling only one or two samples fit before the queue overflows, so
+    the window cannot fill and the unconditional drop path is what claims the warning. At 30 of 32
+    loss is one chunk away whatever we do, so the user learns within a chunk instead of never, and
+    an arm-time special case for a near-full queue is the kind of exception that cost two earlier
+    revisions of this design. See the note beside STRUGGLE_ARRIVAL_WINDOW.
     """
     for seed in (7, 16, 23, 30, 32):
         eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
@@ -491,6 +560,99 @@ def test_pre_arm_evidence_can_never_spend_the_warning():
         assert e._struggle_warned is False, "pre-arm evidence claimed the one-shot warning"
     assert errors == [], errors[:3]
     print("  OK  pre-arm evidence can never claim the warning, however arming interleaves")
+
+
+def test_under_real_chunker_jitter_a_recovering_session_is_never_warned():
+    """M2: the smooth simulation above justifies the window lengths with an argument it does not
+    test. This one drives the engine from independently phased per-source chunkers across the real
+    6 to 12 s boundary behaviour (see _simulate_chunkers) and pins the two properties that matter.
+
+    MEASURED, and recorded here so the next reader does not have to re-derive it:
+
+      * an 8-arrival window spans ~28 s on average and ~20 s at its tightest (all-6 s cuts on two
+        sources), not the ~32 s the earlier comment claimed. Corrected there.
+      * the recovery case is CLEAN: a card fast enough to be recovering (RTF <= 0.25) never warns
+        while draining an inherited backlog, at any starting depth up to 30. That is the case this
+        design must not get wrong, because a slow first-run model load routinely hands the engine
+        20+ chunks.
+      * there IS a marginal band, RTF ~0.30 to ~0.50 with a backlog already past the completion
+        threshold, where a session that ends up draining can still warn. The claim comes from the
+        COMPLETION window (4 samples, shared with the CPU ladder as DOWNGRADE_WINDOW), not the
+        arrival window: at 80 to 100% of capacity the depth wobbles up within any 4 samples even
+        while the long-run trend is down. Deliberately NOT chased. Two channels break even at
+        RTF 0.5, so those sessions are inside 20% of losing audio with a minute or more already
+        queued, the banner they get offers exactly the right remedy, and the alternative is a
+        condition that would re-open a blind spot. A spurious banner is dismissible; a missed
+        warning is lost audio.
+    """
+    # The protection that must hold: recovering, at every depth a slow model load could hand us.
+    for backlog in (10, 20, 26, 30):
+        for rtf in (0.05, 0.15, 0.25):
+            for seed in range(4):
+                eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
+                r = _simulate_chunkers(eng, rtf=rtf, backlog=backlog, seed=seed)
+                assert not r["warned"], (
+                    f"backlog {backlog} at RTF {rtf} (seed {seed}) warned while recovering: {r}")
+                assert r["end"] == 0 and r["dropped"] == 0, r
+    # And the harm that must be caught, from an empty queue, with the jitter running.
+    for rtf in (0.55, 0.7, 1.0):
+        for seed in range(4):
+            eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
+            r = _simulate_chunkers(eng, rtf=rtf, backlog=0, seed=seed)
+            assert r["warned"], f"a session losing ground at RTF {rtf} (seed {seed}) never warned: {r}"
+            assert r["at"] is not None and r["at"] < 400.0, r
+    # The window length claim, measured rather than asserted from theory.
+    eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
+    r = _simulate_chunkers(eng, rtf=0.1, backlog=0, seed=7)
+    assert 18.0 <= r["worst_span"] <= 32.0, f"8 arrivals spanned {r['worst_span']:.1f}s at worst"
+    assert 22.0 <= r["span"] <= 34.0, f"8 arrivals spanned {r['span']:.1f}s on average"
+    print(f"  OK  real chunker jitter: recovery never warns, real loss always does "
+          f"(8 arrivals span ~{r['span']:.0f}s, ~{r['worst_span']:.0f}s at worst)")
+
+
+def test_the_depth_sample_is_taken_inside_the_lock():
+    """H of round 5: the depth used to be measured by the CALLER and passed in, so a thread could
+    read a depth, be descheduled, and have its now-stale value appended as the first sample of a
+    window that arm_struggle (or a model swap) had cleared in the meantime. A pre-arm 24 landing
+    ahead of a healthy 29, 28, 27 reads as growth and spends the one-shot warning on a session that
+    is recovering. The sample is taken inside the lock now, so a sample and a clear are mutually
+    exclusive by construction: this test pauses INSIDE the sampling call and proves the clear
+    cannot interleave.
+    """
+    eng = _stub_engine(is_cpu=False, device="cuda")
+    eng._arrival_hist.append(24)                 # a leftover the clear is about to remove
+    sampling, release = threading.Event(), threading.Event()
+
+    class _PausingQueue:
+        """Stands in for the chunk queue and stops the world inside qsize(), which is exactly where
+        the depth is read. Everything else passes through to the real queue."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def qsize(self):
+            sampling.set()
+            release.wait(timeout=5.0)
+            return 27
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    eng._queue = _PausingQueue(eng._queue)
+    sampler = threading.Thread(target=lambda: eng._struggle_evaluate(arrival=True))
+    sampler.start()
+    assert sampling.wait(3.0), "the evaluation never reached the sampling point"
+    clearer = threading.Thread(target=eng.arm_struggle)   # one of the two clear sites
+    clearer.start()
+    clearer.join(0.3)
+    assert clearer.is_alive(),         "a window clear ran while a depth sample was in flight: the sample is outside the lock"
+    release.set()
+    sampler.join(5.0)
+    clearer.join(5.0)
+    assert not sampler.is_alive() and not clearer.is_alive(), "a thread never finished"
+    assert list(eng._arrival_hist) == [],         f"a sample taken before the clear survived it: {list(eng._arrival_hist)}"
+    assert eng._struggle_warned is False, "a stale sample claimed the warning"
+    print("  OK  the depth sample happens inside the lock: no clear can interleave with it")
 
 
 def test_concurrent_producers_cannot_corrupt_the_window_or_double_spend():
@@ -936,11 +1098,13 @@ if __name__ == "__main__":
              test_worker_records_rtf_on_a_non_cpu_engine_and_a_draining_backlog_never_warns,
              test_two_channel_session_losing_ground_at_rtf_0_6_warns,
              test_mic_only_session_with_a_transient_backlog_does_not_warn,
-             test_producer_warns_from_any_inherited_depth,
+             test_producer_warns_from_any_inherited_depth_and_at_the_ceiling_only_on_the_drop,
              test_producer_warns_when_a_partial_drain_reverses,
              test_a_healthy_drain_from_a_deep_backlog_stays_silent,
              test_producer_warns_on_the_first_drop_without_any_window,
              test_pre_arm_evidence_can_never_spend_the_warning,
+             test_under_real_chunker_jitter_a_recovering_session_is_never_warned,
+             test_the_depth_sample_is_taken_inside_the_lock,
              test_concurrent_producers_cannot_corrupt_the_window_or_double_spend,
              test_the_warning_is_inert_on_cpu_and_on_a_file_import,
              test_the_warning_fires_once_per_session_and_survives_a_raising_callback,

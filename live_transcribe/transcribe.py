@@ -390,8 +390,12 @@ DOWNGRADE_WINDOW = 4     # consecutive chunks of evidence required before a step
 # one that is DRAINING has newest below oldest and cannot warn, whatever depth it started from, so
 # no baseline, floor or healthy-first precondition is needed to tell catch-up from starvation. The
 # arrival window is 8 rather than 4 because it must not be fooled by arrival jitter: the per-source
-# chunker threads pick their own silence boundaries (capture_core), so depths step up and down by a
-# chunk or two around the trend, and 8 arrivals spans about 32 s of a two-channel session.
+# chunker threads pick their own silence boundaries and carry the tail forward (capture_core), so
+# emissions run 6 to 12 s, the sources drift in and out of phase, and depths step up and down by a
+# chunk or two around the trend. MEASURED against that behaviour (see the jitter test in
+# tests/test_struggle_signal.py), 8 arrivals spans ~28 s of a two-channel session and ~20 s at its
+# tightest, and a card fast enough to be recovering (RTF <= 0.25) never trips it while draining a
+# backlog of up to 30, which is the case this must not get wrong.
 #
 # RTF stays measured on every backend (see _run): the CPU ladder needs it and it is the useful
 # number in the diagnostic log line. It just no longer decides this warning.
@@ -403,6 +407,13 @@ DOWNGRADE_WINDOW = 4     # consecutive chunks of evidence required before a step
 QUEUE_MAXSIZE = 32              # bounded chunk queue: live capture drops past this rather than stall
 STRUGGLE_QUEUE_HIGH = QUEUE_MAXSIZE * 3 // 4   # producer-side "loss is imminent" mark (24 of 32)
 STRUGGLE_ARRIVAL_WINDOW = 8     # arrivals of evidence for the producer-side trend
+#
+# ACCEPTED, chosen not missed: a session ARMED at a near-ceiling depth (30 or more of 32) warns on
+# its first dropped chunk rather than before it, because only one or two samples can be taken before
+# the queue overflows and the window never fills. No special case is added for it. At 30 of 32 loss
+# is one chunk away whatever we do, the unconditional drop path still claims the warning, so the
+# user learns within a chunk instead of never; and an arm-time decision for an already-full queue is
+# exactly the kind of special case that cost two earlier revisions of this file.
 
 # The transcript line for that warning. Hedged deliberately: the engine measures inference time and
 # queue depth, which cannot tell another program apart from thermal throttling, memory pressure, a
@@ -1426,7 +1437,7 @@ class Engine:
         # still speaks when transcription is so slow, or so stalled, that completions dry up.
         # _struggle_evaluate holds the lock for a handful of comparisons on an 8-slot deque, and
         # the delivery it hands back is done off this thread entirely.
-        self._deliver_struggle(self._struggle_evaluate(depth=self._queue.qsize(), arrival=True))
+        self._deliver_struggle(self._struggle_evaluate(arrival=True))
         return True
 
     def set_initial_prompt(self, prompt):
@@ -1653,22 +1664,27 @@ class Engine:
             self._arrival_hist.clear()
             self.struggle_armed = True
 
-    def _struggle_evaluate(self, *, depth=None, arrival=False, forced=None):
+    def _struggle_evaluate(self, *, arrival=False, forced=None):
         """The locked half of the warning, and the ONLY place struggle state is read or written.
 
-        Records one queue-depth sample and decides whether it claims the one-shot warning. Returns
-        the reason string when THIS call won the ratchet, else None; the caller passes that straight
-        to _deliver_struggle, which runs with no lock held. Splitting it this way is what makes the
-        decision atomic: sampling, verdict and claim happen inside a single acquisition, so no other
-        thread can arm, clear or claim between them (and nothing can index a deque that a concurrent
-        arm has just emptied).
+        TAKES the queue-depth sample itself, inside the lock, and decides whether it claims the
+        one-shot warning. Returns the reason string when THIS call won the ratchet, else None; the
+        caller passes that straight to _deliver_struggle, which runs with no lock held. Splitting it
+        this way is what makes the decision atomic: sampling, verdict and claim happen inside a
+        single acquisition, so no other thread can arm, clear or claim between them. The SAMPLE has
+        to be taken in here too, never handed in by the caller: a depth measured outside the lock is
+        a reading from before a concurrent arm_struggle or model-swap clear, and appending it after
+        that clear makes a stale value the first sample of a freshly emptied window (a pre-arm 24
+        ahead of a healthy 29, 28, 27 reads as growth). Nothing can index a deque that a concurrent
+        clear has just emptied, either.
 
         `forced` claims outright, for an actual drop: audio is being lost right now, which needs no
         trend to justify. Otherwise the rule is the same at both sampling points, deep AND still
         growing, differing only in where the samples come from and how deep counts as deep:
 
-          arrival=True   on_chunk, capture threads, over STRUGGLE_QUEUE_HIGH
-          arrival=False  the worker, once per completed chunk, over BACKPRESSURE_BEAM_THRESHOLD
+          arrival=True   on_chunk, capture threads, the queue depth, over STRUGGLE_QUEUE_HIGH
+          arrival=False  the worker, once per completed chunk, pending() so the chunk in flight
+                         counts, over BACKPRESSURE_BEAM_THRESHOLD
 
         Cheap enough for the real-time audio path: a deque append and three comparisons. Every
         input the decision reads is read inside the acquisition, including `adaptive` and `_device`,
@@ -1686,7 +1702,7 @@ class Engine:
             why = forced
             if why is None:
                 win = self._arrival_hist if arrival else self._pending_hist
-                win.append(depth)
+                win.append(self._queue.qsize() if arrival else self.pending())
                 need = STRUGGLE_QUEUE_HIGH if arrival else BACKPRESSURE_BEAM_THRESHOLD + 1
                 if len(win) < win.maxlen or win[-1] < need or win[-1] <= win[0]:
                     return None
@@ -1738,6 +1754,16 @@ class Engine:
             # through the transcript even when no thread could be started.
             pass
 
+    def _take_struggle_notice(self):
+        """Consume the "the transcript owes a STRUGGLE_NOTICE" flag, under the lock like every
+        other struggle field, and return whether this call took it. The caller emits AFTER this
+        returns and never with the lock held: _emit_notice fans out to subscribers, which write the
+        transcript file and the SSE stream."""
+        with self._struggle_lock:
+            due = self._struggle_notice_due
+            self._struggle_notice_due = False
+        return due
+
     def _maybe_warn_gpu_struggle(self):
         """Worker-side sampling point: the queue depth at each completed chunk.
 
@@ -1746,7 +1772,7 @@ class Engine:
         arrivals are outrunning transcription, which ends in dropped audio. RTF is not part of the
         verdict (see the constants), only of the log line.
         """
-        why = self._struggle_evaluate(depth=self.pending())
+        why = self._struggle_evaluate()
         if why is not None:
             avg = (sum(self._rtf) / len(self._rtf)) if self._rtf else 0.0
             why = f"{why}, RTF ~{avg:.2f}"
@@ -1779,8 +1805,7 @@ class Engine:
             # A "cannot hold real time" warning tripped since the last chunk, possibly on the
             # capture thread, which must never touch subscribers. Emit its notice here, on the
             # worker, ahead of any gap marker: the explanation should precede the hole.
-            if self._struggle_notice_due:
-                self._struggle_notice_due = False
+            if self._take_struggle_notice():
                 self._emit_notice(t_start, STRUGGLE_NOTICE)
 
             # If chunks were dropped to backpressure before this one, record the
