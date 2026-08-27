@@ -1375,8 +1375,15 @@ def reconfigure(req: ReconfigureRequest):
         # other explicit code is forced as-is (see transcribe.decode_language).
         eff_family = family if family is not None else cur_family
         decode_lang = transcribe.decode_language(eff_family, new_lang)
+        # With a model swap, also hand over the backend it was built on so the engine's
+        # device identity (_device/_is_cpu/_compute_type) moves with the model: an
+        # mlx -> cpu change must enable the CPU downgrade ladder and make the NEXT
+        # reconfigure resolve from "cpu", not a stale "mlx" (codex M1). On Windows
+        # device_str always equals the engine's current device, so this is a no-op there.
         engine.request_change(language=decode_lang, engine=new_engine_pref,
-                              model=model, model_name=model_name, size=new_size, family=family)
+                              model=model, model_name=model_name, size=new_size, family=family,
+                              device=(device_str if model is not None else None),
+                              compute_type=(compute if model is not None else None))
         # Only a request that actually carries a language change may rewrite the session's
         # canonical language; a tier/engine-only change keeps it exactly as the user chose it.
         if change_lang:

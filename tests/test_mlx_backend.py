@@ -291,6 +291,40 @@ def test_engine_drain_parity_on_mlx_tier():
     print(f"  OK  mlx-turbo engine drained all {n} chunks; downgrade ladder inert")
 
 
+def test_apply_pending_change_updates_device_identity():
+    # codex M1: an mlx -> cpu model swap must update _device/_is_cpu/_compute_type WITH the
+    # model (the CPU downgrade ladder re-arms; the next reconfigure resolves from "cpu"), and
+    # a swap without device info (every Windows caller today) keeps the backend untouched.
+    cache_key = ("digiphyte/fluister-turbo", "mlx", "fp16")
+    transcribe._MODEL_CACHE.pop(cache_key, None)
+    with _fake_mlx(), _snapshot_local(), \
+         _patched(transcribe, "_FLUISTER", dict(transcribe._FLUISTER)):
+        transcribe._FLUISTER["large-v3-turbo"] = "digiphyte/fluister-turbo"
+        engine = transcribe.Engine(tier="mlx-turbo")
+        assert (engine._device, engine._is_cpu, engine._compute_type) == ("mlx", False, "fp16")
+        cpu_model = object()
+        engine.request_change(language="en", engine="auto", model=cpu_model,
+                              model_name="large-v3-turbo", size="large-v3-turbo",
+                              family="whisper", device="cpu", compute_type="int8")
+        engine._apply_pending_change(0.0)
+        assert engine.model is cpu_model
+        assert (engine._device, engine._is_cpu, engine._compute_type) == ("cpu", True, "int8"), \
+            "mlx -> cpu swap must re-arm the CPU identity (ladder + reconfigure resolution)"
+        # And back onto mlx.
+        engine.request_change(language="af", engine="auto", model=object(),
+                              model_name="digiphyte/fluister-turbo", size="large-v3-turbo",
+                              family="fluister", device="mlx", compute_type="fp16")
+        engine._apply_pending_change(0.0)
+        assert (engine._device, engine._is_cpu, engine._compute_type) == ("mlx", False, "fp16")
+        # No device info: backend identity untouched (Windows same-device swaps).
+        engine.request_change(language="en", engine="auto", model=object(),
+                              model_name="large-v3-turbo", size="large-v3-turbo", family="whisper")
+        engine._apply_pending_change(0.0)
+        assert (engine._device, engine._is_cpu, engine._compute_type) == ("mlx", False, "fp16")
+    transcribe._MODEL_CACHE.pop(cache_key, None)
+    print("  OK  _apply_pending_change moves _device/_is_cpu/_compute_type with the model (None keeps them)")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_local_snapshot_path_preferred,
@@ -303,7 +337,8 @@ if __name__ == "__main__":
                test_import_stays_lazy_and_tiers_present,
                test_tier_choices_unchanged,
                test_default_chunk_seconds_mlx_is_gpu_class,
-               test_engine_drain_parity_on_mlx_tier):
+               test_engine_drain_parity_on_mlx_tier,
+               test_apply_pending_change_updates_device_identity):
         try:
             fn()
         except AssertionError as e:

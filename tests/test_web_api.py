@@ -1037,9 +1037,13 @@ def test_reconfigure_family_change_on_mlx_reresolves():
         # af Fluister turbo on mlx -> language-only switch to en: family flips to whisper, size
         # kept, but stock turbo has no MLX form; the resolver (stubbed to today's cpu-strong
         # answer) must drive the load onto the CPU with int8, asked for the KEPT size on "auto".
-        _run(_FakeEngine(), {"language": "en"}, "cpu-strong")
+        f1 = _run(_FakeEngine(), {"language": "en"}, "cpu-strong")
         assert resolves[-1] == ("large-v3-turbo", "auto", "en", "auto"), resolves
         assert loads[-1] == ("large-v3-turbo", "cpu", "int8"), loads
+        # codex M1: the swap hands the new backend to the engine so _device/_is_cpu/
+        # _compute_type move with the model.
+        assert f1.changes[-1].get("device") == "cpu", f1.changes
+        assert f1.changes[-1].get("compute_type") == "int8", f1.changes
         # engine-only switch whose target IS mapped stays on mlx, compute kept.
         fake = _FakeEngine()
         fake.family = "whisper"

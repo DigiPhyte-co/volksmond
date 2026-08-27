@@ -1362,7 +1362,8 @@ class Engine:
         self.initial_prompt = prompt
         self._rebuild_prompt_leak(prompt, self.language)
 
-    def request_change(self, *, language, engine, model=None, model_name=None, size=None, family=None):
+    def request_change(self, *, language, engine, model=None, model_name=None, size=None, family=None,
+                       device=None, compute_type=None):
         """Queue a live language and/or model change, applied by the worker between chunks.
 
         Pass `model` (a WhisperModel the CALLER already built via load_model, off the worker, so
@@ -1370,11 +1371,16 @@ class Engine:
         the model; omit them to keep the current model and change only the decode language - instant,
         no reload, and the right move for a bilingual meeting on a both-capable model. `language` is
         the next decode language (None == auto-detect, "af"/"en" otherwise); the prompt is recomposed
-        for it. A second request before the worker applies the first simply replaces it."""
+        for it. `device`/`compute_type` (with `model`) record the backend the new model was BUILT on
+        ("cpu"/"cuda"/"mlx"), so a cross-backend swap (mlx <-> cpu on a Mac) updates the engine's
+        device identity together with the model; None keeps the current values (every same-device
+        swap, which is all Windows ever does). A second request before the worker applies the first
+        simply replaces it."""
         with self._change_lock:
             self._pending_change = {
                 "language": language, "engine": engine,
                 "model": model, "model_name": model_name, "size": size, "family": family,
+                "device": device, "compute_type": compute_type,
             }
 
     def request_loop_history_reset(self):
@@ -1413,6 +1419,17 @@ class Engine:
             self.size = ch["size"]
             self.family = ch["family"]
             self.is_fluister = ch["family"] == "fluister"
+            # A cross-backend swap (mlx <-> cpu on a Mac) must move the engine's device
+            # identity WITH the model: _is_cpu gates the CPU adaptive downgrade ladder,
+            # and _device/_compute_type drive the next reconfigure's resolution and any
+            # downgrade reload. Applied here on the worker thread together with the model
+            # (single writer), so model and device identity can never be torn. None (the
+            # only value Windows callers ever pass) keeps the current backend untouched.
+            if ch.get("device"):
+                self._device = ch["device"]
+                self._is_cpu = ch["device"] == "cpu"
+            if ch.get("compute_type"):
+                self._compute_type = ch["compute_type"]
         self.initial_prompt = _compose_prompt(self.language, self._user_prompt)
         self._rebuild_prompt_leak(self._user_prompt, self.language)
         self._recent.clear()  # a model/language flip legitimately changes output style
