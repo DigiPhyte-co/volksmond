@@ -2236,6 +2236,9 @@ function deviceBadge(tier) {
   if (tier && tier.indexOf("gpu") === 0) {   // gpu, gpu-4gb, gpu-turbo, gpu-medium, gpu-small
     return el("span", { class: "chip ok", title: (S.cuda && S.cuda.gpu_name) || "GPU" }, [icon("check", 12), "GPU"]);
   }
+  if (tier.indexOf("mlx") === 0) {           // mlx, mlx-turbo: the Apple GPU via MLX (Mac only)
+    return el("span", { class: "chip ok", title: "Apple GPU" }, [icon("check", 12), "Apple GPU"]);
+  }
   return el("span", { class: "chip" }, "CPU");
 }
 
@@ -3882,7 +3885,9 @@ function refreshAutoPreflight() {
 }
 // Friendly size label from the loaded model id/path (a stock name like "large-v3", a hosted
 // Fluister repo like "digiphyte/fluister-medium", or a local ct2 dir). Mirrors the Quality
-// vocabulary so the live chip can read "Fluister, Best".
+// vocabulary so the live chip can read "Fluister, Best". The substring rules also cover the
+// MLX repos (digiphyte/fluister-turbo-mlx, mlx-community/whisper-large-v3-mlx), which read
+// the same as their ct2 twins ("High quality" / "Best").
 function sizeLabelFromModel(model) {
   var m = (model || "").toLowerCase();
   if (!m) return "";
@@ -4087,7 +4092,9 @@ function aecLiveControl() {
 // shown here and in the download panel, so the two never disagree. Auto is default.
 var QUALITY_OPTS = [["auto", "Auto"], ["small", "Fast"], ["medium", "Balanced"], ["large-v3-turbo", "High quality"], ["large-v3", "Best"]];
 // Legacy saved tier keys -> the new model-keyed quality, so old settings still highlight.
-var LEGACY_QUALITY = { "gpu": "large-v3", "gpu-4gb": "large-v3", "gpu-turbo": "large-v3-turbo", "gpu-medium": "medium", "gpu-small": "small", "cpu-large": "large-v3", "cpu-strong": "large-v3-turbo", "cpu-mid": "medium", "cpu": "small", "cpu-min": "small" };
+// The mlx tiers (Apple GPU via MLX, Mac only) map like their gpu twins so the live Quality
+// select shows the true size instead of falling back to Auto.
+var LEGACY_QUALITY = { "gpu": "large-v3", "gpu-4gb": "large-v3", "gpu-turbo": "large-v3-turbo", "gpu-medium": "medium", "gpu-small": "small", "cpu-large": "large-v3", "cpu-strong": "large-v3-turbo", "cpu-mid": "medium", "cpu": "small", "cpu-min": "small", "mlx": "large-v3", "mlx-turbo": "large-v3-turbo" };
 function normalizeQuality(q) {
   if (!q) return "auto";
   for (var i = 0; i < QUALITY_OPTS.length; i++) { if (QUALITY_OPTS[i][0] === q) return q; }
