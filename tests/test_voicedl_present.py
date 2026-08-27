@@ -143,13 +143,68 @@ def test_snapshot_has_weights_edge_cases():
     print("  OK  _snapshot_has_weights() fails safe on falsy/non-dir/degenerate inputs (FIX 2)")
 
 
+def test_delete_holds_slot_against_concurrent_download_start():
+    # codex M4 (pre-existing ct2 race): delete() used to check the slot under _LOCK, release it,
+    # then rmtree, so a download could claim the slot and stream into the cache being removed.
+    # Now delete holds the slot as "deleting" for the whole removal: every starter refuses while
+    # it runs, and the previous terminal state is restored afterwards.
+    import shutil as _shutil
+    import types as _types
+    from pathlib import Path
+    orig_hub, orig_shutil, orig_cfg = voicedl._hub_cache, voicedl.shutil, voicedl.config
+
+    class _FakeConfig:
+        data = {"installed_models": {}}
+        def load(self):
+            return dict(self.data)
+        def update(self, kw):
+            self.data.update(kw)
+
+    with tempfile.TemporaryDirectory() as cache:
+        repo_dir = os.path.join(cache, "models--digiphyte--fluister-small")
+        os.makedirs(repo_dir)
+        _write(os.path.join(repo_dir, "blob.bin"), 2048)
+        observed = {}
+
+        def racing_rmtree(path):
+            # Mid-delete: the slot must read "deleting" and EVERY starter must refuse.
+            observed["state_during"] = voicedl._STATE["state"]
+            for starter in (lambda: voicedl.start_download("small"),
+                            lambda: voicedl.start_fluister_download("small"),
+                            lambda: voicedl.start_swivuriso_download()):
+                try:
+                    starter()
+                    observed.setdefault("raced", []).append(starter)
+                except RuntimeError:
+                    pass
+            return _shutil.rmtree(path)
+
+        try:
+            voicedl._hub_cache = lambda: Path(cache)
+            voicedl.config = _FakeConfig()
+            voicedl.shutil = _types.SimpleNamespace(rmtree=racing_rmtree)
+            voicedl._set(state="done")     # a finished download's terminal state must survive
+            voicedl.delete("digiphyte/fluister-small")
+        finally:
+            voicedl._hub_cache, voicedl.shutil = orig_hub, orig_shutil
+            voicedl.config = orig_cfg
+        assert observed.get("state_during") == "deleting", observed
+        assert "raced" not in observed, "a starter claimed the slot during delete's rmtree"
+        assert not os.path.exists(repo_dir), "the delete itself must still complete"
+        assert voicedl._STATE["state"] == "done", \
+            "the pre-delete terminal state must be restored after the removal"
+        voicedl._set(state="idle")
+    print("  OK  delete() holds the slot as 'deleting'; no download can start into a dying cache")
+
+
 if __name__ == "__main__":
     tests = (test_fluister_present_counts_local_build_dir,
              test_fluister_present_falls_back_to_repo_probe,
              test_present_false_when_model_bin_missing_in_valid_snapshot,
              test_present_false_when_download_model_raises,
              test_ct2_rule_unchanged_by_mlx_shape,
-             test_snapshot_has_weights_edge_cases)
+             test_snapshot_has_weights_edge_cases,
+             test_delete_holds_slot_against_concurrent_download_start)
     failures = 0
     for fn in tests:
         try:

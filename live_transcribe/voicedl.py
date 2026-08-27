@@ -292,6 +292,19 @@ def _set(**kw):
         _STATE.update(kw)
 
 
+def _claim_slot(fields):
+    """Atomically claim the single global download slot: refuse while ANY busy state holds it,
+    then mark it downloading with `fields` under the same lock hold. \"deleting\" is busy too
+    (codex M4): delete() holds the slot for the duration of its rmtree, so a download can never
+    start into a cache that is being removed under it (a race that pre-existed on the ct2 path)."""
+    with _LOCK:
+        if _STATE["state"] == "downloading":
+            raise RuntimeError("A model is already downloading.")
+        if _STATE["state"] == "deleting":
+            raise RuntimeError("A model is being removed. Try again shortly.")
+        _STATE.update(fields)
+
+
 # ── real transferred-byte progress ─────────────────────────────────────────
 # With HF_HUB_DISABLE_SYMLINKS=1 (forced in __init__ so ct2 can open the cache), hf_hub streams the
 # big model.bin into a temp/incomplete location and only drops the finished file into the counted
@@ -451,20 +464,14 @@ def start_download(model):
         # MLX form (darwin-arm64 only): same one-slot _STATE machinery, the MLX repo as
         # `repo` so progress polling / the stall detector / the on-disk floor all work.
         total = _SIZES.get(target, _SIZES[model])
-        with _LOCK:
-            if _STATE["state"] == "downloading":
-                raise RuntimeError("A model is already downloading.")
-            _STATE.update({"state": "downloading", "model": model, "repo": target,
-                           "kind": "whisper", "version": None, "revision": None,
-                           "downloaded": 0, "total": total, "error": None})
+        _claim_slot({"state": "downloading", "model": model, "repo": target,
+                     "kind": "whisper", "version": None, "revision": None,
+                     "downloaded": 0, "total": total, "error": None})
         threading.Thread(target=_run_mlx, args=(target, "", None, total), daemon=True).start()
         return
-    with _LOCK:
-        if _STATE["state"] == "downloading":
-            raise RuntimeError("A model is already downloading.")
-        _STATE.update({"state": "downloading", "model": model, "repo": _repo_id(model),
-                       "kind": "whisper", "version": None, "revision": None,
-                       "downloaded": 0, "total": _SIZES[model], "error": None})
+    _claim_slot({"state": "downloading", "model": model, "repo": _repo_id(model),
+                 "kind": "whisper", "version": None, "revision": None,
+                 "downloaded": 0, "total": _SIZES[model], "error": None})
     threading.Thread(target=_run, args=(model,), daemon=True).start()
 
 
@@ -488,17 +495,31 @@ def delete(model):
         dirs = [_repo_dir(model)] + ([Path(SWIVURISO_LOCAL)] if os.path.isdir(SWIVURISO_LOCAL) else [])
     else:
         raise ValueError("Unknown model")
+    # Hold the single global slot as "deleting" for the whole removal (codex M4): checking and
+    # releasing before rmtree left a window where a starter could claim the slot and download
+    # into the cache being removed under it. Every starter (_claim_slot) refuses while a delete
+    # runs; the previous terminal state (idle/done/error) is restored afterwards so a finished
+    # download's progress state is not clobbered by an unrelated delete.
     with _LOCK:
         if _STATE["state"] == "downloading":
             raise RuntimeError("A model is downloading. Wait for it to finish.")
-    for d in dirs:
-        if d.exists():
-            try:
-                shutil.rmtree(d)
-            except OSError as e:
-                # Surface the failure (e.g. a Windows file lock) instead of reporting a
-                # silent success that did not actually free any space.
-                raise RuntimeError(f"Could not remove the model files: {e}")
+        if _STATE["state"] == "deleting":
+            raise RuntimeError("A model is already being removed. Wait for it to finish.")
+        prev_state = _STATE["state"]
+        _STATE["state"] = "deleting"
+    try:
+        for d in dirs:
+            if d.exists():
+                try:
+                    shutil.rmtree(d)
+                except OSError as e:
+                    # Surface the failure (e.g. a Windows file lock) instead of reporting a
+                    # silent success that did not actually free any space.
+                    raise RuntimeError(f"Could not remove the model files: {e}")
+    finally:
+        with _LOCK:
+            if _STATE["state"] == "deleting":
+                _STATE["state"] = prev_state
     if model in fluister_repos or model == SWIVURISO_REPO or model in _MLX_TARGETS:
         _forget_installed(model)
 
@@ -768,12 +789,9 @@ def start_fluister_update(size):
     else:
         total = man.get("approx_bytes") or _FLUISTER_SIZES.get(size, 0)
         worker = _run_fluister
-    with _LOCK:
-        if _STATE["state"] == "downloading":
-            raise RuntimeError("A model is already downloading.")
-        _STATE.update({"state": "downloading", "model": size, "repo": repo, "kind": "fluister",
-                       "version": version, "revision": revision,
-                       "downloaded": 0, "total": total, "error": None})
+    _claim_slot({"state": "downloading", "model": size, "repo": repo, "kind": "fluister",
+                 "version": version, "revision": revision,
+                 "downloaded": 0, "total": total, "error": None})
     threading.Thread(target=worker, args=(repo, revision, version, total), daemon=True).start()
 
 
@@ -806,12 +824,9 @@ def start_swivuriso_download():
     Raises RuntimeError if a download is already running. Reuses _run_fluister (a generic repo sync +
     record-installed); the blank revision skips the pin check and records the baseline version."""
     repo = SWIVURISO_REPO
-    with _LOCK:
-        if _STATE["state"] == "downloading":
-            raise RuntimeError("A model is already downloading.")
-        _STATE.update({"state": "downloading", "model": "swivuriso", "repo": repo, "kind": "swivuriso",
-                       "version": _SWIVURISO_BASELINE, "revision": "",
-                       "downloaded": 0, "total": _SWIVURISO_SIZE, "error": None})
+    _claim_slot({"state": "downloading", "model": "swivuriso", "repo": repo, "kind": "swivuriso",
+                 "version": _SWIVURISO_BASELINE, "revision": "",
+                 "downloaded": 0, "total": _SWIVURISO_SIZE, "error": None})
     threading.Thread(target=_run_fluister, args=(repo, "", _SWIVURISO_BASELINE, _SWIVURISO_SIZE),
                      daemon=True).start()
 
@@ -830,10 +845,7 @@ def start_fluister_download(size):
     else:
         total = _FLUISTER_SIZES.get(size, 0)
         worker = _run_fluister
-    with _LOCK:
-        if _STATE["state"] == "downloading":
-            raise RuntimeError("A model is already downloading.")
-        _STATE.update({"state": "downloading", "model": size, "repo": repo, "kind": "fluister",
-                       "version": _FLUISTER_BASELINE, "revision": "",
-                       "downloaded": 0, "total": total, "error": None})
+    _claim_slot({"state": "downloading", "model": size, "repo": repo, "kind": "fluister",
+                 "version": _FLUISTER_BASELINE, "revision": "",
+                 "downloaded": 0, "total": total, "error": None})
     threading.Thread(target=worker, args=(repo, "", _FLUISTER_BASELINE, total), daemon=True).start()
