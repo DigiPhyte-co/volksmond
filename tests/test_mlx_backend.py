@@ -291,6 +291,24 @@ def test_engine_drain_parity_on_mlx_tier():
     print(f"  OK  mlx-turbo engine drained all {n} chunks; downgrade ladder inert")
 
 
+def test_app_main_mlx_smoke_env_var():
+    # codex L2: VOLKSMOND_SMOKE=mlx turns the app entry (app_main.py, the frozen entry on both
+    # platforms) into an MLX import smoke and NEVER launches the app. On a platform without the
+    # MLX runtime (this Windows dev box) it prints SKIP and exits 0; mac-release.yml runs the
+    # same hook inside the built .app and requires the OK line (exit 1 on darwin-arm64 failure).
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, VOLKSMOND_SMOKE="mlx")
+    out = subprocess.run([sys.executable, os.path.join(root, "app_main.py")],
+                         capture_output=True, text=True, env=env, timeout=120, cwd=root)
+    combined = (out.stdout or "") + (out.stderr or "")
+    assert out.returncode == 0, f"smoke must exit 0 off darwin-arm64: rc={out.returncode}\n{combined}"
+    assert ("MLX SMOKE OK" in combined) or ("MLX SMOKE SKIP" in combined), combined
+    assert "Uvicorn" not in combined and "server" not in combined.lower(), \
+        "the smoke must exit before the app/server starts"
+    print("  OK  VOLKSMOND_SMOKE=mlx: app entry runs the import smoke and exits (SKIP/OK, rc 0)")
+
+
 def test_apply_pending_change_updates_device_identity():
     # codex M1: an mlx -> cpu model swap must update _device/_is_cpu/_compute_type WITH the
     # model (the CPU downgrade ladder re-arms; the next reconfigure resolves from "cpu"), and
@@ -338,6 +356,7 @@ if __name__ == "__main__":
                test_tier_choices_unchanged,
                test_default_chunk_seconds_mlx_is_gpu_class,
                test_engine_drain_parity_on_mlx_tier,
+               test_app_main_mlx_smoke_env_var,
                test_apply_pending_change_updates_device_identity):
         try:
             fn()

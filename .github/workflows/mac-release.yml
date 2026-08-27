@@ -276,6 +276,28 @@ jobs:
           fi
           echo "    MLX runtime OK ($METALLIBS metallib file(s); mlx + mlx_whisper dirs and tokenizer assets present)"
 
+          # Frozen import smoke (codex L2): the structural asserts above only prove files
+          # exist. This runs the built app binary itself with VOLKSMOND_SMOKE=mlx, which
+          # imports mlx.core + mlx_whisper inside the frozen interpreter (torch is excluded
+          # from the bundle, so this also proves mlx_whisper imports without it) and exits
+          # 1 on darwin-arm64 if the import fails. Asserting the OK line guards against an
+          # older entry point that would ignore the env var and exit 0 some other way.
+          echo "==> Frozen MLX import smoke (VOLKSMOND_SMOKE=mlx)"
+          set +e
+          SMOKE_OUT="$(VOLKSMOND_SMOKE=mlx "$EXE" 2>&1)"
+          SMOKE_RC=$?
+          set -e
+          printf '%s\n' "$SMOKE_OUT"
+          if [ "$SMOKE_RC" -ne 0 ]; then
+            echo "::error title=Bundle check::Frozen MLX smoke exited $SMOKE_RC. The bundle cannot import mlx.core/mlx_whisper (see output above)."
+            exit 1
+          fi
+          if ! printf '%s' "$SMOKE_OUT" | grep -q "MLX SMOKE OK"; then
+            echo "::error title=Bundle check::Frozen MLX smoke did not print 'MLX SMOKE OK' (entry point ignored VOLKSMOND_SMOKE?)."
+            exit 1
+          fi
+          echo "    frozen MLX import smoke OK"
+
           if [ "$MODE" = "release" ]; then
             echo "==> Asserting Developer ID signature + entitlements (release mode)"
             codesign --verify --strict "$HELPER" || {
