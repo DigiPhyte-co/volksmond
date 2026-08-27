@@ -204,8 +204,9 @@ def _build_model(model_name, device, compute_type, cpu_threads):
         # Apple Metal via the mlx-whisper adapter. Imported lazily so Windows (where the
         # mlx packages have no wheels and are never installed) pays nothing for this
         # branch. compute_type/cpu_threads have no MLX equivalent; the repo's own
-        # precision applies. The adapter does its own local-first snapshot resolve,
-        # mirroring the local_files_only contract below.
+        # precision applies. The adapter resolves the snapshot LOCAL-ONLY and raises
+        # when the repo is not cached (stricter than the ct2 fallback below): an MLX
+        # download must only ever happen through voicedl, never inside mlx-whisper.
         from . import mlxbackend
         repo = mlxbackend.mlx_model_for(model_name)
         if repo is None:

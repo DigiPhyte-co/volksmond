@@ -72,10 +72,22 @@ def _patched(obj, name, value):
         setattr(obj, name, orig)
 
 
+_FAKE_SNAPSHOT = os.path.join("fake", "hub", "snapshots", "abc123")
+
+
+@contextlib.contextmanager
+def _snapshot_local(path=_FAKE_SNAPSHOT):
+    """huggingface_hub.snapshot_download resolves to a fake LOCAL snapshot path,
+    the only way an adapter may be constructed (an uncached repo raises)."""
+    with _patched(huggingface_hub, "snapshot_download", lambda *a, **k: path):
+        yield
+
+
 @contextlib.contextmanager
 def _snapshot_raises():
     """huggingface_hub.snapshot_download always fails: the local cache is 'empty',
-    so the adapter must fall back to the raw repo id (and never hit the network)."""
+    so the adapter constructor must raise (never hand mlx-whisper the repo id,
+    which would let its own downloader fetch multi-GB silently)."""
     def _raise(*a, **k):
         raise FileNotFoundError("not cached (test)")
     with _patched(huggingface_hub, "snapshot_download", _raise):
@@ -108,20 +120,26 @@ def test_local_snapshot_path_preferred():
     print("  OK  cached repo resolves to the local snapshot path (local_files_only=True)")
 
 
-def test_repo_id_when_not_cached():
+def test_uncached_repo_raises_never_downloads():
+    # An uncached repo must RAISE at construction (codex H1): falling back to the raw
+    # repo id would let warm-up's dummy inference trigger mlx-whisper's own multi-GB
+    # download, before consent and outside voicedl's slot/progress machinery.
     from live_transcribe import mlxbackend
     with _fake_mlx() as calls, _snapshot_raises():
-        m = mlxbackend.MlxWhisperModel("digiphyte/fluister-turbo-mlx")
-        m.transcribe(_audio(), language="af")
-    assert calls[0]["kwargs"]["path_or_hf_repo"] == "digiphyte/fluister-turbo-mlx"
-    print("  OK  uncached repo falls back to the repo id (mlx-whisper may download)")
+        try:
+            mlxbackend.MlxWhisperModel("digiphyte/fluister-turbo-mlx")
+            raise SystemExit("adapter construction succeeded on an uncached repo")
+        except RuntimeError as e:
+            assert "not downloaded" in str(e), e
+    assert calls == [], "no transcribe call may happen for an uncached repo"
+    print("  OK  uncached repo raises at construction; mlx-whisper can never self-download")
 
 
 def test_guard_kwarg_mapping():
     # The full production call surface (transcribe.py's Engine._run call), with the
     # real GUARD dict, must arrive at mlx_whisper correctly translated.
     from live_transcribe import mlxbackend
-    with _fake_mlx() as calls, _snapshot_raises():
+    with _fake_mlx() as calls, _snapshot_local():
         m = mlxbackend.MlxWhisperModel("mlx-community/whisper-large-v3-mlx")
         m.transcribe(_audio(), language="af", initial_prompt="Volksmond, DigiPhyte",
                      vad_filter=True, beam_size=5, **transcribe.GUARD)
@@ -161,7 +179,7 @@ def test_segment_contract():
                              {"text": "wereld ", "start": 1.2, "end": 2.0}],
                 "language": "af"}
 
-    with _fake_mlx(), _snapshot_raises():
+    with _fake_mlx(), _snapshot_local():
         m = mlxbackend.MlxWhisperModel("mlx-community/whisper-large-v3-mlx")
         sys.modules["mlx_whisper"].transcribe = _two_segs
         segs, info = m.transcribe(_audio(), language="af")
@@ -176,7 +194,7 @@ def test_segment_contract():
 
 def test_rejects_non_ndarray_audio():
     from live_transcribe import mlxbackend
-    with _fake_mlx(), _snapshot_raises():
+    with _fake_mlx(), _snapshot_local():
         m = mlxbackend.MlxWhisperModel("mlx-community/whisper-large-v3-mlx")
         try:
             m.transcribe([0.0] * 160, language="af")
@@ -239,7 +257,7 @@ def test_engine_drain_parity_on_mlx_tier():
     from live_transcribe import mlxbackend
     cache_key = ("digiphyte/fluister-turbo", "mlx", "fp16")
     transcribe._MODEL_CACHE.pop(cache_key, None)
-    with _fake_mlx(delay=0.03), _snapshot_raises(), \
+    with _fake_mlx(delay=0.03), _snapshot_local(), \
          _patched(transcribe, "_FLUISTER", dict(transcribe._FLUISTER)):
         # Force the af turbo resolve to the hosted repo id (a dev machine with a
         # local ct2 dir would otherwise resolve to a path outside the D3 map).
@@ -276,7 +294,7 @@ def test_engine_drain_parity_on_mlx_tier():
 if __name__ == "__main__":
     failures = 0
     for fn in (test_local_snapshot_path_preferred,
-               test_repo_id_when_not_cached,
+               test_uncached_repo_raises_never_downloads,
                test_guard_kwarg_mapping,
                test_dropped_and_renamed_constants_pinned,
                test_segment_contract,

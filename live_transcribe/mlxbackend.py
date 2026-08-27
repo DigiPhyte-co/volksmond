@@ -58,10 +58,12 @@ class MlxWhisperModel:
     """Duck-typed WhisperModel running mlx-whisper on the Apple GPU.
 
     `model_id` is an MLX repo id (a value of MLX_REPOS). The constructor resolves
-    it to a LOCAL snapshot path when the repo is already downloaded, mirroring
-    _build_model's local-first contract, so mlx-whisper's own downloader never
-    revalidates over the network at Begin. compute_type/cpu_threads have no MLX
-    equivalent (the repo holds its own precision), so the adapter takes neither.
+    it to a LOCAL snapshot path, local-only like _build_model's ct2 contract but
+    STRICTER: an uncached repo raises (see _resolve_local) rather than letting
+    mlx-whisper's own downloader fetch it, so no MLX download can ever bypass
+    voicedl's consent/progress/single-slot machinery. compute_type/cpu_threads
+    have no MLX equivalent (the repo holds its own precision), so the adapter
+    takes neither.
     """
 
     def __init__(self, model_id):
@@ -75,15 +77,21 @@ class MlxWhisperModel:
 
     @staticmethod
     def _resolve_local(model_id):
-        """Local cache only: never touch the network for an already-downloaded repo.
-        Fall back to the repo id (a network-allowed resolve inside mlx-whisper) only
-        if it genuinely is not on disk yet."""
+        """Local cache only: NEVER let mlx-whisper's own downloader touch the network.
+        An uncached repo raises instead of falling back to the repo id: handing the repo
+        id to mlx_whisper.transcribe would let its downloader silently pull a multi-GB
+        snapshot (warm-up's dummy inference triggers this before any consent), outside
+        voicedl's single global download slot and progress state, and racing a later
+        voicedl download over the same cache. Every MLX download must go through voicedl
+        first; the engine build path guarantees that before this constructor runs."""
         try:
             import huggingface_hub
             return huggingface_hub.snapshot_download(model_id, local_files_only=True)
         except Exception as e:
-            print(f"[mlx] {model_id} not in local cache ({e}); allowing a download", flush=True)
-            return model_id
+            raise RuntimeError(
+                f"The MLX model {model_id} is not downloaded yet; download it first "
+                "(all MLX downloads go through voicedl, never mlx-whisper's own fetch)"
+            ) from e
 
     def transcribe(self, audio, language=None, initial_prompt=None, **kwargs):
         """The Engine call surface: returns (segments, info) where each segment
