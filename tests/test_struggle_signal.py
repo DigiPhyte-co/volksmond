@@ -1,30 +1,41 @@
-"""Tests for the "model struggling to keep up" nudge signal path.
+"""Tests for the "model struggling to keep up" nudge signal path (both causes).
 
-When a live CPU session auto-downgrades (transcribe.Engine._maybe_downgrade, ladder
-medium->small->base->tiny) it now fires an optional on_downgrade(old_size, new_size) callback on
-the worker thread, which the web layer turns into a one-time banner + a single Windows toast. This
-covers, cheapest first:
+One banner, two engine-side causes. A live CPU session auto-downgrades
+(transcribe.Engine._maybe_downgrade, ladder medium->small->base->tiny) and fires
+on_downgrade(old_size, new_size); a live GPU session has no ladder, so when it is sustained-slower
+than real time AND its queue is backing up it fires on_struggle()
+(transcribe.Engine._maybe_warn_gpu_struggle). Both run on the worker thread and both become the
+same one-time banner + single Windows toast, told apart by the nudge's "reason". This covers,
+cheapest first:
 
-  1. The Engine callback itself (transcribe.py): captured old_size is the PRE-swap size, fires once
-     per rung, None is a no-op, a raising callback never breaks the worker, and it stays inert on
-     GPU / Swivuriso / non-adaptive / a full ladder. Driven by calling _maybe_downgrade directly on
-     an Engine built with __new__ (no real model load) against stubbed load_model/resolve_model.
-  2. web/app.py's _on_downgrade with a hand-set STATE and a monkeypatched notify.show: publishes
-     once per session, updates new_size in place on a later rung (keeping the original old_size),
-     never re-fires the toast, guards STATE.stopping and a stale engine, does not re-nag after a
-     dismiss, and honours the setting + env kill switch.
-  3. The endpoints and gating: /api/status carries the nudge, POST /api/struggle-nudge dismisses
-     (session-only) and mutes (persists struggle_nudge=false), 409 with no live session, CSRF, and
-     the settings key exists and is patchable.
+  1. The Engine downgrade callback (transcribe.py): captured old_size is the PRE-swap size, fires
+     once per rung, None is a no-op, a raising callback never breaks the worker, and it stays inert
+     on GPU / Swivuriso / non-adaptive / a full ladder. Driven by calling _maybe_downgrade directly
+     on an Engine built with __new__ (no real model load) against stubbed load_model/resolve_model.
+  1b. The Engine GPU warning: the RTF sample is now recorded on EVERY backend (it used to be
+     CPU-only, which is what left a starved GPU with no signal), the warning needs slow AND backed
+     up together, is inert on CPU and on a file import, and fires at most once per session. Driven
+     both directly and end-to-end through Engine._run against a sleep-only model stub.
+  2. web/app.py's _on_downgrade and _on_gpu_struggle with a hand-set STATE and a monkeypatched
+     notify.show: publish once per session with the right reason, the CPU one updates new_size in
+     place on a later rung (keeping the original old_size), neither re-fires the toast, both guard
+     STATE.stopping and a stale engine, neither re-nags after a dismiss, and both honour the
+     setting + env kill switch.
+  3. The endpoints and gating: /api/status carries the nudge (reason included), POST
+     /api/struggle-nudge dismisses (session-only) and mutes (persists struggle_nudge=false), 409
+     with no live session, CSRF, and the settings key exists and is patchable.
 
 No audio, no pywin32, no real capture and no model load: the seams are load_model/resolve_model
-(stubbed), notify.show (monkeypatched), config.load/update (monkeypatched) and STATE (hand-set and
-restored).
+(stubbed), the transcribing model itself (a sleep-only stub), notify.show (monkeypatched),
+config.load/update (monkeypatched) and STATE (hand-set and restored).
 
 Run:  python tests/test_struggle_signal.py   (from the project root; exit 0 = pass)
 """
 import os
+import queue
 import sys
+import threading
+import time
 from collections import deque
 
 # Make `import live_transcribe` work when run as a plain script.
@@ -42,13 +53,18 @@ client.headers.update({"X-Volksmond-CSRF": CSRF_TOKEN})
 
 # --- helpers ---------------------------------------------------------------
 
-def _stub_engine(size="medium", family="whisper", adaptive=True, is_cpu=True, rtf=2.0):
-    """A minimal Engine with just the attributes _maybe_downgrade touches, built WITHOUT __init__
-    so no model is loaded. _rtf is filled to a full window whose average trips the downgrade."""
+def _stub_engine(size="medium", family="whisper", adaptive=True, is_cpu=True, rtf=2.0,
+                 device=None, pending=0):
+    """A minimal Engine with just the attributes _maybe_downgrade / _maybe_warn_gpu_struggle touch,
+    built WITHOUT __init__ so no model is loaded. _rtf is filled to a full window whose average
+    trips both thresholds. `device` defaults to the backend `is_cpu` implies ("cpu"/"cuda"); pass
+    "mlx" for the Apple path. `pending` seeds a REAL queue so pending() is the engine's own method,
+    which is the GPU warning's backlog co-condition."""
     eng = transcribe.Engine.__new__(transcribe.Engine)
     eng.family = family
     eng.adaptive = adaptive
     eng._is_cpu = is_cpu
+    eng._device = device if device is not None else ("cpu" if is_cpu else "cuda")
     eng.size = size
     eng.language = "en"
     eng.engine = "auto"
@@ -59,12 +75,56 @@ def _stub_engine(size="medium", family="whisper", adaptive=True, is_cpu=True, rt
     eng.is_fluister = False
     eng.subscribers = []
     eng.on_downgrade = None
+    eng.on_struggle = None
+    eng._struggle_warned = False
+    eng._busy = False
+    eng._queue = queue.Queue(maxsize=32)
+    for i in range(pending):
+        eng._queue.put(("SYS", [], float(i)))
     _fill_rtf(eng, rtf)
     return eng
 
 
 def _fill_rtf(eng, val=2.0):
     eng._rtf = deque([val] * transcribe.DOWNGRADE_WINDOW, maxlen=transcribe.DOWNGRADE_WINDOW)
+
+
+class _SlowModel:
+    """A transcribing model that only burns time and returns nothing. The worker computes RTF as
+    (elapsed / audio seconds), so a fixed sleep against a very short chunk is a controllable,
+    sustained-slower-than-real-time session with no model, no audio and no GPU anywhere."""
+
+    def __init__(self, work_secs):
+        self.work_secs = work_secs
+
+    def transcribe(self, audio, **kw):
+        time.sleep(self.work_secs)
+        return ([], None)
+
+
+def _worker_engine(device="cuda", chunks=12, chunk_secs=0.005, work_secs=0.02):
+    """A stub Engine wired well enough to run Engine._run() ON THE CALLING THREAD: _stop is already
+    set, so the loop drains the pre-queued chunks and exits. Everything the loop touches is hand-set
+    (no capture, no rings, no real model); _rtf starts EMPTY so the worker itself has to fill it."""
+    eng = _stub_engine(is_cpu=(device == "cpu"), device=device)
+    eng._rtf = deque(maxlen=transcribe.DOWNGRADE_WINDOW)
+    eng.model = _SlowModel(work_secs)
+    eng.initial_prompt = None
+    eng.beam_size = 5
+    eng._silence_gate = False          # no rings here; the gate is not what is under test
+    eng._loop_guard_on = False
+    eng._dropped = 0
+    eng._pending_mic = []
+    eng._pending_change = None
+    eng._pending_recent_reset = False
+    eng._change_lock = threading.Lock()
+    eng._stop = threading.Event()
+    eng._stop.set()                    # drain the queue, then exit
+    eng._abort = threading.Event()
+    eng._queue = queue.Queue(maxsize=64)
+    for i in range(chunks):
+        eng._queue.put(("SYS", [0.0] * int(16000 * chunk_secs), float(i)))
+    return eng
 
 
 class _stub_models:
@@ -200,6 +260,98 @@ def test_callback_inert_off_the_cpu_adaptive_path():
     print("  OK  callback stays inert on GPU / non-adaptive / Swivuriso / low-RTF / unfilled window")
 
 
+# --- 1b. the GPU struggle warning (transcribe.py) --------------------------
+
+def test_worker_records_rtf_on_a_non_cpu_engine_and_warns_end_to_end():
+    """The regression this feature exists for: the RTF sample used to be appended only inside
+    `if self._is_cpu`, so on cuda/mlx the window stayed permanently EMPTY and nothing could ever
+    react. Run the real worker loop against a deliberately slow model stub and assert both that
+    the window filled and that the warning came out once, as a notice, via _fanout not _route."""
+    eng = _worker_engine(device="cuda")
+    notices, routed, fired = [], [], []
+    eng.subscribe(lambda seg: notices.append(seg))
+    eng._route = lambda seg: routed.append(seg)      # nothing synthetic may take this path
+    eng.on_struggle = lambda: fired.append(1)
+    eng._run()
+    assert len(eng._rtf) == eng._rtf.maxlen, f"a cuda session recorded no RTF at all: {eng._rtf}"
+    assert sum(eng._rtf) / len(eng._rtf) > transcribe.GPU_STRUGGLE_RTF, list(eng._rtf)
+    assert fired == [1], f"the GPU warning must fire exactly once from the worker, got {fired}"
+    assert eng._struggle_warned is True
+    assert len(notices) == 1 and "struggling to keep up" in notices[0].text, [s.text for s in notices]
+    assert notices[0].source == "SYS", notices[0].source
+    assert routed == [], "a synthetic line must never go through _route (loop guard / echo ring)"
+    print("  OK  the worker records RTF on cuda and warns once, as a notice, never via _route")
+
+
+def test_gpu_struggle_needs_slow_AND_a_backed_up_queue():
+    # Slow and backing up: the real starvation. Both cuda and mlx are GPU sessions.
+    for dev in ("cuda", "mlx"):
+        eng = _stub_engine(is_cpu=False, device=dev, rtf=2.0, pending=8)
+        fired = []
+        eng.on_struggle = lambda: fired.append(1)
+        eng._maybe_warn_gpu_struggle(30.0)
+        assert fired == [1], f"{dev}: a slow, backed-up GPU session must warn"
+    # Slow but the queue is short: a dense burst of speech the queue absorbs and clears. This is
+    # the whole false-positive defence, so it must stay silent even with a fully slow window.
+    eng = _stub_engine(is_cpu=False, device="cuda", rtf=2.0,
+                       pending=transcribe.BACKPRESSURE_BEAM_THRESHOLD)
+    fired = []
+    eng.on_struggle = lambda: fired.append(1)
+    eng._maybe_warn_gpu_struggle(30.0)
+    assert fired == [] and eng._struggle_warned is False, "a burst the queue absorbs must not warn"
+    # Backed up but comfortably faster than real time: nothing is wrong, do not warn.
+    eng2 = _stub_engine(is_cpu=False, device="cuda", rtf=0.2, pending=20)
+    fired2 = []
+    eng2.on_struggle = lambda: fired2.append(1)
+    eng2._maybe_warn_gpu_struggle(30.0)
+    assert fired2 == [], "a fast GPU with a backlog (catch-up) must not warn"
+    # A partial window is not evidence yet.
+    eng3 = _stub_engine(is_cpu=False, device="cuda", rtf=2.0, pending=20)
+    eng3._rtf = deque([2.0, 2.0], maxlen=transcribe.DOWNGRADE_WINDOW)
+    fired3 = []
+    eng3.on_struggle = lambda: fired3.append(1)
+    eng3._maybe_warn_gpu_struggle(30.0)
+    assert fired3 == [], "an unfilled RTF window must not warn"
+    print("  OK  the GPU warning needs slow AND backed up: bursts, catch-up and short windows stay silent")
+
+
+def test_gpu_struggle_inert_on_cpu_and_on_a_file_import():
+    for label, kw in (("cpu", {"is_cpu": True, "device": "cpu"}),
+                      ("file import", {"is_cpu": False, "device": "cuda", "adaptive": False})):
+        eng = _stub_engine(rtf=2.0, pending=20, **kw)
+        fired = []
+        eng.on_struggle = lambda: fired.append(1)
+        eng._maybe_warn_gpu_struggle(30.0)
+        assert fired == [] and eng._struggle_warned is False, f"{label}: must not warn"
+    print("  OK  the GPU warning stays inert on CPU (the ladder's job) and on a file import")
+
+
+def test_gpu_struggle_fires_once_per_session_and_survives_a_raising_callback():
+    eng = _stub_engine(is_cpu=False, device="cuda", rtf=2.0, pending=20)
+    fired, notices = [], []
+    eng.subscribe(lambda seg: notices.append(seg))
+    eng.on_struggle = lambda: fired.append(1)
+    eng._maybe_warn_gpu_struggle(30.0)
+    _fill_rtf(eng)                       # still starved later in the same session
+    eng._maybe_warn_gpu_struggle(90.0)
+    assert fired == [1], f"the warning must fire once per session, got {fired}"
+    assert len(notices) == 1, f"and put exactly one notice in the transcript, got {len(notices)}"
+    # A raising callback must never take the transcription worker down with it.
+    eng2 = _stub_engine(is_cpu=False, device="cuda", rtf=2.0, pending=20)
+
+    def boom():
+        raise RuntimeError("callback exploded")
+
+    eng2.on_struggle = boom
+    eng2._maybe_warn_gpu_struggle(30.0)   # must not raise
+    assert eng2._struggle_warned is True
+    # A None callback is a no-op (CLI, tests): the notice still lands, nothing raises.
+    eng3 = _stub_engine(is_cpu=False, device="cuda", rtf=2.0, pending=20)
+    eng3._maybe_warn_gpu_struggle(30.0)
+    assert eng3._struggle_warned is True
+    print("  OK  the GPU warning fires once per session; a raising or None callback is harmless")
+
+
 # --- 2. the _on_downgrade handler (web/app.py) -----------------------------
 
 def test_handler_publishes_once_and_updates_in_place():
@@ -217,20 +369,23 @@ def test_handler_publishes_once_and_updates_in_place():
             webapp.STATE.struggle_notified = False
             # First downgrade: banner appears, toast fires once.
             webapp._on_downgrade(eng, "medium", "small")
-            assert webapp.STATE.struggle_nudge == {"old_size": "medium", "new_size": "small",
+            assert webapp.STATE.struggle_nudge == {"reason": "cpu-downgrade", "old_size": "medium",
+                                                   "new_size": "small",
                                                    "recording": False}, webapp.STATE.struggle_nudge
             assert webapp.STATE.struggle_notified is True
             assert len(calls) == 1 and calls[0]["tag"] == "struggle", calls
             assert callable(calls[0]["on_click"]), "the toast must be clickable back to the app"
             # A later rung updates new_size IN PLACE (original old_size kept), no second toast.
             webapp._on_downgrade(eng, "small", "base")
-            assert webapp.STATE.struggle_nudge == {"old_size": "medium", "new_size": "base",
+            assert webapp.STATE.struggle_nudge == {"reason": "cpu-downgrade", "old_size": "medium",
+                                                   "new_size": "base",
                                                    "recording": False}, webapp.STATE.struggle_nudge
             assert len(calls) == 1, f"the toast must fire only once per session, got {len(calls)}"
             # `recording` is captured at emit time: once recording, the next update reflects it.
             webapp.STATE.recording = True
             webapp._on_downgrade(eng, "base", "tiny")
-            assert webapp.STATE.struggle_nudge == {"old_size": "medium", "new_size": "tiny",
+            assert webapp.STATE.struggle_nudge == {"reason": "cpu-downgrade", "old_size": "medium",
+                                                   "new_size": "tiny",
                                                    "recording": True}, webapp.STATE.struggle_nudge
             assert len(calls) == 1
     finally:
@@ -338,6 +493,81 @@ def test_handler_gated_by_setting_and_env():
     print("  OK  gate: setting off, env kill switch, sane default ON, handler short-circuits")
 
 
+def test_gpu_handler_publishes_the_gpu_busy_reason_once():
+    saved = _save_state()
+    calls, restore_notify = _catch_toasts()
+    eng = object()
+    try:
+        with _on_setting(on=True):
+            webapp.STATE.running = True
+            webapp.STATE.source_kind = "live"
+            webapp.STATE.stopping = False
+            webapp.STATE.recording = False
+            webapp.STATE.engine = eng
+            webapp.STATE.struggle_nudge = None
+            webapp.STATE.struggle_notified = False
+            published = webapp._on_gpu_struggle(eng)
+            # No old_size/new_size: nothing was switched, so there is nothing honest to put there.
+            assert webapp.STATE.struggle_nudge == {"reason": "gpu-busy",
+                                                   "recording": False}, webapp.STATE.struggle_nudge
+            assert published == webapp.STATE.struggle_nudge
+            assert webapp.STATE.struggle_notified is True
+            assert len(calls) == 1 and calls[0]["tag"] == "struggle", calls
+            assert callable(calls[0]["on_click"]), "the toast must be clickable back to the app"
+            # The engine only fires once, but a second call must still be harmless: no second toast.
+            webapp._on_gpu_struggle(eng)
+            assert len(calls) == 1, f"the toast must fire only once per session, got {len(calls)}"
+    finally:
+        restore_notify()
+        _restore_state(saved)
+    print("  OK  the GPU handler publishes reason=gpu-busy (no sizes) and toasts once")
+
+
+def test_gpu_handler_guards_stopping_a_stale_engine_a_dismiss_and_the_setting():
+    saved = _save_state()
+    calls, restore_notify = _catch_toasts()
+    eng = object()
+    try:
+        with _on_setting(on=True):
+            webapp.STATE.running = True
+            webapp.STATE.source_kind = "live"
+            webapp.STATE.recording = False
+            webapp.STATE.struggle_nudge = None
+            webapp.STATE.struggle_notified = False
+            # Stopping: never nudge a session that is finishing.
+            webapp.STATE.stopping = True
+            webapp.STATE.engine = eng
+            assert webapp._on_gpu_struggle(eng) is None
+            assert webapp.STATE.struggle_nudge is None and calls == [], "nudged a stopping session"
+            # Stale engine: a callback from an engine that is no longer the session's (the
+            # catch-up drain, a switch) must not publish onto the current one.
+            webapp.STATE.stopping = False
+            webapp.STATE.engine = object()
+            assert webapp._on_gpu_struggle(eng) is None
+            assert webapp.STATE.struggle_nudge is None and calls == [], "published for a stale engine"
+            # Surfaced then dismissed: do not nag again.
+            webapp.STATE.engine = eng
+            webapp._on_gpu_struggle(eng)
+            assert webapp.STATE.struggle_nudge is not None and len(calls) == 1
+            webapp.STATE.struggle_nudge = None            # the user dismissed it
+            assert webapp._on_gpu_struggle(eng) is None
+            assert webapp.STATE.struggle_nudge is None, "a dismissed banner was re-raised"
+            assert len(calls) == 1
+        # Setting off (and the env kill switch, shared with the CPU path): publish nothing at all.
+        with _on_setting(on=False):
+            webapp.STATE.stopping = False
+            webapp.STATE.engine = eng
+            webapp.STATE.struggle_nudge = None
+            webapp.STATE.struggle_notified = False
+            assert webapp._on_gpu_struggle(eng) is None
+            assert webapp.STATE.struggle_nudge is None and len(calls) == 1, "surfaced while switched off"
+            assert webapp.STATE.struggle_notified is False, "a gated-off warning must not latch"
+    finally:
+        restore_notify()
+        _restore_state(saved)
+    print("  OK  the GPU handler honours stopping, a stale engine, a dismiss and the setting")
+
+
 # --- 3. the endpoints, /api/status and the settings key --------------------
 
 def test_status_carries_the_struggle_nudge():
@@ -347,12 +577,19 @@ def test_status_carries_the_struggle_nudge():
         webapp.STATE.stopping = False
         webapp.STATE.source_kind = "live"
         webapp.STATE.engine = None
-        webapp.STATE.struggle_nudge = {"old_size": "medium", "new_size": "tiny", "recording": True}
+        webapp.STATE.struggle_nudge = {"reason": "cpu-downgrade", "old_size": "medium",
+                                       "new_size": "tiny", "recording": True}
         st = client.get("/api/status").json()
         assert st["running"] is True and st["struggle_nudge"] == webapp.STATE.struggle_nudge, st
+        assert st["struggle_nudge"]["reason"] == "cpu-downgrade", st["struggle_nudge"]
+        # The reason is what the banner branches its copy on, so it must survive the poll for
+        # BOTH causes (the GPU one carries no sizes at all).
+        webapp.STATE.struggle_nudge = {"reason": "gpu-busy", "recording": False}
+        st2 = client.get("/api/status").json()
+        assert st2["struggle_nudge"] == {"reason": "gpu-busy", "recording": False}, st2["struggle_nudge"]
     finally:
         _restore_state(saved)
-    print("  OK  /api/status hands the outstanding struggle nudge to the UI")
+    print("  OK  /api/status hands the outstanding struggle nudge, reason included, to the UI")
 
 
 def test_endpoint_requires_a_live_session_and_the_csrf_token():
@@ -406,10 +643,16 @@ if __name__ == "__main__":
              test_callback_none_is_a_noop_and_raising_never_breaks_the_worker,
              test_callback_steps_each_rung_and_stops_at_the_floor,
              test_callback_inert_off_the_cpu_adaptive_path,
+             test_worker_records_rtf_on_a_non_cpu_engine_and_warns_end_to_end,
+             test_gpu_struggle_needs_slow_AND_a_backed_up_queue,
+             test_gpu_struggle_inert_on_cpu_and_on_a_file_import,
+             test_gpu_struggle_fires_once_per_session_and_survives_a_raising_callback,
              test_handler_publishes_once_and_updates_in_place,
              test_handler_guards_stopping_and_a_stale_engine,
              test_handler_does_not_renag_after_a_dismiss,
              test_handler_gated_by_setting_and_env,
+             test_gpu_handler_publishes_the_gpu_busy_reason_once,
+             test_gpu_handler_guards_stopping_a_stale_engine_a_dismiss_and_the_setting,
              test_status_carries_the_struggle_nudge,
              test_endpoint_requires_a_live_session_and_the_csrf_token,
              test_endpoint_dismisses_for_the_session_and_mutes_by_persisting,

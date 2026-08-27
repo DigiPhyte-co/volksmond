@@ -168,11 +168,16 @@ class _State:
         self.silence_watch = None
         self.silence_stop: Optional[threading.Event] = None
         # "Model struggling to keep up" nudge. struggle_nudge is the outstanding warning the UI
-        # renders as a banner ({"old_size", "new_size", "recording"}) or None; it is set by the
-        # engine's on_downgrade callback when a live CPU session auto-downgrades. struggle_notified
-        # is the once-per-session latch: the Windows toast fires only on the first downgrade, and a
-        # banner the user has dismissed is not re-raised by a later rung. Both session-scoped, so
-        # reset() clears them.
+        # renders as a banner, or None. It carries a "reason" discriminator plus "recording" (the
+        # session's recording state when it was raised):
+        #   "cpu-downgrade": a live CPU session auto-downgraded (engine on_downgrade). Adds
+        #                    "old_size"/"new_size", the rungs it started from and is on now.
+        #   "gpu-busy":      a live GPU session cannot hold real time, usually because another
+        #                    program has the card (engine on_struggle). No sizes: nothing changed,
+        #                    there is no GPU ladder to step down.
+        # struggle_notified is the once-per-session latch shared by BOTH: the Windows toast fires
+        # only the first time, and a banner the user has dismissed is not re-raised. Both
+        # session-scoped, so reset() clears them.
         self.struggle_nudge: Optional[dict] = None
         self.struggle_notified: bool = False
         # t0-capture: capture (and recording, if on) start the instant Begin is clicked, while the
@@ -727,14 +732,20 @@ def _silence_signal():
 
 
 # --- "model struggling to keep up" nudge --------------------------------------
-# When a live CPU session auto-downgrades (transcribe.Engine._maybe_downgrade, ladder
-# medium->small->base->tiny) because it cannot hold real time, the transcription silently gets
-# rougher. Surface it: a one-time banner (STATE.struggle_nudge, polled via /api/status) plus a
-# single Windows toast, with the offer to start recording so the meeting can be re-transcribed at
-# full accuracy afterwards. The downgrade ITSELF always happens; this only makes it visible, and
-# only for a CPU + adaptive(live) + transcribing session (a GPU tier never downgrades, Swivuriso is
-# a single fixed model, a record-only session has no engine). Data integrity, not a Business
-# nicety, so the toast fires ungated like the silence one, never through /api/notify-meeting.
+# One surface, two causes, both meaning "the transcript you are watching is getting worse":
+#   CPU: the session auto-downgrades (transcribe.Engine._maybe_downgrade, ladder
+#        medium->small->base->tiny) because it cannot hold real time, so transcription silently
+#        gets rougher. Swivuriso is a single fixed model and never downgrades.
+#   GPU: there is no ladder to step down, so the engine warns instead
+#        (transcribe.Engine._maybe_warn_gpu_struggle) when a live cuda/mlx session is
+#        sustained-slow AND its queue is backing up. Measured incident: other programs were
+#        sharing the card, Volksmond fell behind and dropped 350+ chunks with no warning at all.
+# Either way: a one-time banner (STATE.struggle_nudge, polled via /api/status) plus a single
+# Windows toast, with the offer to start recording so the meeting can be re-transcribed at full
+# accuracy afterwards. Neither path changes what the engine does; both only make it visible, and
+# only for an adaptive (live) + transcribing session (a record-only session has no engine). Data
+# integrity, not a Business nicety, so the toast fires ungated like the silence one, never through
+# /api/notify-meeting.
 STRUGGLE_ENV = "SA_LIVE_STRUGGLE_NUDGE"
 
 
@@ -780,9 +791,13 @@ def _on_downgrade(engine, old_size, new_size):
         # still on screen falls through and is updated in place below.
         if STATE.struggle_notified and STATE.struggle_nudge is None:
             return None
-        prior = STATE.struggle_nudge
+        # .get, not [...]: a gpu-busy nudge carries no sizes, and on a Mac an mlx->cpu reconfigure
+        # can genuinely put a CPU downgrade after one (nothing else can). Fall back to this rung's
+        # own old_size rather than inventing a value.
+        prior_old = (STATE.struggle_nudge or {}).get("old_size")
         STATE.struggle_nudge = {
-            "old_size": prior["old_size"] if prior else old_size,
+            "reason": "cpu-downgrade",
+            "old_size": prior_old or old_size,
             "new_size": new_size,
             "recording": STATE.recording,
         }
@@ -799,6 +814,37 @@ def _on_downgrade(engine, old_size, new_size):
                     "Your computer can't transcribe this meeting at full quality in real time, so "
                     "Volksmond stepped down to a faster model to keep up. It is still running. Open "
                     "Volksmond to record the audio and re-transcribe at full accuracy later.",
+                    tag="struggle", on_click=notify.focus_app)
+    return published
+
+
+def _on_gpu_struggle(engine):
+    """Engine.on_struggle callback: surface a live GPU session that cannot hold real time.
+
+    Same thread discipline and the same guards as _on_downgrade above (worker thread, STATE.lock,
+    session identity, no re-nag after a dismiss, toast once and outside the lock). Two differences:
+    the reason is "gpu-busy" and there are no sizes, because nothing was changed. The engine fires
+    this at most once per session, so there is no in-place update path. Returns the published nudge
+    dict, or None."""
+    if not _struggle_nudge_on():
+        return None
+    published = None
+    fire_toast = False
+    with STATE.lock:
+        if STATE.stopping or STATE.engine is not engine:
+            return None
+        if STATE.struggle_notified and STATE.struggle_nudge is None:
+            return None
+        STATE.struggle_nudge = {"reason": "gpu-busy", "recording": STATE.recording}
+        published = STATE.struggle_nudge
+        fire_toast = not STATE.struggle_notified
+        STATE.struggle_notified = True
+    if fire_toast:
+        from .. import notify
+        notify.show("Volksmond is struggling to keep up",
+                    "Another program is using your graphics card, so Volksmond is falling behind "
+                    "and some audio may not be transcribed. Open Volksmond to record the meeting "
+                    "and re-transcribe it at full accuracy later.",
                     tag="struggle", on_click=notify.focus_app)
     return published
 
@@ -972,9 +1018,11 @@ def status():
             # The outstanding long-silence warning ({"minutes","count","at"}) or None. The UI
             # polls this while a live session runs and floats a banner when it appears.
             "silence_nudge": STATE.silence_nudge,
-            # The outstanding "model struggling to keep up" warning ({"old_size","new_size",
-            # "recording"}) or None, set when a live CPU session auto-downgrades. Same poll, a
-            # parallel banner. `recording` is the session's recording state when it was raised.
+            # The outstanding "model struggling to keep up" warning or None, set when a live CPU
+            # session auto-downgrades ({"reason":"cpu-downgrade","old_size","new_size","recording"})
+            # or a live GPU session cannot hold real time ({"reason":"gpu-busy","recording"}). Same
+            # poll, one banner whose copy branches on the reason. `recording` is the session's
+            # recording state when it was raised.
             "struggle_nudge": STATE.struggle_nudge,
             # True iff recording is, or has ever been, active this session (start-time or a
             # mid-session record-from-here). The live screen and finish handoff key off it, and once
@@ -2026,11 +2074,13 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
             # time): the live CPU-downgrade nudge, the SYS echo-veto reference, and the gain-invariant
             # raw-MIC feed. Attaching here means every chunk captured from now on has ring history by the
             # time it is replayed; the pre-engine backlog (captured during the model load) has none and
-            # falls back to sample-based tests. on_downgrade is inert until STATE.engine is published (the
-            # _on_downgrade guard drops callbacks whose engine is not STATE.engine), so no spurious
-            # "struggling" nudge fires during the expected catch-up.
+            # falls back to sample-based tests. Both struggle callbacks are inert until STATE.engine is
+            # published (their guards drop callbacks whose engine is not STATE.engine), so no spurious
+            # "struggling" nudge fires during the expected catch-up, whose deep queue would otherwise
+            # meet the GPU warning's backlog condition.
             cap = STATE.capture
             engine.on_downgrade = lambda old, new, _e=engine: _on_downgrade(_e, old, new)
+            engine.on_struggle = lambda _e=engine: _on_gpu_struggle(_e)
             _sys_ring = transcribe.EnergyRing()
             engine.sys_env = _sys_ring
             if cap is not None:

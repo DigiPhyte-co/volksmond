@@ -744,6 +744,8 @@ window.VM_I18N = {
       "Volksmond het na 'n ligter, vinniger model oorgeskakel om lewendig te bly, so hierdie deel is dalk minder akkuraat. Neem nou op en hertranskribeer daarna teen volle akkuraatheid.",
     "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Your recording can be re-transcribed at full accuracy afterward.":
       "Volksmond het na 'n ligter, vinniger model oorgeskakel om lewendig te bly, so hierdie deel is dalk minder akkuraat. Jou opname kan daarna teen volle akkuraatheid hertranskribeer word.",
+    "Another program is using your graphics card, so Volksmond is falling behind. If it stays behind, some audio will not be transcribed.":
+      "'n Ander program gebruik jou grafikakaart, so Volksmond raak agter. As dit agter bly, sal sommige klank nie getranskribeer word nie.",
     "Record from here": "Neem van hier af op",
     "Keep going": "Gaan voort",
     "Don't warn again": "Moenie weer waarsku nie",

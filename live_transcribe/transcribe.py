@@ -358,10 +358,31 @@ BACKPRESSURE_BEAM_THRESHOLD = 6
 # never back up (avoids oscillation). large-v3/turbo are deliberately NOT in the
 # ladder: too slow to be a sane CPU live floor. `tiny` is the last-resort rung -
 # rough, but guarantees real-time on almost anything, which still beats dropping
-# audio. GPU tiers never downgrade (they keep up).
+# audio. GPU tiers have no ladder: there is nothing faster to step down to, so a
+# starved GPU WARNS instead (see GPU_STRUGGLE_RTF / _maybe_warn_gpu_struggle).
 CPU_LADDER = ["medium", "small", "base", "tiny"]
 DOWNGRADE_RTF = 0.95     # rolling real-time factor above this = not keeping up
 DOWNGRADE_WINDOW = 4     # consecutive chunks of evidence required before a step down
+
+# A live GPU session that cannot hold real time. Measured incident: other programs were sharing
+# the card for a whole meeting (a local LLM and a second transcriber, leaving it both compute-
+# contended and ~500 MB short of full), so Volksmond fell behind and silently dropped 350+ chunks
+# with no warning at all. There is no GPU ladder to step down, so this only WARNS.
+#
+# The trigger is the rolling real-time factor and nothing else, deliberately: RTF measures the
+# HARM directly, so it catches compute contention, VRAM exhaustion, a spill into shared system
+# memory over PCIe and a slow disk identically, needs no hardware probe or extra dependency, and
+# means the same thing on cuda, mlx and any future backend. A VRAM-threshold trigger would do
+# none of that: it would miss pure contention and fire on a card that is legitimately full but fast.
+#
+# Deliberately LOWER than DOWNGRADE_RTF (0.95), not a reuse of it, for two reasons. First,
+# 0.95 has a pinned CPU meaning (the downgrade trip). Second, ONE worker thread serves BOTH
+# channels: web/app.py feeds MIC and SYS into the same engine.on_chunk, so a two-channel live
+# session only holds real time while the PER-CHUNK factor stays below roughly 0.5. By 0.7 the
+# session is already losing ground; waiting for 0.95 would warn after the queue had begun to
+# drop. The pending() co-condition (see _maybe_warn_gpu_struggle) is what keeps a dense burst
+# of speech from tripping it.
+GPU_STRUGGLE_RTF = 0.7
 
 # Hold each MIC segment this long before showing it in the LIVE view, so a speaker echo lands
 # just after its cleaner SYS original instead of jumbled in front of it (the system channel
@@ -1201,6 +1222,11 @@ class Engine:
                                                # Decoupled like subscribe(): the web layer sets it to
                                                # surface the downgrade (banner + one-time toast); the
                                                # engine stays ignorant of app.py/notify/STATE.
+        self.on_struggle = None                # optional callback(), fired on the worker thread at
+                                               # most ONCE per session when a live GPU session falls
+                                               # behind (see _maybe_warn_gpu_struggle). Same
+                                               # decoupling and best-effort contract as on_downgrade.
+        self._struggle_warned = False          # the one-shot ratchet for the above
         self._pending_mic = []                # [(release_monotonic, Segment)] held by MIC_PUBLISH_DELAY
         self.sys_env = None                   # optional EnergyRing (far end) -> enables the MIC echo veto
         self.mic_env = None                   # optional EnergyRing (RAW near end) -> gain-invariant
@@ -1553,6 +1579,47 @@ class Engine:
             except Exception as e:
                 print(f"[engine] on_downgrade callback error: {e}", flush=True)
 
+    def _maybe_warn_gpu_struggle(self, t_start):
+        """Warn ONCE when a live GPU session is sustained-slower than real time AND backing up.
+
+        The GPU counterpart of _maybe_downgrade, except it only warns: there is no GPU ladder to
+        step down (and an engine-originated GPU reconfigure would be a second writer racing the
+        user's own, see request_change's known limitation), so the honest answer is to tell the
+        user while there is still queue left to warn inside. At 8 s GPU chunks and a 32-slot
+        queue that is roughly two minutes of buffer, i.e. the warning lands BEFORE the first
+        dropped chunk.
+
+        Both conditions are required. Sustained slow (a full RTF window averaging over
+        GPU_STRUGGLE_RTF) says we are losing ground; pending() over BACKPRESSURE_BEAM_THRESHOLD
+        says the queue is ACTUALLY backing up. Slow-but-draining is a dense burst of speech the
+        queue absorbs, which is normal and must never warn. `adaptive` keeps file imports out
+        entirely: an import running slower than real time is expected, not a fault.
+        """
+        if self._struggle_warned or not self.adaptive or self._device == "cpu":
+            return
+        if len(self._rtf) < self._rtf.maxlen:
+            return
+        avg = sum(self._rtf) / len(self._rtf)
+        # pending() counts the chunk in flight (we are inside it here), which is the honest
+        # reading: it still has to finish before the queue moves.
+        if avg <= GPU_STRUGGLE_RTF or self.pending() <= BACKPRESSURE_BEAM_THRESHOLD:
+            return
+        self._struggle_warned = True
+        print(f"[engine] {self._device} RTF ~{avg:.2f} (> {GPU_STRUGGLE_RTF}) with "
+              f"{self.pending()} chunk(s) pending; warning that we cannot hold real time", flush=True)
+        # _emit_notice, never _route: a synthetic line must not enter RecentEmissions (the loop
+        # guard) or SysTextRing (the echo reference for veto arm 2).
+        self._emit_notice(t_start, "[engine: struggling to keep up, the graphics card may be "
+                                   "busy with another program]")
+        # Best-effort, exactly like on_downgrade: a None callback (CLI, tests) is a no-op and a
+        # raising one must never take the transcription worker down with it.
+        cb = self.on_struggle
+        if cb is not None:
+            try:
+                cb()
+            except Exception as e:
+                print(f"[engine] on_struggle callback error: {e}", flush=True)
+
     def _run(self):
         # Loop until the sentinel, or (during shutdown) until the queue empties.
         # We deliberately do NOT break the instant _stop is set, that would drop
@@ -1699,13 +1766,16 @@ class Engine:
                             continue
                     self._route(out)
 
-                # Adaptive model downgrade (CPU only): track real-time factor and
-                # step down to a faster model if we're sustained-slower than real-time.
-                if self._is_cpu:
-                    audio_dur = len(audio) / 16000.0
-                    if audio_dur > 0:
-                        self._rtf.append(elapsed / audio_dur)
-                    self._maybe_downgrade(t_start)
+                # Real-time factor for this chunk, recorded on EVERY backend. It used to be
+                # measured only on CPU, which left _rtf permanently empty on cuda/mlx and so left
+                # a starved GPU with no adaptive response and no signal at all (the incident).
+                # Both consumers below self-gate: _maybe_downgrade still steps the CPU ladder and
+                # only the CPU ladder; _maybe_warn_gpu_struggle only warns, and only off CPU.
+                audio_dur = len(audio) / 16000.0
+                if audio_dur > 0:
+                    self._rtf.append(elapsed / audio_dur)
+                self._maybe_downgrade(t_start)
+                self._maybe_warn_gpu_struggle(t_start)
             except Exception as e:
                 print(f"[engine] transcribe error on {source} chunk: {e}", flush=True)
             finally:

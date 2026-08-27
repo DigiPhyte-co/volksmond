@@ -1777,10 +1777,11 @@ function retryPrepare() {
   }).catch(function (e) { toast(e.message || "Could not retry.", true); });
 }
 function silenceSig(n) { return n ? (String(n.at || "") + "|" + String(n.count || 0)) : ""; }
-// The struggle nudge carries no timestamp; its identity is the model step plus whether
-// recording has since started, so any of those changing re-renders (a second downgrade, or
-// recording turning on so the banner switches to its "already recording" wording).
-function struggleSig(n) { return n ? (String(n.old_size || "") + "|" + String(n.new_size || "") + "|" + (n.recording ? "1" : "0")) : ""; }
+// The struggle nudge carries no timestamp; its identity is the reason plus the model step plus
+// whether recording has since started, so any of those changing re-renders (a second downgrade, a
+// switch of reason, or recording turning on so the banner switches to its "already recording"
+// wording). A gpu-busy nudge has no sizes; String(undefined || "") is "" and compares fine.
+function struggleSig(n) { return n ? (String(n.reason || "") + "|" + String(n.old_size || "") + "|" + String(n.new_size || "") + "|" + (n.recording ? "1" : "0")) : ""; }
 function refreshSilence() {
   if (!S.live.running || S.live.sourceKind === "file") return;
   api.get("/api/status").then(function (st) {
@@ -1847,11 +1848,13 @@ function silenceBanner() {
 }
 
 /* ── model struggling to keep up during a live session ─────────── */
-// Parallel to the silence nudge: the server steps a CPU session down to a lighter, faster model
-// when it cannot hold real time, and publishes struggle_nudge on /api/status
-// ({old_size, new_size, recording}). The page notices it on the SAME poll (refreshSilence) and
-// offers the honest answers: start recording so the audio can be re-transcribed at full accuracy
-// afterward, or keep going. Recording can also be started from the standalone live-footer button.
+// Parallel to the silence nudge, with two causes behind one banner. The server publishes
+// struggle_nudge on /api/status, always carrying {reason, recording}: "cpu-downgrade" (it stepped a
+// CPU session down to a lighter, faster model to stay live, plus old_size/new_size) or "gpu-busy"
+// (a GPU session cannot hold real time, usually another program on the card; no sizes, because
+// nothing changed). The page notices it on the SAME poll (refreshSilence) and offers the honest
+// answers: start recording so the audio can be re-transcribed at full accuracy afterward, or keep
+// going. Recording can also be started from the standalone live-footer button.
 async function recordFromHere() {
   // Optimistic + double-click guard: flipping recording now hides BOTH triggers (this action's
   // banner button and the live-footer button), so a fast second click short-circuits here and
@@ -1913,9 +1916,14 @@ function struggleBanner() {
   // this session, there is already audio to re-transcribe, so drop the record affordance and switch
   // the copy. (Same condition that hides the standalone footer button.)
   var hasRec = !!(S.live.recording || S.live.recordingStarted);
-  var body = hasRec
-    ? "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Your recording can be re-transcribed at full accuracy afterward."
-    : "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Record now and re-transcribe at full accuracy afterward.";
+  // Only the copy branches on the reason; the card, the actions and the dismiss are one surface.
+  // A gpu-busy warning is a prediction ("if it stays behind"), not a completed change, so it does
+  // not gain a recording variant: the record offer below is still the whole remedy.
+  var body = (S.live.struggleNudge && S.live.struggleNudge.reason) === "gpu-busy"
+    ? "Another program is using your graphics card, so Volksmond is falling behind. If it stays behind, some audio will not be transcribed."
+    : hasRec
+      ? "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Your recording can be re-transcribed at full accuracy afterward."
+      : "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Record now and re-transcribe at full accuracy afterward.";
   var actions = [];
   // Record button only when nothing has recorded yet; once it has, the audio is already kept for a
   // re-transcribe, so the primary action falls away (matches the body copy).
@@ -4289,7 +4297,7 @@ function adoptRunning(status) {
   seedFromTranscript();
   seedNotes();
   S.live.silenceNudge = status.silence_nudge || null;   // a nudge that fired before this reload
-  S.live.struggleNudge = status.struggle_nudge || null; // same, for a downgrade that fired before this reload
+  S.live.struggleNudge = status.struggle_nudge || null; // same, for a struggle warning raised before this reload (reason included)
   S.live.recordingStarted = !!status.recording_started; // latched: recording is or was active this session
   if (status.source_kind !== "file") { startLevels(); startSilencePoll(); }
   if (status.source_kind === "file") {
