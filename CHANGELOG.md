@@ -1,5 +1,20 @@
 # Changelog, SA-Live-Transcribe
 
+## 2026-09-03, v1.13.3 (Fast Track only)
+
+`licensing.APP_VERSION` 1.13.2 -> 1.13.3.
+
+Faster and more honest on CPU-only machines, and nothing lost when the live text struggles.
+
+- **Model loading no longer times out on CPU.** The load budget is now device-aware (10 minutes on CPU, 2 on a GPU), the screen shows "still loading m:ss" with the audio safe instead of a false error, Retry joins the load already running, and the CPU model pre-warms when the app opens. Audio captured before the model was ready is transcribed once it is, or marked in the transcript with one line, never dropped silently.
+- **The CPU fallback ladder stays in the Fluister family.** Fluister base and Fluister tiny (Minimal and Lite) join medium and small, so an Afrikaans session never falls back to a stock model that cannot speak Afrikaans. Nothing is downloaded mid-meeting; a rung is used only if it is already on the machine. When even the smallest rung cannot keep up, the engine skips the oldest backlog with a clear note and the recording keeps it, instead of producing loops. Downgrades need real evidence (replay bursts are ignored, at least 90 s apart), the next model is built in the background so live text does not stall, and the banner tells you when live text has gone rough and to re-transcribe afterwards.
+- **CPU decoding is about twice as fast.** A 20 s encoder window and beam 1 on CPU (measured: same accuracy at 20 s, a small cost from beam 1); GPU decoding unchanged. The CPU auto tier is now Fluister small, medium remains selectable.
+- **Mic gate.** Microphone audio with no speech in it is no longer sent to the model, which halves mic compute and removes most of the "baie, baie, baie" junk. A live Mic gate toggle sits beside echo cancel with a skipped-chunk counter, and a quiet-microphone safety valve relaxes the gate automatically (gentle, then off) rather than cutting a quiet talker off. The far end is never gated; recordings keep the full mic audio.
+- **Every meeting is recorded by default.** The live screen shows a recording indicator, the finish screen shows the file with Keep or Delete, and if the engine downgraded mid-meeting it offers to re-transcribe from the recording. Recording stays on your computer; switch it off for good in Settings under Data and privacy.
+- **Diagnostics.** The app log now rotates across launches (5 x 5 MB) with a header naming the version, install kind, OS, CPU, RAM and GPU. "Save diagnostics" writes a small zip (logs, operational settings only, model list) to Downloads, and the feedback email asks for it. No transcripts, notes, audio or meeting context are ever included.
+- **Fast Track edition.** The direct download is now "Volksmond Fast Track" with a white icon, so it is easy to tell apart from the Microsoft Store edition on the same machine. Upgrades replace the existing install as before.
+- Fixes: Settings can switch recording off (the API dropped the field); guard log lines no longer print transcript text; tray tooltip names the edition.
+
 ## 2026-08-20, v1.13.2: honest model presence, and the loaded model made visible
 
 `licensing.APP_VERSION` 1.13.1 -> 1.13.2.
