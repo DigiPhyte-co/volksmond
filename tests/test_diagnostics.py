@@ -310,6 +310,74 @@ def test_settings_allow_list_covers_only_operational_keys():
     print("  OK  the allow-list classifies every key in config.DEFAULTS")
 
 
+# --- the third privacy hole: the log itself ---------------------------------
+
+_DROPPED = "Jan se rekeningnommer is vier vier sewe een"
+
+
+def test_rejected_text_is_a_length_not_the_words():
+    """The engine's drop guards logged the first 40 characters of what they threw away, and the
+    bundle ships raw logs. Off by default now: a length, a source, a time and a reason."""
+    from live_transcribe import transcribe as T
+    prev = os.environ.pop("SA_LIVE_LOG_TEXT", None)
+    try:
+        off = T._logtxt(_DROPPED)
+        assert _DROPPED not in off and "Jan" not in off, off
+        assert off == f"<{len(_DROPPED)} chars>", off
+        os.environ["SA_LIVE_LOG_TEXT"] = "1"
+        on = T._logtxt(_DROPPED)
+        assert _DROPPED[:40] in on, "the support flag must bring the text back"
+        # read per call, so a support session can flip it without a rebuild
+        os.environ["SA_LIVE_LOG_TEXT"] = "0"
+        assert T._logtxt(_DROPPED) == off
+    finally:
+        os.environ.pop("SA_LIVE_LOG_TEXT", None)
+        if prev is not None:
+            os.environ["SA_LIVE_LOG_TEXT"] = prev
+    print("  OK  a dropped segment logs its length, and its text only under the flag")
+
+
+def test_no_engine_drop_log_interpolates_the_segment_text():
+    """Structural companion: every one of those four log lines must route its text through
+    _logtxt, so a new guard cannot quietly reintroduce the leak."""
+    import inspect
+    from live_transcribe import transcribe as T
+    src = inspect.getsource(T.Engine._run)
+    assert "text[:40]" not in src, "a drop log still slices the segment text straight into f-string"
+    for marker in ("prompt-leak dropped", "echo-veto dropped MIC",
+                   "xchan-echo dropped MIC", "loop-guard suppressed"):
+        i = src.index(marker)
+        line_end = src.index("flush=True", i)
+        assert "_logtxt(text)" in src[i:line_end], marker
+    print("  OK  all four engine drop logs go through _logtxt")
+
+
+def test_bundle_strips_text_from_an_old_style_drop_line():
+    """Belt and braces. A log written by an older build (or by a support session with
+    SA_LIVE_LOG_TEXT=1) still must not carry meeting content out in the bundle."""
+    base = _tmpdir("bundle-logs5")
+    log = diagnostics.open_log(base)
+    log.write(f"[engine] prompt-leak dropped MIC @ 12.4s '{_DROPPED}'\n")
+    log.write(f"[engine] echo-veto dropped MIC @ 18.0s [coverage] '{_DROPPED}'\n")
+    log.write(f"[engine] xchan-echo dropped MIC @ 20.1s [own=-31.0 marg=12.0 ov=0.80] '{_DROPPED}'\n")
+    log.write(f"[engine] loop-guard suppressed SYS @ 31.5s p=5 '{_DROPPED}'\n")
+    log.write("[engine] loop-guard suppressed MIC @ 40.0s p=6 <44 chars>\n")
+    log.write("[tier] quality='medium' device='cpu' gpu_present=False\n")
+    log.close()
+    dest = _tmpdir("bundle-out5")
+    out = diagnostics.save_bundle(dest_dir=dest, base=base)
+    with zipfile.ZipFile(out) as z:
+        text = z.read("logs/volksmond.log").decode("utf-8")
+    assert _DROPPED not in text and "rekeningnommer" not in text, text
+    assert text.count("<text omitted>") == 4, text
+    # the numbers a support case actually reads are all still there
+    for kept in ("@ 12.4s", "[coverage]", "own=-31.0", "ov=0.80", "p=5", "<44 chars>"):
+        assert kept in text, (kept, text)
+    # and an unrelated line is untouched
+    assert "[tier] quality='medium' device='cpu' gpu_present=False" in text, text
+    print("  OK  the bundle strips the text payload off the engine drop lines")
+
+
 # --- the feedback email ----------------------------------------------------
 
 def test_feedback_body_asks_for_the_diagnostics_file():
@@ -352,6 +420,9 @@ if __name__ == "__main__":
                test_redact_handles_the_json_escaped_path_form,
                test_bundle_omits_the_settings_the_user_typed,
                test_settings_allow_list_covers_only_operational_keys,
+               test_rejected_text_is_a_length_not_the_words,
+               test_no_engine_drop_log_interpolates_the_segment_text,
+               test_bundle_strips_text_from_an_old_style_drop_line,
                test_feedback_body_asks_for_the_diagnostics_file,
                test_summary_line_is_one_short_line):
         try:

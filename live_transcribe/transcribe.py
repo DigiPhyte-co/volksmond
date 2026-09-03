@@ -777,6 +777,25 @@ def vad_options_for(source):
     return MIC_VAD if source == "MIC" else None
 
 
+def _logtxt(text, n=40):
+    """How a rejected segment's TEXT appears in the log: a length, not the words.
+
+    The guards below (prompt leak, echo veto, cross-channel echo, loop guard) each logged the
+    first 40 characters of what they dropped. That is meeting content, and the diagnostics
+    bundle ships the raw log files, so it left the machine in a file the user emails us while
+    the UI promises "No transcripts, no notes". What actually diagnoses these guards is the
+    count, the source, the timestamp and the reason; the words are a development convenience.
+
+    Set SA_LIVE_LOG_TEXT=1 for a support session (read per call, so it can be flipped without a
+    rebuild) and the text comes back. Off by default, and the bundle sanitises these lines
+    anyway (diagnostics._sanitise_log) so an old log or a flagged run cannot leak through it.
+    """
+    text = text or ""
+    if os.environ.get("SA_LIVE_LOG_TEXT") == "1":
+        return repr(text[:n])
+    return f"<{len(text)} chars>"
+
+
 def _gate_log(engine, source, t_start, skipped, why, stats=None):
     """Return `skipped` after counting it and logging it under SA_LIVE_MIC_GATE_DEBUG.
 
@@ -2360,7 +2379,7 @@ class Engine:
                     # anchor). Toggle SA_LIVE_PROMPT_LEAK_GUARD=0.
                     if self._prompt_leak_on and self._prompt_leak.is_leak(text):
                         print(f"[engine] prompt-leak dropped {source} @ "
-                              f"{t_start + float(seg.start):.1f}s {text[:40]!r}", flush=True)
+                              f"{t_start + float(seg.start):.1f}s {_logtxt(text)}", flush=True)
                         continue
                     # Phrase-loop artifact: a segment that is mostly one repeated multi-word unit
                     # ("ek het nie ek het nie ...") is a quiet-mic hallucination, not speech.
@@ -2399,7 +2418,7 @@ class Engine:
                         _drop, _why = sys_echo_veto(_mic, self.sys_env, out.t_start, out.t_end, len(text.split()),
                                                     mic_ring=self._ring_for("MIC"))
                         if _drop:
-                            print(f"[engine] echo-veto dropped MIC @ {out.t_start:.1f}s [{_why}] {text[:40]!r}", flush=True)
+                            print(f"[engine] echo-veto dropped MIC @ {out.t_start:.1f}s [{_why}] {_logtxt(text)}", flush=True)
                             continue
                     # Arm 2: energy-armed fuzzy echo. Catches the quiet-but-GAPPY far end that arm
                     # 1 correctly refuses, by demanding the text echo what the far end just said on
@@ -2424,7 +2443,7 @@ class Engine:
                             self._ring_for("MIC"), self.sys_env, self._sys_text)
                         if _d2:
                             print(f"[engine] xchan-echo dropped MIC @ {out.t_start:.1f}s "
-                                  f"[own={_own:.1f} marg={_marg:.1f} ov={_ov:.2f}] {text[:40]!r}",
+                                  f"[own={_own:.1f} marg={_marg:.1f} ov={_ov:.2f}] {_logtxt(text)}",
                                   flush=True)
                             continue
                     # Cross-segment loop: this line is the 5th+ cycle of a short, fast
@@ -2436,7 +2455,7 @@ class Engine:
                         _p = self._recent.observe(source, text, out.t_start)
                         if _p:
                             print(f"[engine] loop-guard suppressed {source} @ {out.t_start:.1f}s "
-                                  f"p={_p} {text[:40]!r}", flush=True)
+                                  f"p={_p} {_logtxt(text)}", flush=True)
                             continue
                     self._route(out)
 

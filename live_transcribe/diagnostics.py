@@ -430,6 +430,53 @@ def _redacted_settings():
     return redact(json.dumps(raw, ensure_ascii=False, indent=2)), sorted(omitted)
 
 
+# Log lines that used to carry the TEXT of a rejected segment. transcribe._logtxt fixed that at
+# the source (a length, unless SA_LIVE_LOG_TEXT=1); this is the belt to that pair of braces, so a
+# log written by an older build, or by a support session with the flag on, still cannot put
+# meeting content in a bundle. Deliberately narrow: only these four line shapes are touched.
+_TEXT_LOG_PREFIXES = ("[engine] prompt-leak dropped", "[engine] echo-veto dropped",
+                      "[engine] xchan-echo dropped", "[engine] loop-guard suppressed")
+_LOG_ANCHOR = re.compile(r"^(.*?@ -?\d+(?:\.\d+)?s)(.*)$")
+_LOG_SAFE_TAIL = re.compile(r"^<\d+ chars>$")     # what _logtxt writes now
+
+
+def _sanitise_log_line(line: str) -> str:
+    """Strip the segment-text payload off one of the known engine drop lines.
+
+    Everything up to the "@ <time>s" anchor is kept, then each following [bracketed] group or
+    key=value field, because those are numbers. The first token that is neither begins the text,
+    and the rest of the line becomes <text omitted> unless it is already _logtxt's length form.
+    """
+    body = line.rstrip("\n")
+    if not body.lstrip().startswith(_TEXT_LOG_PREFIXES):
+        return line
+    m = _LOG_ANCHOR.match(body)
+    if not m:
+        return line
+    kept, rest = [m.group(1)], m.group(2).strip()
+    while rest:
+        if rest.startswith("["):
+            end = rest.find("]")
+            if end < 0:
+                break
+            kept.append(rest[:end + 1])
+            rest = rest[end + 1:].lstrip()
+            continue
+        tok, _, remainder = rest.partition(" ")
+        if "=" not in tok:
+            break
+        kept.append(tok)
+        rest = remainder.lstrip()
+    if rest and not _LOG_SAFE_TAIL.match(rest):
+        rest = "<text omitted>"
+    out = " ".join(kept + ([rest] if rest else []))
+    return out + "\n" if line.endswith("\n") else out
+
+
+def _sanitise_log(text: str) -> str:
+    return "".join(_sanitise_log_line(ln) for ln in text.splitlines(keepends=True))
+
+
 def _hub_cache() -> Path:
     """The HuggingFace cache holding the voice models. Same resolution voicedl uses,
     reimplemented on stdlib so the bundle never drags the model stack into memory."""
@@ -521,8 +568,8 @@ def save_bundle(dest_dir=None, base=None) -> Path:
       logs/volksmond.log* this launch and the previous five
 
     Transcripts, notes and recordings live in the sessions folder and are never read
-    by this function. Every member is text, and every member is passed through
-    redact() first.
+    by this function. Every member is text, every member is passed through redact()
+    first, and the log copies also go through _sanitise_log().
     """
     dest = Path(dest_dir) if dest_dir is not None else default_bundle_dir()
     dest.mkdir(parents=True, exist_ok=True)
@@ -539,5 +586,5 @@ def save_bundle(dest_dir=None, base=None) -> Path:
                 text = lf.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            z.writestr("logs/" + lf.name, redact(text))
+            z.writestr("logs/" + lf.name, redact(_sanitise_log(text)))
     return out
