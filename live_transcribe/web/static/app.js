@@ -1913,7 +1913,17 @@ function struggleBanner() {
   // this session, there is already audio to re-transcribe, so drop the record affordance and switch
   // the copy. (Same condition that hides the standalone footer button.)
   var hasRec = !!(S.live.recording || S.live.recordingStarted);
-  var body = hasRec
+  var n = S.live.struggleNudge || {};
+  var body;
+  if (n.old_size && n.old_size === n.new_size)
+    // A shed event, not a model change: the engine ran out of smaller models in this family and
+    // is skipping audio to stay live rather than dropping to a model that would invent text.
+    body = hasRec
+      ? "Volksmond is skipping some audio to stay live. Your recording still has all of it and can be re-transcribed at full accuracy afterward."
+      : "Volksmond is skipping some audio to stay live. Record now so nothing is lost, and re-transcribe at full accuracy afterward.";
+  else if (n.indicative)
+    body = "Live text is now rough (smaller model). The recording has everything, re-transcribe it afterwards.";
+  else body = hasRec
     ? "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Your recording can be re-transcribed at full accuracy afterward."
     : "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Record now and re-transcribe at full accuracy afterward.";
   var actions = [];
@@ -3249,7 +3259,8 @@ function summaryDownloadPanel(manage) {
 }
 /* ── voice (transcription) model download, shared by setup and settings ─── */
 var VOICE_LABELS = {
-  "base":   { title: "Lite",         note: "The smallest and fastest, but the roughest. Only for very old or low-power computers." },
+  "tiny":   { title: "Minimal",      note: "The fastest and the roughest. A live safety net for a slow computer, not a transcript to rely on." },
+  "base":   { title: "Lite",         note: "Very fast and quite rough. For old or low-power computers, and the step above Minimal when the live view is falling behind." },
   "small":  { title: "Light",        note: "Light and quick, easy on memory. Good everyday accuracy on most laptops." },
   "medium": { title: "Balanced",     note: "A good balance of speed and accuracy on a typical computer. The usual sweet spot." },
   "large-v3-turbo": { title: "High quality", note: "Near the best accuracy, but lighter and faster. Great on a strong CPU or any GPU." },

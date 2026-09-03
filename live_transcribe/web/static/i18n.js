@@ -506,11 +506,14 @@ window.VM_I18N = {
       "'n DigiPhyte-produk, gebou in Suid-Afrika. Alle transkripsie gebeur op hierdie masjien tensy jy uitdruklik inteken.",
 
     // Voice (transcription) model download
+    "Minimal": "Minimaal",
     "Lite": "Lig (basies)",
     "Light": "Lig",
     "High quality": "Hoë gehalte",
-    "The smallest and fastest, but the roughest. Only for very old or low-power computers.":
-      "Die kleinste en vinnigste, maar die growwe. Net vir baie ou of lae-krag rekenaars.",
+    "The fastest and the roughest. A live safety net for a slow computer, not a transcript to rely on.":
+      "Die vinnigste en die growwe. 'n Lewendige veiligheidsnet vir 'n stadige rekenaar, nie 'n transkripsie om op staat te maak nie.",
+    "Very fast and quite rough. For old or low-power computers, and the step above Minimal when the live view is falling behind.":
+      "Baie vinnig en taamlik grof. Vir ou of lae-krag rekenaars, en die trap bo Minimaal wanneer die lewendige aansig agter raak.",
     "Light and quick, easy on memory. Good everyday accuracy on most laptops.":
       "Lig en vinnig, maklik op geheue. Goeie alledaagse akkuraatheid op die meeste skootrekenaars.",
     "A good balance of speed and accuracy on a typical computer. The usual sweet spot.":
@@ -744,6 +747,12 @@ window.VM_I18N = {
       "Volksmond het na 'n ligter, vinniger model oorgeskakel om lewendig te bly, so hierdie deel is dalk minder akkuraat. Neem nou op en hertranskribeer daarna teen volle akkuraatheid.",
     "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Your recording can be re-transcribed at full accuracy afterward.":
       "Volksmond het na 'n ligter, vinniger model oorgeskakel om lewendig te bly, so hierdie deel is dalk minder akkuraat. Jou opname kan daarna teen volle akkuraatheid hertranskribeer word.",
+    "Live text is now rough (smaller model). The recording has everything, re-transcribe it afterwards.":
+      "Die lewendige teks is nou grof (kleiner model). Die opname het alles, hertranskribeer dit agterna.",
+    "Volksmond is skipping some audio to stay live. Your recording still has all of it and can be re-transcribed at full accuracy afterward.":
+      "Volksmond slaan van die klank oor om lewendig te bly. Jou opname het steeds alles en kan daarna teen volle akkuraatheid hertranskribeer word.",
+    "Volksmond is skipping some audio to stay live. Record now so nothing is lost, and re-transcribe at full accuracy afterward.":
+      "Volksmond slaan van die klank oor om lewendig te bly. Neem nou op sodat niks verlore gaan nie, en hertranskribeer daarna teen volle akkuraatheid.",
     "Record from here": "Neem van hier af op",
     "Keep going": "Gaan voort",
     "Don't warn again": "Moenie weer waarsku nie",
