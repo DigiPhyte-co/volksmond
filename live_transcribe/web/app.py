@@ -3105,8 +3105,12 @@ def open_folder(which: str = "sessions"):
 
     which: "sessions" (default, transcripts + recordings) | "voice_models" (the
     Whisper model cache) | "summary_models" (the local summary GGUFs), so the user
-    can find and remove models on disk themselves."""
-    if which == "voice_models":
+    can find and remove models on disk themselves | "diagnostics" (where the
+    diagnostics zip is written, so the user can attach it to an email)."""
+    if which == "diagnostics":
+        from .. import diagnostics
+        target = str(diagnostics.default_bundle_dir())
+    elif which == "voice_models":
         from .. import voicedl
         p = Path(voicedl.cache_dir())
         try:
@@ -3552,6 +3556,33 @@ def app_info():
         # update check, which the UI hides because the Store owns updates. Nothing else differs.
         "store": buildflags.STORE_BUILD,
     }
+
+
+@app.get("/api/diagnostics")
+def diagnostics_summary():
+    """One short machine line (CPU, cores, RAM, GPU, install kind) for the feedback
+    email. Computed on demand, not on app load, because the GPU part shells nvidia-smi.
+    Read-only and non-sensitive: no licence, no paths, no user content."""
+    from .. import diagnostics
+    return {"summary": diagnostics.summary_line(),
+            "install": diagnostics.install_kind(),
+            "folder": str(diagnostics.default_bundle_dir())}
+
+
+@app.post("/api/diagnostics")
+def diagnostics_save():
+    """Write the diagnostics zip to the user's Downloads folder and say where it went.
+
+    Nothing is uploaded; the file lands on the user's own disk and only travels if the
+    user attaches it to an email themselves. Contents are a fixed allow-list (logs,
+    redacted settings, the system header, a model inventory): never a transcript, a
+    note or an audio file. See live_transcribe/diagnostics.py."""
+    from .. import diagnostics
+    try:
+        p = diagnostics.save_bundle()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not write the diagnostics file: {e}")
+    return {"path": str(p), "folder": str(p.parent), "name": p.name}
 
 
 @app.post("/api/pick")
