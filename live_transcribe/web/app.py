@@ -939,10 +939,15 @@ def _build_output_path(topic: str) -> Path:
 
 @app.get("/", response_class=HTMLResponse)
 def index():
+    from .. import edition
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     # Hand the page the CSRF token so app.js can echo it on unsafe requests.
     tag = f'<meta name="vm-csrf" content="{CSRF_TOKEN}" />'
-    return html.replace("</head>", f"  {tag}\n</head>", 1)
+    html = html.replace("</head>", f"  {tag}\n</head>", 1)
+    # Then this edition's identity: the direct-download build gets the "Volksmond Fast Track"
+    # tab title and the inverted tab icon, so it is distinguishable from a Store install on the
+    # same machine. Every other edition gets the page back unchanged.
+    return edition.brand_page(html)
 
 
 @app.get("/api/status")

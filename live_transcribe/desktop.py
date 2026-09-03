@@ -16,9 +16,14 @@ import socket
 import threading
 import time
 
+from . import edition
+
 HOST = "127.0.0.1"
 PREFERRED_PORT = 8765
-WINDOW_TITLE = "Volksmond"
+# Per edition: the direct-download build says "Volksmond Fast Track", so its window, taskbar
+# button and Alt-Tab entry are distinguishable from a Store install of the same app on the same
+# machine. Every other edition says "Volksmond" exactly as before (live_transcribe/edition.py).
+WINDOW_TITLE = edition.DISPLAY_NAME
 
 # How long the close is allowed to wait for a running session to finalise. Long enough for
 # a normal stop (capture stop + a short ASR backlog + closing the files), short enough that

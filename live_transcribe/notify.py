@@ -316,14 +316,25 @@ def focus_app() -> bool:
 # --- the real backend ------------------------------------------------------
 
 def _icon_path():
-    """Absolute path to volksmond.ico, or None. Frozen builds carry it next to the app
-    (sys._MEIPASS); a source run has it in the project root beside live_transcribe/."""
+    """Absolute path to this edition's .ico, or None. Frozen builds carry it next to the app
+    (sys._MEIPASS); a source run has it in the project root beside live_transcribe/.
+
+    The direct-download edition wears the inverted Fast Track icon and the others wear the
+    original (live_transcribe/edition.py), so ask which one before falling back to the original:
+    the tray icon must match the taskbar icon, or a notification would look like the other
+    edition's. The fallback also covers an older bundle that carries only volksmond.ico."""
     from pathlib import Path
+
+    from . import edition
+    names = [edition.ICON_FILE]
+    if "volksmond.ico" not in names:
+        names.append("volksmond.ico")
     candidates = []
     meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        candidates.append(Path(meipass) / "volksmond.ico")
-    candidates.append(Path(__file__).resolve().parent.parent / "volksmond.ico")
+    for name in names:
+        if meipass:
+            candidates.append(Path(meipass) / name)
+        candidates.append(Path(__file__).resolve().parent.parent / name)
     for p in candidates:
         try:
             if p.is_file():
