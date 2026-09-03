@@ -173,6 +173,38 @@ def test_saving_false_persists_a_real_false_not_a_missing_key():
         assert webapp._record_default() is True, "switching it back on must take effect"
 
 
+def test_the_settings_api_really_switches_recording_off():
+    """The regression this test exists for: SettingsPatch is an explicit allow-list, so a key the
+    UI posts but the model does not declare is dropped by pydantic with a 200 and no error. The
+    Settings toggle then appears to work while every future session still records. Exercised
+    through the real endpoint, disk included, not by poking config."""
+    with _settings_file("{}"):
+        r = client.post("/api/settings", json={"record_sessions": False})
+        assert r.status_code == 200, f"{r.status_code}: {r.text}"
+        assert r.json().get("record_sessions") is False, \
+            f"the endpoint's own view must show the switch off: {r.json()}"
+        raw = json.loads(config._SETTINGS_PATH.read_text(encoding="utf-8"))
+        assert raw.get("record_sessions") is False, f"off must reach settings.json: {raw}"
+        assert client.get("/api/settings").json().get("record_sessions") is False, \
+            "a reload of the Settings screen must still show it off"
+        assert webapp._record_default() is False, \
+            "and the start path must honour it, or the session records anyway"
+        # and back on again, so the round trip is a switch and not a one-way door
+        assert client.post("/api/settings", json={"record_sessions": True}).status_code == 200
+        assert webapp._record_default() is True
+
+
+def test_every_key_the_ui_posts_is_declared_on_settingspatch():
+    """Structural guard for the whole class of bug above: anything app.js hands saveSettings must
+    exist on SettingsPatch, or it is silently discarded on arrival."""
+    import re
+    posted = set(re.findall(r"saveSettings\(\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", APP_JS))
+    assert "record_sessions" in posted, "precondition: the UI posts the recording switch"
+    declared = set(webapp.SettingsPatch.model_fields)
+    missing = sorted(posted - declared)
+    assert not missing, f"app.js posts settings SettingsPatch would drop: {missing}"
+
+
 # --- 2. the start endpoint follows the setting -----------------------------
 
 def test_start_without_a_record_flag_follows_the_setting():
@@ -406,6 +438,8 @@ if __name__ == "__main__":
     tests = (test_schema_default_is_on,
              test_unset_records_and_explicit_false_is_honoured,
              test_saving_false_persists_a_real_false_not_a_missing_key,
+             test_the_settings_api_really_switches_recording_off,
+             test_every_key_the_ui_posts_is_declared_on_settingspatch,
              test_start_without_a_record_flag_follows_the_setting,
              test_start_with_recording_switched_off_does_not_record,
              test_downgrade_latch_survives_a_muted_banner_and_reaches_status,

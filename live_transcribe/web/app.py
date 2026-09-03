@@ -3655,6 +3655,7 @@ class SettingsPatch(BaseModel):
     aec_live: Optional[bool] = None
     agc_live: Optional[bool] = None
     mic_gate: Optional[bool] = None         # skip microphone chunks with no speech evidence before decoding
+    record_sessions: Optional[bool] = None  # save the meeting audio on every live session. Declared here or pydantic drops it and the Settings switch silently does nothing.
     summary_device: Optional[str] = None
     save_location: Optional[str] = None
     default_context: Optional[str] = None
