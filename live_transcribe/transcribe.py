@@ -543,6 +543,100 @@ def _silence_floor_db(ring, t_hi, static_db=-45.0):
     return min(-35.0, max(-55.0, lvl - 30.0))
 
 
+# --- MIC speech-evidence gate (WP-3) --------------------------------------------------------
+# Arms 1 and 2 of _chunk_is_silence both judge a chunk on its LOUDEST raw frame, so one door
+# bang, one keyboard click or one cough keeps a whole 15 s chunk of room tone. Measured on a
+# 67 min CPU capture: only 8 to 12 min of the MIC channel was near-end speech, yet in a 10 min
+# window the peak tests kept 36 of 40 MIC chunks; decoding them cost MORE than the far end
+# (RTF 0.89 on MIC against 0.42 on SYS) and produced the loops and the prompt echo that made up
+# that session's entire junk budget.
+#
+# Arm 3 swaps the peak for CONTINUITY: speech occupies frames, a transient does not. A MIC chunk
+# is decoded only when at least MIC_EVIDENCE_SECONDS of its raw 100 ms ring frames clear an
+# evidence threshold.
+#
+# The threshold is the room's own p10 floor (measured strictly BEFORE the chunk, so a chunk is
+# never judged against itself) plus MIC_EVIDENCE_MARGIN_DB, but never above
+# MIC_EVIDENCE_CEILING_DB. The cap is what makes the arm safe in both directions:
+#   quiet room - the floor sits well below the cap, so the threshold follows the room down and a
+#                quiet talker still clears it (measured floors on the incident capture: -53 to
+#                -59 dBFS, thresholds -35 to -39, near-end speech -22.8 dBFS mean);
+#   noisy room - the floor rises to within 20 dB of the cap, room frames clear the threshold on
+#                their own, and the arm goes inert rather than eating a quiet talker.
+# 20 dB: near-end speech on that capture sat about 30 dB above its own p10 room tone, so this is
+# the midpoint, leaving 13 to 16 dB of headroom below real speech.
+#
+# MIC only, by design. The far end is a digital signal at a known level with no microphone, no
+# room and no AGC; there is no measured junk to gate there and no basis for these constants.
+MIC_EVIDENCE_MARGIN_DB = 20.0     # above this channel's own p10 room tone ...
+MIC_EVIDENCE_CEILING_DB = -35.0   # ... but never above this (the noisy-room escape)
+MIC_EVIDENCE_SECONDS = 0.5        # of frames that must clear it before the chunk is decoded
+
+# Per-source silero VAD options (faster-whisper 1.2.1 VadOptions). The library defaults -
+# threshold 0.5, min_speech_duration_ms 0, min_silence_duration_ms 2000, speech_pad_ms 400 -
+# only split a chunk on a silence LONGER THAN TWO SECONDS and keep speech regions of any length,
+# so a near-silent 15 s mic chunk arrives at the decoder as one merged "speech" region: measured
+# on the incident capture, 86% of the MIC channel passed the VAD as speech in 39 such regions.
+# MIC gets a tighter set; SYS keeps the library defaults (vad_parameters=None), which is what it
+# has always run and what every existing SYS measurement was taken on.
+#
+# `threshold` is deliberately NOT raised. Raising it is where quiet real speech dies, and the
+# problem measured here is region MERGING, not the per-frame speech probability.
+MIC_VAD = dict(
+    threshold=0.5,                # unchanged, on purpose (see above)
+    min_speech_duration_ms=250,   # a sub-quarter-second region is a click or a bump, not a word
+    min_silence_duration_ms=500,  # split on a half-second gap instead of waiting for two seconds
+    speech_pad_ms=200,            # half the default padding, so a split is not merged back
+)
+
+
+def vad_options_for(source):
+    """The VAD options this source decodes with: the tightened set for MIC, None (the
+    faster-whisper defaults) for SYS and for anything else."""
+    return MIC_VAD if source == "MIC" else None
+
+
+def _gate_log(engine, source, t_start, skipped, why):
+    """Return `skipped` after logging one gate decision under SA_LIVE_MIC_GATE_DEBUG.
+
+    Numbers only: never any audio and never any transcribed text. Module-level, and every
+    attribute read through getattr, so the half-Engine stubs the gate tests build (which borrow
+    _chunk_is_silence unbound) keep working untouched.
+    """
+    if getattr(engine, "_mic_gate_debug", False):
+        print(f"[gate] {source} @ {t_start:.1f}s {'skip' if skipped else 'keep'} [{why}]", flush=True)
+    return skipped
+
+
+def mic_speech_evidence(ring, t_start, t_hi,
+                        margin_db=MIC_EVIDENCE_MARGIN_DB,
+                        ceiling_db=MIC_EVIDENCE_CEILING_DB,
+                        need_s=MIC_EVIDENCE_SECONDS):
+    """(verdict, detail) for arm 3. verdict True = speech evidence, False = none, None = inert.
+
+    Inert whenever the evidence would have to be guessed: no room-tone baseline before the chunk
+    (see noise_floor_before - nothing earlier, or under 10 s of history), or no ring frames
+    covering the window at all. Never gate on missing evidence.
+
+    `detail` is a short numbers-only string for the debug log: no audio, no text.
+    """
+    floor = ring.noise_floor_before(t_start)
+    if floor is None:
+        return None, "no baseline"
+    frames = ring.frames_in(t_start, t_hi)
+    if not frames:
+        return None, "no frames"
+    thr = min(floor + margin_db, ceiling_db)
+    n_evid = sum(1 for d in frames if d >= thr)
+    # need_s worth of ring frames, derived from the ring's own resolution rather than a constant
+    # shared with capture_core (10 frames/s today), and never more than a third of a short chunk:
+    # a 1 s tail must not have to spend half its frames proving itself.
+    dur = max(t_hi - t_start, 1e-6)
+    need = min(max(1, int(round(need_s * len(frames) / dur))), max(1, len(frames) // 3))
+    return (n_evid >= need,
+            f"floor={floor:.0f} thr={thr:.0f} evid={n_evid}/{len(frames)} need={need}")
+
+
 def sys_echo_veto(mic_audio, sys_ring, abs_start, abs_end, word_count, sr=16000,
                   frame_ms=100, tol=0.3, active_floor=-50.0, min_coverage=0.60,
                   margin_db=10.0, mic_ceiling=-28.0, *, mic_ring=None):
@@ -1212,6 +1306,11 @@ class Engine:
         # losing the other. "0" makes arm 2 fully inert, ring included.
         self._xchan_veto2 = os.environ.get("SA_LIVE_XCHAN_VETO2", "1") != "0"
         self._silence_gate = os.environ.get("SA_LIVE_SILENCE_GATE", "1") != "0"
+        # Arm 3 of the silence gate (MIC speech evidence) and its per-chunk decision log. The
+        # arm has its own switch so a support session can restore the peak-only gate without
+        # losing arms 1 and 2; the log is off by default because it is one line per MIC chunk.
+        self._mic_speech_gate = os.environ.get("SA_LIVE_MIC_SPEECH_GATE", "1") != "0"
+        self._mic_gate_debug = os.environ.get("SA_LIVE_MIC_GATE_DEBUG", "0") != "0"
         self._prompt_leak_on = os.environ.get("SA_LIVE_PROMPT_LEAK_GUARD", "1") != "0"
         self._loop_guard_on = os.environ.get("SA_LIVE_LOOP_GUARD", "1") != "0"
         self._recent = RecentEmissions()   # cross-segment loop history, per source
@@ -1267,11 +1366,21 @@ class Engine:
            which this arm stays inert. The last two are what keep the first chunk of a sustained
            quiet talker: at -40 dBFS throughout, p10 and peak are both -40, and a
            self-referential baseline would call that a dead channel and eat real speech.
+        3. MIC ONLY - speech evidence (WP-3): both tests above key off the loudest frame, which
+           one door bang, one keyboard click or one cough is enough to satisfy for a whole 15 s
+           chunk of room tone. This one asks instead how MANY frames cleared an evidence
+           threshold, because speech occupies frames and a transient does not. See
+           mic_speech_evidence for the threshold and the two ways it stays inert. Its own switch,
+           SA_LIVE_MIC_SPEECH_GATE=0, restores the peak-only behaviour of arms 1 and 2.
 
         Without a ring (uploads, ring-less paths, SA_LIVE_RAW_MIC_RING=0 for EITHER source) it
         falls back to `_is_silence(audio)` verbatim, which keeps its four pinned tests untouched.
         A ring with no frames covering the window also falls back: never gate on missing evidence.
-        Both tests share SA_LIVE_SILENCE_GATE=0.
+        All three tests share SA_LIVE_SILENCE_GATE=0.
+
+        Skipping is a DECODE decision only. The recorder is fed from the capture callback, ahead
+        of the engine queue (web/app.py _feed, __main__.py feed), so a chunk the gate skips is
+        already on disk in full and the saved audio is unchanged by any of this.
         """
         # The gate is the one consumer that honours SA_LIVE_RAW_MIC_RING for BOTH sources: the
         # switch exists to restore pre-WP-4 gate behaviour wholesale, and a switch that left SYS
@@ -1288,10 +1397,20 @@ class Engine:
         if peak is None:
             return _is_silence(audio)
         if peak < _silence_floor_db(ring, t_hi):
-            return True
+            return _gate_log(self, source, t_start, True, "absolute")
         floor = ring.noise_floor_before(t_start)
-        return (floor is not None and peak <= dead_ceiling_db
-                and (peak - floor) <= dead_margin_db)
+        if (floor is not None and peak <= dead_ceiling_db
+                and (peak - floor) <= dead_margin_db):
+            return _gate_log(self, source, t_start, True, f"dead peak={peak:.0f} floor={floor:.0f}")
+        # Arm 3 (MIC only): continuity, not peak. Additive - it can only skip a chunk the two
+        # peak arms already decided to keep, never rescue one they skipped.
+        if source == "MIC" and getattr(self, "_mic_speech_gate", True):
+            verdict, why = mic_speech_evidence(ring, t_start, t_hi)
+            if verdict is not None:
+                return _gate_log(self, source, t_start, not verdict, f"evidence {why}")
+            return _gate_log(self, source, t_start, False, f"evidence inert ({why})")
+        return _gate_log(self, source, t_start, False, f"peak={peak:.0f}")
+
 
     def subscribe(self, fn):
         self.subscribers.append(fn)
@@ -1603,6 +1722,8 @@ class Engine:
                     language=self.language,
                     initial_prompt=self.initial_prompt,
                     vad_filter=True,
+                    # Per-source VAD: the tightened MIC set, the library defaults for SYS.
+                    vad_parameters=vad_options_for(source),
                     beam_size=beam,
                     **GUARD,
                 )
