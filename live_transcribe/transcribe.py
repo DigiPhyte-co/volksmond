@@ -6,6 +6,7 @@ memory at one model's footprint and simplifies the data flow. If GPU under-
 utilisation becomes a problem in V1 with a snappier chunk size, we can run
 two model instances; not worth it for V0.
 """
+import contextlib
 import os
 import queue
 import re
@@ -20,6 +21,9 @@ from . import cudadl
 cudadl.register_dll_dir()
 
 from faster_whisper import WhisperModel
+# Imported as a MODULE (not just the class) because the CPU encoder window below has to rebind
+# one name inside it; see _pad_or_trim.
+import faster_whisper.transcribe as _fw_transcribe
 
 # The fuzzy word matcher the end-of-session echo strip already uses; the live fuzzy echo veto
 # (fuzzy_echo_veto below) reuses it so both places call the same two words "the same word".
@@ -44,11 +48,19 @@ def _fluister(repo, local, stock):
 
 # size -> canonical Fluister HuggingFace repo. The single source of truth for the repo ids, so the
 # voice-model catalogue and the update manifest (voicedl) resolve exactly the repos this engine loads.
+#
+# base and tiny are here for ONE reason: they are the bottom two rungs of the live CPU ladder
+# (CPU_LADDER), and stock base/tiny are unusable on Afrikaans. Measured on a five minute Afrikaans
+# slice against a large-v3 reference: stock base scores WER 0.91 and answers in Dutch, stock tiny
+# 1.47 with a dozen loop lines; the Fluister forms of the same sizes score 0.58 and 0.78. A ladder
+# that steps out of the family to "keep up" buys speed by inventing text, so it must not exist.
 FLUISTER_REPOS = {
     "large-v3":       "digiphyte/fluister-large-v3",
     "large-v3-turbo": "digiphyte/fluister-turbo",
     "medium":         "digiphyte/fluister-medium",
     "small":          "digiphyte/fluister-small",
+    "base":           "digiphyte/fluister-base",
+    "tiny":           "digiphyte/fluister-tiny",
 }
 
 # size -> Fluister model id: the hosted HF repo (downloaded on first use), or the local ct2 build
@@ -58,6 +70,8 @@ _FLUISTER = {
     "large-v3-turbo": _fluister(FLUISTER_REPOS["large-v3-turbo"], r"C:\Users\seanf\.cache\af-lora-turbo-ct2-int8", "large-v3-turbo"),
     "medium":         _fluister(FLUISTER_REPOS["medium"], r"C:\Users\seanf\.cache\af-lora-medium-ct2-int8", "medium"),
     "small":          _fluister(FLUISTER_REPOS["small"], r"C:\Users\seanf\.cache\af-lora-small-ct2-int8", "small"),
+    "base":           _fluister(FLUISTER_REPOS["base"], r"C:\Users\seanf\.cache\af-lora-base-ct2-int8", "base"),
+    "tiny":           _fluister(FLUISTER_REPOS["tiny"], r"C:\Users\seanf\.cache\af-lora-tiny-ct2-int8", "tiny"),
 }
 
 
@@ -182,6 +196,81 @@ TIER_CONFIG = {
 }
 
 
+# ── CPU decode defaults: a 20 s encoder window and beam 1 ──────────────────
+# Measured 2026-09-03 on one five minute Afrikaans slice, CPU int8, 8 threads, WER against a
+# large-v3 GPU reference, 15 s audio chunks throughout:
+#
+#   model  window beam   RTF     WER
+#   small   30 s    5   0.159   0.345    <- the old default
+#   small   20 s    1   0.072   0.373
+#   medium  30 s    5   0.442   0.289    <- the old default
+#   medium  20 s    1   0.191   0.307
+#
+# A 20 s window costs nothing in WER (medium is fractionally BETTER at 0.282 vs 0.289 at beam 5)
+# and saves 16-27 %; beam 1 costs about +0.02 WER and saves another 41-46 %. Together they roughly
+# halve the CPU cost, which is what lets a laptop hold real time on two sources at once. 15 s was
+# also measured and is catastrophic (WER 1.4-1.9, doubled word counts, the model emitting
+# timestamps past the end of its own window): never go below 20 s.
+#
+# GPU work (CUDA and Metal) is untouched at Whisper's native 30 s / beam 5. The window is applied
+# per MODEL, not per process: only a ct2 model built for device="cpu" carries _vm_encoder_frames,
+# and only a decode wrapped in encoder_window() sees the shortened pad length.
+CPU_ENCODER_WINDOW_S = 20
+CPU_BEAM_SIZE = 1
+DEFAULT_BEAM_SIZE = 5              # GPU / MLX, and any caller that asks for a beam explicitly
+
+# faster-whisper pads every mel window back to 3000 frames (30 s) before handing it to the encoder:
+# generate_segments() calls the module-level pad_or_trim() with no length, so shrinking the feature
+# extractor alone does NOT shrink what the encoder actually sees. The only seam is that name. It is
+# rebound ONCE, process-wide, to a wrapper that keeps the stock 3000 unless the CALLING THREAD has
+# asked for a shorter window (encoder_window() sets a thread-local from the model's own attribute).
+# Thread-local rather than a global flag on purpose: a CUDA or Metal engine decoding in the same
+# process, on its own worker thread, must keep the full 30 s window and never be able to observe
+# the CPU one. An explicit length (faster-whisper passes none today) always wins.
+_ENCODER_WINDOW = threading.local()
+_FW_PAD_OR_TRIM = _fw_transcribe.pad_or_trim
+
+
+def _pad_or_trim(array, length=None, *, axis=-1):
+    if length is None:
+        length = getattr(_ENCODER_WINDOW, "frames", None) or 3000
+    return _FW_PAD_OR_TRIM(array, length, axis=axis)
+
+
+_pad_or_trim._vm_patched = True
+if not getattr(_fw_transcribe.pad_or_trim, "_vm_patched", False):
+    _fw_transcribe.pad_or_trim = _pad_or_trim
+
+
+def set_encoder_window(model, seconds):
+    """Point a ct2 model's feature extractor at a `seconds`-long encoder window and record the
+    resulting mel width on the model as _vm_encoder_frames (what encoder_window() then honours).
+
+    Returns the mel frame count, or None for a model with no ct2 feature extractor (the MLX
+    adapter), which is left exactly as it is."""
+    fe = getattr(model, "feature_extractor", None)
+    if fe is None:
+        return None
+    fe.chunk_length = seconds
+    fe.n_samples = seconds * fe.sampling_rate
+    fe.nb_max_frames = fe.n_samples // fe.hop_length
+    model._vm_encoder_frames = fe.nb_max_frames
+    return fe.nb_max_frames
+
+
+@contextlib.contextmanager
+def encoder_window(model):
+    """Run a decode with this model's shortened encoder window (a no-op for any model without
+    one, i.e. every CUDA/Metal model). Yields the mel frame count, or None."""
+    frames = getattr(model, "_vm_encoder_frames", None)
+    prev = getattr(_ENCODER_WINDOW, "frames", None)
+    _ENCODER_WINDOW.frames = frames
+    try:
+        yield frames
+    finally:
+        _ENCODER_WINDOW.frames = prev
+
+
 # ── model cache + warm-up ──────────────────────────────────────────────────
 # Building a WhisperModel is the slow part of starting a session. Two costs hide here:
 #  1. With no local_files_only, faster-whisper revalidates the model against HuggingFace
@@ -199,7 +288,7 @@ _WARM_LOCK = threading.Lock()     # guards _WARM only (kept separate so status r
 _WARM = {"state": "idle", "tier": None, "model": None}   # state: idle|warming|ready|error; model = resolved id being warmed
 
 
-def _build_model(model_name, device, compute_type, cpu_threads):
+def _build_model(model_name, device, compute_type, cpu_threads, local_only=False):
     if device == "mlx":
         # Apple Metal via the mlx-whisper adapter. Imported lazily so Windows (where the
         # mlx packages have no wheels and are never installed) pays nothing for this
@@ -218,23 +307,62 @@ def _build_model(model_name, device, compute_type, cpu_threads):
         kw["cpu_threads"] = cpu_threads
         kw["num_workers"] = 1
     # Local cache only: never touch the network for an already-downloaded model. Fall back
-    # to a normal (network-allowed) load only if it genuinely is not on disk yet.
+    # to a normal (network-allowed) load only if it genuinely is not on disk yet - and never
+    # when the caller said local_only, which is how the live ladder guarantees it will not stop
+    # to download a model in the middle of a meeting.
     try:
-        return WhisperModel(model_name, local_files_only=True, **kw)
+        m = WhisperModel(model_name, local_files_only=True, **kw)
     except Exception as e:
+        if local_only:
+            raise
         print(f"[engine] {model_name} not in local cache ({e}); allowing a download", flush=True)
-        return WhisperModel(model_name, local_files_only=False, **kw)
+        m = WhisperModel(model_name, local_files_only=False, **kw)
+    if device == "cpu":
+        # Every CPU model, everywhere (live, file import, warm-up), gets the measured CPU
+        # window. See CPU_ENCODER_WINDOW_S.
+        set_encoder_window(m, CPU_ENCODER_WINDOW_S)
+    return m
 
 
-def load_model(model_name, device, compute_type, cpu_threads=8):
+def model_present(model_id):
+    """True when `model_id` can be loaded WITHOUT touching the network.
+
+    The live ladder's usability test: a rung that is not already on this machine is skipped, never
+    downloaded mid-meeting. A bare directory is judged directly; anything else is resolved through
+    the HuggingFace cache with local_files_only. In both cases a real model.bin has to be there,
+    because hf_hub reports a snapshot as present as soon as refs/main survives, even when an
+    interrupted download left the weights missing (the same trap voicedl._present guards). Any
+    error means "not present": never claim a model on missing evidence."""
+    if not model_id:
+        return False
+    if os.path.isdir(model_id):
+        return _has_ct2_weights(model_id)
+    try:
+        from huggingface_hub import snapshot_download
+        path = snapshot_download(model_id, local_files_only=True)
+    except Exception:
+        return False
+    return _has_ct2_weights(path)
+
+
+def _has_ct2_weights(path, min_bytes=1_000_000):
+    try:
+        binp = os.path.join(path, "model.bin")
+        return os.path.isfile(binp) and os.path.getsize(binp) > min_bytes
+    except Exception:
+        return False
+
+
+def load_model(model_name, device, compute_type, cpu_threads=8, local_only=False):
     """Return a cached WhisperModel for these settings, building it (from the local cache,
     no network) if needed. Safe from both the warm-up thread and session start; the build
-    lock makes a Begin during warm-up wait for the warm model instead of building a second."""
+    lock makes a Begin during warm-up wait for the warm model instead of building a second.
+    local_only=True refuses the network fallback and raises instead (the live ladder)."""
     key = (model_name, device, compute_type)
     with _BUILD_LOCK:
         m = _MODEL_CACHE.get(key)
         if m is None:
-            m = _build_model(model_name, device, compute_type, cpu_threads)
+            m = _build_model(model_name, device, compute_type, cpu_threads, local_only=local_only)
             # Bound memory: drop the oldest cache slot. The just-built model, and any model a
             # live session still holds, stay alive via their own references; only the slot goes.
             while len(_MODEL_CACHE) >= _CACHE_MAX:
@@ -283,8 +411,11 @@ def _warm_run(tier, cfg, model_id, language, fam):
             if warm_lang is None and fam != "swivuriso":
                 warm_lang = "af"   # historic warm token for auto-detect; a fixed token skips detection on zeros
             try:
-                list(m.transcribe(np.zeros(16000, dtype=np.float32), language=warm_lang,
-                                  vad_filter=False, beam_size=1)[0])
+                # Inside encoder_window so a CPU model warms at the SAME mel width it will decode
+                # at (20 s), rather than autotuning ctranslate2 for a shape it never sees again.
+                with encoder_window(m):
+                    list(m.transcribe(np.zeros(16000, dtype=np.float32), language=warm_lang,
+                                      vad_filter=False, beam_size=1)[0])
             except Exception:
                 pass
         with _WARM_LOCK:
@@ -356,12 +487,38 @@ BACKPRESSURE_BEAM_THRESHOLD = 6
 # CPU adaptive model ladder (highest-quality -> fastest). When a CPU start model
 # can't hold real-time, the engine steps DOWN this ladder until it keeps up -
 # never back up (avoids oscillation). large-v3/turbo are deliberately NOT in the
-# ladder: too slow to be a sane CPU live floor. `tiny` is the last-resort rung -
-# rough, but guarantees real-time on almost anything, which still beats dropping
-# audio. GPU tiers never downgrade (they keep up).
+# ladder: too slow to be a sane CPU live floor. GPU tiers never downgrade (they keep up).
+#
+# Three rules the ladder obeys, all of them learned the hard way on a CPU-only laptop that walked
+# medium -> small -> base -> tiny inside half an hour and produced Dutch-flavoured loops:
+#
+#  1. IN-FAMILY ONLY. A rung is only taken when it resolves to the SAME family the session started
+#     in. For an Afrikaans session that means Fluister the whole way down (which is why
+#     FLUISTER_REPOS now carries base and tiny); a stock-Whisper session keeps the stock ladder.
+#     Speed bought by leaving the family is not speed, it is fabrication.
+#  2. PRESENT ONLY. A rung is usable only if it is already on this machine (model_present). No
+#     model is ever downloaded in the middle of a meeting; an absent rung is skipped.
+#  3. SHED, DO NOT DEGRADE. Below the last usable rung there is no smaller model to take, so the
+#     engine drops the OLDEST queued audio instead (see _maybe_shed) and says so in the transcript.
+#     Missing audio you can see beats invented text you cannot.
 CPU_LADDER = ["medium", "small", "base", "tiny"]
 DOWNGRADE_RTF = 0.95     # rolling real-time factor above this = not keeping up
-DOWNGRADE_WINDOW = 4     # consecutive chunks of evidence required before a step down
+DOWNGRADE_WINDOW = 4     # eligible chunks of evidence required before a step down
+# Minimum wall clock between rung changes. The field cascade was self-feeding: a freshly built
+# ct2 model pays its whole load cost on its FIRST inference (measured 35 s for medium, 16 s for
+# small on a desktop), that single sample poisons a 4-sample window, and the ladder immediately
+# stepped again. The first sample on a new model is now discarded outright (_cold_decode) AND a
+# step has to earn a full window of fresh evidence over at least this long.
+DOWNGRADE_MIN_SECONDS = 90.0
+# Backlog bound, in seconds of audio waiting to be transcribed. Past this the engine is no longer
+# live in any useful sense, so the shed valve drops the oldest queued audio back down to the bound.
+# Three 15 s chunks per source plus the one in flight, i.e. about 45 s of lag, is the point where
+# the "live" text stops being live.
+SHED_BACKLOG_SECONDS = 45.0
+# Past this rung the live text is indicative only: still the right family, but small enough that it
+# should be read as a rough guide and re-transcribed from the recording afterwards. Surfaced to the
+# UI as `indicative` on the downgrade payload.
+INDICATIVE_BELOW = "small"
 
 # Hold each MIC segment this long before showing it in the LIVE view, so a speaker echo lands
 # just after its cleaner SYS original instead of jumbled in front of it (the system channel
@@ -1406,14 +1563,36 @@ class Segment:
     text: str
 
 
+def _chunk_seconds(item, sr=16000):
+    """Audio seconds in a queued chunk. 0.0 for anything that is not real audio (test stubs feed
+    ints and strings), so the backlog accounting can never raise on the worker thread."""
+    try:
+        return len(item[1]) / float(sr)
+    except Exception:
+        return 0.0
+
+
+def _mmss(seconds):
+    """Session-relative seconds as m:ss, for notices a reader has to line up with the transcript."""
+    try:
+        s = max(0, int(round(seconds)))
+    except Exception:
+        return "?"
+    return f"{s // 60}:{s % 60:02d}"
+
+
 class Engine:
-    def __init__(self, tier, language="af", initial_prompt=None, cpu_threads=8, beam_size=5, adaptive=True, engine="auto"):
+    def __init__(self, tier, language="af", initial_prompt=None, cpu_threads=8, beam_size=None, adaptive=True, engine="auto"):
         self.engine = (engine or "auto").lower()
         if tier not in TIER_CONFIG:
             raise ValueError(f"Unknown tier {tier!r}; choose from {list(TIER_CONFIG)}")
         self.tier = tier
         self.language = language
-        self.beam_size = beam_size
+        # beam_size=None means "this device's measured default": 1 on CPU (see CPU_BEAM_SIZE,
+        # roughly halves the cost for about +0.02 WER), 5 everywhere else. An explicit value from
+        # the caller is always honoured, on either device.
+        self.beam_size = beam_size if beam_size is not None else (
+            CPU_BEAM_SIZE if TIER_CONFIG[tier]["device"] == "cpu" else DEFAULT_BEAM_SIZE)
         # adaptive=True (live): cut beam + downgrade the model under backlog to keep
         # up with real time. adaptive=False (file import): not real time, so never
         # trade quality for speed - keep the chosen model and full beam size.
@@ -1448,6 +1627,17 @@ class Engine:
         self._compute_type = cfg["compute_type"]
         self._cpu_threads = cpu_threads
         self._rtf = deque(maxlen=DOWNGRADE_WINDOW)  # recent real-time factors (CPU downgrade)
+        # ── live ladder + shed valve state (CPU only) ──
+        # Chunks the shed valve pulled back out of the queue so it could drop the OLDEST first.
+        # Only the worker touches it, producers only ever put on the queue, and it is always
+        # drained before the queue, so it holds strictly older chunks and FIFO order is preserved.
+        self._front = deque()
+        self._last_rung_change = time.monotonic()   # DOWNGRADE_MIN_SECONDS is measured from here
+        self._cold_decode = True      # first decode on a freshly built model: its RTF is load cost
+        self._last_feed = {}          # source -> monotonic of that source's previous chunk
+        self._swap = None             # at most ONE next-rung model being built off the worker
+        self.shed_seconds = 0.0       # total audio the shed valve dropped this session
+        self.shed_events = 0
         self.subscribers = []
         self.on_downgrade = None               # optional callback(old_size, new_size), fired on the
                                                # worker thread after a successful CPU auto-downgrade.
@@ -1504,6 +1694,39 @@ class Engine:
         the prompt from anchor+names down to names alone (exactly the incident scenario)."""
         self._prompt_leak = PromptLeakMatcher(
             user_prompt, AF_ANCHOR_PROMPT if language == "af" else None)
+
+    @property
+    def indicative(self):
+        """True once the active model sits BELOW `small` on the ladder, i.e. the live text should
+        be read as a rough guide and the recording re-transcribed afterwards. Still the session's
+        own family (the ladder never leaves it), just a model small enough to say so."""
+        try:
+            return CPU_LADDER.index(self.size) > CPU_LADDER.index(INDICATIVE_BELOW)
+        except ValueError:
+            return False
+
+    def _is_burst(self, source, audio):
+        """True when this chunk arrived FASTER than real time for its source.
+
+        The evidence that separates a replay/catch-up burst from a machine that genuinely cannot
+        keep up. Live capture hands over one chunk per chunk-duration per source, so the gap
+        between two chunks of the SAME source is about the chunk length; a burst feed (a replay
+        harness, a buffered flush after a device glitch) closes that gap to nothing. Measured per
+        source on purpose: MIC and SYS both feed this one engine, so a cross-source gap is
+        near zero even in a perfectly healthy live session.
+
+        The RTF of a burst-fed chunk is a real measurement of the model, but it is not evidence
+        about holding REAL TIME, so it is excluded from the downgrade window."""
+        now = time.monotonic()
+        prev = self._last_feed.get(source)
+        self._last_feed[source] = now
+        if prev is None:
+            return False
+        try:
+            dur = len(audio) / 16000.0
+        except Exception:
+            return False
+        return dur > 0 and (now - prev) < 0.5 * dur
 
     def _ring_for(self, source):
         """This source's energy ring, or None when it has none (or the kill switch is off).
@@ -1652,11 +1875,22 @@ class Engine:
         self._worker.join(timeout=timeout)  # timeout=None -> wait until fully drained
 
     def pending(self):
-        """Approximate chunks still to transcribe (queued + the one in flight)."""
-        n = self._queue.qsize()
+        """Approximate chunks still to transcribe (shed buffer + queued + the one in flight)."""
+        n = self._queue.qsize() + len(self._front)
         if self._busy:
             n += 1
         return n
+
+    def _backlog_seconds(self):
+        """Seconds of audio still waiting to be transcribed (shed buffer + queue). The real-time
+        contract, and what the shed valve bounds. Chunks that are not real audio count as 0."""
+        total = sum(_chunk_seconds(i) for i in self._front if i is not None)
+        try:
+            with self._queue.mutex:          # read-only snapshot; producers only ever append
+                queued = list(self._queue.queue)
+        except Exception:
+            queued = []
+        return total + sum(_chunk_seconds(i) for i in queued if i is not None)
 
     def is_alive(self):
         """True while the transcription worker thread is running."""
@@ -1673,8 +1907,11 @@ class Engine:
         """
         if self._stop.is_set():
             return False  # shutting down, don't accept new audio while we drain
+        # Stamped with its arrival time and whether it arrived faster than real time, so the
+        # downgrade window can judge live evidence only (see _is_burst).
+        item = (source, audio, t_start, time.monotonic(), self._is_burst(source, audio))
         try:
-            self._queue.put((source, audio, t_start), block=block, timeout=timeout)
+            self._queue.put(item, block=block, timeout=timeout)
             return True
         except queue.Full:
             if not block:
@@ -1772,6 +2009,10 @@ class Engine:
         self._rebuild_prompt_leak(self._user_prompt, self.language)
         self._recent.clear()  # a model/language flip legitimately changes output style
         self._rtf.clear()   # judge the (possibly new) model fresh; never downgrade on the old RTF
+        if ch["model"] is not None:
+            self._cold_decode = True            # the new model pays its load cost on its first decode
+            self._last_rung_change = time.monotonic()
+            self._swap = None                   # a ladder build in flight is stale now: drop it
         lang_name = {"af": "Afrikaans", "en": "English"}.get(self.language, self.language or "auto-detect")
         self._emit_notice(t_start, f"[engine: now {self.family} {self.size}, language {lang_name}]")
 
@@ -1833,58 +2074,212 @@ class Engine:
         """Emit a system notice into the transcript (e.g. a model change)."""
         self._fanout(Segment(source="SYS", t_start=t_start, t_end=t_start, text=text))
 
-    def _maybe_downgrade(self, t_start):
-        """Step down CPU_LADDER when sustained RTF shows we can't hold real-time.
+    def _notify_downgrade(self, old_size, new_size):
+        """Fire on_downgrade best-effort. Fully decoupled, exactly like the segment subscribers:
+        this runs on the worker thread, so the callback body does its own thread-safe hand-off. A
+        None callback (CLI, file import, tests) is a no-op; a raising callback must never take the
+        transcription worker down with it. The UI reads self.indicative / self.shed_seconds off
+        the engine when it builds its payload, so this signature stays as it has always been."""
+        cb = self.on_downgrade
+        if cb is None:
+            return
+        try:
+            cb(old_size, new_size)
+        except Exception as e:
+            print(f"[engine] on_downgrade callback error: {e}", flush=True)
 
-        Only fires on CPU. Ratchets down only, never back up, to avoid
-        oscillation. The new (smaller) model also chews through the queued
-        backlog faster, which is how the session catches back up.
+    def _next_rung(self):
+        """The next USABLE rung below the current model, or None when there is none left.
+
+        Usable means both of the ladder's hard rules at once: it resolves to the family this
+        session is already running (never a stock model under an Afrikaans session), and it is
+        already on this machine (never a mid-meeting download). A rung that fails either test is
+        skipped and the search carries on down; when nothing is left the caller sheds instead.
+        Returns (size, model_id, family)."""
+        try:
+            idx = CPU_LADDER.index(self.size)
+        except ValueError:
+            idx = -1  # start size above the ladder (turbo/large-v3) -> first rung is next
+        for size in CPU_LADDER[idx + 1:]:
+            # Keep the family AND the user's engine choice: a forced-Fluister or forced-Whisper
+            # session must NOT silently flip to language-based auto when the size drops a rung.
+            model_id, fam = resolve_model(size, self.language, self.engine)
+            if fam != self.family:
+                print(f"[engine] ladder: skipping {size} ({fam}, not {self.family})", flush=True)
+                continue
+            if not model_present(model_id):
+                print(f"[engine] ladder: skipping {size} ({model_id} is not on this machine)", flush=True)
+                continue
+            return size, model_id, fam
+        return None
+
+    def _begin_swap(self, size, model_id, family):
+        """Start building the next rung on a HELPER thread and return at once, so the worker keeps
+        decoding on the current model while the new one loads. A ct2 build plus its first inference
+        costs tens of seconds (measured 35 s for medium, 16 s for small), and doing that on the
+        worker used to stall transcription outright at the exact moment the session was already
+        behind. At most one build is ever in flight, so memory is bounded at one extra model."""
+        if self._swap is not None:
+            return
+        swap = {"size": size, "model_id": model_id, "family": family,
+                "model": None, "error": None, "done": threading.Event()}
+        self._swap = swap
+        threading.Thread(target=self._swap_run, args=(swap,), daemon=True, name="rung-swap").start()
+
+    def _swap_run(self, swap):
+        try:
+            # local_only: the ladder never downloads. _next_rung already checked, this is the
+            # belt-and-braces half of the same rule.
+            swap["model"] = load_model(swap["model_id"], "cpu", self._compute_type,
+                                       cpu_threads=self._cpu_threads, local_only=True)
+        except Exception as e:
+            swap["error"] = e
+        finally:
+            swap["done"].set()
+
+    def _install_swap(self, t_start):
+        """Install a finished helper-thread build. Worker thread only, so self.model stays
+        single-writer. Returns True when the rung actually changed."""
+        swap = self._swap
+        if swap is None or not swap["done"].is_set():
+            return False
+        self._swap = None                       # drop the reference either way: one build in flight
+        self._last_rung_change = time.monotonic()
+        if swap["model"] is None:
+            print(f"[engine] downgrade load failed ({swap['size']}): {swap['error']}", flush=True)
+            return False
+        old_size = self.size   # capture BEFORE the swap: the callback reports the size we left
+        self.model = swap["model"]
+        self.size = swap["size"]
+        self.model_name = swap["model_id"]
+        self.family = swap["family"]
+        self.is_fluister = swap["family"] == "fluister"
+        self._rtf.clear()
+        # A different model legitimately changes output style, so the cross-segment loop history
+        # from the old one is not evidence about the new one (_apply_pending_change has always
+        # done this for a language/model change; the ladder used to forget to).
+        self._recent.clear()
+        self._cold_decode = True                # the first decode pays this model's load cost
+        self._emit_notice(t_start, f"[engine: switched to '{self.size}' model to keep up with the audio]")
+        self._notify_downgrade(old_size, self.size)
+        return True
+
+    def _maybe_downgrade(self, t_start):
+        """Step down CPU_LADDER when sustained, honest evidence says we can't hold real-time.
+
+        Only fires on CPU. Ratchets down only, never back up, to avoid oscillation. The new
+        (smaller) model also chews through the queued backlog faster, which is how the session
+        catches back up. See CPU_LADDER for the three rules the step itself obeys.
         """
         # Swivuriso is a single fixed model (size-independent), so there is no smaller rung to drop
         # to; never downgrade it.
         if self.family == "swivuriso":
             return
-        if not self.adaptive or not self._is_cpu or len(self._rtf) < self._rtf.maxlen:
+        if not self.adaptive or not self._is_cpu:
+            return
+        if self._install_swap(t_start):
+            return                              # just changed rung; judge the new one fresh
+        if self._swap is not None:
+            return                              # a rung is already being built off-thread
+        if time.monotonic() - self._last_rung_change < DOWNGRADE_MIN_SECONDS:
+            return                              # a step has to hold for a while before the next
+        if len(self._rtf) < self._rtf.maxlen:
             return
         avg = sum(self._rtf) / len(self._rtf)
         if avg <= DOWNGRADE_RTF:
             return
-        try:
-            idx = CPU_LADDER.index(self.size)
-        except ValueError:
-            idx = -1  # start size above the ladder (turbo/large-v3) -> first rung is next
-        if idx + 1 >= len(CPU_LADDER):
-            return  # already on the fastest rung; nothing more to give
-        new_size = CPU_LADDER[idx + 1]
-        # Keep the family AND the user's engine choice: a forced-Fluister or forced-Whisper session
-        # must NOT silently flip to language-based auto when the model size drops a rung.
-        new_model, new_family = resolve_model(new_size, self.language, self.engine)
-        print(f"[engine] CPU RTF ~{avg:.2f} (> {DOWNGRADE_RTF}); "
-              f"downgrading {self.size} -> {new_size}", flush=True)
-        try:
-            new = load_model(new_model, "cpu", self._compute_type, cpu_threads=self._cpu_threads)
-        except Exception as e:
-            print(f"[engine] downgrade load failed ({new_size}): {e}", flush=True)
-            return
-        old_size = self.size   # capture BEFORE the swap: the callback reports the size we left
-        self.model = new
-        self.size = new_size
-        self.model_name = new_model
-        self.family = new_family
-        self.is_fluister = new_family == "fluister"
-        self._rtf.clear()
-        self._emit_notice(t_start, f"[engine: switched to '{new_size}' model to keep up with the audio]")
-        # Surface the downgrade to whoever is listening (the web layer floats a banner + fires a
-        # one-time toast). Best-effort and fully decoupled, exactly like the segment subscribers:
-        # this runs on the worker thread, so the callback body does its own thread-safe hand-off.
-        # A None callback (CLI, file import, tests) is a no-op; a raising callback must never take
-        # the transcription worker down with it.
-        cb = self.on_downgrade
-        if cb is not None:
+        self._start_step(f"CPU RTF ~{avg:.2f} (> {DOWNGRADE_RTF})")
+
+    def _start_step(self, reason):
+        """Begin a step to the next usable rung, if the ladder is allowed to move and has one.
+
+        The two callers hold different evidence and both are honest: a full window of over-budget
+        RTF, and a shed event (the backlog blew past its bound on a live feed, which is the real
+        time contract failing in the most direct way there is). Everything else - swivuriso, the
+        minimum spacing, one build in flight, in-family, present-only - is checked here or in
+        _next_rung, so neither caller can bypass a rule."""
+        if self.family == "swivuriso" or not self.adaptive or not self._is_cpu:
+            return False
+        if self._swap is not None:
+            return False
+        if time.monotonic() - self._last_rung_change < DOWNGRADE_MIN_SECONDS:
+            return False
+        nxt = self._next_rung()
+        if nxt is None:
+            # Nothing usable left below this model. Do NOT reach outside the family or the local
+            # store for one: the shed valve handles it from here. Clear the window so the next
+            # decision is made on fresh evidence rather than a standing trigger.
+            self._rtf.clear()
+            return False
+        new_size, new_model, new_family = nxt
+        print(f"[engine] {reason}; downgrading {self.size} -> {new_size}", flush=True)
+        self._begin_swap(new_size, new_model, new_family)
+        self._rtf.clear()                       # don't re-trigger while the build runs
+        return True
+
+    def _drain_to_front(self):
+        """Move everything queued into the worker's own front buffer so the shed valve can drop the
+        OLDEST audio. queue.Queue only drops the NEWEST (a full queue refuses the put), which is
+        the wrong end: the newest chunk is the one the listener is waiting to see."""
+        while True:
             try:
-                cb(old_size, new_size)
-            except Exception as e:
-                print(f"[engine] on_downgrade callback error: {e}", flush=True)
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            if item is None:
+                self._stop.set()   # never lose the shutdown sentinel; the drained+stop check exits
+                continue
+            self._front.append(item)
+
+    def _maybe_shed(self, t_start):
+        """Drop the OLDEST queued audio when the backlog is past SHED_BACKLOG_SECONDS.
+
+        The last honest move. When the machine cannot keep up and there is no usable rung left
+        below the current model, the choice is between falling further and further behind (the live
+        view slides minutes into the past) and losing some audio. Losing audio wins, provided it is
+        SAID: the notice names how much and where, and the recording, if one is running, still has
+        every second of it. Live only (self.adaptive): a file import is not real time and must
+        never lose a chunk."""
+        if not self.adaptive or not self._is_cpu:
+            return
+        if self._stop.is_set():
+            # Shutting down and draining the tail. There is no real-time obligation left, and
+            # stop(drain=True) exists precisely so the last minutes of the session are not lost.
+            return
+        if self._backlog_seconds() <= SHED_BACKLOG_SECONDS:
+            return
+        self._drain_to_front()
+        dropped = 0.0
+        first = last = None
+        while self._front and self._backlog_seconds() > SHED_BACKLOG_SECONDS:
+            item = self._front.popleft()
+            if item is None:
+                continue
+            dur = _chunk_seconds(item)
+            if first is None:
+                first = item[2]
+            last = item[2] + dur
+            dropped += dur
+        if dropped <= 0:
+            return
+        self.shed_seconds += dropped
+        self.shed_events += 1
+        span = f" ({_mmss(first)} to {_mmss(last)})" if first is not None else ""
+        print(f"[engine] shed {dropped:.0f}s of backlog{span}; "
+              f"total shed {self.shed_seconds:.0f}s", flush=True)
+        self._emit_notice(t_start, f"[engine: skipped {dropped:.0f} s of audio{span} to catch up]")
+        # Surface it the same way a rung change is surfaced: same callback, same banner. Passing
+        # the current size for both sides says "nothing changed model-side, this is the shed
+        # valve", which is what the banner copy keys off.
+        self._notify_downgrade(self.size, self.size)
+        # A shed IS the real-time contract failing, and it is far more direct evidence than a
+        # rolling RTF average: the backlog went past its bound on a live feed. Measured on a ten
+        # minute two-source replay starting at medium on four threads, waiting for the RTF window
+        # alone left the session on medium for six minutes and 126 s of audio shed before it
+        # stepped; stepping on the shed itself cuts that to one shed event. Every ladder rule
+        # still applies (_start_step), so this can only ever take a rung that is in-family,
+        # present, and past the minimum spacing.
+        self._start_step(f"shed {dropped:.0f}s of backlog")
 
     def _run(self):
         # Loop until the sentinel, or (during shutdown) until the queue empties.
@@ -1892,17 +2287,23 @@ class Engine:
         # the queued backlog (the last minutes of the session). Instead we drain.
         while True:
             self._flush_pending_mic()   # release held MIC whose delay elapsed (ticks each ~0.5s)
-            try:
-                item = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                if self._stop.is_set():
-                    break  # shutdown requested and the backlog is fully drained
-                continue
+            if self._front:
+                item = self._front.popleft()   # chunks the shed valve pulled back: strictly older
+            else:
+                try:
+                    item = self._queue.get(timeout=0.5)
+                except queue.Empty:
+                    if self._stop.is_set():
+                        break  # shutdown requested and the backlog is fully drained
+                    continue
             if item is None:
                 break  # sentinel
             if self._abort.is_set():
                 continue  # hard abort: discard remaining items without transcribing
-            source, audio, t_start = item
+            # Tolerant unpack: on_chunk stamps arrival time + the burst flag, but a bare
+            # (source, audio, t_start) put straight on the queue still works.
+            source, audio, t_start = item[0], item[1], item[2]
+            burst = bool(item[4]) if len(item) > 4 else False
 
             # Apply a queued live language/model change before this chunk (worker-thread only, so
             # self.model stays single-writer, like the adaptive downgrade further down).
@@ -1931,17 +2332,22 @@ class Engine:
                 if self._silence_gate and self._chunk_is_silence(source, audio, t_start):
                     continue
                 t0 = time.monotonic()
-                segs, _info = self.model.transcribe(
-                    audio,
-                    language=self.language,
-                    initial_prompt=self.initial_prompt,
-                    vad_filter=True,
-                    # Per-source VAD: the tightened MIC set, the library defaults for SYS.
-                    vad_parameters=vad_options_for(source),
-                    beam_size=beam,
-                    **GUARD,
-                )
-                seg_list = list(segs)  # faster-whisper is lazy, this forces the actual compute
+                # encoder_window(): a CPU model decodes at its measured 20 s window (the mel is
+                # otherwise padded back to 30 s inside faster-whisper). Inert for CUDA/Metal.
+                with encoder_window(self.model) as _win_frames:
+                    _kw = {"chunk_length": _win_frames // 100} if _win_frames else {}
+                    segs, _info = self.model.transcribe(
+                        audio,
+                        language=self.language,
+                        initial_prompt=self.initial_prompt,
+                        vad_filter=True,
+                        # Per-source VAD: the tightened MIC set, the library defaults for SYS.
+                        vad_parameters=vad_options_for(source),
+                        beam_size=beam,
+                        **_kw,
+                        **GUARD,
+                    )
+                    seg_list = list(segs)  # faster-whisper is lazy, this forces the actual compute
                 elapsed = time.monotonic() - t0
 
                 for seg in seg_list:
@@ -2038,9 +2444,15 @@ class Engine:
                 # step down to a faster model if we're sustained-slower than real-time.
                 if self._is_cpu:
                     audio_dur = len(audio) / 16000.0
-                    if audio_dur > 0:
+                    # Only LIVE, WARM samples are evidence about holding real time. A burst-fed
+                    # chunk was never a real-time obligation (see _is_burst), and the first decode
+                    # on a freshly built model is dominated by that model's one-off load cost -
+                    # counting either is how a single slow moment used to cascade the whole ladder.
+                    if audio_dur > 0 and not burst and not self._cold_decode:
                         self._rtf.append(elapsed / audio_dur)
+                    self._cold_decode = False
                     self._maybe_downgrade(t_start)
+                    self._maybe_shed(t_start)
             except Exception as e:
                 print(f"[engine] transcribe error on {source} chunk: {e}", flush=True)
             finally:

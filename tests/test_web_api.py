@@ -267,10 +267,13 @@ def test_family_resolution():
     assert T.family_for_language("") == "fluister"      # auto-detect -> Fluister
     assert T.family_for_language(None) == "fluister"    # None == auto -> Fluister
     # resolve_model now returns (model_id, family) where family is "fluister" | "whisper" |
-    # "swivuriso". Explicit English -> stock size; a size with no Fluister build stays stock even for
-    # Afrikaans (base/tiny have no app-side Fluister entry).
+    # "swivuriso". Explicit English -> stock size. Every rung of the CPU ladder, base and tiny
+    # included, has a Fluister build, so an Afrikaans session NEVER resolves to a stock model.
     assert T.resolve_model("small", "en") == ("small", "whisper")
-    assert T.resolve_model("base", "af") == ("base", "whisper")
+    for _size in T.CPU_LADDER:
+        assert T.resolve_model(_size, "af")[1] == "fluister", _size
+    # A size with genuinely no Fluister build still falls back honestly to stock.
+    assert T.resolve_model("large-v2", "af") == ("large-v2", "whisper")
     # Auto-detect ("") resolves to a Fluister build when one exists for that size.
     assert T.resolve_model("large-v3", "")[1] == "fluister"
     # Engine override forces the family regardless of language.

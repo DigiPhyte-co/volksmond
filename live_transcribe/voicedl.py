@@ -72,6 +72,11 @@ _FLUISTER_SIZES = {
     "large-v3-turbo":   819_000_000,
     "medium":           774_000_000,
     "small":            250_000_000,
+    # The two live-ladder rungs below small (real repo totals on HuggingFace, 2026-09-03:
+    # 79.3 MB and 44.0 MB). Tiny next to the rest, and the difference between the CPU ladder
+    # staying in the Fluister family below small and having to leave it.
+    "base":              79_000_000,
+    "tiny":              44_000_000,
     # MLX (Apple Metal) form of Fluister turbo. Only ever the download target on darwin-arm64
     # with the MLX runtime installed; keyed by repo id, never offered on Windows.
     # TODO(sean): fp16-sized placeholder pending the fp16 vs q8 publishing call.
