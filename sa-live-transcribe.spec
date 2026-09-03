@@ -25,6 +25,16 @@ if OFFLINE and STORE:
 # (dist-store) and naming its zip volksmond-store_<ver>.zip, so the folder name here can stay
 # what the exe, the shortcuts and the MSIX manifest all expect.
 APP_NAME = "Volksmond-Offline" if OFFLINE else "Volksmond"
+# The connected edition is the direct download from the website, and it can sit on the same
+# machine as a Store install of the same app. It therefore ships as "Volksmond Fast Track" with
+# an INVERTED icon (brand-blue mark on a white tile) so the two are distinguishable in the
+# taskbar, the Start menu and Alt-Tab. Store and offline keep the original blue-tile icon. Both
+# .ico files are generated from the real brand mark by build-icon.py; only the one this edition
+# wears is bundled, so the other two bundles are unchanged. The exe / folder / installer FILE
+# names are untouched: the release pipeline and every published download URL key on
+# Volksmond.exe and Volksmond-Setup-<ver>.exe (release.ps1), so the Fast Track identity is
+# display only. live_transcribe/edition.py derives the same answer at run time.
+ICON = "volksmond.ico" if (OFFLINE or STORE) else "volksmond-fasttrack.ico"
 # Excluded from the offline bundle so these paths are not merely disabled but physically absent: a
 # source-available verifier can confirm the update-manifest fetch (updatecheck), the calendar
 # (outlook/outlook_local), and the Graph/cloud auth lib (msal) are gone.
@@ -90,8 +100,10 @@ datas += [(os.path.join("live_transcribe", "web", "static"),
 # The app icon as a DATA file as well as the EXE icon: live_transcribe/notify.py loads it at
 # runtime (LoadImage from disk) for the notification tray icon, and an icon compiled into the
 # EXE's resources is not reachable that way. Without this the notifications wear the generic
-# Windows application icon instead of the Volksmond mark.
-datas += [("volksmond.ico", ".")]
+# Windows application icon instead of the Volksmond mark. This edition's icon only (see ICON
+# above): live_transcribe/notify.py asks live_transcribe/edition.py for the filename, and the two
+# derive the edition from the same flags, so the tray icon always matches the taskbar icon.
+datas += [(ICON, ".")]
 
 # CPU-only: drop the CUDA GPU libraries ctranslate2 bundles (cuBLAS/cuDNN/cudart/
 # cuFFT/nvrtc). Keeps libctranslate2 + the CPU oneDNN libs, roughly 1 GB smaller.
@@ -126,7 +138,8 @@ pyz = PYZ(a.pure)
 # print() and tracebacks do not crash and testers still get a log to send. Flip
 # to console=True only to debug a build whose window will not appear.
 # icon: rounded-tile rendering of the brand mark (see build-icon.py); regenerate
-# by running `python build-icon.py` if the brand mark changes.
+# by running `python build-icon.py` if the brand mark changes. Which of the two
+# colourways this edition wears is decided by ICON at the top of this file.
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True,
-          name=APP_NAME, console=False, icon="volksmond.ico")
+          name=APP_NAME, console=False, icon=ICON)
 coll = COLLECT(exe, a.binaries, a.datas, name=APP_NAME)
