@@ -785,6 +785,13 @@ def _on_downgrade(engine, old_size, new_size):
             "old_size": prior["old_size"] if prior else old_size,
             "new_size": new_size,
             "recording": STATE.recording,
+            # Read off the engine rather than passed in, so the callback signature stays as it has
+            # always been. `indicative` is true once the ladder is below `small`: still the right
+            # model family, but small enough that the live text should be read as a rough guide.
+            # `shed_seconds` is the audio the engine dropped to catch up (0 unless it had to);
+            # old_size == new_size means THIS event was a shed, not a model change.
+            "indicative": bool(getattr(engine, "indicative", False)),
+            "shed_seconds": round(float(getattr(engine, "shed_seconds", 0.0) or 0.0)),
         }
         published = STATE.struggle_nudge
         fire_toast = not STATE.struggle_notified

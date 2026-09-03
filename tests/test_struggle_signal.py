@@ -24,7 +24,9 @@ restored).
 Run:  python tests/test_struggle_signal.py   (from the project root; exit 0 = pass)
 """
 import os
+import queue
 import sys
+import threading
 from collections import deque
 
 # Make `import live_transcribe` work when run as a plain script.
@@ -44,7 +46,8 @@ client.headers.update({"X-Volksmond-CSRF": CSRF_TOKEN})
 
 def _stub_engine(size="medium", family="whisper", adaptive=True, is_cpu=True, rtf=2.0):
     """A minimal Engine with just the attributes _maybe_downgrade touches, built WITHOUT __init__
-    so no model is loaded. _rtf is filled to a full window whose average trips the downgrade."""
+    so no model is loaded. _rtf is filled to a full window whose average trips the downgrade, and
+    _last_rung_change is put far enough in the past to clear DOWNGRADE_MIN_SECONDS."""
     eng = transcribe.Engine.__new__(transcribe.Engine)
     eng.family = family
     eng.adaptive = adaptive
@@ -59,8 +62,30 @@ def _stub_engine(size="medium", family="whisper", adaptive=True, is_cpu=True, rt
     eng.is_fluister = False
     eng.subscribers = []
     eng.on_downgrade = None
+    eng._swap = None
+    eng._cold_decode = False
+    eng._last_rung_change = 0.0            # monotonic 0 is always > DOWNGRADE_MIN_SECONDS ago
+    eng._front = deque()
+    eng._queue = queue.Queue(maxsize=32)
+    eng._stop = threading.Event()
+    eng._recent = transcribe.RecentEmissions()
+    eng.shed_seconds = 0.0
+    eng.shed_events = 0
     _fill_rtf(eng, rtf)
     return eng
+
+
+def _step(eng, t=1.0, timeout=5.0):
+    """Drive one full ladder step. The next rung is now built on a HELPER thread so the worker keeps
+    decoding meanwhile, so a step takes two passes through _maybe_downgrade: the first starts the
+    build, the second installs it once it is ready. Returns True if a rung was installed."""
+    before = eng.size
+    eng._maybe_downgrade(t)
+    swap = eng._swap
+    if swap is not None:
+        assert swap["done"].wait(timeout), "the helper-thread build never finished"
+    eng._maybe_downgrade(t)
+    return eng.size != before
 
 
 def _fill_rtf(eng, val=2.0):
@@ -74,13 +99,16 @@ class _stub_models:
     def __enter__(self):
         self._load = transcribe.load_model
         self._resolve = transcribe.resolve_model
+        self._present = transcribe.model_present
         transcribe.load_model = lambda *a, **k: object()
         transcribe.resolve_model = lambda size, language, engine: (f"model-{size}", "whisper")
+        transcribe.model_present = lambda model_id: True   # every rung is on this machine
         return self
 
     def __exit__(self, *exc):
         transcribe.load_model = self._load
         transcribe.resolve_model = self._resolve
+        transcribe.model_present = self._present
 
 
 _STATE_FIELDS = ("running", "stopping", "source_kind", "engine", "recording",
@@ -138,7 +166,7 @@ def test_callback_gets_preswap_old_size_and_new_size():
         eng = _stub_engine(size="medium")
         calls = []
         eng.on_downgrade = lambda old, new: calls.append((old, new))
-        eng._maybe_downgrade(12.0)
+        _step(eng, 12.0)
     assert eng.size == "small", f"the downgrade must still happen; size is {eng.size}"
     assert calls == [("medium", "small")], f"callback must get the PRE-swap old size, got {calls}"
     print("  OK  on_downgrade fires with (pre-swap old_size, new_size) after a successful step")
@@ -149,7 +177,7 @@ def test_callback_none_is_a_noop_and_raising_never_breaks_the_worker():
         # None callback: the swap still happens, nothing is called, nothing raised.
         eng = _stub_engine(size="medium")
         eng.on_downgrade = None
-        eng._maybe_downgrade(1.0)
+        _step(eng, 1.0)
         assert eng.size == "small"
         # A raising callback must be swallowed: the swap still happens and _maybe_downgrade returns
         # normally (a crash here would take the transcription worker thread down).
@@ -159,7 +187,7 @@ def test_callback_none_is_a_noop_and_raising_never_breaks_the_worker():
             raise RuntimeError("callback exploded")
 
         eng2.on_downgrade = boom
-        eng2._maybe_downgrade(2.0)     # must not raise
+        _step(eng2, 2.0)               # must not raise
         assert eng2.size == "base", "a raising callback must not prevent the downgrade"
     print("  OK  a None callback is a no-op and a raising callback never breaks the downgrade")
 
@@ -169,11 +197,12 @@ def test_callback_steps_each_rung_and_stops_at_the_floor():
         eng = _stub_engine(size="base")
         seen = []
         eng.on_downgrade = lambda old, new: seen.append((old, new))
-        eng._maybe_downgrade(1.0)      # base -> tiny
+        _step(eng, 1.0)                # base -> tiny
         assert eng.size == "tiny" and seen == [("base", "tiny")], (eng.size, seen)
         # Already on the fastest rung: no further step, no callback.
         _fill_rtf(eng)
-        eng._maybe_downgrade(2.0)
+        eng._last_rung_change = 0.0
+        _step(eng, 2.0)
         assert eng.size == "tiny" and seen == [("base", "tiny")], "must not step past the floor"
     print("  OK  callback fires per rung and never fires once on the fastest rung")
 
@@ -187,7 +216,7 @@ def test_callback_inert_off_the_cpu_adaptive_path():
             eng = _stub_engine(size="medium", **kw)
             fired = []
             eng.on_downgrade = lambda old, new: fired.append((old, new))
-            eng._maybe_downgrade(1.0)
+            _step(eng, 1.0)
             assert eng.size == "medium", f"{label}: must not downgrade"
             assert fired == [], f"{label}: callback must not fire"
         # A partial (not-yet-full) RTF window must not downgrade either.
@@ -195,7 +224,7 @@ def test_callback_inert_off_the_cpu_adaptive_path():
         eng._rtf = deque([2.0, 2.0], maxlen=transcribe.DOWNGRADE_WINDOW)   # len 2 < maxlen 4
         fired = []
         eng.on_downgrade = lambda old, new: fired.append(1)
-        eng._maybe_downgrade(1.0)
+        _step(eng, 1.0)
         assert eng.size == "medium" and fired == [], "an unfilled RTF window must not downgrade"
     print("  OK  callback stays inert on GPU / non-adaptive / Swivuriso / low-RTF / unfilled window")
 
@@ -218,20 +247,23 @@ def test_handler_publishes_once_and_updates_in_place():
             # First downgrade: banner appears, toast fires once.
             webapp._on_downgrade(eng, "medium", "small")
             assert webapp.STATE.struggle_nudge == {"old_size": "medium", "new_size": "small",
-                                                   "recording": False}, webapp.STATE.struggle_nudge
+                                                   "recording": False, "indicative": False,
+                                                   "shed_seconds": 0}, webapp.STATE.struggle_nudge
             assert webapp.STATE.struggle_notified is True
             assert len(calls) == 1 and calls[0]["tag"] == "struggle", calls
             assert callable(calls[0]["on_click"]), "the toast must be clickable back to the app"
             # A later rung updates new_size IN PLACE (original old_size kept), no second toast.
             webapp._on_downgrade(eng, "small", "base")
             assert webapp.STATE.struggle_nudge == {"old_size": "medium", "new_size": "base",
-                                                   "recording": False}, webapp.STATE.struggle_nudge
+                                                   "recording": False, "indicative": False,
+                                                   "shed_seconds": 0}, webapp.STATE.struggle_nudge
             assert len(calls) == 1, f"the toast must fire only once per session, got {len(calls)}"
             # `recording` is captured at emit time: once recording, the next update reflects it.
             webapp.STATE.recording = True
             webapp._on_downgrade(eng, "base", "tiny")
             assert webapp.STATE.struggle_nudge == {"old_size": "medium", "new_size": "tiny",
-                                                   "recording": True}, webapp.STATE.struggle_nudge
+                                                   "recording": True, "indicative": False,
+                                                   "shed_seconds": 0}, webapp.STATE.struggle_nudge
             assert len(calls) == 1
     finally:
         restore_notify()
