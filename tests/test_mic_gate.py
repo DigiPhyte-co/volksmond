@@ -120,6 +120,51 @@ def test_gate_passes_a_quiet_talker_in_a_quiet_room():
     assert _GateEngine(mic_ring=ring)._chunk_is_silence("MIC", audio(), HISTORY_S) is False
 
 
+# --- arm 1: the absolute floor is a ceiling on a relative test, not a cut of its own -----------
+
+def test_a_low_gain_mic_is_not_cut_by_the_absolute_floor():
+    """The measured failure: at -18 dB of mic attenuation the whole channel - speech and room
+    together - sits under the -45 dBFS speech floor, so arm 1 cut 33 of 40 chunks and arm 3
+    never ran on any of them. A talker 23 dB above their own room tone is speech whatever the
+    absolute level says."""
+    ring = ring_of(frames(60, -49.0, room_db=-72.0), room_db=-72.0)
+    assert -49.0 < T._silence_floor_db(ring, HISTORY_S + CHUNK_S), \
+        "precondition: this talker is under the absolute speech floor"
+    assert _GateEngine(mic_ring=ring)._chunk_is_silence("MIC", audio(), HISTORY_S) is False, \
+        "a quiet talker well above their own room floor must be decoded"
+
+
+def test_a_dead_chunk_under_the_floor_is_still_skipped():
+    """The other half of the pair, and what stops the fix from being a loosening: a channel
+    sitting flat ON its own noise floor rose above nothing and is still skipped."""
+    ring = ring_of(frames(0, -49.0, room_db=-72.0), room_db=-72.0)   # whole window at room tone
+    assert _GateEngine(mic_ring=ring)._chunk_is_silence("MIC", audio(), HISTORY_S) is True, \
+        "flat noise at the room floor is not speech, at any absolute level"
+    # and one 6 dB bump above the floor is still not enough to call it speech
+    near = ring_of(frames(60, -66.0, room_db=-72.0), room_db=-72.0)
+    assert _GateEngine(mic_ring=near)._chunk_is_silence("MIC", audio(), HISTORY_S) is True
+
+
+def test_the_far_end_keeps_the_plain_absolute_cut():
+    """SYS is a digital feed at a known level with no microphone and no gain to lose. The
+    relative qualifier is a microphone fix and must not touch it."""
+    ring = ring_of(frames(60, -49.0, room_db=-72.0), room_db=-72.0)
+    assert _GateEngine(sys_ring=ring)._chunk_is_silence("SYS", audio(), HISTORY_S) is True, \
+        "the same ring that is now decoded on MIC must still be skipped on SYS"
+
+
+def test_switching_the_gate_off_stands_arm_1_down_too():
+    """The valve escalates to off by clearing the same flag the live toggle clears, and a user
+    who has already been cut off must not then be cut off by the coarser arm instead. Visible on
+    a chunk with no room baseline yet (session start), which is the one case arm 2 cannot judge
+    and arm 1 therefore still decides on its own."""
+    ring = ring_of(frames(60, -50.0), history_s=0.0)         # nothing before the window
+    assert _GateEngine(mic_ring=ring, arm3=True)._chunk_is_silence("MIC", audio(), 0.0) is True, \
+        "precondition: with the gate armed and no baseline, the absolute floor still cuts"
+    assert _GateEngine(mic_ring=ring, arm3=False)._chunk_is_silence("MIC", audio(), 0.0) is False, \
+        "with the gate off, arm 1 must stand down as well"
+
+
 # --- the AGC, which is the reason the ring must stay raw --------------------------------------
 
 def test_gate_holds_when_agc_lifts_the_chunk_but_not_the_ring():
@@ -175,8 +220,12 @@ def test_arm_3_is_inert_without_a_room_baseline():
 
 def test_arm_3_never_rescues_a_chunk_the_peak_arms_skipped():
     """Additive, in one direction only: arm 3 can turn a keep into a skip, never a skip into a
-    keep. A room-tone chunk with plenty of frames just above its own floor is still skipped by
-    the absolute arm."""
+    keep. A room-tone chunk with plenty of frames just above its own floor is still skipped.
+
+    Since arm 1 became relative the two arms cannot disagree here anyway: arm 1 skips only what
+    failed to rise 6 dB above the room, and 6 dB can never clear arm 3's 20 dB evidence bar. This
+    chunk (10 dB above the floor) is now past arm 1 and skipped by arm 3 on its frame count,
+    which is the same verdict for a better reason."""
     ring = ring_of(frames(150, -60.0), room_db=-70.0)
     assert _GateEngine(mic_ring=ring)._chunk_is_silence("MIC", audio(), HISTORY_S) is True
 

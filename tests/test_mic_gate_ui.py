@@ -203,10 +203,15 @@ def test_gentle_mode_then_decodes_the_quiet_talker():
 def test_valve_does_not_fire_on_a_dead_quiet_room():
     """The pair test, and the reason a bare skip count would be wrong. An empty room skips every
     chunk too, but its frames sit at the floor, nowhere near the band under the threshold. The
-    gate must stay in normal mode: there is nobody to stop cutting off."""
+    gate must stay in normal mode: there is nobody to stop cutting off.
+
+    n_loud=0 is what makes it an empty room: every frame IS the room tone. (It used to pass
+    DEAD_QUIET_DB for 60 of the 150 frames, which put those frames 18 dB BELOW the established
+    room, dragged the p10 baseline down with them and left the room's own tone looking like
+    sustained activity under the bar. A room cannot be quieter than its own noise floor.)"""
     f = Feeder()
     for _ in range(T.MIC_GATE_WINDOW * 3):
-        f.chunk(DEAD_QUIET_DB)
+        f.chunk(DEAD_QUIET_DB, n_loud=0)
     st = f.eng.mic_gate_state()
     assert st["skipped"] == T.MIC_GATE_WINDOW * 3, st
     assert st["mode"] == "normal" and st["hint"] is None, st

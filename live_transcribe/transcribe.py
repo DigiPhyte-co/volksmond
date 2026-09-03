@@ -753,6 +753,16 @@ MIC_GATE_WINDOW = 8               # the valve looks at the last N MIC chunks the
 MIC_GATE_TRIP = 6                 # ... and trips when this many were skipped AND near the line
 MIC_GATE_NEAR_BAND_DB = 12.0      # "just under the line" = within this far below the threshold
 
+# Arm 1's relative qualifier (MIC only). The absolute -45 dBFS floor was calibrated on a mic at a
+# healthy level; a low-gain one puts its speech AND its room under that line together, so the
+# absolute test alone cut the talker before arm 3 or the valve could see them at all (measured:
+# -18 dB of attenuation, 33 of 40 chunks skipped as "absolute", arm 3 never reached). The floor is
+# now a CEILING on a relative test - skip only when the chunk also failed to rise this far above
+# the room tone it arrived into - so the cut needs both "quiet in absolute terms" and "nothing
+# happened here". 6 dB, not arm 2's 8: this arm is the coarser of the two and should defer.
+ABS_FLOOR_MARGIN_DB = 6.0         # above the room floor, and arm 1 keeps the chunk ...
+ABS_FLOOR_GENTLE_MARGIN_DB = 3.0  # ... halved once the valve has stepped down to gentle
+
 # Per-source silero VAD options (faster-whisper 1.2.1 VadOptions). The library defaults -
 # threshold 0.5, min_speech_duration_ms 0, min_silence_duration_ms 2000, speech_pad_ms 400 -
 # only split a chunk on a silence LONGER THAN TWO SECONDS and keep speech regions of any length,
@@ -1767,7 +1777,11 @@ class Engine:
         1. Absolute: the loudest frame never reached the speech floor (see _silence_floor_db).
            That is the point of WP-4 - live AGC lifts a silent room's chunk energy over the
            -45 dBFS floor, so the chunk-fed gate was effectively dead on a quiet mic, the exact
-           condition Whisper fabricates on.
+           condition Whisper fabricates on. On MIC that floor is a CEILING on a relative test
+           rather than a cut of its own (see ABS_FLOOR_MARGIN_DB): a low-gain microphone puts
+           its speech and its room under -45 dBFS together, so the chunk must ALSO have failed
+           to rise above the room tone before it is skipped. The quiet-mic safety valve owns
+           this arm as well: gentle halves the margin and off stands it down.
         2. Dead channel (relative): the loudest frame sits <= `dead_margin_db` above this
            channel's room tone as measured STRICTLY BEFORE the chunk (ring p10 of the frames
            preceding t_start), i.e. nothing here rose meaningfully above the background it
@@ -1811,9 +1825,32 @@ class Engine:
         peak = ring.max_db(t_start, t_hi)
         if peak is None:
             return _is_silence(audio)
-        if peak < _silence_floor_db(ring, t_hi):
-            return _gate_log(self, source, t_start, True, "absolute")
         floor = ring.noise_floor_before(t_start)
+        abs_floor = _silence_floor_db(ring, t_hi)
+        if peak < abs_floor:
+            if source != "MIC":
+                return _gate_log(self, source, t_start, True, "absolute")
+            # MIC: the absolute floor is a CEILING on a relative test, not a cut of its own.
+            # Measured at -18 dB of mic attenuation on a real capture: 33 of 40 chunks were cut
+            # here, arm 3 never got to run on any of them and the safety valve therefore never
+            # saw the quiet mic it exists for. A low-gain microphone puts EVERYTHING - speech
+            # and room alike - under -45 dBFS, so an absolute floor alone cannot tell a quiet
+            # talker from an empty room. What can is the room's own tone: skip only when nothing
+            # in the chunk rose meaningfully above the floor it arrived into.
+            # The valve owns this arm too. Gentle halves the margin, and off (whether the valve
+            # stepped there or the user did) stands it down entirely, or the escalation would
+            # hand a cut-off user from one arm to another. Arm 1 feeds the valve no near-miss
+            # evidence, deliberately: post-fix it only fires ON the room floor, which is the
+            # dead-room signature, never a talker under the bar. That evidence is arm 3's.
+            armed = bool(getattr(self, "_mic_speech_gate", True))
+            gentle = getattr(self, "_mic_gate_level", "normal") == "gentle"
+            margin = ABS_FLOOR_GENTLE_MARGIN_DB if gentle else ABS_FLOOR_MARGIN_DB
+            if armed and (floor is None or (peak - floor) <= margin):
+                # floor is None (session start, under 10 s of history) keeps the old absolute cut:
+                # with no room tone to compare against there is nothing better to do, and this is
+                # what the pinned first-chunk cases expect.
+                why = "absolute" if floor is None else f"absolute peak={peak:.0f} floor={floor:.0f}"
+                return _gate_log(self, source, t_start, True, why)
         if (floor is not None and peak <= dead_ceiling_db
                 and (peak - floor) <= dead_margin_db):
             return _gate_log(self, source, t_start, True, f"dead peak={peak:.0f} floor={floor:.0f}")
