@@ -256,6 +256,12 @@ function fmtElapsed(sinceIso) {
   if (h > 0) return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
   return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
 }
+// m:ss from a plain seconds count (the model-load elapsed counter). Not fmtElapsed: that one takes
+// an ISO start time, and the server owns the load clock here, not the browser.
+function fmtSecs(secs) {
+  var t = Math.max(0, Math.floor(secs || 0));
+  return Math.floor(t / 60) + ":" + String(t % 60).padStart(2, "0");
+}
 function fmtBytes(n) {
   if (!n) return ""; if (n < 1024) return n + " B";
   if (n < 1048576) return (n / 1024).toFixed(0) + " KB";
@@ -1725,7 +1731,12 @@ function startReadinessPoll() {
 }
 function stopReadinessPoll() { if (readinessTimer) { clearInterval(readinessTimer); readinessTimer = null; } }
 // Signature of the prepare object so a steady poll (same phase/bytes) never forces a re-render.
-function prepareSig(p) { return p ? (String(p.phase) + "|" + String(p.model) + "|" + String(p.downloaded) + "|" + String(p.total) + "|" + (p.stalled ? "1" : "0")) : ""; }
+// The load's elapsed seconds are part of it, rounded to whole seconds, because a counter that does
+// not tick is worse than none: that is one small re-render per poll, only while the model loads.
+function prepareSig(p) {
+  return p ? (String(p.phase) + "|" + String(p.model) + "|" + String(p.downloaded) + "|" + String(p.total)
+    + "|" + (p.stalled ? "1" : "0") + "|" + String(Math.floor(p.elapsed || 0)) + "|" + (p.slow ? "1" : "0")) : "";
+}
 // Adopt the server's transcription-readiness + prepare progress onto S.live; returns true if
 // anything changed (so the caller can re-render). Shared by the readiness poll and the silence
 // reconcile, so a steady state never forces a re-render and the two stay in step.
@@ -2377,9 +2388,19 @@ function preparePanel(failMsg) {
                     : (fmtGB(dl) + " " + tr("downloaded so far")) }),
     ]);
   } else {
+    // Loading. The server owns the clock (p.elapsed), so the counter keeps counting across a page
+    // reload and matches the budget the server is actually holding it to. The hint appears only
+    // once the server says the wait is a long one (CPU past its hint threshold), so a fast machine
+    // never sees it.
     progressBlock = el("div", { style: { width: "100%", maxWidth: "420px" } }, [
-      el("div", { style: { fontWeight: "600", fontSize: "13px", textAlign: "center" }, text: "Loading into memory" }),
+      el("div", { style: { fontWeight: "600", fontSize: "13px", textAlign: "center" } }, [
+        el("span", { text: "Loading into memory" }),
+        p.elapsed ? el("span", { class: "mono ink-3", style: { marginLeft: "8px", fontWeight: "500" } },
+          raw(fmtSecs(p.elapsed))) : null,
+      ]),
       el("div", { class: "track", style: { marginTop: "10px" } }, el("div", { class: "indeterminate" })),
+      p.slow ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "6px", textAlign: "center" },
+        text: "First load on this computer can take a few minutes. It is faster next time." }) : null,
     ]);
   }
   return el("div", { class: "rec-stage", style: { maxWidth: "520px", margin: "0 auto" } }, [
