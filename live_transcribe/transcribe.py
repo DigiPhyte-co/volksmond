@@ -837,6 +837,35 @@ _LEAK_NGRAM_COVERAGE = 0.75    # matched n-gram spans must cover this much of th
 _LEAK_UNIT_MAX = 4             # a "unit" is a name/jargon term; longer -> prose, n-gram it instead
 _LEAK_LONG_PROMPT = 60         # a prompt longer than this is prose -> n-gram-only (safety valve)
 
+# Mode C (WP-3), the short anchor-echo drop. Modes A and B both need the leak to be MOST of the
+# segment: A wants 0.80 coverage by whole prompt units, B wants 0.75 coverage by 5-grams. The
+# residue they miss is the short scatter - three or four of the anchor's own distinctive words
+# in a row, in no order the anchor ever used ("Afrikaans, kodewissel, dankie"), which covers no
+# n-gram and matches no unit. Whisper emits these on non-speech, never mid-conversation.
+#
+# The terms are DERIVED from AF_ANCHOR_PROMPT, never listed a second time: its tokens of at least
+# _LEAK_ANCHOR_MINLEN characters. Six is where the anchor stops being ordinary conversation: it
+# keeps kodewisseling / vergadering / besigheid / kollegas / afrikaans / engels / sprekers /
+# dankie and leaves out baie, nogal, ons, hulle, julle, sjoe, more, tog. A token also matches by
+# prefix in either direction, so the truncation Whisper actually emits ("kodewissel") counts.
+#
+# The anchor labels its own two halves, and the split matters. Everything after "Algemene woorde"
+# ("common words") is, by the constant's own declaration, ordinary Afrikaans: "ons kinders is
+# baie lekker vandag" is a real sentence built entirely from it. So at least one hit must come
+# from the INSTRUCTION half - the half that talks ABOUT the transcription (afrikaans, engels,
+# kodewisseling, sprekers, nederlands, gesprek) and that a speaker has no reason to recite.
+#
+# Safety, measured 2026-09-03 on the incident capture: 0 of 53 segments of genuine Afrikaans
+# (the GPU large-v3 far-end reference, 918 words, plus both far-end CPU decodes) trip this, while
+# it catches the prompt-echo lines in the near-end junk. Four bounds buy that: only short
+# segments, at least two DISTINCT anchor terms, at least one of them from the instruction half,
+# and an escape for any segment still carrying _LEAK_ANCHOR_MIN_OWN words of the speaker's own.
+_LEAK_ANCHOR_SPLIT = "Algemene woorde"   # the anchor's own label for its ordinary-Afrikaans half
+_LEAK_ANCHOR_MINLEN = 6        # anchor tokens shorter than this are ordinary speech, never terms
+_LEAK_ANCHOR_MAX_TOKENS = 12   # only short segments; real sentences are longer than the scatter
+_LEAK_ANCHOR_MIN_HITS = 2      # distinct spoken terms; one is a speaker legitimately saying it
+_LEAK_ANCHOR_MIN_OWN = 5       # words NOT in the prompt that keep any segment, however many hits
+
 # Short, language-agnostic (EN+AF) filler list, derived from the observed leaks: these are
 # the words that pad a leak ("and Danica Freimond.", "... , yeah.") and must not count
 # against coverage. Written with the same normalisation as segments ("'n" -> "n").
@@ -1054,6 +1083,13 @@ class PromptLeakMatcher:
         self._units = []      # Mode A: normalised token tuples, matched as contiguous n-grams
         self._vocab = set()   # Mode A: every token of those units (see the F7 note in is_leak)
         self._ngrams = set()  # Mode B: every _LEAK_NGRAM-length n-gram of the anchor / long prompt
+        # Mode C: the anchor's terms, the subset of them from its instruction half, and every
+        # token of the whole prompt (anchor plus user prompt) so "words of the speaker's own"
+        # means own, not merely non-anchor.
+        head = (anchor or "").split(_LEAK_ANCHOR_SPLIT)[0]
+        self._anchor_terms = sorted({t for t in _norm_tokens(anchor) if len(t) >= _LEAK_ANCHOR_MINLEN})
+        self._anchor_head = {t for t in self._anchor_terms if t in set(_norm_tokens(head))}
+        self._prompt_vocab = set(_norm_tokens(anchor)) | set(_norm_tokens(user_prompt))
         toks = _norm_tokens(user_prompt)
         if len(toks) > _LEAK_LONG_PROMPT:
             # Safety valve: a pasted agenda, not a name list. Unit/coverage matching over a
@@ -1096,6 +1132,8 @@ class PromptLeakMatcher:
         if not toks:
             return False
         if self._ngram_leak(toks):
+            return True
+        if self._anchor_echo(toks):
             return True
         if not self._units:
             return False
@@ -1144,6 +1182,36 @@ class PromptLeakMatcher:
         if cov < _LEAK_COVERAGE:
             return False
         return len(content) >= _LEAK_MIN_CONTENT or matched_len > 1
+
+    def _anchor_echo(self, toks):
+        """Mode C: a SHORT segment that is a scatter of the anchor's own distinctive terms.
+
+        Additive to modes A and B and deliberately narrow (see the _LEAK_ANCHOR_* notes): a
+        segment of at most _LEAK_ANCHOR_MAX_TOKENS tokens carrying at least
+        _LEAK_ANCHOR_MIN_HITS DISTINCT spoken words that are anchor terms, at least one of them
+        matching the anchor's instruction half, and fewer than _LEAK_ANCHOR_MIN_OWN tokens
+        that are not in the prompt at all.
+        Inert on a non-af session, where there is no anchor.
+        """
+        if not self._anchor_terms or len(toks) > _LEAK_ANCHOR_MAX_TOKENS:
+            return False
+        hit, head = set(), False
+        for t in set(toks):
+            for term in self._anchor_terms:
+                # Either direction, because Whisper truncates the anchor's long words as often
+                # as it extends them ("kodewissel" for "kodewisseling", "afrikaanse" for
+                # "afrikaans"). The MINLEN floor on both sides keeps this off short words.
+                if t == term or (len(t) >= _LEAK_ANCHOR_MINLEN
+                                 and (t.startswith(term) or term.startswith(t))):
+                    # Count the SPOKEN token, never the terms it matched: prefix matching lets a
+                    # single "Afrikaans" hit both "afrikaans" and "afrikaanse", and counting terms
+                    # would turn one word into the two the drop requires.
+                    hit.add(t)
+                    head = head or term in self._anchor_head
+        if len(hit) < _LEAK_ANCHOR_MIN_HITS or not head:
+            return False
+        own = sum(1 for t in toks if t not in self._prompt_vocab)
+        return own < _LEAK_ANCHOR_MIN_OWN
 
     def _ngram_leak(self, toks):
         """Mode B: the anchor / long prompt / long unit, matched as contiguous n-grams.
