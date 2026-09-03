@@ -9,8 +9,9 @@
  */
 "use strict";
 
-// Where "Report a bug or request a feature" sends. Privacy-first mailto: it
-// only carries the app version and OS, never logs or transcripts.
+// Where "Report a bug or request a feature" sends. Privacy-first mailto: the body
+// carries the app version, the OS, and one line describing the hardware. Logs go in
+// the diagnostics zip, which the USER attaches; transcripts never go anywhere.
 var FEEDBACK_EMAIL = "volksmond@digiphyte.com";
 // The business / licensing page: current pricing and what a Business licence covers.
 // Personal use is free, so this is only ever a "learn or buy" link, opened in the browser.
@@ -1224,42 +1225,88 @@ function openExternal(url) {
   else { window.open(url, "_blank", "noopener"); }
 }
 function openStoreListing() { openExternal(STORE_PRODUCT_URI); }
+// Ask the server to write the diagnostics zip. Returns the response ({path, folder,
+// name}) or null on failure; the caller decides what to say. Nothing is uploaded: the
+// file is written to this machine's Downloads folder and only ever travels if the user
+// attaches it to an email themselves.
+async function saveDiagnostics(quiet) {
+  try {
+    var r = await api.post("/api/diagnostics");
+    if (!quiet) toast("Diagnostics saved to " + r.path);
+    return r;
+  } catch (e) {
+    if (!quiet) toast(e.message || "Could not save diagnostics.", true);
+    return null;
+  }
+}
+// The email body. mailto: cannot attach a file and Outlook truncates a long body, so
+// this stays short: the version line, one machine line (CPU, cores, RAM, GPU, install
+// kind) and where the user can find the zip to attach.
+function feedbackBody(af, version, plat, machine, diagPath) {
+  return (af ? "Beskryf die fout of die funksie wat jy graag wil hê:" : "Describe the bug or the feature you would like:") +
+    "\n\n\n----------------------------------------\n" +
+    "Volksmond version " + version + "\n" +
+    (machine ? machine + "\n" : "") + plat + "\n" +
+    (diagPath
+      ? (af ? "Heg asseblief hierdie lêer aan: " : "Please attach this file: ") + diagPath
+      : (af ? "Heg asseblief die diagnostiese lêer aan (Stoor diagnostiek in Volksmond, dan kyk in Aflaaie)."
+            : "Please attach the diagnostics file (use Save diagnostics in Volksmond, then look in Downloads).")) + "\n";
+}
 function reportBug() {
   // No phone-home: the app never sends anything. It either hands a prefilled draft to
   // the user's default mail app (mailto), or copies a report to the clipboard for them
-  // to paste into webmail. The send always happens outside the app.
+  // to paste into webmail. The send always happens outside the app, and the diagnostics
+  // zip is only ever attached by the user.
   var info = S.appInfo || {};
   var version = info.version || "?", plat = info.platform || "?";
   var af = LANG === "af";
   var subject = "Volksmond feedback (v" + version + ")";
-  var body =
-    (af ? "Beskryf die fout of die funksie wat jy graag wil hê:" : "Describe the bug or the feature you would like:") +
-    "\n\n\n----------------------------------------\n" +
-    "Volksmond version " + version + "\n" + plat + "\n" +
-    (af ? "(Geen logs of transkripsies is aangeheg nie. Voeg self enigiets nuttig by.)"
-        : "(No logs or transcripts are attached. Add anything helpful yourself.)") + "\n";
-  var mailto = "mailto:" + FEEDBACK_EMAIL + "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
-  var reportText = "To: " + FEEDBACK_EMAIL + "\nSubject: " + subject + "\n\n" + body;
+  var machine = "", diagPath = "";
+  function body() { return feedbackBody(af, version, plat, machine, diagPath); }
+  function mailtoUrl() {
+    return "mailto:" + FEEDBACK_EMAIL + "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body());
+  }
+  function reportText() { return "To: " + FEEDBACK_EMAIL + "\nSubject: " + subject + "\n\n" + body(); }
+
+  var pathLine = el("div", { class: "mono", style: { fontSize: "11.5px", wordBreak: "break-all", marginTop: "4px" } },
+    raw(af ? "Nog nie gestoor nie." : "Not saved yet."));
+  var openBtn = el("button", { class: "btn primary", onclick: async function () {
+    openBtn.disabled = true;
+    var r = await saveDiagnostics(true);
+    openBtn.disabled = false;
+    if (r) { diagPath = r.path; clear(pathLine); append(pathLine, raw(r.path)); }
+    else { toast("Could not save diagnostics. Sending the report without it.", true); }
+    openExternal(mailtoUrl());
+    modal.remove();
+  } }, [icon("note", 14), "Save diagnostics and open email"]);
 
   var modal = el("div", { class: "modal-backdrop", onclick: function (e) { if (e.target === modal) modal.remove(); } }, [
     el("div", { class: "modal" }, [
       el("h2", { text: "Report a bug or idea" }),
       el("p", { class: "ink-3", style: { margin: "8px 0 14px", fontSize: "13px" }, text: "Nothing is sent automatically. The app never phones home, you send this yourself." }),
-      el("div", { style: { display: "flex", alignItems: "center", gap: "10px", padding: "10px 12px", background: "var(--surface-2)", borderRadius: "8px", marginBottom: "16px" } }, [
+      el("div", { style: { display: "flex", alignItems: "center", gap: "10px", padding: "10px 12px", background: "var(--surface-2)", borderRadius: "8px", marginBottom: "12px" } }, [
         el("span", { style: { color: "var(--ink-3)", display: "inline-flex" } }, icon("bug", 16)),
         el("div", {}, [
           el("div", { style: { fontSize: "12px", color: "var(--ink-3)" }, text: "Send it to" }),
           el("div", { class: "mono", style: { fontSize: "13.5px" }, text: FEEDBACK_EMAIL }),
         ]),
       ]),
+      el("div", { style: { padding: "10px 12px", background: "var(--surface-2)", borderRadius: "8px", marginBottom: "16px" } }, [
+        el("div", { style: { fontSize: "12.5px" }, text: "We save a small diagnostics file to your Downloads folder. Please attach it to the email: it is what lets us tell you what went wrong." }),
+        el("div", { class: "s", style: { fontSize: "11.5px", marginTop: "6px" }, text: "It holds the app logs, your settings, and what this computer is. No transcripts, no notes, no audio, no licence key." }),
+        pathLine,
+      ]),
       el("div", { class: "row gap-8", style: { justifyContent: "flex-end", flexWrap: "wrap" } }, [
         el("button", { class: "btn ghost", onclick: function () { modal.remove(); } }, "Close"),
-        el("button", { class: "btn ghost", onclick: function () { copyText(reportText); } }, [icon("copy", 14), "Copy report"]),
-        el("button", { class: "btn primary", onclick: function () { openExternal(mailto); modal.remove(); } }, [icon("note", 14), "Open email"]),
+        el("button", { class: "btn ghost", onclick: function () { copyText(reportText()); } }, [icon("copy", 14), "Copy report"]),
+        openBtn,
       ]),
     ]),
   ]);
   APP.appendChild(modal);
+  // The machine line needs a GPU probe (a subprocess), so it is fetched when the modal
+  // opens rather than on every app load. If it never arrives the body simply omits it.
+  api.get("/api/diagnostics").then(function (d) { machine = d.summary || ""; }).catch(function () {});
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -3790,6 +3837,12 @@ function dataCard(st) {
       el("div", { class: "body" }, [el("div", { class: "t", text: "Audio is off by default" }),
         el("div", { class: "s", text: "Recording is only kept when you switch it on for a meeting. The privacy promise holds otherwise." })]),
       el("div", { class: "ctl" }, el("span", { class: "chip ok" }, [icon("check", 12), "On by you only"])),
+    ]),
+    el("div", { class: "set-row" }, [
+      el("div", { class: "ic" }, icon("bug", 18)),
+      el("div", { class: "body" }, [el("div", { class: "t", text: "Save diagnostics" }),
+        el("div", { class: "s", text: "Writes a small zip to your Downloads folder with the app logs, your settings and what this computer is. Attach it when you report a problem. No transcripts, no notes, no audio, no licence key, and nothing is sent anywhere." })]),
+      el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: function () { saveDiagnostics(false); } }, "Save")),
     ]),
   ]);
 }
