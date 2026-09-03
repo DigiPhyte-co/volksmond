@@ -85,6 +85,30 @@ def test_offline_edition_keeps_the_plain_name():
     print("  OK  SA_LIVE_OFFLINE=1 -> offline, still 'Volksmond', original icon")
 
 
+def _tooltip(extra_env, frozen=False):
+    """notify.TOOLTIP, the tray icon's hover text, as a fresh interpreter sees it."""
+    env = {k: v for k, v in os.environ.items() if k not in ("SA_LIVE_OFFLINE", "SA_LIVE_STORE")}
+    env.update(extra_env)
+    code = "import sys\n"
+    if frozen:
+        code += "sys.frozen = True\n"
+    code += "from live_transcribe import notify\nprint(notify.TOOLTIP)\n"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         cwd=ROOT, env=env, timeout=300)
+    assert out.returncode == 0, f"notify failed to import:\n{out.stdout}\n{out.stderr}"
+    return out.stdout.strip().splitlines()[-1]
+
+
+def test_tray_tooltip_follows_the_edition_name():
+    """The tray icon is one of the places a user with both installs looks to tell them apart,
+    and its hover text was still hard-coded to "Volksmond" in every edition."""
+    assert _tooltip({}, frozen=True) == "Volksmond Fast Track", "the connected edition's tooltip"
+    assert _tooltip({"SA_LIVE_STORE": "1"}, frozen=True) == "Volksmond", "the Store is unchanged"
+    assert _tooltip({"SA_LIVE_OFFLINE": "1"}, frozen=True) == "Volksmond", "offline is unchanged"
+    assert _tooltip({}) == "Volksmond", "a source run is nobody's install"
+    print("  OK  the tray tooltip says Fast Track only on the connected edition")
+
+
 def _page_title(extra_env, frozen=False):
     """The <title> brand_page() produces for a minimal index page, per edition."""
     env = {k: v for k, v in os.environ.items() if k not in ("SA_LIVE_OFFLINE", "SA_LIVE_STORE")}
@@ -188,6 +212,7 @@ if __name__ == "__main__":
                test_frozen_no_flag_is_fast_track,
                test_store_edition_keeps_the_plain_name,
                test_offline_edition_keeps_the_plain_name,
+               test_tray_tooltip_follows_the_edition_name,
                test_brand_page_only_touches_the_connected_edition,
                test_fasttrack_ico_has_the_same_sizes_as_the_original,
                test_fasttrack_ico_is_the_original_inverted,
