@@ -32,6 +32,12 @@ party ever receives the audio, the POPIA third-party-processing concern that app
 cloud transcription tools does not arise. The source is published precisely so you can
 verify this yourself.
 
+Meetings are recorded by default, so a live transcript that goes wrong can be redone from
+the audio instead of being lost. The recording is written to your own save folder on this
+computer and never leaves it, the live screen tells you it is recording for as long as it
+runs, and when the meeting ends Volksmond shows you where the file is and deletes it on one
+click. You can also switch recording off for good in Settings, under Data and privacy.
+
 ## Licensing
 
 Volksmond is **free for personal use**. Commercial and team use needs a per-person
