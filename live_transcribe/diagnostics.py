@@ -14,10 +14,11 @@ exactly that reason; we could not even establish which CPU the machine had. So:
   4. save_bundle() zips exactly those artefacts for the user to attach to an email.
 
 POPIA. Transcripts, notes, recordings and the licence token are personal or secret and are
-NEVER collected here. The bundle is a fixed, allow-listed file set: logs, settings.json with
-secret-bearing keys redacted, the system header, and a model inventory (names and sizes, no
-contents). Every text member is run through redact() so the user's profile path does not
-travel with it. Nothing is ever uploaded: the file is written to the user's own Downloads
+NEVER collected here. The bundle is a fixed, allow-listed file set: logs, the system header, a
+model inventory (names and sizes, no contents), and settings.json reduced to an ALLOW-LIST of
+operational keys, so what the user typed into the app (default_context, ai_instructions) is
+"<omitted>" and a secret-shaped key is "<redacted>". Every text member is run through redact()
+so the user's profile path does not travel with it. Nothing is ever uploaded: the file is written to the user's own Downloads
 folder and the user chooses whether to send it.
 
 Deliberately stdlib-only and import-light, the same contract paths.py keeps: app_main.py
@@ -353,8 +354,10 @@ def summary_line() -> str:
 def redact(text: str) -> str:
     """Replace the user's profile path with <user> in any text leaving the machine.
 
-    Windows paths appear with either slash, and case varies (C:\\Users vs c:\\users),
-    so match case-insensitively on both forms.
+    Windows paths appear with either slash, and case varies (C:\\Users vs c:\\users), and a path
+    that has been through json.dumps carries DOUBLED backslashes (C:\\\\Users\\\\name). All three
+    forms are matched, case-insensitively; the longest form goes first so a partial match can
+    never eat the start of a longer one.
     """
     if not text:
         return text
@@ -362,9 +365,9 @@ def redact(text: str) -> str:
         home = str(Path.home())
     except Exception:
         return text
-    for form in {home, home.replace("\\", "/")}:
-        if form:
-            text = re.sub(re.escape(form), "<user>", text, flags=re.IGNORECASE)
+    forms = {home, home.replace("\\", "/"), home.replace("\\", "\\\\")}
+    for form in sorted((f for f in forms if f), key=len, reverse=True):
+        text = re.sub(re.escape(form), "<user>", text, flags=re.IGNORECASE)
     return text
 
 
@@ -375,18 +378,56 @@ def redact(text: str) -> str:
 # by shape rather than by somebody remembering to add it here.
 _SECRET_KEY_HINTS = ("key", "secret", "token", "password", "licence", "license")
 
+# The settings the bundle may carry: an explicit ALLOW-list, because the deny-list it replaced
+# only masked secret-SHAPED keys and shipped everything else verbatim. settings.json also holds
+# content the user typed - default_context (names, jargon, who is in the room) and
+# ai_instructions (custom prompts) - and the UI promises "No transcripts, no notes". A deny-list
+# gets that wrong by default every time a content-bearing key is added; an allow-list gets it
+# right by default and only ever fails closed.
+#
+# Derived by classifying config.DEFAULTS: everything here is a knob, a choice or a machine fact
+# that a support case needs (which model, which device, which language, which switches, which
+# folder) and none of it is anything the user wrote. Every other key, known or unknown, is
+# exported as "<omitted>". Paths still go through redact() on the way out.
+_SETTINGS_ALLOW = frozenset({
+    # what to transcribe, and with what
+    "interface_language", "transcription_language", "transcribe_languages",
+    "tier", "device", "engine", "summary_device", "summary_model", "ai_backend",
+    # audio switches (the first questions a "it heard nothing" case asks)
+    "aec", "aec_live", "agc_live", "mic_gate", "record_sessions",
+    # where files go, and what is installed here
+    "save_location", "save_location_migrated", "installed_models",
+    # notifications and nudges
+    "os_toasts", "silence_nudge", "silence_nudge_minutes", "struggle_nudge",
+    "summary_footer", "calendar_reminders",
+    # first-run / UI state markers, all booleans, counters or a catalogue id
+    "setup_complete", "session_count", "business_nudge_seen",
+    "active_instruction_id", "live_notes_width",
+})
 
-def _redacted_settings() -> str:
+
+def _redacted_settings():
+    """(json text, sorted names of the keys omitted by policy) for the bundle.
+
+    Secret-shaped keys read "<redacted>" as before; everything outside _SETTINGS_ALLOW reads
+    "<omitted>" and its name is reported so system.txt can say what was left out. The key NAMES
+    stay in the file on purpose: knowing that default_context was set (and not what it said) is
+    often the whole answer to a support question.
+    """
     try:
         raw = json.loads((data_dir() / "settings.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return "{}"
+        return "{}", []
+    omitted = []
     if isinstance(raw, dict):
         for k in list(raw):
             low = k.lower()
             if any(h in low for h in _SECRET_KEY_HINTS):
                 raw[k] = "<redacted>"
-    return redact(json.dumps(raw, ensure_ascii=False, indent=2))
+            elif k not in _SETTINGS_ALLOW:
+                raw[k] = "<omitted>"
+                omitted.append(k)
+    return redact(json.dumps(raw, ensure_ascii=False, indent=2)), sorted(omitted)
 
 
 def _hub_cache() -> Path:
@@ -473,8 +514,9 @@ def save_bundle(dest_dir=None, base=None) -> Path:
     r"""Write the support bundle and return its path.
 
     Exactly four kinds of member, nothing else, ever:
-      system.txt          the same header the log gets at launch
-      settings.json       settings with secret-bearing keys replaced by <redacted>
+      system.txt          the same header the log gets at launch, plus the omission note
+      settings.json       the allow-listed operational settings only; secret-bearing keys read
+                          <redacted> and everything the user typed reads <omitted>
       models.txt          installed model names and sizes, no contents
       logs/volksmond.log* this launch and the previous five
 
@@ -485,9 +527,12 @@ def save_bundle(dest_dir=None, base=None) -> Path:
     dest = Path(dest_dir) if dest_dir is not None else default_bundle_dir()
     dest.mkdir(parents=True, exist_ok=True)
     out = dest / bundle_name()
+    settings_text, omitted = _redacted_settings()
+    note = ("settings omitted by policy (content the user typed): "
+            + (", ".join(omitted) if omitted else "none") + "\n")
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("system.txt", redact(header_text()) + "\n")
-        z.writestr("settings.json", _redacted_settings())
+        z.writestr("system.txt", redact(header_text()) + "\n" + redact(note))
+        z.writestr("settings.json", settings_text)
         z.writestr("models.txt", models_text())
         for lf in log_files(base):
             try:

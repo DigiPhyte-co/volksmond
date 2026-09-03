@@ -220,6 +220,96 @@ def test_redact_handles_both_slash_forms_and_case():
     print("  OK  redact() covers both slash forms and either case")
 
 
+def test_redact_handles_the_json_escaped_path_form():
+    """settings.json is written by json.dumps, so a path in it carries DOUBLED backslashes.
+    The single-backslash pattern does not match that at all, so the profile path used to travel
+    with every bundle that carried a save_location."""
+    home = str(Path.home())
+    escaped = json.dumps(os.path.join(home, "Volksmond"))       # "C:\\Users\\name\\Volksmond"
+    out = diagnostics.redact(escaped)
+    assert home.lower() not in out.lower(), out
+    assert home.replace("\\", "\\\\").lower() not in out.lower(), out
+    assert "<user>" in out, out
+    print("  OK  redact() covers the JSON-escaped path form too")
+
+
+class _settings_at:
+    """Point diagnostics' data_dir at a temp folder holding this settings.json."""
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.dir = _tmpdir("settings")
+
+    def __enter__(self):
+        (self.dir / "settings.json").write_text(self.raw, encoding="utf-8")
+        self.prev = diagnostics.data_dir
+        diagnostics.data_dir = lambda: self.dir
+        return self.dir
+
+    def __exit__(self, *exc):
+        diagnostics.data_dir = self.prev
+        return False
+
+
+def test_bundle_omits_the_settings_the_user_typed():
+    """The second privacy hole, and the reason settings.json is now an allow-list: the bundle
+    used to export every setting whose NAME did not look secret. default_context and
+    ai_instructions are things the user wrote (names, jargon, a custom prompt) while the UI
+    promises "No transcripts, no notes"."""
+    context = "Jan Vermeulen, Chenelle, mediese verslag, Rekeningnommer 4471"
+    prompt = "Skryf altyd op oor Jan se toestand en noem sy prokureur"
+    raw = json.dumps({
+        "default_context": context,
+        "ai_instructions": [{"id": "custom", "name": "Mine", "prompt": prompt}],
+        "cloud_api_key": {"b64": "c2stbGl2ZS1TRUNSRVQ="},
+        "licence_accepted": True,
+        # the operational half, which must survive: this is what a support case reads
+        "tier": "medium", "device": "cpu", "engine": "fluister", "mic_gate": False,
+        "record_sessions": True, "transcription_language": "af",
+    }, indent=2)
+    base = _tmpdir("bundle-logs4")
+    log = diagnostics.open_log(base)
+    log.write("nothing sensitive here\n")
+    log.close()
+    dest = _tmpdir("bundle-out4")
+    with _settings_at(raw):
+        out = diagnostics.save_bundle(dest_dir=dest, base=base)
+    with zipfile.ZipFile(out) as z:
+        blob = b"".join(z.read(n) for n in z.namelist())
+        settings = json.loads(z.read("settings.json").decode("utf-8") or "{}")
+        system = z.read("system.txt").decode("utf-8")
+    for secret in (context, prompt, "Jan Vermeulen", "4471", "c2stbGl2ZS1TRUNSRVQ="):
+        assert secret.encode("utf-8") not in blob, secret
+    assert settings["default_context"] == "<omitted>", settings
+    assert settings["ai_instructions"] == "<omitted>", settings
+    assert settings["cloud_api_key"] == "<redacted>", settings
+    # the operational settings are still there, and still true
+    assert settings["tier"] == "medium" and settings["device"] == "cpu", settings
+    assert settings["engine"] == "fluister" and settings["mic_gate"] is False, settings
+    assert settings["record_sessions"] is True, settings
+    # and system.txt says what was left out, by name
+    assert "omitted by policy" in system, system
+    assert "default_context" in system and "ai_instructions" in system, system
+    print("  OK  settings the user typed are omitted, and system.txt says which")
+
+
+def test_settings_allow_list_covers_only_operational_keys():
+    """The allow-list is derived from config.DEFAULTS, so a NEW setting is omitted until somebody
+    classifies it. This pins both halves: nothing content-bearing is on the list, and the list
+    names no key that is not a real setting."""
+    from live_transcribe import config
+    content_bearing = {"default_context", "ai_instructions"}
+    assert not (content_bearing & diagnostics._SETTINGS_ALLOW), \
+        "a key the user types must never be on the allow-list"
+    stray = diagnostics._SETTINGS_ALLOW - set(config.DEFAULTS)
+    assert not stray, f"the allow-list names settings that do not exist: {sorted(stray)}"
+    for k in set(config.DEFAULTS) - diagnostics._SETTINGS_ALLOW:
+        low = k.lower()
+        assert k in content_bearing or any(h in low for h in diagnostics._SECRET_KEY_HINTS), \
+            f"{k} is neither allow-listed nor content/secret: classify it in diagnostics.py"
+    print("  OK  the allow-list classifies every key in config.DEFAULTS")
+
+
 # --- the feedback email ----------------------------------------------------
 
 def test_feedback_body_asks_for_the_diagnostics_file():
@@ -259,6 +349,9 @@ if __name__ == "__main__":
                test_bundle_never_includes_a_transcript,
                test_bundle_redacts_the_profile_path_and_secret_settings,
                test_redact_handles_both_slash_forms_and_case,
+               test_redact_handles_the_json_escaped_path_form,
+               test_bundle_omits_the_settings_the_user_typed,
+               test_settings_allow_list_covers_only_operational_keys,
                test_feedback_body_asks_for_the_diagnostics_file,
                test_summary_line_is_one_short_line):
         try:
