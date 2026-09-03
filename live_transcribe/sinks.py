@@ -149,11 +149,23 @@ class AudioRecorder:
     the mic channel is already echo-cancelled, so the stereo file needs no further
     echo work.
 
-    POPIA: only instantiated when the user passes --keep-audio, which requires
-    consent from everyone recorded. Audio is the highest-sensitivity artefact;
-    do not enable by default.
+    POPIA: the app records every live session by default (config record_sessions), because a
+    live transcript that fails is only recoverable from the audio. That is honest, not silent:
+    the file is written to the user's own save folder on this machine and never leaves it, the
+    live screen says it is recording for as long as it runs, the finish screen shows where the
+    file is and deletes it on one click, and Settings turns recording off for good. Audio is
+    still the highest-sensitivity artefact, so anything that touches it keeps those guarantees.
+
+    Format: 16-bit PCM WAV (SUFFIX). Everything that reads a saved recording resolves the
+    extension through SUFFIX, so the format is changeable in one place; FLAC would halve the
+    size but needs libsndfile (soundfile) added to requirements.txt and to the PyInstaller
+    specs, and neither ships in the bundle today.
     """
     TARGET_RATE = 16000
+    # Container/extension of a finished recording. Read by the web layer (see _recording_path)
+    # so the file the recorder writes and the file the app offers to keep, delete or
+    # re-transcribe can never drift apart.
+    SUFFIX = ".wav"
     # Zero-fill a source only when its written samples lag the chunk's wall-clock
     # position (t_start) by more than this. The chunker derives t_start from the
     # session clock minus the buffered span, so its jitter is bounded by the WASAPI
@@ -295,7 +307,7 @@ class AudioRecorder:
         """
         mic = self.stem.with_name(f"{self.stem.name}-MIC.wav")
         sys_ = self.stem.with_name(f"{self.stem.name}-SYS.wav")
-        out = self.stem.with_name(f"{self.stem.name}.wav")
+        out = self.stem.with_name(f"{self.stem.name}{self.SUFFIX}")
         have_mic, have_sys = mic.is_file(), sys_.is_file()
         if not (have_mic or have_sys):
             return

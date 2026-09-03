@@ -4,7 +4,8 @@ Singleton-state design: only one session at a time (live or file). The server
 holds the engine, audio capture, recorder, and sinks; HTTP endpoints start/stop
 the session and stream segments to the browser via Server-Sent Events.
 
-A session can transcribe live, record live (off by default, POPIA), do both, or
+A session can transcribe live, record live (ON by default, see config
+record_sessions and _record_default), do both, or
 transcribe an existing file. Transcripts and recordings save to the user's chosen
 save_location (validated; falls back to a per-platform default folder, see
 _sessions_dir).
@@ -175,6 +176,12 @@ class _State:
         # reset() clears them.
         self.struggle_nudge: Optional[dict] = None
         self.struggle_notified: bool = False
+        # Latch: did the engine drop to a smaller model at any point this session? Set on the FIRST
+        # downgrade and never cleared while the session lives, independent of the nudge (a user who
+        # switched the banner off still degraded, and still deserves the offer). Reported by
+        # /api/status and by the stop response, which is what the finish screen reads to offer a
+        # re-transcribe from the recording. Session-scoped, so reset() clears it.
+        self.downgraded: bool = False
         # t0-capture: capture (and recording, if on) start the instant Begin is clicked, while the
         # transcription model loads on a background thread. `preparing` is True from Begin until that
         # engine is ready (or errors); `prepare_error` carries a short model-load failure message for
@@ -236,6 +243,7 @@ class _State:
         self.silence_nudge = None
         self.struggle_nudge = None
         self.struggle_notified = False
+        self.downgraded = False
         # t0-capture: clear the preparing flag, any load error, and drop the pending-audio hold so a
         # never-loaded model's buffer cannot outlive its session (and its RAM is freed at finalise).
         self.preparing = False
@@ -765,7 +773,15 @@ def _on_downgrade(engine, old_size, new_size):
     the banner's new_size in place (keeping the original old_size, the full-quality model the
     session began degrading from) but never re-fires the toast, and a banner the user has already
     dismissed is not re-raised. `recording` is captured at emit time (STATE.recording), so the
-    frontend can drop the record offer when the session is already recording."""
+    frontend can drop the record offer when the session is already recording.
+
+    The STATE.downgraded latch is set FIRST, before the nudge gate: turning the banner off silences
+    the surfacing, not the fact, and the finish screen's "re-transcribe from the recording" offer
+    keys off the fact. Same identity guard as the nudge, so a stale engine cannot mark the current
+    session as degraded."""
+    with STATE.lock:
+        if not STATE.stopping and STATE.engine is engine:
+            STATE.downgraded = True
     if not _struggle_nudge_on():
         return None
     published = None
@@ -803,6 +819,24 @@ def _on_downgrade(engine, old_size, new_size):
     return published
 
 
+def _record_default() -> bool:
+    """Whether a live session saves its audio when the client does not say either way.
+
+    ON unless the user has explicitly switched recording off. The distinction that matters is
+    "unset" versus "false": config.load() merges the saved file over DEFAULTS, so an install whose
+    settings.json has never carried a "record_sessions" key reads True (it has never chosen, so it
+    records), while a user who turned it off has False on disk and keeps it off. A settings file we
+    cannot read at all is treated as unset, for the same reason: a meeting is easier to delete than
+    to recover.
+
+    The recording is written to the save location on this computer and never leaves it.
+    """
+    try:
+        return config.load().get("record_sessions", True) is not False
+    except Exception:
+        return True
+
+
 class StartRequest(BaseModel):
     topic: str = ""
     tier: str = "auto"            # "auto" | "gpu" | "cpu-strong" | "cpu-mid"
@@ -815,7 +849,8 @@ class StartRequest(BaseModel):
     context_override: Optional[str] = None
     mic_device: Optional[str] = None
     loopback_device: Optional[str] = None
-    record: bool = False          # also save the audio (POPIA: needs consent)
+    record: Optional[bool] = None  # save the audio too. None -> the record_sessions setting
+                                   # (_record_default, ON unless the user switched it off).
     transcribe: bool = True       # False == record-only (for machines too slow to keep up live)
     aec_live: Optional[bool] = None  # live echo cancellation (None -> settings default)
     agc_live: Optional[bool] = None  # live mic auto-gain (None -> settings default)
@@ -980,6 +1015,10 @@ def status():
             # mid-session record-from-here). The live screen and finish handoff key off it, and once
             # true /api/record-from-here refuses (re-recording the same stem would truncate the WAV).
             "recording_started": STATE.recording_started,
+            # True once the engine has dropped to a smaller model this session (latched,
+            # independent of whether the struggle banner is switched on). The finish screen uses
+            # it to offer a re-transcribe of the recording at full quality.
+            "downgraded": STATE.downgraded,
             # t0-capture: transcription-model readiness. Capture (and recording, if on) are already
             # live from Begin; while the model loads on the background thread the UI shows a
             # "preparing" state and polls this. model_ready is the AUTHORITATIVE flag (set at phase-1
@@ -1214,6 +1253,74 @@ def record_from_here():
         audio_stem = str(stem)
     # audio_stem must reach the client: the finish-screen re-transcribe handoff keys off it.
     return {"recording": True, "audio_stem": audio_stem}
+
+
+def _recording_path(stem: str) -> Path:
+    """The saved recording for a session stem, inside the sessions folder.
+
+    The stem is validated through the same allow-list as a transcript filename (traversal
+    segments, path separators, ADS colons, glob metacharacters and Windows reserved names all
+    rejected), so a stem from the client can only ever name a file in the save folder. It is
+    validated AS GIVEN rather than reduced to its basename first: a request that names a path is
+    refused outright instead of quietly acting on a different file than it asked for, which
+    matters when the action is a delete. The suffix comes from the recorder, so the recording
+    format lives in one place.
+    """
+    _validate_session_filename(stem + ".md")
+    return _sessions_dir() / (stem + sinks.AudioRecorder.SUFFIX)
+
+
+class RecordingRequest(BaseModel):
+    stem: str
+
+
+@app.get("/api/recording")
+def recording_info(stem: str):
+    """Where a session's recording is and how big it is, for the finish screen's keep-or-delete
+    choice. Reads the file's size only, never its audio. exists=False once it has been deleted,
+    or when the session never recorded."""
+    p = _recording_path(stem)
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return {"stem": stem, "exists": False, "path": str(p), "name": p.name, "bytes": 0}
+    return {"stem": stem, "exists": True, "path": str(p), "name": p.name, "bytes": size}
+
+
+@app.post("/api/recording/delete")
+def recording_delete(req: RecordingRequest):
+    """Delete a session's recording from this computer, now.
+
+    Recording is on by default, so the promise that pays for it is that one click at the end of a
+    meeting really removes the audio. Deleted means gone from disk, not hidden and not moved to a
+    recycle bin we control. The transcript, the notes and any summary are untouched; only the audio
+    goes. The per-source -MIC/-SYS/-MIXED channels are removed too: they only survive when the
+    stereo fold failed, and leaving them behind would make "deleted" a lie.
+
+    A failed unlink is a 500, deliberately: the user must never be told the audio is gone while it
+    is still on disk. 409 while that same session is still running (its recorder holds the file)."""
+    p = _recording_path(req.stem)
+    with STATE.lock:
+        if (STATE.running and STATE.output_path is not None
+                and STATE.output_path.stem == p.stem):
+            raise HTTPException(status_code=409,
+                                detail="That session is still running. Stop it first, then delete the recording.")
+    freed, removed = 0, []
+    for cand in (p,
+                 p.with_name(f"{p.stem}-MIC.wav"),
+                 p.with_name(f"{p.stem}-SYS.wav"),
+                 p.with_name(f"{p.stem}-MIXED.wav")):
+        try:
+            size = cand.stat().st_size
+        except OSError:
+            continue   # not there: nothing to delete
+        try:
+            cand.unlink()
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Could not delete {cand.name}: {e}")
+        freed += size
+        removed.append(cand.name)
+    return {"stem": req.stem, "deleted": bool(removed), "removed": removed, "freed": freed}
 
 
 class StruggleNudgeRequest(BaseModel):
@@ -2188,7 +2295,9 @@ def start(req: StartRequest):
         STATE.notice = None
 
         transcribe_on = bool(req.transcribe)
-        record_on = bool(req.record)
+        # An explicit record flag from the client wins (the pre-meeting toggle); omitted means
+        # "use the saved preference", which records unless the user turned it off.
+        record_on = bool(req.record) if req.record is not None else _record_default()
         if not transcribe_on and not record_on:
             raise HTTPException(status_code=400, detail="Nothing to do: enable transcription or recording.")
 
@@ -2810,6 +2919,9 @@ def stop(what: str = "all"):
             build_thread = STATE.build_thread
             preparing_case = engine is None and prep_eng is not None
             pending = (prep_eng.pending() if prep_eng else (engine.pending() if engine else 0))
+            # Read the downgrade latch here, under the lock and before the drain thread resets the
+            # session: the finish screen needs it to offer a re-transcribe from the recording.
+            downgraded = STATE.downgraded
 
             def _drain_transcription():
                 if preparing_case:
@@ -2887,12 +2999,14 @@ def stop(what: str = "all"):
 
             threading.Thread(target=_drain_transcription, daemon=True, name="stop-transcription").start()
             return {"stopped": "transcription", "stopping": True, "pending": pending,
-                    "recording": STATE.recording, "output_path": out}
+                    "recording": STATE.recording, "output_path": out,
+                    "downgraded": downgraded}
 
         # what == "all"
         if STATE.stopping:
             pending = STATE.engine.pending() if STATE.engine else 0
-            return {"stopping": True, "pending": pending, "output_path": out}
+            return {"stopping": True, "pending": pending, "output_path": out,
+                    "downgraded": STATE.downgraded}
         STATE.stopping = True
         _silence_signal()   # the session is over; the watcher must not outlive the drain
         engine = STATE.engine
@@ -2908,6 +3022,9 @@ def stop(what: str = "all"):
         build_thread = STATE.build_thread
         preparing_case = engine is None and prep_eng is not None
         pending = (engine.pending() if engine else (prep_eng.pending() if prep_eng else 0))
+        # Same reason as the partial stop above: read the downgrade latch under the lock, before
+        # the drain thread resets the session out from under it.
+        downgraded = STATE.downgraded
 
     def _drain_and_close():
         # Stop capturing FIRST (flushes the final partial chunk into the engine
@@ -2957,7 +3074,7 @@ def stop(what: str = "all"):
 
     _bump_session_count()  # one completed live/record session; file transcription is counted on its own completion
     threading.Thread(target=_drain_and_close, daemon=True, name="stop-drain").start()
-    return {"stopping": True, "pending": pending, "output_path": out}
+    return {"stopping": True, "pending": pending, "output_path": out, "downgraded": downgraded}
 
 
 def _parse_session_filename(name: str) -> dict:

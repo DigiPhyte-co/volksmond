@@ -129,6 +129,7 @@ var IP = {
   pencil: '<path d="M4 20l1.2-4.2L16 5a2 2 0 0 1 3 3L8.2 18.8z"/><path d="M14 7l3 3"/>',
   calendar: '<rect x="4" y="5" width="16" height="16" rx="2"/><path d="M4 9.5h16M8 3v4M16 3v4"/>',
   bell: '<path d="M6.5 10.5a5.5 5.5 0 0 1 11 0c0 4 1.5 5.5 1.5 5.5H5s1.5-1.5 1.5-5.5z"/><path d="M10 19a2 2 0 0 0 4 0"/>',
+  trash: '<path d="M5 7h14M10 7V4.5h4V7M6.8 7l.9 13h8.6l.9-13"/><path d="M10.5 10.5v6M13.5 10.5v6"/>',
 };
 function icon(name, size) {
   size = size || 16;
@@ -196,6 +197,11 @@ function freshLive() {
     // family, size, label, downloaded, total, stalled }; prepareStalledClient is set by the
     // client-side watchdog when the byte count has not moved for a long time.
     preparing: false, prepare: null, prepareStalledClient: false,
+    // Server-owned latched flag: true once the engine has dropped to a smaller model this
+    // session. Latched like recordingStarted, and independent of the struggle banner (a muted
+    // banner does not un-degrade the transcript). The finish screen reads it to offer a
+    // re-transcribe from the recording.
+    downgraded: false,
   };
 }
 var S = {
@@ -206,7 +212,11 @@ var S = {
   starting: { active: false, kind: null, title: "", error: null, startedAt: null },
   form: { title: "", language: "af", moreLang: null, tier: "auto", device: "auto", engine: "auto", participants: [], terms: [], context: null, record: false, aec: false, agcLive: true, stereoSplit: false, mic: null, loopback: null, advancedOpen: false },
   setup: { stage: "welcome", choice: "transcribe" },
-  finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null },
+  // recordingInfo is {exists, path, name, bytes} from /api/recording (null until it answers);
+  // recordingDeleted and recordingKept record the user's one choice at the end of the meeting;
+  // downgraded says the live transcript ran part of the meeting on a smaller model.
+  finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null,
+            recordingInfo: null, recordingDeleted: false, recordingKept: false, downgraded: false },
   reader: { name: "", title: "", text: "", summarising: false, summary: null },
   reminder: null,   // active calendar reminder: {subject, attendees, start, key}, or null
   upgrade: { keyState: "empty", value: "", msg: "" },
@@ -903,7 +913,7 @@ async function doStop(what) {
         function (st) { return !st.running || (!st.stopping && !st.transcribing); },
         function (st) {
           S.live.stopping = false;
-          if (!st.running) { gotoFinish(resp.output_path, st && st.sink_error); }
+          if (!st.running) { gotoFinish(resp.output_path, st && st.sink_error, resp && resp.downgraded); }
           else { S.live.recording = true; go("recordonly"); }
         }
       );
@@ -913,7 +923,7 @@ async function doStop(what) {
     S.live.stopping = true; render();
     pollStatus(
       function (st) { return !st.running; },
-      function (st) { gotoFinish(resp.output_path, st && st.sink_error); },
+      function (st) { gotoFinish(resp.output_path, st && st.sink_error, resp && resp.downgraded); },
       function (st) {
         if (st.running && st.stopping && elapsedEl) {
           var n = typeof st.pending === "number" ? st.pending : 0;
@@ -924,14 +934,20 @@ async function doStop(what) {
     );
   } catch (e) { toast(e.message || "Could not stop.", true); }
 }
-function gotoFinish(outputPath, sinkError) {
+function gotoFinish(outputPath, sinkError, downgraded) {
   saveNotesNow();                                  // flush any pending notes for this session
   var notesText = (S.live.notes || "").trim();
+  var wasDowngraded = !!downgraded || !!S.live.downgraded;   // the stop response, or the last poll
   teardownLive();
   S.finish.outputPath = outputPath || S.live.outputPath;
   S.finish.title = S.live.title || topicFromName(baseName(S.finish.outputPath));
   S.finish.recordingStem = S.live.recordingStarted ? S.live.audioStem : null;   // latch, not the live flag: a recording that was stopped mid-session still has a file to surface
   S.finish.summary = null; S.finish.savedAs = null; S.finish.summarising = false;
+  // Fresh keep-or-delete choice for THIS meeting, and the recording's real location and size,
+  // fetched from the server (the file is finalised by the time the session stops running).
+  S.finish.recordingInfo = null; S.finish.recordingDeleted = false; S.finish.recordingKept = false;
+  S.finish.downgraded = wasDowngraded;
+  if (S.finish.recordingStem) refreshRecordingInfo(S.finish.recordingStem);
   S.finish.sinkError = sinkError || null;
   S.finish.notes = notesText; S.finish.hasNotes = !!notesText; S.finish.includeNotes = true;
   S.live.running = false;
@@ -1799,6 +1815,10 @@ function refreshSilence() {
     if (rec !== S.live.recording) { S.live.recording = rec; changed = true; }
     var rs = !!st.recording_started;
     if (rs !== S.live.recordingStarted) { S.live.recordingStarted = rs; changed = true; }
+    // Latched server flag: once the engine has dropped to a smaller model, keep it. Nothing on the
+    // live screen changes, so it never forces a render; the finish screen reads it as the fallback
+    // when the stop response did not carry it (a reload mid-session, say).
+    if (st.downgraded) S.live.downgraded = true;
     // H1: system-audio capture health. Absent (file/record-only sessions never set it server-side)
     // is treated the same as "active" so it never renders a stale warning.
     var ss = st.sys_state || null;
@@ -2011,7 +2031,7 @@ function preView() {
       el("div", { class: "tone-tile", style: { width: "36px", height: "36px", flex: "0 0 auto", background: "var(--record-soft)", color: "var(--record)" } }, icon("dot", 16)),
       el("div", { class: "grow" }, [
         el("div", { style: { fontWeight: "600", fontSize: "13.5px" }, text: "Record the audio" }),
-        el("p", { class: "ink-2", style: { fontSize: "12px", marginTop: "3px" }, text: "Keeps the audio on this machine until you stop. Lets you transcribe or summarise it again later, more accurately." }),
+        el("p", { class: "ink-2", style: { fontSize: "12px", marginTop: "3px" }, text: "On by default. The audio stays on this computer, and if the live transcript goes wrong you can redo it from the recording. Keep or delete it when the meeting ends." }),
       ]),
       toggleEl(S.form.record, function () { S.form.record = !S.form.record; render(); }, true),
     ]),
@@ -2443,7 +2463,7 @@ function liveView() {
   // recording mid-session. recordingStarted is latched, so once a session has recorded the button
   // stays gone (a restart would clobber the WAV). Independent of the banner; both call recordFromHere().
   var recSlot;
-  if (S.live.recording) recSlot = el("span", { class: "rec-ind" }, [el("i"), "Recording audio"]);
+  if (S.live.recording) recSlot = el("span", { class: "rec-ind", title: tr("The audio is being saved to your save folder on this computer. You can keep or delete it when the meeting ends.") }, [el("i"), "Recording to this computer"]);
   else if (S.live.transcribing && !S.live.recordingStarted) recSlot = el("button", { class: "btn sm record", onclick: function () { recordFromHere(); } }, [icon("dot", 12), "Record from here"]);
   else recSlot = null;
 
@@ -2542,6 +2562,92 @@ function importingView() {
 }
 
 /* ── finish & save ────────────────────────────────────────── */
+// Ask the server where this session's recording is and how big it is. Best effort: if it cannot
+// answer, the finish card falls back to the file name it already knows and offers the same choice.
+function refreshRecordingInfo(stem) {
+  api.get("/api/recording?stem=" + encodeURIComponent(baseName(stem)))
+    .then(function (info) { S.finish.recordingInfo = info; if (S.route === "finish") render(); })
+    .catch(function () {});
+}
+// Delete the recording, now. No confirmation dialog: the meeting is over, the button says what it
+// does, and the transcript, notes and summary are all untouched. The card then says it is gone.
+async function deleteRecording() {
+  var stem = S.finish.recordingStem;
+  if (!stem) return;
+  try {
+    await api.post("/api/recording/delete", { stem: baseName(stem) });
+    S.finish.recordingDeleted = true;
+    S.finish.recordingInfo = null;
+    toast("Recording deleted from this computer.");
+    refreshSessions();
+    render();
+  } catch (e) { toast(e.message || "Could not delete the recording.", true); }
+}
+// The keep-or-delete card, shown at the end of any meeting that recorded. Recording is on by
+// default, so this is the moment the promise is kept: you see where the audio is, how big it is,
+// and you decide. If the live transcript degraded to a smaller model, the same card offers to redo
+// it from the recording through the normal file-transcription flow.
+function recordingCard() {
+  var stem = S.finish.recordingStem;
+  if (!stem) return null;
+  if (S.finish.recordingDeleted) {
+    return el("div", { class: "card", style: { padding: "16px" } }, el("div", { class: "row gap-12" }, [
+      el("div", { class: "tone-tile ok", style: { width: "36px", height: "36px" } }, icon("check", 18)),
+      el("div", {}, [
+        el("div", { style: { fontWeight: "600" }, text: "Recording deleted." }),
+        el("div", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "2px" }, text: "The audio is off this computer. Your transcript and notes are still saved." }),
+      ]),
+    ]));
+  }
+  var info = S.finish.recordingInfo || {};
+  var fileName = info.name || (baseName(stem) + ".wav");
+  var size = info.bytes ? fmtBytes(info.bytes) : "";
+  var where = el("div", {}, [
+    el("div", { class: "ink-3 mono", style: { fontSize: "11.5px", marginTop: "4px" }, text: info.path || fileName }),
+    size ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "2px" }, text: trFmt("{size} on this computer", { size: size }) }) : null,
+  ]);
+  var head = el("div", { class: "row gap-12" }, [
+    el("div", { class: "tone-tile accent", style: { width: "36px", height: "36px" } }, icon("mic", 18)),
+    el("div", { class: "grow" }, [
+      el("div", { style: { fontWeight: "600" }, text: S.finish.recordingKept ? "Recording kept on this computer" : "The audio of this meeting was recorded" }),
+      where,
+    ]),
+  ]);
+  var body = [head];
+  if (!S.finish.recordingKept) {
+    // Two equal buttons, keep first and focused: the safe choice must be the easy one, and delete
+    // must never be a mis-click away from being the default. "Keep THE recording" deliberately, not
+    // "Keep recording": that phrase already means "carry on recording" on the silence banner, and
+    // one file-deleting button must never be able to read as the other.
+    var keepBtn = el("button", { class: "btn primary grow", onclick: function () { S.finish.recordingKept = true; render(); } }, [icon("check", 15), "Keep the recording"]);
+    setTimeout(function () { try { keepBtn.focus(); } catch (e) {} }, 0);
+    body.push(el("div", { class: "row gap-8", style: { marginTop: "14px" } }, [
+      keepBtn,
+      el("button", { class: "btn record grow", onclick: deleteRecording }, [icon("trash", 15), "Delete the recording"]),
+    ]));
+  }
+  if (S.finish.downgraded) {
+    body.push(el("div", { style: { marginTop: "14px", paddingTop: "12px", borderTop: "1px solid var(--line)" } }, [
+      el("div", { class: "ink-2", style: { fontSize: "12.5px" }, text: "The live transcript ran on a smaller model for part of this meeting. Re-transcribe from the recording now?" }),
+      el("div", { class: "row gap-8", style: { marginTop: "10px" } }, [
+        el("button", { class: "btn", onclick: function () { retranscribeFinishRecording(); } }, [icon("note", 15), "Re-transcribe from the recording"]),
+      ]),
+    ]));
+  }
+  return el("div", { class: "card", style: { padding: "18px" } }, body);
+}
+// Hand the recording to the SAME file-transcription flow the record-only handoff uses (the import
+// screen, then /api/transcribe-file). A file run is never adaptive, so it uses the full model at
+// the quality this machine is set to instead of the smaller one the live pass fell back to.
+function retranscribeFinishRecording() {
+  var stem = S.finish.recordingStem;
+  if (!stem) { toast("Recording path missing.", true); return; }
+  S.importStem = stem;
+  S.importPath = null;
+  S.importName = baseName(stem) + ".wav";
+  S.form.title = S.finish.title || "";
+  go("importpre");
+}
 function finishView() {
   var name = baseName(S.finish.outputPath);
   return el("div", { class: "screen center" }, el("div", { class: "screen-inner col-mid stack", style: { gap: "16px" } }, [
@@ -2566,6 +2672,7 @@ function finishView() {
         el("button", { class: "btn ghost", onclick: async function () { try { var t = await api.text("/sessions/" + encodeURIComponent(name)); copyText(t); } catch (e) { toast(e.message, true); } } }, [icon("copy", 15), "Copy"]),
       ]),
     ]),
+    recordingCard(),
     summariseCard(name, "finish"),
     el("div", { class: "row", style: { marginTop: "4px" } }, [
       el("span", { class: "grow" }),
@@ -3671,12 +3778,31 @@ function dataCard(st) {
         el("div", { class: "s", style: { fontSize: "11.5px", marginTop: "6px" }, text: "For maximum privacy, choose a folder that a cloud provider does not sync (OneDrive, Google Drive, Dropbox, and the like)." })]),
       el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: pickSaveFolder }, "Change")),
     ]),
+    recordDefaultRow(st),
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("lock", 18)),
-      el("div", { class: "body" }, [el("div", { class: "t", text: "Audio is off by default" }),
-        el("div", { class: "s", text: "Recording is only kept when you switch it on for a meeting. The privacy promise holds otherwise." })]),
-      el("div", { class: "ctl" }, el("span", { class: "chip ok" }, [icon("check", 12), "On by you only"])),
+      el("div", { class: "body" }, [el("div", { class: "t", text: "Nothing leaves this computer" }),
+        el("div", { class: "s", text: "Audio, transcripts, notes and summaries are written to your save folder and stay there. No account, no cloud, no third party ever receives them." })]),
+      el("div", { class: "ctl" }, el("span", { class: "chip ok" }, [icon("check", 12), "Local only"])),
     ]),
+  ]);
+}
+// One-click switch for the recording default. On (an unset setting counts as on) every meeting
+// saves its audio, so a transcript that goes wrong can be redone from the file; off means no
+// session records unless you switch it on for that meeting. Flipping it also moves the
+// pre-meeting toggle, so Settings and the next meeting always agree.
+function recordDefaultRow(st) {
+  var on = st.record_sessions !== false;
+  return el("div", { class: "set-row" }, [
+    el("div", { class: "ic" }, icon("mic", 18)),
+    el("div", { class: "body" }, [
+      el("div", { class: "t", text: "Record the audio of every meeting" }),
+      el("div", { class: "s", text: "On, so that a transcript that goes wrong can be redone from the audio afterwards. The recording stays on this computer, the live screen shows you while it runs, and you can delete it with one click when the meeting ends." }),
+    ]),
+    el("div", { class: "ctl" }, toggleEl(on, function () {
+      S.form.record = !on;
+      saveSettings({ record_sessions: !on });
+    })),
   ]);
 }
 async function pickSaveFolder() {
@@ -4228,6 +4354,10 @@ async function boot() {
     S.form.engine = S.settings.engine || "auto";
     S.form.aecLive = !!S.settings.aec_live;
     S.form.agcLive = S.settings.agc_live !== false;   // default ON (an old settings file has no key)
+    // Recording is ON unless the user switched it off in Settings. Same "unset means on" read as
+    // agcLive: a settings file that has never carried record_sessions has never chosen, so it
+    // records, and only an explicit false turns the pre-meeting toggle off.
+    S.form.record = S.settings.record_sessions !== false;
     S.form.aec = !!S.settings.aec;
   }
   if (S.devices) {
@@ -4291,6 +4421,7 @@ function adoptRunning(status) {
   S.live.silenceNudge = status.silence_nudge || null;   // a nudge that fired before this reload
   S.live.struggleNudge = status.struggle_nudge || null; // same, for a downgrade that fired before this reload
   S.live.recordingStarted = !!status.recording_started; // latched: recording is or was active this session
+  S.live.downgraded = !!status.downgraded;              // latched: the engine dropped to a smaller model before this reload
   if (status.source_kind !== "file") { startLevels(); startSilencePoll(); }
   if (status.source_kind === "file") {
     S.route = "importing";

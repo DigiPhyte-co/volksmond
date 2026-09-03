@@ -189,6 +189,8 @@ window.VM_I18N = {
     "Your saved default context is applied automatically. Add anything specific to this meeting here.":
       "Jou gestoorde verstekkonteks word outomaties toegepas. Voeg enigiets spesifiek tot hierdie vergadering hier by.",
     "Record the audio": "Neem die klank op",
+    "On by default. The audio stays on this computer, and if the live transcript goes wrong you can redo it from the recording. Keep or delete it when the meeting ends.":
+      "Standaard aan. Die klank bly op hierdie rekenaar, en as die lewendige transkripsie verkeerd loop kan jy dit uit die opname oordoen. Hou of vee dit uit wanneer die vergadering klaar is.",
     "Keeps the audio on this machine until you stop. Lets you transcribe or summarise it again later, more accurately.":
       "Hou die klank op hierdie masjien tot jy stop. Laat jou dit later weer transkribeer of opsom, meer akkuraat.",
     "Courtesy line you could say": "Beleefdheidsin wat jy kan sê",
@@ -224,6 +226,9 @@ window.VM_I18N = {
     "Stop and save": "Stop en stoor",
     "Stop": "Stop",
     "Recording audio": "Neem klank op",
+    "Recording to this computer": "Neem op na hierdie rekenaar",
+    "The audio is being saved to your save folder on this computer. You can keep or delete it when the meeting ends.":
+      "Die klank word na jou stoorgids op hierdie rekenaar gestoor. Jy kan dit hou of uitvee wanneer die vergadering klaar is.",
     "Saving to ": "Stoor na ",
     "Listening. The transcript appears here as people talk.":
       "Luister. Die transkripsie verskyn hier soos mense praat.",
@@ -294,6 +299,21 @@ window.VM_I18N = {
     "Transcribe later": "Transkribeer later",
     "You can transcribe a recording any time from ": "Jy kan 'n opname enige tyd transkribeer vanaf ",
     ". Recordings are kept until you delete them.": ". Opnames word gehou tot jy hulle uitvee.",
+
+    // Finish screen: keep or delete this meeting's recording, and the offer to redo the
+    // transcript from it when the live pass ran on a smaller model.
+    "The audio of this meeting was recorded": "Die klank van hierdie vergadering is opgeneem",
+    "Recording kept on this computer": "Opname op hierdie rekenaar gehou",
+    "Keep the recording": "Hou die opname",
+    "Delete the recording": "Vee die opname uit",
+    "Recording deleted.": "Opname uitgevee.",
+    "The audio is off this computer. Your transcript and notes are still saved.":
+      "Die klank is van hierdie rekenaar af. Jou transkripsie en notas is steeds gestoor.",
+    "Recording deleted from this computer.": "Opname van hierdie rekenaar af uitgevee.",
+    "Could not delete the recording.": "Kon nie die opname uitvee nie.",
+    "The live transcript ran on a smaller model for part of this meeting. Re-transcribe from the recording now?":
+      "Die lewendige transkripsie het vir 'n deel van hierdie vergadering op 'n kleiner model geloop. Hertranskribeer nou uit die opname?",
+    "Re-transcribe from the recording": "Hertranskribeer uit die opname",
 
     // Importing
     "Cancel": "Kanselleer",
@@ -442,10 +462,12 @@ window.VM_I18N = {
     "Save transcripts and recordings to": "Stoor transkripsies en opnames na",
     "For maximum privacy, choose a folder that a cloud provider does not sync (OneDrive, Google Drive, Dropbox, and the like).":
       "Vir maksimum privaatheid, kies 'n gids wat 'n wolkverskaffer nie sinkroniseer nie (OneDrive, Google Drive, Dropbox, en dies meer).",
-    "Audio is off by default": "Klank is standaard af",
-    "Recording is only kept when you switch it on for a meeting. The privacy promise holds otherwise.":
-      "Opname word net gehou wanneer jy dit vir 'n vergadering aanskakel. Andersins geld die privaatheidsbelofte.",
-    "On by you only": "Net deur jou aan",
+    "Record the audio of every meeting": "Neem die klank van elke vergadering op",
+    "On, so that a transcript that goes wrong can be redone from the audio afterwards. The recording stays on this computer, the live screen shows you while it runs, and you can delete it with one click when the meeting ends.":
+      "Aan, sodat 'n transkripsie wat verkeerd loop naderhand uit die klank oorgedoen kan word. Die opname bly op hierdie rekenaar, die lewendige skerm wys jou terwyl dit loop, en jy kan dit met een klik uitvee wanneer die vergadering klaar is.",
+    "Nothing leaves this computer": "Niks verlaat hierdie rekenaar nie",
+    "Audio, transcripts, notes and summaries are written to your save folder and stay there. No account, no cloud, no third party ever receives them.":
+      "Klank, transkripsies, notas en opsommings word na jou stoorgids geskryf en bly daar. Geen rekening, geen wolk, geen derde party ontvang dit ooit nie.",
     "Danger zone, these settings can send data off your computer":
       "Gevaarsone, hierdie instellings kan data van jou rekenaar af stuur",
     "Online API key for a future fallback": "Aanlyn API-sleutel vir 'n toekomstige terugval",
