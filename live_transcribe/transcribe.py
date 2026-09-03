@@ -1855,18 +1855,34 @@ class Engine:
         avg = sum(self._rtf) / len(self._rtf)
         if avg <= DOWNGRADE_RTF:
             return
+        self._start_step(f"CPU RTF ~{avg:.2f} (> {DOWNGRADE_RTF})")
+
+    def _start_step(self, reason):
+        """Begin a step to the next usable rung, if the ladder is allowed to move and has one.
+
+        The two callers hold different evidence and both are honest: a full window of over-budget
+        RTF, and a shed event (the backlog blew past its bound on a live feed, which is the real
+        time contract failing in the most direct way there is). Everything else - swivuriso, the
+        minimum spacing, one build in flight, in-family, present-only - is checked here or in
+        _next_rung, so neither caller can bypass a rule."""
+        if self.family == "swivuriso" or not self.adaptive or not self._is_cpu:
+            return False
+        if self._swap is not None:
+            return False
+        if time.monotonic() - self._last_rung_change < DOWNGRADE_MIN_SECONDS:
+            return False
         nxt = self._next_rung()
         if nxt is None:
             # Nothing usable left below this model. Do NOT reach outside the family or the local
             # store for one: the shed valve handles it from here. Clear the window so the next
             # decision is made on fresh evidence rather than a standing trigger.
             self._rtf.clear()
-            return
+            return False
         new_size, new_model, new_family = nxt
-        print(f"[engine] CPU RTF ~{avg:.2f} (> {DOWNGRADE_RTF}); "
-              f"downgrading {self.size} -> {new_size}", flush=True)
+        print(f"[engine] {reason}; downgrading {self.size} -> {new_size}", flush=True)
         self._begin_swap(new_size, new_model, new_family)
         self._rtf.clear()                       # don't re-trigger while the build runs
+        return True
 
     def _drain_to_front(self):
         """Move everything queued into the worker's own front buffer so the shed valve can drop the
@@ -1923,6 +1939,14 @@ class Engine:
         # the current size for both sides says "nothing changed model-side, this is the shed
         # valve", which is what the banner copy keys off.
         self._notify_downgrade(self.size, self.size)
+        # A shed IS the real-time contract failing, and it is far more direct evidence than a
+        # rolling RTF average: the backlog went past its bound on a live feed. Measured on a ten
+        # minute two-source replay starting at medium on four threads, waiting for the RTF window
+        # alone left the session on medium for six minutes and 126 s of audio shed before it
+        # stepped; stepping on the shed itself cuts that to one shed event. Every ladder rule
+        # still applies (_start_step), so this can only ever take a rung that is in-family,
+        # present, and past the minimum spacing.
+        self._start_step(f"shed {dropped:.0f}s of backlog")
 
     def _run(self):
         # Loop until the sentinel, or (during shutdown) until the queue empties.

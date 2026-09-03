@@ -349,6 +349,40 @@ def test_shedding_drops_the_oldest_audio_first_and_bounds_the_backlog():
     print("  OK  shedding drops the oldest first, bounds the backlog, and reports the span")
 
 
+def test_a_shed_also_steps_the_ladder_when_a_rung_is_available():
+    # A shed is the real-time contract failing outright, which is stronger evidence than a rolling
+    # RTF average. Measured on a ten minute two-source replay starting at medium: waiting for the
+    # RTF window alone left the session on medium for six minutes and 126 s of shed audio.
+    with _stub_models():
+        eng = _stub_engine(size="medium")
+        eng._rtf.clear()                        # no RTF evidence at all: the shed is the evidence
+        eng.subscribers = [_Collect()]
+        for i in range(8):
+            eng._queue.put(("SYS", _chunk(15.0), float(i * 15), time.monotonic(), False))
+        eng._maybe_shed(200.0)
+        assert eng.shed_events == 1
+        swap = eng._swap
+        assert swap is not None, "a shed must start a step when a rung is available"
+        assert swap["done"].wait(10)
+        eng._maybe_downgrade(210.0)
+        assert eng.size == "small", eng.size
+        # But it still cannot break a ladder rule: inside the minimum spacing, nothing moves.
+        eng2 = _stub_engine(size="medium", aged=False)
+        eng2.subscribers = [_Collect()]
+        for i in range(8):
+            eng2._queue.put(("SYS", _chunk(15.0), float(i * 15), time.monotonic(), False))
+        eng2._maybe_shed(200.0)
+        assert eng2.shed_events == 1 and eng2._swap is None, "a shed jumped the minimum spacing"
+        # And on the floor rung there is nothing to step to; the shed still happens.
+        eng3 = _stub_engine(size="tiny")
+        eng3.subscribers = [_Collect()]
+        for i in range(8):
+            eng3._queue.put(("SYS", _chunk(15.0), float(i * 15), time.monotonic(), False))
+        eng3._maybe_shed(200.0)
+        assert eng3.shed_events == 1 and eng3._swap is None and eng3.size == "tiny"
+    print("  OK  a shed steps the ladder when it may, and never breaks a ladder rule to do it")
+
+
 def test_shedding_is_live_only_and_quiet_when_the_backlog_is_fine():
     # A file import is not real time and must never lose a chunk.
     eng = _stub_engine(size="tiny", adaptive=False)
@@ -563,6 +597,7 @@ TESTS = (test_every_ladder_rung_has_a_fluister_build,
          test_a_rung_change_clears_the_loop_history_and_the_rtf_window,
          test_a_failed_build_leaves_the_engine_on_its_current_rung,
          test_shedding_drops_the_oldest_audio_first_and_bounds_the_backlog,
+         test_a_shed_also_steps_the_ladder_when_a_rung_is_available,
          test_shedding_is_live_only_and_quiet_when_the_backlog_is_fine,
          test_a_shed_pass_never_loses_the_shutdown_sentinel,
          test_indicative_flips_below_small,
