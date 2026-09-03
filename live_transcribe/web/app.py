@@ -298,7 +298,23 @@ PREPARE_DOWNLOAD_STALL_SECONDS = 60
 # allow a much longer grace before declaring a stall; a genuine mid-download stall (bytes far below
 # total, flat) still fails at PREPARE_DOWNLOAD_STALL_SECONDS.
 PREPARE_VERIFY_GRACE_SECONDS = 180
-PREPARE_LOAD_TIMEOUT_SECONDS = 120
+# Load budget, BY DEVICE (WP-1). The slow part of a load is not the constructor, it is the first
+# inference: CTranslate2 materialises the weights lazily, so the real cost lands in the warm-up done
+# inside the model build lock. Measured on a Ryzen 7 7700X: medium ~35 s, small ~16 s, base ~5 s. A
+# laptop CPU is 2 to 4x slower, so a first medium load there is 70 to 140 s and a whole cold start
+# (disk read on a slow SSD, antivirus, a busy machine) can be minutes. A CUDA or Metal load is a few
+# seconds, so a long budget there would only hide a real hang. One flat 120 s therefore declared
+# failure on a perfectly healthy CPU laptop that just needed another two minutes.
+#
+# The budget is the point at which we GIVE UP, not the point at which we tell the user it is slow:
+# while the load thread is alive the prepare state stays "loading" with an elapsed counter, and on
+# CPU a soft hint appears after PREPARE_LOAD_SLOW_HINT_SECONDS. See load_budget_seconds().
+PREPARE_LOAD_TIMEOUT_SECONDS = 120        # CUDA / Metal (and the historical default)
+PREPARE_LOAD_TIMEOUT_SECONDS_CPU = 600    # CPU: generous, because a healthy first load is minutes
+PREPARE_LOAD_SLOW_HINT_SECONDS = 60       # CPU only: "first load can take a few minutes" hint
+# How often the load watchdog wakes to publish the elapsed counter into STATE.prepare. The UI polls
+# /api/status about every 1.5 s, so one second is fine and costs one short lock hold per tick.
+_PREPARE_LOAD_POLL_SECONDS = 1.0
 # A DIFFERENT model may already own the single global download slot (a Settings download). We wait for
 # it rather than fight, but only for a bounded time: an indefinitely-occupied slot would starve this
 # session forever (another "loads indefinitely"), so past this we surface a distinct retryable error and
@@ -306,6 +322,24 @@ PREPARE_LOAD_TIMEOUT_SECONDS = 120
 PREPARE_FOREIGN_SLOT_TIMEOUT_SECONDS = 180
 # How often the background builder polls voicedl.progress() into STATE.prepare while downloading.
 _PREPARE_POLL_SECONDS = 0.5
+
+
+def load_device_for(tier):
+    """The backend a tier loads on: "cpu", "cuda" or "mlx". Unknown tiers are treated as CPU, which
+    is the conservative answer (the generous budget, and pre-warm skips nothing it should warm)."""
+    try:
+        return (transcribe.TIER_CONFIG.get(tier) or {}).get("device") or "cpu"
+    except Exception:
+        return "cpu"
+
+
+def load_budget_seconds(tier=None, device=None):
+    """How long the model LOAD may run before it is called a failure, for this tier/device.
+
+    Pass a tier (the usual case) or a device directly. One function so the CPU/GPU split lives in
+    exactly one place and the numbers are testable without building a model."""
+    dev = device or load_device_for(tier)
+    return PREPARE_LOAD_TIMEOUT_SECONDS_CPU if dev == "cpu" else PREPARE_LOAD_TIMEOUT_SECONDS
 
 # Human-readable quality label per model size, mirroring the picker's four tiers (voicedl._OFFER):
 # Fast=small, Balanced=medium, High quality=large-v3-turbo, Best=large-v3. base/tiny are internal
@@ -344,6 +378,62 @@ class _PendingAudio:
         # finalise_if_empty). While it is >0, cap enforcement drops the NEWEST (right) chunk, never the
         # protected front; while it is 0 (the common case) append() drops the OLDEST exactly as before.
         self._protected = 0
+        # Span of audio EVICTED at the cap, so a drop can be admitted in the transcript instead of
+        # only in the console log (WP-1 no-silent-loss). Earliest t_start and latest chunk end seen
+        # across every eviction; the SPAN is the honest number because MIC and SYS overlap in time.
+        self._dropped_lo = None
+        self._dropped_hi = None
+
+    def _note_dropped(self, audio, t_start):
+        """Record the time span of one evicted chunk (called under the lock)."""
+        try:
+            dur = len(audio) / 16000.0
+        except TypeError:
+            dur = 0.0
+        try:
+            t0 = float(t_start)
+        except (TypeError, ValueError):
+            return
+        self._dropped_lo = t0 if self._dropped_lo is None else min(self._dropped_lo, t0)
+        hi = t0 + dur
+        self._dropped_hi = hi if self._dropped_hi is None else max(self._dropped_hi, hi)
+
+    def dropped_span(self):
+        """(t_start, seconds) of the audio evicted at the cap, or (None, 0.0) if nothing was."""
+        with self._lock:
+            if self._dropped_lo is None:
+                return None, 0.0
+            return self._dropped_lo, max(0.0, (self._dropped_hi or self._dropped_lo) - self._dropped_lo)
+
+    def clear_dropped(self):
+        """Forget the evicted span once it has been reported, so a later build (a retry after a
+        catch-up failure reuses this same buffer) cannot write the same gap line twice."""
+        with self._lock:
+            self._dropped_lo = None
+            self._dropped_hi = None
+
+    def held_span(self):
+        """(t_start, seconds) covered by the audio still held, or (None, 0.0) when empty. Used to
+        state plainly in the transcript how much was never transcribed live when a session is
+        stopped before the model ever finished loading."""
+        with self._lock:
+            if not self._buf:
+                return None, 0.0
+            lo = hi = None
+            for _s, audio, t_start in self._buf:
+                try:
+                    t0 = float(t_start)
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    dur = len(audio) / 16000.0
+                except TypeError:
+                    dur = 0.0
+                lo = t0 if lo is None else min(lo, t0)
+                hi = (t0 + dur) if hi is None else max(hi, t0 + dur)
+            if lo is None:
+                return None, 0.0
+            return lo, max(0.0, (hi or lo) - lo)
 
     def _warn_once(self, newest):
         if self._warned:
@@ -366,6 +456,7 @@ class _PendingAudio:
                     self._samples -= len(new_audio)
                 except TypeError:
                     pass
+                self._note_dropped(new_audio, _t)
                 self._warn_once(newest=True)
         else:
             while self._samples > self._max and len(self._buf) > 1:
@@ -374,6 +465,7 @@ class _PendingAudio:
                     self._samples -= len(old_audio)
                 except TypeError:
                     pass
+                self._note_dropped(old_audio, _t)
                 self._warn_once(newest=False)
 
     def append(self, source, audio, t_start):
@@ -458,6 +550,128 @@ def _engine_alive(engine):
         return bool(engine.is_alive())
     except Exception:
         return True
+
+
+# --- one model load in flight per build key (WP-1) --------------------------------------------
+# A prepare that finds a load already running for its exact build key ATTACHES to it: same thread,
+# same result. Before this, a Retry after a load timeout started a SECOND Engine, which could only
+# sit on transcribe._BUILD_LOCK until the first one finished and then take the cache hit, so the
+# user paid the whole first load again in wall-clock time before anything was transcribed. An
+# already-FINISHED load whose engine nobody claimed is also attachable, so a Retry clicked after a
+# slow load quietly completed gets that engine instantly instead of building another.
+# A FAILED load is never attachable: Retry must genuinely try again.
+_LOAD_LOCK = threading.Lock()
+_LOAD_INFLIGHT = {}     # key -> {"thread": Thread, "result": dict, "started": monotonic}
+
+
+def _load_in_flight(key):
+    """Is a load for `key` still running, or finished with an engine nobody has claimed? Small,
+    read-only view of the registry for tests and callers that only want the fact."""
+    with _LOAD_LOCK:
+        rec = _LOAD_INFLIGHT.get(key)
+        if rec is None:
+            return False
+        return bool(rec["thread"].is_alive() or "engine" in rec["result"])
+
+
+def _start_or_attach_load(key, make_engine):
+    """Return (thread, result, started_at, attached) for the model load of `key`.
+
+    Starts a load only when there is not already a usable one: a live thread, or a finished one
+    whose engine is still unclaimed. `result` is filled with "engine" or "error" by the thread.
+    `started_at` is the ORIGINAL start, so an attached caller reports the true elapsed time."""
+    with _LOAD_LOCK:
+        rec = _LOAD_INFLIGHT.get(key)
+        if rec is not None and (rec["thread"].is_alive() or "engine" in rec["result"]):
+            return rec["thread"], rec["result"], rec["started"], True
+        result = {}
+
+        def _load():
+            try:
+                result["engine"] = make_engine()
+            except Exception as e:   # surfaced as prepare_error by the caller; never crashes the app
+                result["error"] = e
+
+        t = threading.Thread(target=_load, daemon=True, name="engine-load")
+        _LOAD_INFLIGHT[key] = {"thread": t, "result": result, "started": time.monotonic()}
+        t.start()
+        return t, result, _LOAD_INFLIGHT[key]["started"], False
+
+
+def _clear_load(key, result):
+    """Forget the in-flight record for `key`, but only if it is still the one that produced
+    `result` (identity-guarded, so a newer load started meanwhile is never dropped)."""
+    with _LOAD_LOCK:
+        rec = _LOAD_INFLIGHT.get(key)
+        if rec is not None and rec["result"] is result:
+            _LOAD_INFLIGHT.pop(key, None)
+
+
+def _reset_loads():
+    """Forget every in-flight load record. For tests, which reuse one process and must not let one
+    case's abandoned fake engine be attached to by the next."""
+    with _LOAD_LOCK:
+        _LOAD_INFLIGHT.clear()
+
+
+def _fmt_gap(seconds):
+    """A duration in the plain style the app uses elsewhere: "47 s", "10 min", "5 min 27 s"."""
+    s = int(round(max(0.0, float(seconds))))
+    if s < 60:
+        return f"{s} s"
+    if s % 60 == 0:
+        return f"{s // 60} min"
+    return f"{s // 60} min {s % 60} s"
+
+
+def _note_untranscribed(md_sink, browser_sink, t_start, seconds, recording):
+    """Write ONE honest line into the transcript where live transcription did not happen.
+
+    Silence in a transcript reads as silence in the room, which is the one thing the app must never
+    imply. Every path that gives up on held audio (a stop before the model ever loaded, an eviction
+    at the pending-buffer cap) calls this, so a gap is always stated rather than left blank. Written
+    straight to the sinks in the same shape and voice as the engine's own notices (see
+    transcribe._emit_notice); the recorder is untouched, so when recording is on the audio itself is
+    still on disk and can be transcribed afterwards."""
+    if seconds is None or seconds < 1.0:
+        return   # sub-second rounding noise is not a gap worth a line
+    tail = ("the recording still has them" if recording
+            else "there is no recording of them")
+    seg = transcribe.Segment(
+        source="SYS", t_start=float(t_start or 0.0), t_end=float(t_start or 0.0),
+        text=f"[engine: {_fmt_gap(seconds)} before the model loaded were not transcribed live, {tail}]")
+    for sink in (md_sink, browser_sink):
+        if sink is None:
+            continue
+        try:
+            sink(seg)
+        except Exception as e:
+            print(f"[start] could not record the untranscribed-audio notice: {e}", flush=True)
+
+
+def _mark_abandoned_backlog(md_sink, browser_sink, pb, recording):
+    """The pending buffer is about to be thrown away with no engine to replay it into (a Stop while
+    the model was still loading). Say so in the transcript instead of leaving a silent hole."""
+    if pb is None:
+        return
+    t_start, seconds = pb.held_span()
+    if seconds <= 0:
+        return
+    print(f"[start] {_fmt_gap(seconds)} of held audio was never transcribed (stopped before the "
+          f"model finished loading); noting the gap in the transcript.", flush=True)
+    _note_untranscribed(md_sink, browser_sink, t_start, seconds, recording)
+
+
+def _mark_dropped_backlog(md_sink, browser_sink, pb, recording):
+    """Some held audio was evicted at the pending-buffer cap while the model loaded. The replay can
+    never bring it back, so state the gap once, at the point the engine goes live."""
+    if pb is None:
+        return
+    t_start, seconds = pb.dropped_span()
+    if seconds <= 0:
+        return
+    pb.clear_dropped()      # reported once, never twice (a retry reuses this same buffer)
+    _note_untranscribed(md_sink, browser_sink, t_start, seconds, recording)
 
 
 def _drain_pending_into_engine(engine, pb):
@@ -1430,6 +1644,64 @@ def warm_up(req: WarmUpRequest):
     return transcribe.warm_up_async(tier, language, engine_override or engine_pref)
 
 
+def prewarm_at_startup():
+    """Warm the CPU model the next Begin will load, at APP START rather than at the first Begin.
+
+    On CPU the load is minutes and it is otherwise paid in full, with the meeting already running, at
+    the worst possible moment. Starting it when the app opens means the first session usually finds a
+    warm model, and when it does not it is at least already part-way through.
+
+    Deliberately narrow:
+      * CPU tiers only. A CUDA or Metal load is a few seconds, so there is nothing to hide there.
+      * Only a model already on disk. This never downloads anything: no network at app start.
+      * The tier is resolved exactly as Begin resolves it, from saved settings, so an explicit model
+        choice is honoured and never overridden by a guess.
+      * A no-op while a session is running, and idempotent against the pre-meeting screen's
+        /api/warm-up (transcribe.warm_up_async returns early when that model is cached or warming),
+        so the two can never double-warm. A user who then changes the model simply warms the new one;
+        the wasted work is one background load of a model they had selected at the time.
+    Returns a small dict describing what it did, so it is testable without a model.
+    SA_LIVE_PREWARM=0 turns it off.
+    """
+    if os.environ.get("SA_LIVE_PREWARM", "1") == "0":
+        return {"state": "skipped", "why": "disabled"}
+    try:
+        with STATE.lock:
+            if STATE.running:
+                return {"state": "skipped", "why": "session running"}
+        settings = config.load()
+        quality = settings.get("tier") or "auto"
+        device = settings.get("device") or "auto"
+        language = settings.get("language") or None
+        engine_pref = settings.get("engine") or "auto"
+        tier, engine_override = resolve_tier_engine(quality, device, language, engine_pref)
+        effective_engine = engine_override or engine_pref
+        if load_device_for(tier) != "cpu":
+            return {"state": "skipped", "why": "not a CPU tier", "tier": tier}
+        # Present-on-disk is the gate: pre-warm must never start a download.
+        plan = _resolve_download_plan(tier, language, effective_engine)
+        if not plan.get("present"):
+            return {"state": "skipped", "why": "model not downloaded", "tier": tier}
+        print(f"[warmup] pre-warming {plan.get('model')} for {tier} at app start (CPU)", flush=True)
+        return transcribe.warm_up_async(tier, language, effective_engine)
+    except Exception as e:      # best-effort: a pre-warm problem must never affect starting the app
+        print(f"[warmup] pre-warm at start skipped: {e}", flush=True)
+        return {"state": "skipped", "why": str(e)}
+
+
+def _prewarm_on_startup():
+    """ASGI startup hook: run the pre-warm decision OFF the startup path. Resolving the tier can
+    probe the GPU and the download plan touches the disk, so even the decision runs on its own
+    thread; the server binds and serves the UI without waiting for any of it."""
+    threading.Thread(target=prewarm_at_startup, daemon=True, name="prewarm").start()
+
+
+# Registered on the router directly (rather than the deprecated @app.on_event decorator) so any ASGI
+# host that runs the lifespan - uvicorn in web/__main__.py, and the desktop shell through it - pays
+# the same start-up pre-warm.
+app.router.on_startup.append(_prewarm_on_startup)
+
+
 class PreflightRequest(BaseModel):
     tier: str = "auto"
     device: str = "auto"
@@ -1732,8 +2004,10 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
     WP-2 adds a real two-phase prepare BEFORE the engine is wired up: a "downloading" phase (only when
     the model is not already cached) that polls voicedl.progress() into STATE.prepare and gives up with
     a retryable error if no bytes arrive for PREPARE_DOWNLOAD_STALL_SECONDS, then a "loading" phase
-    (the Engine build, now a fast local_files_only cache hit) bounded by a PREPARE_LOAD_TIMEOUT_SECONDS
-    watchdog. Either failure leaves capture + recording running and is retryable via /api/prepare/retry.
+    (the Engine build) bounded by a device-aware budget (load_budget_seconds: minutes on CPU, where a
+    healthy first load genuinely takes that long, seconds-scale on CUDA/Metal). Either failure leaves
+    capture + recording running and is retryable via /api/prepare/retry, and a retry ATTACHES to a load
+    already in flight rather than queueing a second Engine behind it (_start_or_attach_load).
     WP-1 flips STATE.model_ready True at phase-1 end (engine built + started), independent of the
     backlog drain, so a slow CPU can never leave the UI stuck on "preparing"."""
     from .. import voicedl
@@ -1881,27 +2155,41 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
                 last_change = now
             time.sleep(_PREPARE_POLL_SECONDS)
 
-    # --- phase "loading": build the Engine (a fast local_files_only cache hit now the files are
-    # present), bounded by a watchdog so a load that never returns becomes a retryable error instead of
-    # an endless spinner. The build runs in a sub-thread we join with a timeout; on timeout we bail and
-    # leave that thread to finish or die on its own (rare pathological case; documented seam).
+    # --- phase "loading": build the Engine. On a warm cache this is quick; on CPU it is dominated by
+    # the first inference and can honestly take minutes (see load_budget_seconds). The load runs in a
+    # sub-thread that we watch rather than blind-join, so that:
+    #   * while the thread is ALIVE the prepare state stays "loading" with an elapsed counter, never
+    #     the error screen: a slow machine is not a failure;
+    #   * a repeat prepare (Retry) ATTACHES to the live load instead of starting a second Engine, which
+    #     would only queue behind the first on the model build lock. That queueing is exactly what
+    #     turned a 120 s timeout into a multi-minute wait after Retry;
+    #   * only a dead thread (exception surfaced) or an exhausted budget becomes an error.
     _set_prepare("loading")
     if not _still_ours():
         return
-    build = {}
-
-    def _load():
-        try:
-            build["engine"] = transcribe.Engine(tier=tier, language=language,
-                                                 initial_prompt=prompt, engine=engine_pref)
-        except Exception as e:   # surfaced as prepare_error below; never crashes the app or session
-            build["error"] = e
-
-    lt = threading.Thread(target=_load, daemon=True, name="engine-load")
-    lt.start()
-    lt.join(PREPARE_LOAD_TIMEOUT_SECONDS)
+    device = load_device_for(tier)
+    budget = load_budget_seconds(device=device)
+    lt, build, load_started, attached = _start_or_attach_load(
+        (tier, language, prompt, engine_pref),
+        lambda: transcribe.Engine(tier=tier, language=language,
+                                  initial_prompt=prompt, engine=engine_pref))
+    if attached:
+        print(f"[start] attaching to the model load already in flight for {tier} "
+              f"({time.monotonic() - load_started:.0f}s so far)", flush=True)
+    while lt.is_alive():
+        elapsed = time.monotonic() - load_started
+        if elapsed >= budget:
+            break
+        if not _still_ours():
+            return               # stop/switch/new-start: leave the load running for whoever is next
+        # Honest waiting: publish the elapsed seconds (and, on CPU, the "this is normal" hint) so the
+        # UI can count up instead of pretending nothing is happening or claiming a failure.
+        _set_prepare("loading", elapsed=round(elapsed, 1), budget=budget,
+                     slow=bool(device == "cpu" and elapsed >= PREPARE_LOAD_SLOW_HINT_SECONDS))
+        lt.join(_PREPARE_LOAD_POLL_SECONDS)
     if lt.is_alive():
-        _fail("Loading the transcription model timed out. Please try again.")
+        _fail(f"The transcription model did not finish loading after {_fmt_gap(budget)}. "
+              f"Please try again.")
         return
     if "error" in build:
         _fail(f"Could not load the transcription model: {build['error']}")
@@ -1910,6 +2198,9 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
     if engine is None:
         _fail("Could not load the transcription model on this computer.")
         return
+    # This build owns the engine now; drop the in-flight record so the NEXT prepare starts a fresh
+    # load rather than attaching to a finished one and handing out an engine already in use.
+    _clear_load((tier, language, prompt, engine_pref), build)
 
     def _release_prep_engine():
         # Drop the private handle ONLY if it still points at THIS build's engine (identity-guarded like
@@ -2064,6 +2355,11 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
             pass
         _release_prep_engine()
         return
+
+    # If the load ran long enough for the buffer to hit its cap, some early audio was evicted and no
+    # replay can bring it back. Say so once, here, so the transcript never presents an eviction as
+    # silence (the console warning alone is invisible to the person reading the transcript).
+    _mark_dropped_backlog(md_sink, browser_sink, pb, bool(STATE.recording))
 
     # --- phase 2: drain the buffer into the engine, in order, OUTSIDE STATE.lock, until a pass comes
     # back empty and the atomic flip publishes the engine. Because STATE.engine is still None, any
@@ -2809,9 +3105,15 @@ def stop(what: str = "all"):
             pb = STATE.pending_audio
             build_thread = STATE.build_thread
             preparing_case = engine is None and prep_eng is not None
+            # No engine at all (the model never finished loading) and audio still held: there is
+            # nowhere to replay it, so the gap gets STATED in the transcript rather than left blank.
+            abandoned_pb = pb if (engine is None and prep_eng is None) else None
+            browser_sink = STATE.browser_sink
+            was_recording = bool(STATE.recording)
             pending = (prep_eng.pending() if prep_eng else (engine.pending() if engine else 0))
 
             def _drain_transcription():
+                _mark_abandoned_backlog(md_sink, browser_sink, abandoned_pb, was_recording)
                 if preparing_case:
                     # Wait for the builder to RELEASE the private engine - return from its thread - before
                     # draining it, so we are the SOLE feeder (no two-feeder race). The builder releases
@@ -2907,6 +3209,10 @@ def stop(what: str = "all"):
         pb = STATE.pending_audio
         build_thread = STATE.build_thread
         preparing_case = engine is None and prep_eng is not None
+        # No engine at all (the model never finished loading): the held backlog has nowhere to go, so
+        # the transcript says how much was never transcribed instead of just ending short.
+        no_engine_case = engine is None and prep_eng is None
+        browser_sink = STATE.browser_sink
         pending = (engine.pending() if engine else (prep_eng.pending() if prep_eng else 0))
 
     def _drain_and_close():
@@ -2919,6 +3225,11 @@ def stop(what: str = "all"):
                 cap.stop()
         except Exception:
             pass
+        if no_engine_case:
+            # Stopped before the model ever loaded. cap.stop() has just flushed the last chunk into the
+            # buffer, so this covers the whole span; done here, before md_sink.close(), so the notice is
+            # part of the saved transcript.
+            _mark_abandoned_backlog(md_sink, browser_sink, pb, rec is not None)
         if preparing_case:
             # Model still catching up: cap.stop() above flushed the final chunk into pending_audio (the
             # engine is unpublished, so _feed buffers it). Wait for the builder to RELEASE the private

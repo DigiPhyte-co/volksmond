@@ -238,6 +238,8 @@ window.VM_I18N = {
       "Die klank word nou op hierdie rekenaar vasgevang en opgeneem.",
     "The transcription model is still loading. The transcript fills in from the start the moment it is ready, and if you are recording, the audio is saved from the very beginning.":
       "Die transkripsiemodel laai nog. Die transkripsie vul van voor af in sodra dit gereed is, en as jy opneem, word die klank van heel voor af gestoor.",
+    "First load on this computer can take a few minutes. It is faster next time.":
+      "Die eerste laai op hierdie rekenaar kan 'n paar minute duur. Dit is vinniger volgende keer.",
     "Could not load the transcription model on this computer.":
       "Kon nie die transkripsiemodel op hierdie rekenaar laai nie.",
     "The download stalled. Check your connection and try again.":
