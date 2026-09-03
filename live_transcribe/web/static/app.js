@@ -169,6 +169,12 @@ function freshLive() {
     // Live AEC toggle: rendered from the ENGINE'S confirmed state (/api/status, /api/aec-live),
     // never from stored settings, so it can never show a value the engine does not have.
     aecAvailable: false, aecActive: false, aecBusy: false, noticeShown: "",
+    // Live mic gate, on the same terms as the AEC toggle above: rendered from the ENGINE'S
+    // confirmed state (/api/status, /api/mic-gate), never from stored settings. Null until the
+    // engine exists, which is what hides the control. Shape once set:
+    // {on, mode: "normal"|"gentle"|"off", skipped, decoded}. micGateHintSeq is the last
+    // safety-valve hint this client has already shown, so a reload never re-fires an old one.
+    micGate: null, micGateBusy: false, micGateHintSeq: 0,
     // Outstanding long-silence warning from the server ({minutes, count, at}), or null.
     // Server-owned: the watcher lives there, so this is only ever a copy of /api/status.
     silenceNudge: null,
@@ -467,6 +473,9 @@ function refreshLiveAec() {
     if (!st || !st.running) return;
     S.live.aecAvailable = !!st.aec_live_available;
     S.live.aecActive = !!st.aec_live_active;
+    // Same poll, same posture: the mic gate is engine-confirmed too, and this is the first read
+    // of it after Begin (a hint cannot have fired yet, so adopt the sequence silently).
+    adoptMicGate(st, true);
     if (S.route === "live" || S.route === "recordonly") render();
   }).catch(function () {});
 }
@@ -502,6 +511,66 @@ function liveAecToggle() {
     S.live.aecBusy ? el("span", { class: "spinner sm" }) : toggleEl(!!S.live.aecActive, toggleLiveAec),
   ]);
 }
+// The safety valve's one-shot messages, keyed by the mode it stepped down to.
+var MIC_GATE_HINTS = {
+  gentle: "Your microphone is quiet, mic gate set to gentle",
+  off: "Mic gate switched off for this meeting: your microphone is very quiet",
+};
+// Adopt /api/status's mic_gate object into S.live and surface any new safety-valve hint.
+// Returns true when something the UI draws has changed, so pollers can render() once for all of
+// their fields. `silent` (a page reload adopting the current status) takes the hint sequence
+// WITHOUT toasting, so a hint that fired before the reload is never shown twice.
+function adoptMicGate(st, silent) {
+  var g = st && st.mic_gate;
+  if (!g) return false;
+  var was = S.live.micGate;
+  var now = { on: !!g.on, mode: g.mode || "normal", skipped: g.skipped || 0, decoded: g.decoded || 0 };
+  var changed = !was || was.on !== now.on || was.mode !== now.mode || was.skipped !== now.skipped;
+  S.live.micGate = now;
+  var seq = g.hint_seq || 0;
+  if (seq > (S.live.micGateHintSeq || 0)) {
+    S.live.micGateHintSeq = seq;
+    if (!silent && MIC_GATE_HINTS[g.hint]) toast(MIC_GATE_HINTS[g.hint]);
+  }
+  return changed;
+}
+// Toggle the mic gate mid-meeting. Like the AEC toggle: the UI reflects the CONFIRMED new state
+// from the server, not an optimistic flip, and the server persists the choice as the new default.
+async function toggleLiveMicGate() {
+  if (S.live.micGateBusy || !S.live.micGate) return;
+  S.live.micGateBusy = true; render();
+  var want = !S.live.micGate.on;
+  try {
+    var resp = await api.post("/api/mic-gate", { enabled: want });
+    adoptMicGate({ mic_gate: resp }, true);
+    if (S.settings) S.settings.mic_gate = S.live.micGate.on;
+    if (resp.persisted === false) toast("Mic gate changed for this meeting, but the choice could not be saved as your default.");
+    else toast(S.live.micGate.on ? "Mic gate on." : "Mic gate off.");
+  } catch (e) {
+    toast(e.message || "Could not change the mic gate.", true);
+  } finally {
+    S.live.micGateBusy = false; render();
+  }
+}
+// Compact in-meeting mic-gate control for the live audio strip, with the running count of chunks
+// it has skipped so the user can see it working. Hidden until the engine reports its state.
+function liveMicGateToggle() {
+  var g = S.live.micGate;
+  if (!g) return null;
+  var n = g.skipped || 0;
+  return el("div", { class: "row gap-6", style: { alignItems: "center", flex: "0 0 auto" },
+    title: tr("Skips microphone audio with no speech in it so the far end gets the CPU. Switch it off if it ever cuts you off.") }, [
+    el("span", { class: "ink-3", style: { fontSize: "11.5px" }, text: "Mic gate" }),
+    g.on && g.mode === "gentle" ? el("span", { class: "ink-3", style: { fontSize: "11px", opacity: ".8" }, text: "gentle" }) : null,
+    S.live.micGateBusy ? el("span", { class: "spinner sm" }) : toggleEl(!!g.on, toggleLiveMicGate),
+    // The count and its label are separate spans so the label alone is an i18n key: an exact-key
+    // translation table cannot hold "18 quiet chunks skipped".
+    n > 0 ? el("span", { class: "ink-3", style: { fontSize: "11px", whiteSpace: "nowrap" } }, [
+      el("span", { text: String(n) }),
+      el("span", { style: { marginLeft: "3px" }, text: n === 1 ? "quiet chunk skipped" : "quiet chunks skipped" }),
+    ]) : null,
+  ]);
+}
 // Compact strip for the live + record-only screens: per source, a dropdown to switch the
 // device on the fly and a level meter. An empty device list degrades to "not detected".
 function liveAudioStrip() {
@@ -530,6 +599,7 @@ function liveAudioStrip() {
     channel("mic", "mic", dev.mics, S.live.micDevice, dev.default_mic_index, "vm-meter-mic"),
     channel("loopback", "speaker", dev.loopbacks, S.live.loopbackDevice, dev.default_loopback_index, "vm-meter-sys"),
     liveAecToggle(),
+    liveMicGateToggle(),
   ]);
 }
 // Compact strip on the live screen to change the LANGUAGE and MODEL mid-meeting. Language alone
@@ -1814,6 +1884,9 @@ function refreshSilence() {
     // is treated the same as "active" so it never renders a stale warning.
     var ss = st.sys_state || null;
     if (ss !== S.live.sysState) { S.live.sysState = ss; changed = true; }
+    // The mic-gate counter and mode, plus any hint the quiet-mic safety valve has just latched.
+    // Not silent: this is the poll that is meant to surface it.
+    if (adoptMicGate(st, false)) changed = true;
     // t0-capture: also adopt model readiness / load error here as a slower self-healing backstop to
     // the 1.5s readiness poll (which stops once ready), so a lost poll cannot leave the chip stuck.
     if (adoptReadiness(st)) changed = true;
@@ -3171,6 +3244,15 @@ function transcriptionCard(st) {
       ]),
       el("div", { class: "ctl" }, toggleEl(st.aec === true, function () { saveSettings({ aec: !(st.aec === true) }); })),
     ]),
+    el("div", { class: "set-row" }, [
+      el("div", { class: "ic" }, icon("mic", 18)),
+      el("div", { class: "body" }, [
+        el("div", { class: "t", text: "Skip quiet mic audio (mic gate)" }),
+        el("div", { class: "s", text: "Skips microphone audio with no speech in it so the far end gets the CPU. Switch it off if it ever cuts you off." }),
+      ]),
+      // "" and 0 are not values here, so only an explicit false turns it off: the default is on.
+      el("div", { class: "ctl" }, toggleEl(st.mic_gate !== false, function () { saveSettings({ mic_gate: st.mic_gate === false }); })),
+    ]),
     el("div", { class: "set-row", style: { display: "block" } }, [
       el("div", { class: "t", style: { marginBottom: "4px" }, text: "Default context, names and jargon" }),
       el("div", { class: "s", style: { marginBottom: "8px" }, text: "Applied to every meeting to help accuracy. Stored on this computer only." }),
@@ -4312,6 +4394,7 @@ function adoptRunning(status) {
   S.live.silenceNudge = status.silence_nudge || null;   // a nudge that fired before this reload
   S.live.struggleNudge = status.struggle_nudge || null; // same, for a downgrade that fired before this reload
   S.live.recordingStarted = !!status.recording_started; // latched: recording is or was active this session
+  adoptMicGate(status, true);                           // silent: a valve hint from before the reload is history
   if (status.source_kind !== "file") { startLevels(); startSilencePoll(); }
   if (status.source_kind === "file") {
     S.route = "importing";

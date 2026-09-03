@@ -679,6 +679,24 @@ window.VM_I18N = {
     "Could not change echo cancellation.": "Kon nie eggo-kansellering verander nie.",
     "Echo cancellation changed for this meeting, but the choice could not be saved as your default.": "Eggo-kansellering is vir hierdie vergadering verander, maar die keuse kon nie as jou verstek gestoor word nie.",
 
+    // Mic gate: the live toggle, its counter, and the quiet-mic safety valve's two hints
+    "Mic gate": "Mikrofoonhek",
+    "gentle": "sag",
+    "Skip quiet mic audio (mic gate)": "Slaan stil mikrofoonklank oor (mikrofoonhek)",
+    "Skips microphone audio with no speech in it so the far end gets the CPU. Switch it off if it ever cuts you off.":
+      "Slaan mikrofoonklank sonder spraak oor sodat die ander kant die SVE kry. Skakel dit af as dit jou ooit afsny.",
+    "quiet chunk skipped": "stil stukkie oorgeslaan",
+    "quiet chunks skipped": "stil stukkies oorgeslaan",
+    "Mic gate on.": "Mikrofoonhek aan.",
+    "Mic gate off.": "Mikrofoonhek af.",
+    "Could not change the mic gate.": "Kon nie die mikrofoonhek verander nie.",
+    "Mic gate changed for this meeting, but the choice could not be saved as your default.":
+      "Die mikrofoonhek is vir hierdie vergadering verander, maar die keuse kon nie as jou verstek gestoor word nie.",
+    "Your microphone is quiet, mic gate set to gentle":
+      "Jou mikrofoon is sag, die mikrofoonhek is op sag gestel",
+    "Mic gate switched off for this meeting: your microphone is very quiet":
+      "Die mikrofoonhek is vir hierdie vergadering afgeskakel: jou mikrofoon is baie sag",
+
     // Stereo interview mode (upload option: one speaker per channel)
     "Stereo interview mode": "Stereo-onderhoudmodus",
     "For phone recordings where the two speakers sit in the left and right channels (e.g. Samsung Interview mode). Transcribes each side separately, labelled Speaker L and Speaker R. A mono file is transcribed as a single track.":

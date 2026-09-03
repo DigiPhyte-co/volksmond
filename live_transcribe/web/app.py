@@ -1220,6 +1220,16 @@ def status():
             # expose this yet (or a mock in tests) reports as 'active' so the UI never raises a
             # false warning. The live screen banners only on the last two values.
             resp["sys_state"] = getattr(STATE.capture, "sys_state", "active")
+        # Live mic-gate truth for the in-meeting toggle and its counter, on the same terms as AEC:
+        # the ENGINE'S own state, pulled fresh, never the stored setting. Shape:
+        # {on, mode: normal|gentle|off, skipped, decoded, hint, hint_seq}. Absent (null) until the
+        # engine exists, which is what the UI keys off to hide the control.
+        eng = _gate_engine()
+        if eng is not None:
+            try:
+                resp["mic_gate"] = eng.mic_gate_state()
+            except Exception:
+                pass
         if STATE.stopping and STATE.engine is not None:
             resp["pending"] = STATE.engine.pending()
         return resp
@@ -1487,6 +1497,60 @@ def set_aec_live(req: AecLiveRequest):
         persisted = False
         print(f"[aec-live] toggle applied but the setting could not be saved: {e}", flush=True)
     return {"aec_live_available": avail, "aec_live_active": active, "persisted": persisted}
+
+
+def _apply_mic_gate_setting(engine):
+    """Start a freshly built engine from the user's saved mic-gate preference (default on).
+
+    The env switch stays the escape hatch a support session can reach for, so it WINS: set
+    SA_LIVE_MIC_SPEECH_GATE at all and the stored setting is left alone. Never fatal - a settings
+    file that cannot be read must not cost anyone their meeting."""
+    if os.environ.get("SA_LIVE_MIC_SPEECH_GATE") is not None:
+        return
+    try:
+        engine.set_mic_gate(bool(config.load().get("mic_gate", True)))
+    except Exception as e:
+        print(f"[mic-gate] could not apply the saved setting, leaving the default: {e}", flush=True)
+
+
+def _gate_engine():
+    """The engine whose mic gate the UI is talking about, or None.
+
+    STATE.engine is only published after the t0-capture backlog has drained, so during catch-up the
+    live engine is the private STATE.preparing_engine. Both are the same object in the end; taking
+    whichever exists is what makes the toggle work from the moment transcription goes live rather
+    than minutes later. No lock: this is a single attribute read, and every caller holds STATE.lock
+    or does not need to."""
+    return STATE.engine if STATE.engine is not None else STATE.preparing_engine
+
+
+class MicGateRequest(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/mic-gate")
+def set_mic_gate(req: MicGateRequest):
+    """Turn the MIC speech gate on or off DURING a session, without ending it.
+
+    The gate is a DECODE filter that skips microphone chunks holding no speech evidence, so both
+    values are a per-chunk flip on the transcription worker: no capture change, no audio gap,
+    effective on the next chunk. It never touches the recording (the recorder is fed ahead of the
+    engine queue) and it never touches the far end. The choice is persisted as the new default the
+    same way the live AEC toggle persists its own. Returns the CONFIRMED engine state, which the UI
+    renders; a failed save is reported in `persisted` rather than failing the request."""
+    with STATE.lock:
+        eng = _gate_engine()
+        if not (STATE.running and not STATE.stopping and eng is not None):
+            raise HTTPException(status_code=409, detail="The mic gate can only be changed while a meeting is being transcribed.")
+        state = eng.set_mic_gate(bool(req.enabled))
+    persisted = True
+    try:
+        config.update({"mic_gate": bool(req.enabled)})
+    except Exception as e:
+        persisted = False
+        print(f"[mic-gate] toggle applied but the setting could not be saved: {e}", flush=True)
+    state["persisted"] = persisted
+    return state
 
 
 class ReconfigureRequest(BaseModel):
@@ -2201,6 +2265,7 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
     # This build owns the engine now; drop the in-flight record so the NEXT prepare starts a fresh
     # load rather than attaching to a finished one and handing out an engine already in use.
     _clear_load((tier, language, prompt, engine_pref), build)
+    _apply_mic_gate_setting(engine)
 
     def _release_prep_engine():
         # Drop the private handle ONLY if it still points at THIS build's engine (identity-guarded like
@@ -2731,6 +2796,8 @@ def transcribe_file(req: TranscribeFileRequest):
             engine = transcribe.Engine(tier=tier, language=language, initial_prompt=prompt, adaptive=False, engine=engine_pref)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Could not load model ({tier}): {e}")
+        # Same saved preference on the re-transcribe path, so the setting means one thing.
+        _apply_mic_gate_setting(engine)
         if base and output_path.exists():
             # Regenerating replaces the prior transcript (the audio is kept as the source of
             # truth). Remove it only now the engine has loaded, so a load failure never loses
@@ -3454,6 +3521,7 @@ class SettingsPatch(BaseModel):
     aec: Optional[bool] = None
     aec_live: Optional[bool] = None
     agc_live: Optional[bool] = None
+    mic_gate: Optional[bool] = None         # skip microphone chunks with no speech evidence before decoding
     summary_device: Optional[str] = None
     save_location: Optional[str] = None
     default_context: Optional[str] = None

@@ -543,6 +543,191 @@ def _silence_floor_db(ring, t_hi, static_db=-45.0):
     return min(-35.0, max(-55.0, lvl - 30.0))
 
 
+# --- MIC speech-evidence gate (WP-3) --------------------------------------------------------
+# Arms 1 and 2 of _chunk_is_silence both judge a chunk on its LOUDEST raw frame, so one door
+# bang, one keyboard click or one cough keeps a whole 15 s chunk of room tone. Measured on a
+# 67 min CPU capture: only 8 to 12 min of the MIC channel was near-end speech, yet in a 10 min
+# window the peak tests kept 36 of 40 MIC chunks; decoding them cost MORE than the far end
+# (RTF 0.89 on MIC against 0.42 on SYS) and produced the loops and the prompt echo that made up
+# that session's entire junk budget.
+#
+# Arm 3 swaps the peak for CONTINUITY: speech occupies frames, a transient does not. A MIC chunk
+# is decoded only when at least MIC_EVIDENCE_SECONDS of its raw 100 ms ring frames clear an
+# evidence threshold.
+#
+# The threshold is the room's own p10 floor (measured strictly BEFORE the chunk, so a chunk is
+# never judged against itself) plus MIC_EVIDENCE_MARGIN_DB, but never above
+# MIC_EVIDENCE_CEILING_DB. The cap is what makes the arm safe in both directions:
+#   quiet room - the floor sits well below the cap, so the threshold follows the room down and a
+#                quiet talker still clears it (measured floors on the incident capture: -53 to
+#                -59 dBFS, thresholds -35 to -39, near-end speech -22.8 dBFS mean);
+#   noisy room - the floor rises to within 20 dB of the cap, room frames clear the threshold on
+#                their own, and the arm goes inert rather than eating a quiet talker.
+# 20 dB: near-end speech on that capture sat about 30 dB above its own p10 room tone, so this is
+# the midpoint, leaving 13 to 16 dB of headroom below real speech.
+#
+# MIC only, by design. The far end is a digital signal at a known level with no microphone, no
+# room and no AGC; there is no measured junk to gate there and no basis for these constants.
+MIC_EVIDENCE_MARGIN_DB = 20.0     # above this channel's own p10 room tone ...
+MIC_EVIDENCE_CEILING_DB = -35.0   # ... but never above this (the noisy-room escape)
+MIC_EVIDENCE_SECONDS = 0.5        # of frames that must clear it before the chunk is decoded
+
+# --- the quiet-mic safety valve (WP-7) -------------------------------------------------------
+# The gate above is relative, so a quiet mic in a QUIET room is already safe: the threshold rides
+# the room down with it. The case it cannot ride down for is a quiet mic in a room loud enough
+# that MIC_EVIDENCE_CEILING_DB caps the threshold. Then the bar stops following the room and a
+# soft talker can sit just under it, chunk after chunk. That is the one way this arm can cut
+# someone off, so it watches for exactly that signature and stands itself down.
+#
+# The signature, per chunk, is two things TOGETHER: the chunk was skipped, AND it held sustained
+# activity in the band just under the threshold (the same "enough frames" test the evidence arm
+# uses, applied to [thr - MIC_GATE_NEAR_BAND_DB, thr)). A dead-quiet room fails the second half,
+# its frames sit at the floor far below the band, so an empty room never trips the valve. Pairing
+# the two is what separates "someone is talking under the bar" from "nobody is talking".
+#
+# Two steps, one way only. It never escalates back automatically: a user who has been cut off
+# once must not be cut off again by the same arm re-arming itself.
+#   normal -> gentle : margin 12 dB, evidence 0.3 s. Still a gate, with the bar about 8 dB lower.
+#   gentle -> off    : the arm goes inert for the rest of the session.
+# Each step clears the window, so the next step is judged on its own fresh MIC_GATE_WINDOW chunks.
+MIC_GATE_GENTLE_MARGIN_DB = 12.0  # gentle mode's margin over the room floor (normal: 20)
+MIC_GATE_GENTLE_SECONDS = 0.3     # gentle mode's evidence requirement (normal: 0.5)
+MIC_GATE_WINDOW = 8               # the valve looks at the last N MIC chunks the arm judged ...
+MIC_GATE_TRIP = 6                 # ... and trips when this many were skipped AND near the line
+MIC_GATE_NEAR_BAND_DB = 12.0      # "just under the line" = within this far below the threshold
+
+# Per-source silero VAD options (faster-whisper 1.2.1 VadOptions). The library defaults -
+# threshold 0.5, min_speech_duration_ms 0, min_silence_duration_ms 2000, speech_pad_ms 400 -
+# only split a chunk on a silence LONGER THAN TWO SECONDS and keep speech regions of any length,
+# so a near-silent 15 s mic chunk arrives at the decoder as one merged "speech" region: measured
+# on the incident capture, 86% of the MIC channel passed the VAD as speech in 39 such regions.
+# MIC gets a tighter set; SYS keeps the library defaults (vad_parameters=None), which is what it
+# has always run and what every existing SYS measurement was taken on.
+#
+# `threshold` is deliberately NOT raised. Raising it is where quiet real speech dies, and the
+# problem measured here is region MERGING, not the per-frame speech probability.
+MIC_VAD = dict(
+    threshold=0.5,                # unchanged, on purpose (see above)
+    min_speech_duration_ms=250,   # a sub-quarter-second region is a click or a bump, not a word
+    min_silence_duration_ms=500,  # split on a half-second gap instead of waiting for two seconds
+    speech_pad_ms=200,            # half the default padding, so a split is not merged back
+)
+
+
+def vad_options_for(source):
+    """The VAD options this source decodes with: the tightened set for MIC, None (the
+    faster-whisper defaults) for SYS and for anything else."""
+    return MIC_VAD if source == "MIC" else None
+
+
+def _gate_log(engine, source, t_start, skipped, why, stats=None):
+    """Return `skipped` after counting it and logging it under SA_LIVE_MIC_GATE_DEBUG.
+
+    Every ring-fed gate decision funnels through here, which is why the MIC session counters and
+    the quiet-mic safety valve live here too rather than at each of the arms' return statements.
+    `stats` is arm 3's measurement dict (see mic_speech_evidence) and is passed ONLY by arm 3, so
+    it doubles as the "this decision is the valve's business" marker.
+
+    Numbers only: never any audio and never any transcribed text. Module-level, and every
+    attribute read through getattr, so the half-Engine stubs the gate tests build (which borrow
+    _chunk_is_silence unbound) keep working untouched.
+    """
+    if source == "MIC":
+        _mic_gate_count(engine, skipped, stats)
+    if getattr(engine, "_mic_gate_debug", False):
+        print(f"[gate] {source} @ {t_start:.1f}s {'skip' if skipped else 'keep'} [{why}]", flush=True)
+    return skipped
+
+
+def _mic_gate_count(engine, skipped, stats):
+    """Tally one MIC decode decision and, for an arm-3 decision, feed the safety valve.
+
+    Counts EVERY ring-fed MIC decision, whichever arm made it, because "quiet chunks skipped" is
+    what the user is shown and a chunk skipped by the absolute arm is just as skipped. The valve,
+    by contrast, only ever sees arm 3's own decisions (stats is not None), because arm 3 is the
+    only thing it can stand down.
+
+    Module-level and defensive throughout: a stub engine without these attributes gets them
+    created, and any surprise leaves the gate itself untouched (a counter must never be able to
+    break a transcription).
+    """
+    try:
+        engine.mic_gate_skipped = getattr(engine, "mic_gate_skipped", 0) + (1 if skipped else 0)
+        engine.mic_gate_decoded = getattr(engine, "mic_gate_decoded", 0) + (0 if skipped else 1)
+        if stats is None:
+            return
+        hist = getattr(engine, "_mic_gate_recent", None)
+        if hist is None:
+            hist = deque(maxlen=MIC_GATE_WINDOW)
+            engine._mic_gate_recent = hist
+        hist.append(bool(skipped) and bool(stats.get("near")))
+        _mic_gate_valve(engine, hist)
+    except Exception:
+        return
+
+
+def _mic_gate_valve(engine, hist):
+    """Step the gate down one level when the last MIC_GATE_WINDOW chunks show the quiet-mic
+    signature: MIC_GATE_TRIP of them skipped WITH sustained activity just under the threshold.
+
+    One-way, one step per full window (the window is cleared on every step), and it latches a
+    one-shot hint for the UI to toast rather than writing anything into the transcript.
+    """
+    if len(hist) < MIC_GATE_WINDOW or sum(1 for near_skip in hist if near_skip) < MIC_GATE_TRIP:
+        return
+    hist.clear()
+    if getattr(engine, "_mic_gate_level", "normal") == "normal":
+        engine._mic_gate_level = "gentle"
+        hint = "gentle"
+    else:
+        engine._mic_speech_gate = False
+        hint = "off"
+    engine.mic_gate_hint = hint
+    engine.mic_gate_hint_seq = getattr(engine, "mic_gate_hint_seq", 0) + 1
+    print(f"[gate] quiet-mic safety valve: mic gate -> {hint}", flush=True)
+
+
+def mic_speech_evidence(ring, t_start, t_hi,
+                        margin_db=MIC_EVIDENCE_MARGIN_DB,
+                        ceiling_db=MIC_EVIDENCE_CEILING_DB,
+                        need_s=MIC_EVIDENCE_SECONDS,
+                        stats=None):
+    """(verdict, detail) for arm 3. verdict True = speech evidence, False = none, None = inert.
+
+    Inert whenever the evidence would have to be guessed: no room-tone baseline before the chunk
+    (see noise_floor_before - nothing earlier, or under 10 s of history), or no ring frames
+    covering the window at all. Never gate on missing evidence.
+
+    `detail` is a short numbers-only string for the debug log: no audio, no text.
+
+    `stats`, when a dict is passed in, is filled with this chunk's measurement for the quiet-mic
+    safety valve: floor, thr, n_evid, n_near, need and `near` (True when the frames sitting in
+    [thr - MIC_GATE_NEAR_BAND_DB, thr) are sustained enough to have cleared the evidence bar had
+    the bar been that much lower). An out-parameter rather than a third return value on purpose:
+    the two-tuple is pinned API. Costs one extra pass over frames already in memory, no audio
+    maths and no decoding.
+    """
+    floor = ring.noise_floor_before(t_start)
+    if floor is None:
+        return None, "no baseline"
+    frames = ring.frames_in(t_start, t_hi)
+    if not frames:
+        return None, "no frames"
+    thr = min(floor + margin_db, ceiling_db)
+    n_evid = sum(1 for d in frames if d >= thr)
+    # need_s worth of ring frames, derived from the ring's own resolution rather than a constant
+    # shared with capture_core (10 frames/s today), and never more than a third of a short chunk:
+    # a 1 s tail must not have to spend half its frames proving itself.
+    dur = max(t_hi - t_start, 1e-6)
+    need = min(max(1, int(round(need_s * len(frames) / dur))), max(1, len(frames) // 3))
+    if stats is not None:
+        n_near = sum(1 for d in frames if thr - MIC_GATE_NEAR_BAND_DB <= d < thr)
+        stats.update(floor=floor, thr=thr, n_evid=n_evid, n_near=n_near, need=need,
+                     frames=len(frames), near=n_near >= need)
+    return (n_evid >= need,
+            f"floor={floor:.0f} thr={thr:.0f} evid={n_evid}/{len(frames)} need={need}")
+
+
 def sys_echo_veto(mic_audio, sys_ring, abs_start, abs_end, word_count, sr=16000,
                   frame_ms=100, tol=0.3, active_floor=-50.0, min_coverage=0.60,
                   margin_db=10.0, mic_ceiling=-28.0, *, mic_ring=None):
@@ -742,6 +927,35 @@ _LEAK_NGRAM = 5                # anchor/long-prompt match length; below 5 common
 _LEAK_NGRAM_COVERAGE = 0.75    # matched n-gram spans must cover this much of the content tokens
 _LEAK_UNIT_MAX = 4             # a "unit" is a name/jargon term; longer -> prose, n-gram it instead
 _LEAK_LONG_PROMPT = 60         # a prompt longer than this is prose -> n-gram-only (safety valve)
+
+# Mode C (WP-3), the short anchor-echo drop. Modes A and B both need the leak to be MOST of the
+# segment: A wants 0.80 coverage by whole prompt units, B wants 0.75 coverage by 5-grams. The
+# residue they miss is the short scatter - three or four of the anchor's own distinctive words
+# in a row, in no order the anchor ever used ("Afrikaans, kodewissel, dankie"), which covers no
+# n-gram and matches no unit. Whisper emits these on non-speech, never mid-conversation.
+#
+# The terms are DERIVED from AF_ANCHOR_PROMPT, never listed a second time: its tokens of at least
+# _LEAK_ANCHOR_MINLEN characters. Six is where the anchor stops being ordinary conversation: it
+# keeps kodewisseling / vergadering / besigheid / kollegas / afrikaans / engels / sprekers /
+# dankie and leaves out baie, nogal, ons, hulle, julle, sjoe, more, tog. A token also matches by
+# prefix in either direction, so the truncation Whisper actually emits ("kodewissel") counts.
+#
+# The anchor labels its own two halves, and the split matters. Everything after "Algemene woorde"
+# ("common words") is, by the constant's own declaration, ordinary Afrikaans: "ons kinders is
+# baie lekker vandag" is a real sentence built entirely from it. So at least one hit must come
+# from the INSTRUCTION half - the half that talks ABOUT the transcription (afrikaans, engels,
+# kodewisseling, sprekers, nederlands, gesprek) and that a speaker has no reason to recite.
+#
+# Safety, measured 2026-09-03 on the incident capture: 0 of 53 segments of genuine Afrikaans
+# (the GPU large-v3 far-end reference, 918 words, plus both far-end CPU decodes) trip this, while
+# it catches the prompt-echo lines in the near-end junk. Four bounds buy that: only short
+# segments, at least two DISTINCT anchor terms, at least one of them from the instruction half,
+# and an escape for any segment still carrying _LEAK_ANCHOR_MIN_OWN words of the speaker's own.
+_LEAK_ANCHOR_SPLIT = "Algemene woorde"   # the anchor's own label for its ordinary-Afrikaans half
+_LEAK_ANCHOR_MINLEN = 6        # anchor tokens shorter than this are ordinary speech, never terms
+_LEAK_ANCHOR_MAX_TOKENS = 12   # only short segments; real sentences are longer than the scatter
+_LEAK_ANCHOR_MIN_HITS = 2      # distinct spoken terms; one is a speaker legitimately saying it
+_LEAK_ANCHOR_MIN_OWN = 5       # words NOT in the prompt that keep any segment, however many hits
 
 # Short, language-agnostic (EN+AF) filler list, derived from the observed leaks: these are
 # the words that pad a leak ("and Danica Freimond.", "... , yeah.") and must not count
@@ -960,6 +1174,13 @@ class PromptLeakMatcher:
         self._units = []      # Mode A: normalised token tuples, matched as contiguous n-grams
         self._vocab = set()   # Mode A: every token of those units (see the F7 note in is_leak)
         self._ngrams = set()  # Mode B: every _LEAK_NGRAM-length n-gram of the anchor / long prompt
+        # Mode C: the anchor's terms, the subset of them from its instruction half, and every
+        # token of the whole prompt (anchor plus user prompt) so "words of the speaker's own"
+        # means own, not merely non-anchor.
+        head = (anchor or "").split(_LEAK_ANCHOR_SPLIT)[0]
+        self._anchor_terms = sorted({t for t in _norm_tokens(anchor) if len(t) >= _LEAK_ANCHOR_MINLEN})
+        self._anchor_head = {t for t in self._anchor_terms if t in set(_norm_tokens(head))}
+        self._prompt_vocab = set(_norm_tokens(anchor)) | set(_norm_tokens(user_prompt))
         toks = _norm_tokens(user_prompt)
         if len(toks) > _LEAK_LONG_PROMPT:
             # Safety valve: a pasted agenda, not a name list. Unit/coverage matching over a
@@ -1002,6 +1223,8 @@ class PromptLeakMatcher:
         if not toks:
             return False
         if self._ngram_leak(toks):
+            return True
+        if self._anchor_echo(toks):
             return True
         if not self._units:
             return False
@@ -1050,6 +1273,36 @@ class PromptLeakMatcher:
         if cov < _LEAK_COVERAGE:
             return False
         return len(content) >= _LEAK_MIN_CONTENT or matched_len > 1
+
+    def _anchor_echo(self, toks):
+        """Mode C: a SHORT segment that is a scatter of the anchor's own distinctive terms.
+
+        Additive to modes A and B and deliberately narrow (see the _LEAK_ANCHOR_* notes): a
+        segment of at most _LEAK_ANCHOR_MAX_TOKENS tokens carrying at least
+        _LEAK_ANCHOR_MIN_HITS DISTINCT spoken words that are anchor terms, at least one of them
+        matching the anchor's instruction half, and fewer than _LEAK_ANCHOR_MIN_OWN tokens
+        that are not in the prompt at all.
+        Inert on a non-af session, where there is no anchor.
+        """
+        if not self._anchor_terms or len(toks) > _LEAK_ANCHOR_MAX_TOKENS:
+            return False
+        hit, head = set(), False
+        for t in set(toks):
+            for term in self._anchor_terms:
+                # Either direction, because Whisper truncates the anchor's long words as often
+                # as it extends them ("kodewissel" for "kodewisseling", "afrikaanse" for
+                # "afrikaans"). The MINLEN floor on both sides keeps this off short words.
+                if t == term or (len(t) >= _LEAK_ANCHOR_MINLEN
+                                 and (t.startswith(term) or term.startswith(t))):
+                    # Count the SPOKEN token, never the terms it matched: prefix matching lets a
+                    # single "Afrikaans" hit both "afrikaans" and "afrikaanse", and counting terms
+                    # would turn one word into the two the drop requires.
+                    hit.add(t)
+                    head = head or term in self._anchor_head
+        if len(hit) < _LEAK_ANCHOR_MIN_HITS or not head:
+            return False
+        own = sum(1 for t in toks if t not in self._prompt_vocab)
+        return own < _LEAK_ANCHOR_MIN_OWN
 
     def _ngram_leak(self, toks):
         """Mode B: the anchor / long prompt / long unit, matched as contiguous n-grams.
@@ -1212,6 +1465,25 @@ class Engine:
         # losing the other. "0" makes arm 2 fully inert, ring included.
         self._xchan_veto2 = os.environ.get("SA_LIVE_XCHAN_VETO2", "1") != "0"
         self._silence_gate = os.environ.get("SA_LIVE_SILENCE_GATE", "1") != "0"
+        # Arm 3 of the silence gate (MIC speech evidence) and its per-chunk decision log. The
+        # arm has its own switch so a support session can restore the peak-only gate without
+        # losing arms 1 and 2; the log is off by default because it is one line per MIC chunk.
+        self._mic_speech_gate = os.environ.get("SA_LIVE_MIC_SPEECH_GATE", "1") != "0"
+        self._mic_gate_debug = os.environ.get("SA_LIVE_MIC_GATE_DEBUG", "0") != "0"
+        # The gate is live-switchable now (set_mic_gate / mic_gate_state), so the env var above is
+        # only the STARTING value; the web layer overrides it from the saved setting and the user
+        # can flip it mid-meeting. _mic_speech_gate stays the on/off flag under its own name so the
+        # worker keeps reading one attribute per chunk (no lock: a bool assignment is atomic and
+        # the next chunk picks it up, which is exactly the contract).
+        self._mic_gate_level = "normal"   # "normal" | "gentle", stepped down by the safety valve
+        self._mic_gate_recent = deque(maxlen=MIC_GATE_WINDOW)  # the valve's window (near-miss skips)
+        self.mic_gate_skipped = 0         # MIC chunks not decoded this session
+        self.mic_gate_decoded = 0         # MIC chunks decoded this session
+        # One-shot hint for the UI, latched by the valve and pulled (never pushed) by /api/status:
+        # a sequence number the client compares against the last one it showed. Pull, so the engine
+        # stays ignorant of the web layer and nothing has to be cleared.
+        self.mic_gate_hint = None         # None | "gentle" | "off"
+        self.mic_gate_hint_seq = 0
         self._prompt_leak_on = os.environ.get("SA_LIVE_PROMPT_LEAK_GUARD", "1") != "0"
         self._loop_guard_on = os.environ.get("SA_LIVE_LOOP_GUARD", "1") != "0"
         self._recent = RecentEmissions()   # cross-segment loop history, per source
@@ -1267,11 +1539,21 @@ class Engine:
            which this arm stays inert. The last two are what keep the first chunk of a sustained
            quiet talker: at -40 dBFS throughout, p10 and peak are both -40, and a
            self-referential baseline would call that a dead channel and eat real speech.
+        3. MIC ONLY - speech evidence (WP-3): both tests above key off the loudest frame, which
+           one door bang, one keyboard click or one cough is enough to satisfy for a whole 15 s
+           chunk of room tone. This one asks instead how MANY frames cleared an evidence
+           threshold, because speech occupies frames and a transient does not. See
+           mic_speech_evidence for the threshold and the two ways it stays inert. Its own switch,
+           SA_LIVE_MIC_SPEECH_GATE=0, restores the peak-only behaviour of arms 1 and 2.
 
         Without a ring (uploads, ring-less paths, SA_LIVE_RAW_MIC_RING=0 for EITHER source) it
         falls back to `_is_silence(audio)` verbatim, which keeps its four pinned tests untouched.
         A ring with no frames covering the window also falls back: never gate on missing evidence.
-        Both tests share SA_LIVE_SILENCE_GATE=0.
+        All three tests share SA_LIVE_SILENCE_GATE=0.
+
+        Skipping is a DECODE decision only. The recorder is fed from the capture callback, ahead
+        of the engine queue (web/app.py _feed, __main__.py feed), so a chunk the gate skips is
+        already on disk in full and the saved audio is unchanged by any of this.
         """
         # The gate is the one consumer that honours SA_LIVE_RAW_MIC_RING for BOTH sources: the
         # switch exists to restore pre-WP-4 gate behaviour wholesale, and a switch that left SYS
@@ -1288,10 +1570,61 @@ class Engine:
         if peak is None:
             return _is_silence(audio)
         if peak < _silence_floor_db(ring, t_hi):
-            return True
+            return _gate_log(self, source, t_start, True, "absolute")
         floor = ring.noise_floor_before(t_start)
-        return (floor is not None and peak <= dead_ceiling_db
-                and (peak - floor) <= dead_margin_db)
+        if (floor is not None and peak <= dead_ceiling_db
+                and (peak - floor) <= dead_margin_db):
+            return _gate_log(self, source, t_start, True, f"dead peak={peak:.0f} floor={floor:.0f}")
+        # Arm 3 (MIC only): continuity, not peak. Additive - it can only skip a chunk the two
+        # peak arms already decided to keep, never rescue one they skipped.
+        if source == "MIC" and getattr(self, "_mic_speech_gate", True):
+            # Read the level per chunk, not once per session: the safety valve steps it down from
+            # under this very call, and a live toggle can flip the flag between two chunks.
+            gentle = getattr(self, "_mic_gate_level", "normal") == "gentle"
+            stats = {}
+            verdict, why = mic_speech_evidence(
+                ring, t_start, t_hi,
+                margin_db=MIC_GATE_GENTLE_MARGIN_DB if gentle else MIC_EVIDENCE_MARGIN_DB,
+                need_s=MIC_GATE_GENTLE_SECONDS if gentle else MIC_EVIDENCE_SECONDS,
+                stats=stats)
+            if verdict is not None:
+                return _gate_log(self, source, t_start, not verdict, f"evidence {why}", stats)
+            return _gate_log(self, source, t_start, False, f"evidence inert ({why})")
+        return _gate_log(self, source, t_start, False, f"peak={peak:.0f}")
+
+    def mic_gate_state(self):
+        """The mic gate as the UI must render it: the ENGINE'S own state, never a stored setting.
+
+        mode is "normal" | "gentle" | "off"; gentle is the quiet-mic safety valve's first step.
+        skipped/decoded are this session's MIC chunk counts. hint/hint_seq carry the valve's
+        one-shot message: the client toasts when hint_seq moves past the one it last showed, so
+        nothing needs clearing and a page reload cannot re-fire an old hint.
+        """
+        on = bool(getattr(self, "_mic_speech_gate", True))
+        return {
+            "on": on,
+            "mode": (getattr(self, "_mic_gate_level", "normal") if on else "off"),
+            "skipped": int(getattr(self, "mic_gate_skipped", 0)),
+            "decoded": int(getattr(self, "mic_gate_decoded", 0)),
+            "hint": getattr(self, "mic_gate_hint", None),
+            "hint_seq": int(getattr(self, "mic_gate_hint_seq", 0)),
+        }
+
+    def set_mic_gate(self, on):
+        """Turn the MIC speech gate on or off, effective on the NEXT chunk. Returns mic_gate_state().
+
+        Decoding only: the recorder is fed ahead of this queue, so neither value changes a single
+        sample of what is saved. Turning it back on restores the level the valve last chose (gentle
+        stays gentle) rather than jumping back to normal, because "never escalate automatically"
+        would be hollow if an off/on flick undid the valve's finding. The window is cleared either
+        way, so the valve judges what happens next, not what happened before the switch."""
+        self._mic_speech_gate = bool(on)
+        try:
+            self._mic_gate_recent.clear()
+        except AttributeError:
+            self._mic_gate_recent = deque(maxlen=MIC_GATE_WINDOW)
+        return self.mic_gate_state()
+
 
     def subscribe(self, fn):
         self.subscribers.append(fn)
@@ -1603,6 +1936,8 @@ class Engine:
                     language=self.language,
                     initial_prompt=self.initial_prompt,
                     vad_filter=True,
+                    # Per-source VAD: the tightened MIC set, the library defaults for SYS.
+                    vad_parameters=vad_options_for(source),
                     beam_size=beam,
                     **GUARD,
                 )
