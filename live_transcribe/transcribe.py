@@ -1893,6 +1893,10 @@ class Engine:
         never lose a chunk."""
         if not self.adaptive or not self._is_cpu:
             return
+        if self._stop.is_set():
+            # Shutting down and draining the tail. There is no real-time obligation left, and
+            # stop(drain=True) exists precisely so the last minutes of the session are not lost.
+            return
         if self._backlog_seconds() <= SHED_BACKLOG_SECONDS:
             return
         self._drain_to_front()

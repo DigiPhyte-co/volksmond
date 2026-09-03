@@ -367,7 +367,16 @@ def test_shedding_is_live_only_and_quiet_when_the_backlog_is_fine():
         eng2._queue.put(("SYS", _chunk(15.0), float(i * 15), time.monotonic(), False))
     eng2._maybe_shed(10.0)
     assert eng2.shed_events == 0 and got2.seen == [] and eng2._backlog_seconds() == 30.0
-    print("  OK  shedding never touches a file import and stays quiet inside the bound")
+    # And a draining shutdown keeps every queued second: stop(drain=True) exists so the tail of
+    # the session is not lost, and by then there is no real-time obligation left to defend.
+    eng3 = _stub_engine(size="tiny")
+    eng3.subscribers = [_Collect()]
+    for i in range(8):
+        eng3._queue.put(("SYS", _chunk(15.0), float(i * 15), time.monotonic(), False))
+    eng3._stop.set()
+    eng3._maybe_shed(10.0)
+    assert eng3.shed_events == 0 and eng3._backlog_seconds() == 120.0, "a drain lost audio"
+    print("  OK  shedding never touches a file import or a draining shutdown, and stays quiet inside the bound")
 
 
 def test_a_shed_pass_never_loses_the_shutdown_sentinel():
