@@ -481,6 +481,32 @@ html, body { margin: 0; padding: 0; height: 100%; }
 .set-row .body .t { font-size: 13.5px; color: var(--ink); font-weight: 500; display: flex; align-items: center; gap: 8px; }
 .set-row .body .s { font-size: 12px; color: var(--ink-3); margin-top: 3px; line-height: 1.45; }
 .set-row .ctl { flex: 0 0 auto; }
+/* Dense model lists keep download state visible without turning Settings into a card stack. */
+.model-setup-list { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.model-setup-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-top: 1px solid var(--line); }
+.model-setup-row:first-child { border-top: 0; }
+.model-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); }
+.model-table { width: 100%; min-width: 790px; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
+.model-table th { padding: 8px 10px; color: var(--ink-3); font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em; text-align: left; text-transform: uppercase; }
+.model-table td { padding: 8px 10px; border-top: 1px solid var(--line); color: var(--ink-2); vertical-align: middle; white-space: nowrap; }
+.model-table th:nth-child(1) { width: 29%; }
+.model-table th:nth-child(2) { width: 19%; }
+.model-table th:nth-child(3) { width: 10%; }
+.model-table th:nth-child(4) { width: 27%; }
+.model-table th:nth-child(5) { width: 15%; }
+.model-table-name { color: var(--ink) !important; font-weight: 500; }
+.model-table-name .chip { margin-left: 6px; vertical-align: middle; }
+.model-table-note { display: block; margin-top: 2px; color: var(--ink-3); font-size: 10.5px; font-weight: 400; }
+.model-table-disabled { opacity: 0.62; }
+.model-table-status { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; }
+.model-table-progress { width: 58px; height: 3px; overflow: hidden; border-radius: 999px; background: var(--line); }
+.model-table-progress > span { display: block; height: 100%; background: var(--accent); transition: width .3s ease; }
+.model-table-action { text-align: right; }
+.model-table-header { justify-content: space-between; }
+.model-family-details { margin-top: 8px; padding: 8px 0; color: var(--ink-3); font-size: 12px; }
+.model-family-details summary { color: var(--ink-2); cursor: pointer; font-weight: 500; }
+.model-family-details .s { margin-top: 7px; line-height: 1.5; }
+.model-storage-row { padding: 10px 0; }
 
 /* Pro badge */
 .pro-badge {
