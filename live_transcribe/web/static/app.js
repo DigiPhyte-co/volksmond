@@ -3562,7 +3562,7 @@ function updateVoiceProgress(p) {
   var bar = document.getElementById("vm-vdl-bar");
   if (bar) bar.style.width = pct + "%";
   var status = document.getElementById("vm-vdl-status");
-  if (status) status.textContent = "Downloading " + pct + "%";
+  if (status) status.textContent = trFmt("Downloading {pct}%", { pct: pct });
 }
 function loadVoiceModels() {
   S._loadingVM = true; S._vmError = false;
@@ -3615,8 +3615,8 @@ function voiceDownloadPanel() {
         (!usable) ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "3px" }, text: "Needs a graphics card (GPU). Choose another for this computer." }) : null,
       ]),
       isThis ? el("div", { class: "model-table-status" }, [
-        el("span", { id: "vm-vdl-status", class: "chip accent", text: "Downloading " + pct + "%" }),
-        el("span", { class: "model-table-progress" }, el("span", { id: "vm-vdl-bar", style: { width: pct + "%" } })),
+        el("span", { id: "vm-vdl-status", class: "chip accent", text: trFmt("Downloading {pct}%", { pct: pct }) }),
+        el("span", { class: "model-table-progress", role: "progressbar", "aria-valuenow": pct, "aria-valuemin": 0, "aria-valuemax": 100 }, el("span", { id: "vm-vdl-bar", style: { width: pct + "%" } })),
       ]) : m.present ? el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]) : (usable ? el("button", { class: "btn sm", onclick: function () { if (!downloading) startVoiceDownload(m.model); } }, "Download") : null),
     ]);
   }));
@@ -3626,24 +3626,28 @@ function voiceTableStatus(row, p, update) {
   if (matches && p.state === "downloading") {
     var pct = modelProgressPct(p);
     return el("div", { class: "model-table-status" }, [
-      el("span", { id: "vm-vdl-status", class: "chip accent", text: "Downloading " + pct + "%" }),
-      el("span", { class: "model-table-progress" }, el("span", { id: "vm-vdl-bar", style: { width: pct + "%" } })),
+      el("span", { id: "vm-vdl-status", class: "chip accent", text: trFmt("Downloading {pct}%", { pct: pct }) }),
+      el("span", { class: "model-table-progress", role: "progressbar", "aria-valuenow": pct, "aria-valuemin": 0, "aria-valuemax": 100 }, el("span", { id: "vm-vdl-bar", style: { width: pct + "%" } })),
     ]);
   }
-  if (matches && p.state === "error") return el("span", { class: "chip warn", title: String(p.error || "") }, "Error: " + shortVoiceError(p.error));
+  if (matches && p.state === "error") return el("span", { class: "chip warn", title: String(p.error || "") }, trFmt("Error: {msg}", { msg: shortVoiceError(p.error) }));
   if (update && update.update_available) return el("span", { class: "chip warn" }, "Update available");
   return row.present ? el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]) : el("span", { class: "chip muted" }, "Not downloaded");
 }
 function voiceTableRows(d) {
-  // The "Auto" chip marks the size the app auto-picks on this hardware (d.recommended_model, a size
-  // name like "medium"). That size can exist in more than one family, so the Fluister row and the
-  // Whisper row for it BOTH carry the "Auto" chip: one per family, which is the intended behaviour.
-  var qualityOrder = ["large-v3", "large-v3-turbo", "medium", "small", "base", "tiny"];
-  var rank = function (size) { var i = qualityOrder.indexOf(size); return i < 0 ? qualityOrder.length : i; };
+  // The "Auto" chip marks the size the app auto-picks on this hardware. Whisper uses
+  // d.recommended_model (the stock-Whisper tier pick, best = large-v3); Fluister uses
+  // d.recommended_fluister_model (best = large-v3-turbo), because the two families rank
+  // large-v3 and large-v3-turbo in opposite order. Both values come from the engine (the
+  // server), never a list duplicated here. Display sort is best-first WITHIN each family, so
+  // the two families order those same two sizes oppositely too.
+  var whisperOrder = ["large-v3", "large-v3-turbo", "medium", "small", "base", "tiny"];
+  var fluisterOrder = ["large-v3-turbo", "large-v3", "medium", "small", "base", "tiny"];
+  var rankIn = function (order, size) { var i = order.indexOf(size); return i < 0 ? order.length : i; };
   var rows = [];
-  (d.fluister || []).slice().sort(function (a, b) { return rank(a.size) - rank(b.size); }).forEach(function (m) {
+  (d.fluister || []).slice().sort(function (a, b) { return rankIn(fluisterOrder, a.size) - rankIn(fluisterOrder, b.size); }).forEach(function (m) {
     rows.push({ family: "fluister", key: m.size, repo: m.repo, present: m.present, bytes: (m.present && m.size_on_disk) ? m.size_on_disk : m.approx_bytes,
-      label: "Fluister " + m.size, languages: "Afrikaans + English", auto: m.size === d.recommended_model,
+      label: "Fluister " + m.size, languages: "Afrikaans + English", auto: m.size === d.recommended_fluister_model,
       onDownload: function () { startFluisterDownload(m.size); },
       onRemove: function () { confirmRemoveVoiceItem("Fluister " + m.size, m.repo, m.size_on_disk || m.approx_bytes); } });
   });
@@ -3654,7 +3658,7 @@ function voiceTableRows(d) {
       onDownload: startSwivurisoDownload,
       onRemove: function () { confirmRemoveVoiceItem("Swivuriso", sv.repo, sv.size_on_disk || sv.approx_bytes); } });
   }
-  (d.models || []).slice().sort(function (a, b) { return rank(a.model) - rank(b.model); }).forEach(function (m) {
+  (d.models || []).slice().sort(function (a, b) { return rankIn(whisperOrder, a.model) - rankIn(whisperOrder, b.model); }).forEach(function (m) {
     rows.push({ family: "whisper", key: m.model, present: m.present, bytes: (m.present && m.size_on_disk) ? m.size_on_disk : m.approx_bytes,
       label: "Whisper " + m.model, languages: "Multilingual", auto: m.model === d.recommended_model,
       gpuNote: m.model === "large-v3" && d.is_gpu === false,
@@ -3667,7 +3671,7 @@ function voiceModelTable() {
   if (!S.voiceModels) return voiceDownloadPanel();
   var d = S.voiceModels; var p = d.progress || {}; var downloading = p.state === "downloading";
   var updates = {}; ((S.modelUpdates && S.modelUpdates.updates) || []).forEach(function (u) { updates[u.repo] = u; });
-  return el("div", { class: "model-table-wrap" }, el("table", { class: "model-table" }, [
+  return el("div", { class: "model-table-wrap" }, el("table", { class: "model-table", "aria-label": tr("Transcription models, on this machine") }, [
     el("thead", {}, el("tr", {}, ["Model", "Languages", "Size", "Status", "Action"].map(function (label) { return el("th", { text: label }); }))),
     el("tbody", {}, voiceTableRows(d).map(function (row) {
       var update = row.family === "fluister" ? updates[row.repo] : null;

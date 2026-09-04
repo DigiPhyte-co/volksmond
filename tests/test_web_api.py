@@ -93,6 +93,11 @@ def test_voice_model_download_api():
     # refused before any bytes move).
     j = client.get("/api/voice-models").json()
     assert j.get("recommended_model"), j
+    # Fluister's own auto-pick best follows the engine's per-family order (best = large-v3-turbo,
+    # our v2 tune beats large-v3), NOT the stock-Whisper tier pick in recommended_model. The UI's
+    # "Auto" chip on the Fluister rows reads this field, so pin it to the engine's answer.
+    from live_transcribe.__main__ import _FAMILY_SIZE_ORDER
+    assert j.get("recommended_fluister_model") == _FAMILY_SIZE_ORDER["fluister"][-1] == "large-v3-turbo", j
     models = j["models"]
     # The four reconciled quality models, shown identically here and on the meeting screen.
     assert [m["model"] for m in models] == ["small", "medium", "large-v3-turbo", "large-v3"], models
@@ -1384,6 +1389,63 @@ def _wait_idle(st, timeout=10.0):
     return not st.running
 
 
+def test_stop_recording_folds_outside_state_lock():
+    # Regression: stop(what="recording") used to call rec.close() - the per-source fold (decode
+    # both channels, re-encode a stereo file, measured ~6.6 s per 30 min of Opus) - while holding
+    # STATE.lock, so a long meeting stalled /api/status and every other lock-taking endpoint for
+    # the whole fold. The recorder is now detached UNDER the lock and closed AFTER it releases.
+    # Prove the lock is free while close() blocks. No audio and no real recorder.
+    import threading as _th
+    st = webapp.STATE
+    close_started = _th.Event()
+    release_close = _th.Event()
+
+    class _BlockingRecorder:
+        last_error = None
+
+        def close(self):
+            close_started.set()
+            # Stand in for the slow fold. STATE.lock must NOT be held while this runs.
+            release_close.wait(5)
+
+    saved = (st.running, st.recording, st.transcribing, st.stopping,
+             st.source_kind, st.recorder, st.sink_error)
+    try:
+        st.running = True
+        st.recording = True
+        st.transcribing = True      # a partial "stop recording": transcription keeps running
+        st.stopping = False
+        st.source_kind = "live"
+        st.recorder = _BlockingRecorder()
+
+        resp_box = {}
+
+        def _do_stop():
+            resp_box["r"] = client.post("/api/stop?what=recording")
+
+        stopper = _th.Thread(target=_do_stop, name="stop-recording", daemon=True)
+        stopper.start()
+        try:
+            assert close_started.wait(5), "recorder.close() (the fold) was never called"
+            # close() is blocking now. If the fold still ran under STATE.lock this acquire hangs.
+            got = st.lock.acquire(timeout=5)
+            assert got, "STATE.lock is held during the recorder fold (still folding inside the lock)"
+            st.lock.release()
+        finally:
+            release_close.set()
+        stopper.join(5)
+        assert not stopper.is_alive(), "stop did not return after close() completed"
+        r = resp_box["r"]
+        assert r.status_code == 200, r.text
+        assert r.json().get("stopped") == "recording", r.json()
+        assert st.recorder is None, "recorder was not detached from STATE"
+    finally:
+        release_close.set()
+        (st.running, st.recording, st.transcribing, st.stopping,
+         st.source_kind, st.recorder, st.sink_error) = saved
+    print("  OK  /api/stop?what=recording releases STATE.lock before the recorder fold completes")
+
+
 def test_session_count_bumped_on_full_stop():
     # WP-6: a normal "Stop and save" counts exactly one completed session. This is the path
     # that already worked; it is pinned because the once-per-session guard added for the other
@@ -1915,6 +1977,7 @@ if __name__ == "__main__":
                test_summarise_accepts_instruction,
                test_model_update_status_logic,
                test_model_update_endpoints,
+               test_stop_recording_folds_outside_state_lock,
                test_session_count_bumped_on_full_stop,
                test_session_count_bumped_on_transcription_branch_finalise,
                test_transcription_drain_finalises_without_a_capture,

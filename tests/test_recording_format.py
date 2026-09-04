@@ -7,8 +7,7 @@ import contextlib
 import io
 import os
 import sys
-import shutil
-import uuid
+import tempfile
 from pathlib import Path
 
 # Make `import live_transcribe` work when run as a plain script.
@@ -21,7 +20,6 @@ from faster_whisper.audio import decode_audio
 from live_transcribe import config, sinks
 from live_transcribe.web import app as webapp
 
-ROOT = Path(__file__).resolve().parent.parent
 RATE = sinks.AudioRecorder.TARGET_RATE
 
 
@@ -31,15 +29,16 @@ def tone(seconds=2.0, frequency=440.0):
 
 
 class _workspace_tmp:
-    """Native libsndfile needs a sandbox-writable path during headless tests."""
+    """A short-path temp dir outside the repo tree. Native libsndfile needs a
+    sandbox-writable path during headless tests, and tempfile keeps it short and out of
+    the working tree (no stray .recording-format-* dir left under the repo root)."""
 
     def __enter__(self):
-        self.path = ROOT / (".recording-format-" + uuid.uuid4().hex)
-        self.path.mkdir()
-        return self.path
+        self._tmp = tempfile.TemporaryDirectory(prefix="vm-recfmt-")
+        return Path(self._tmp.name)
 
     def __exit__(self, *exc):
-        shutil.rmtree(self.path)
+        self._tmp.cleanup()
         return False
 
 
@@ -70,18 +69,27 @@ def test_each_format_round_trips_through_faster_whisper():
         for recording_format in ("flac", "opus", "wav"):
             stem = tmp / recording_format
             recorder = sinks.AudioRecorder(stem, recording_format=recording_format)
+            # Per-source channel files are ALWAYS FLAC when soundfile works (only the final fold
+            # uses the chosen format), so the per-source suffix is .flac for flac and opus.
+            source_ext = ".flac" if recording_format in ("flac", "opus") else ".wav"
+            assert recorder._source_suffix == source_ext, (recording_format, recorder._source_suffix)
             recorder.on_chunk("MIC", tone(frequency=440.0), 0.0)
-            if recording_format == "flac":
+            if source_ext == ".flac":
+                # A crash mid-meeting leaves recoverable lossless per-source FLAC for every
+                # chosen format, since FLAC flushes block by block and needs no clean close.
                 partial_path = stem.with_name(stem.name + "-MIC.flac")
                 partial = decode_audio(str(partial_path), sampling_rate=RATE)
                 assert 0 < len(partial) <= expected, "flushed FLAC blocks must be crash-readable"
-                print(f"  FLAC pre-close readable samples: {len(partial)}/{expected}")
+                print(f"  {recording_format}: per-source FLAC pre-close readable samples: {len(partial)}/{expected}")
             recorder.on_chunk("SYS", tone(frequency=660.0), 0.0)
             assert recorder._samples_written == {"MIC": expected, "SYS": expected}
             recorder.close()
             path = stem.with_suffix(sinks.recording_suffix(recording_format))
             assert path.is_file(), f"{recording_format} final recording was not written"
-            assert not stem.with_name(f"{stem.name}-MIC{path.suffix}").exists()
+            # The per-source channels (always the per-source suffix, not the fold suffix) are
+            # removed once the single file is written.
+            assert not stem.with_name(f"{stem.name}-MIC{source_ext}").exists()
+            assert not stem.with_name(f"{stem.name}-SYS{source_ext}").exists()
             decoded = decode_audio(str(path), sampling_rate=RATE)
             counts[recording_format] = len(decoded)
             error = abs(len(decoded) - expected) / expected
@@ -148,7 +156,9 @@ def test_soundfile_open_failure_falls_back_to_wav_once():
         assert (tmp / "open-fallback.wav").is_file()
     warnings = [line for line in output.getvalue().splitlines() if "[recorder] warning:" in line]
     assert len(warnings) == 1, warnings
-    assert "could not open the OPUS writer" in warnings[0]
+    # Per-source files are FLAC now (only the fold is opus), so the first writer that fails is
+    # the FLAC per-source writer; the whole recorder then falls back to WAV.
+    assert "could not open the FLAC writer" in warnings[0]
 
 
 def test_extension_plumbing_finds_current_and_legacy_recordings():

@@ -467,6 +467,15 @@ window.VM_I18N = {
     "Record the audio of every meeting": "Neem die klank van elke vergadering op",
     "On, so that a transcript that goes wrong can be redone from the audio afterwards. The recording stays on this computer, the live screen shows you while it runs, and you can delete it with one click when the meeting ends.":
       "Aan, sodat 'n transkripsie wat verkeerd loop naderhand uit die klank oorgedoen kan word. Die opname bly op hierdie rekenaar, die lewendige skerm wys jou terwyl dit loop, en jy kan dit met een klik uitvee wanneer die vergadering klaar is.",
+    "Recording format": "Opnameformaat",
+    "Changes take effect on the next recording, not partway through a file.":
+      "Veranderinge tree in werking by die volgende opname, nie halfpad deur 'n lêer nie.",
+    "Lossless (FLAC), default: about 115 MB per hour":
+      "Verliesvry (FLAC), verstek: ongeveer 115 MB per uur",
+    "Compact (Opus): about 15 MB per hour":
+      "Kompak (Opus): ongeveer 15 MB per uur",
+    "Uncompressed (WAV): about 230 MB per hour":
+      "Onsaamgepers (WAV): ongeveer 230 MB per uur",
     "Nothing leaves this computer": "Niks verlaat hierdie rekenaar nie",
     "Audio, transcripts, notes and summaries are written to your save folder and stay there. No account, no cloud, no third party ever receives them.":
       "Klank, transkripsies, notas en opsommings word na jou stoorgids geskryf en bly daar. Geen rekening, geen wolk, geen derde party ontvang dit ooit nie.",
@@ -546,6 +555,28 @@ window.VM_I18N = {
       "Naby die beste akkuraatheid, maar ligter en vinniger. Wonderlik op 'n sterk SVE of enige GPU.",
     "The most accurate. Needs a graphics card (GPU) to be quick; slow on CPU alone.":
       "Die akkuraatste. Benodig 'n grafikakaart (GPU) om vinnig te wees; stadig op die SVE alleen.",
+    // Voice model table (Settings): the card title, column headers, language and status cells,
+    // the download/error chips, and the three-family note under the table.
+    "Transcription models, on this machine": "Transkripsiemodelle, op hierdie masjien",
+    "Model": "Model",
+    "Languages": "Tale",
+    "Size": "Grootte",
+    "Status": "Status",
+    "Action": "Aksie",
+    "Multilingual": "Veeltalig",
+    "Afrikaans + English": "Afrikaans + Engels",
+    "isiZulu, isiXhosa, Sesotho + 4": "isiZulu, isiXhosa, Sesotho + 4",
+    "Not downloaded": "Nie afgelaai nie",
+    "Needs a graphics card (GPU)": "Benodig 'n grafikakaart (GPU)",
+    "Downloading {pct}%": "Besig om af te laai {pct}%",
+    "Error: {msg}": "Fout: {msg}",
+    "About the three model families": "Oor die drie modelfamilies",
+    "Fluister is tuned for Afrikaans and mixed Afrikaans and English.":
+      "Fluister is gestem vir Afrikaans en gemengde Afrikaans en Engels.",
+    "Swivuriso covers seven other South African languages. Beta.":
+      "Swivuriso dek sewe ander Suid-Afrikaanse tale. Beta.",
+    "Whisper covers English and other languages.":
+      "Whisper dek Engels en ander tale.",
     // Model families explainer (Settings, voice model card)
     "Two model families, chosen by language": "Twee modelfamilies, gekies volgens taal",
     "Afrikaans uses Fluister, our Afrikaans-tuned model: much better on Afrikaans and the Afrikaans-English mix. It downloads automatically the first time you transcribe Afrikaans.":
