@@ -1,5 +1,9 @@
 # Changelog, SA-Live-Transcribe
 
+## Unreleased (1.14)
+
+- **Meeting recordings are compressed by default.** New recordings use lossless 16-bit FLAC at about 115 MB per hour, with compact Ogg/Opus at about 15 MB per hour and uncompressed WAV at about 230 MB per hour available under Settings, Data and privacy. Existing WAV recordings remain visible and can still be re-transcribed. If soundfile or its bundled libsndfile cannot open, recording falls back to WAV with one warning so the meeting is not lost. FLAC files are flushed as recording proceeds; Ogg/Opus needs a clean stop to finalise its last page.
+
 ## 2026-09-03, v1.13.3 (Fast Track only)
 
 `licensing.APP_VERSION` 1.13.2 -> 1.13.3.

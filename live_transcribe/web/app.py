@@ -140,7 +140,7 @@ class _State:
         self.recording: bool = False
         # Latch: has recording EVER been active this session (a start-time recording OR a mid-session
         # record-from-here)? Stays True after a what="recording" stop, so a second record-from-here
-        # cannot reuse the session stem and TRUNCATE the first <stem>.wav on its close. Surfaced as
+        # cannot reuse the session stem and TRUNCATE the first recording on its close. Surfaced as
         # /api/status "recording_started"; cleared only by reset() for a fresh session.
         self.recording_started: bool = False
         self.record_raw_mic: bool = False   # live AEC + recording: recorder takes the raw MIC_RAW,
@@ -1239,8 +1239,13 @@ def status():
             "struggle_nudge": STATE.struggle_nudge,
             # True iff recording is, or has ever been, active this session (start-time or a
             # mid-session record-from-here). The live screen and finish handoff key off it, and once
-            # true /api/record-from-here refuses (re-recording the same stem would truncate the WAV).
+            # true /api/record-from-here refuses (re-recording the same stem would truncate the file).
             "recording_started": STATE.recording_started,
+            "recording_format": (
+                STATE.recorder.recording_format if STATE.recorder is not None
+                else (_recording_format_for_stem(STATE.output_path.stem)
+                      if STATE.recording_started and STATE.output_path is not None else None)
+            ),
             # True once the engine has dropped to a smaller model this session (latched,
             # independent of whether the struggle banner is switched on). The finish screen uses
             # it to offer a re-transcribe of the recording at full quality.
@@ -1439,7 +1444,7 @@ def silence_nudge_action(req: SilenceNudgeRequest):
 def record_from_here():
     """Start recording audio partway through a running live transcription ("I forgot to record", or
     the struggle nudge's offer). Captures IDENTICALLY to a start-time recording: the AEC-cleaned MIC
-    + SYS folded to one L/R stereo <stem>.wav, reusing the session stem so it lands as a normal
+    + SYS folded to one L/R stereo recording, reusing the session stem so it lands as a normal
     History row and re-transcribes unchanged.
 
     Records strictly from the click on: the recorder is given the session-clock time of THIS call as
@@ -1460,7 +1465,7 @@ def record_from_here():
             raise HTTPException(status_code=409, detail="This session is already recording.")
         if STATE.recording_started:
             # Recorded earlier this session and stopped: a new recorder on the same stem would
-            # truncate the finalised <stem>.wav on close, losing the first take. Record once.
+            # truncate the finalised recording on close, losing the first take. Record once.
             raise HTTPException(status_code=409, detail="This session has already recorded audio.")
         cap = STATE.capture
         t0 = getattr(cap, "_t0", None)
@@ -1475,7 +1480,8 @@ def record_from_here():
         # and both channels start at 0 aligned to this shared anchor.
         anchor = time.monotonic() - t0
         stem = STATE.output_path.with_suffix("")
-        rec = sinks.AudioRecorder(stem, anchor=anchor)
+        rec = sinks.AudioRecorder(stem, anchor=anchor,
+                                  recording_format=config.load().get("recording_format", "flac"))
         # Attach order matters: _feed reads STATE.recorder / STATE.recording LOCK-FREE every chunk,
         # so publish the recorder BEFORE the flag; the next captured chunk of each source then
         # begins writing. Never the reverse (recording=True with recorder=None). Stop closes this
@@ -1491,19 +1497,31 @@ def record_from_here():
     return {"recording": True, "audio_stem": audio_stem}
 
 
-def _recording_path(stem: str) -> Path:
-    """The saved recording for a session stem, inside the sessions folder.
-
-    The stem is validated through the same allow-list as a transcript filename (traversal
-    segments, path separators, ADS colons, glob metacharacters and Windows reserved names all
-    rejected), so a stem from the client can only ever name a file in the save folder. It is
-    validated AS GIVEN rather than reduced to its basename first: a request that names a path is
-    refused outright instead of quietly acting on a different file than it asked for, which
-    matters when the action is a delete. The suffix comes from the recorder, so the recording
-    format lives in one place.
-    """
+def _recording_candidates(stem: str, include_channels=False):
+    """Allowed recording paths for a validated session stem, newest formats first."""
     _validate_session_filename(stem + ".md")
-    return _sessions_dir() / (stem + sinks.AudioRecorder.SUFFIX)
+    root = _sessions_dir()
+    paths = [root / (stem + ext) for ext in sinks.RECORDING_EXTENSIONS]
+    if include_channels:
+        paths += [root / f"{stem}-{source}{ext}"
+                  for ext in sinks.RECORDING_EXTENSIONS for source in ("MIC", "SYS")]
+        paths.append(root / f"{stem}-MIXED.wav")  # legacy v1.2 to v1.6 recording
+    return paths
+
+
+def _recording_path(stem: str) -> Path:
+    """Return an existing recording in FLAC, Opus or WAV, or the FLAC default path.
+
+    Validation happens before any path is built, so a client-provided stem cannot escape
+    the sessions folder. Existing WAV recordings remain discoverable after the default
+    changes, and runtime WAV fallback files are found without trusting the saved setting.
+    """
+    candidates = _recording_candidates(stem)
+    return next((path for path in candidates if path.is_file()), candidates[0])
+
+
+def _recording_format_for_stem(stem: str) -> str:
+    return sinks.recording_format_from_suffix(_recording_path(stem).suffix)
 
 
 class RecordingRequest(BaseModel):
@@ -1519,8 +1537,10 @@ def recording_info(stem: str):
     try:
         size = p.stat().st_size
     except OSError:
-        return {"stem": stem, "exists": False, "path": str(p), "name": p.name, "bytes": 0}
-    return {"stem": stem, "exists": True, "path": str(p), "name": p.name, "bytes": size}
+        return {"stem": stem, "exists": False, "path": str(p), "name": p.name, "bytes": 0,
+                "format": sinks.recording_format_from_suffix(p.suffix)}
+    return {"stem": stem, "exists": True, "path": str(p), "name": p.name, "bytes": size,
+            "format": sinks.recording_format_from_suffix(p.suffix)}
 
 
 @app.post("/api/recording/delete")
@@ -1542,10 +1562,7 @@ def recording_delete(req: RecordingRequest):
             raise HTTPException(status_code=409,
                                 detail="That session is still running. Stop it first, then delete the recording.")
     freed, removed = 0, []
-    for cand in (p,
-                 p.with_name(f"{p.stem}-MIC.wav"),
-                 p.with_name(f"{p.stem}-SYS.wav"),
-                 p.with_name(f"{p.stem}-MIXED.wav")):
+    for cand in _recording_candidates(req.stem, include_channels=True):
         try:
             size = cand.stat().st_size
         except OSError:
@@ -2694,7 +2711,9 @@ def start(req: StartRequest):
             except Exception:
                 model_name = family = None
 
-        recorder = sinks.AudioRecorder(output_path.with_suffix("")) if record_on else None
+        recording_format = config.load().get("recording_format", "flac")
+        recorder = (sinks.AudioRecorder(output_path.with_suffix(""), recording_format=recording_format)
+                    if record_on else None)
 
         # Publish state BEFORE capture starts so the feed sees consistent flags. For a transcription
         # session the engine is still None here and `preparing` is True: that is the signal _feed uses
@@ -2800,6 +2819,7 @@ def start(req: StartRequest):
             "recording": record_on,
             "transcribing": transcribe_on,
             "audio_stem": str(output_path.with_suffix("")) if record_on else None,
+            "recording_format": recorder.recording_format if recorder is not None else None,
             # t0-capture: capture is live now; transcription may still be loading its model. False here
             # tells the UI to show "preparing" and poll /api/status until model_ready flips true. A
             # record-only session has nothing to load, so it is ready immediately.
@@ -2808,22 +2828,24 @@ def start(req: StartRequest):
 
 
 def _expand_recording_channels(files):
-    """When an uploaded file is ONE channel of a saved Volksmond recording (named
-    <stem>-MIC/-SYS/-MIXED.wav), pull in its sibling channels from the same folder, so a single-file
-    upload still transcribes BOTH sides (and can cancel echo, which needs the MIC + SYS pair). The
-    summed -MIXED is dropped to avoid double-counting once the separate channels are present. A
-    normal media file with no such sibling is returned unchanged. Read-only; the caller's own
-    is_file() filter still applies afterwards."""
+    """Pull in sibling MIC/SYS channels for any supported Volksmond recording.
+
+    A selected FLAC, Opus or WAV channel brings in both sides from the same folder. A
+    legacy MIXED WAV is dropped once separate channels exist, avoiding double-counting.
+    Normal media files with no channel suffix pass through unchanged.
+    """
     extra = []
+    channel_re = re.compile(r"^(.+)-(?:mic|sys|mixed)\.(?:flac|opus|wav)$", re.IGNORECASE)
     for f in list(files):
-        m = re.match(r"^(.+)-(?:mic|sys|mixed)\.wav$", Path(f).name, re.IGNORECASE)
+        m = channel_re.match(Path(f).name)
         if not m:
             continue
         prefix = m.group(1).lower() + "-"
         try:
             for p in sorted(Path(f).parent.iterdir()):
                 n = p.name.lower()
-                if p.is_file() and n.startswith(prefix) and n.endswith(".wav") and not n.endswith("-mixed.wav"):
+                if (p.is_file() and n.startswith(prefix) and channel_re.match(p.name)
+                        and not n.endswith("-mixed.wav")):
                     extra.append(str(p))
         except OSError:
             pass
@@ -2832,7 +2854,7 @@ def _expand_recording_channels(files):
     seen, merged = set(), []
     for f in files + extra:
         if Path(f).name.lower().endswith("-mixed.wav"):
-            continue   # the summed track double-counts once we have the separate channels
+            continue
         key = os.path.normcase(os.path.abspath(f))
         if key not in seen:
             seen.add(key)
@@ -2842,7 +2864,7 @@ def _expand_recording_channels(files):
 
 class TranscribeFileRequest(BaseModel):
     paths: list[str] = []          # explicit file paths (one for import, several for a recording)
-    stem: Optional[str] = None     # alternatively a recording stem; globs <stem>-*.wav
+    stem: Optional[str] = None     # alternatively a recording stem; resolves FLAC, Opus or WAV
     topic: str = ""
     tier: str = "auto"
     device: str = "auto"
@@ -2877,15 +2899,16 @@ def transcribe_file(req: TranscribeFileRequest):
         candidate = Path(req.stem).name + ".md"
         _validate_session_filename(candidate)
         base = candidate[:-3]
-        stereo = sdir / (base + ".wav")
+        stereo = _recording_path(base)
         if stereo.is_file():
-            # New format: one stereo recording (left = MIC, right = SYS), already echo-cancelled.
+            # One stereo recording (left = MIC, right = SYS), already echo-cancelled.
             files.append(str(stereo))
         else:
-            # Legacy format: the per-source channels (-MIC/-SYS), never the summed -MIXED.wav
-            # (it is the same audio summed, so including it would double-count).
-            files += sorted(str(p) for p in sdir.glob(base + "-*.wav")
-                            if not p.name.lower().endswith("-mixed.wav"))
+            # Failed finalisation can leave per-source channels. Accept every current format
+            # plus legacy WAV channels, but never the old summed MIXED file.
+            channel_re = re.compile(r"^.+-(?:mic|sys)\.(?:flac|opus|wav)$", re.IGNORECASE)
+            files += sorted(str(p) for p in _recording_candidates(base, include_channels=True)
+                            if p.is_file() and channel_re.match(p.name))
     elif files:
         files = _expand_recording_channels(files)
     files = [f for f in files if Path(f).is_file()]
@@ -2981,22 +3004,18 @@ def transcribe_file(req: TranscribeFileRequest):
                     print(f"[transcribe-file] quiet-channel boost: {name} +{g:.1f} dB "
                           f"{where} active median", flush=True)
                 return out
-            # New single stereo recording (<stem>.wav: left = MIC, right = SYS), already
-            # echo-cancelled at capture. Split the channels and skip offline AEC entirely.
+            # A saved stereo recording has left = MIC and right = SYS in every current
+            # format. PyAV decodes WAV, FLAC and Ogg/Opus through the same path, keeping
+            # re-transcription independent of the writer library and selected extension.
             if base and len(files) == 1:
-                import wave as _wave
                 import numpy as _np
-                ok, raw = False, b""
+                ok, mic_ch, sys_ch = False, None, None
                 try:
-                    with _wave.open(files[0], "rb") as w:
-                        ok = (w.getnchannels() == 2 and w.getframerate() == 16000)
-                        if ok:
-                            raw = w.readframes(w.getnframes())
+                    mic_ch, sys_ch = decode_audio(files[0], sampling_rate=16000, split_stereo=True)
+                    ok = not _np.array_equal(mic_ch, sys_ch)
                 except Exception:
                     ok = False
                 if ok:
-                    data = _np.frombuffer(raw, dtype="<i2").astype(_np.float32).reshape(-1, 2) / 32768.0
-                    mic_ch, sys_ch = data[:, 0], data[:, 1]
                     # Cross-channel bleed gate. Even on headphones the far side leaks into the MIC at
                     # low level; Whisper transcribes that leak as garbled ghost lines the text de-dup
                     # cannot catch (different words). Silence those MIC frames before transcribing.
@@ -3117,8 +3136,8 @@ def transcribe_file(req: TranscribeFileRequest):
                 if aec_on:
                     from .. import aec as _aec
                     if _aec.available():
-                        mic_fp = next((f for f in files if f.lower().endswith("-mic.wav")), None)
-                        sys_fp = next((f for f in files if f.lower().endswith("-sys.wav")), None)
+                        mic_fp = next((f for f in files if re.search(r"-mic\.(?:flac|opus|wav)$", f, re.IGNORECASE)), None)
+                        sys_fp = next((f for f in files if re.search(r"-sys\.(?:flac|opus|wav)$", f, re.IGNORECASE)), None)
                         if mic_fp and sys_fp:
                             try:
                                 mic_audio = decode_audio(mic_fp, sampling_rate=16000)
@@ -3131,7 +3150,8 @@ def transcribe_file(req: TranscribeFileRequest):
                                 print(f"[transcribe-file] echo cancellation skipped: {e}", flush=True)
                 for fp in files:
                     low = fp.lower()
-                    src = "MIC" if low.endswith("-mic.wav") else ("SYS" if low.endswith("-sys.wav") else "FILE")
+                    src = ("MIC" if re.search(r"-mic\.(?:flac|opus|wav)$", low) else
+                           ("SYS" if re.search(r"-sys\.(?:flac|opus|wav)$", low) else "FILE"))
                     audio = decoded.get(fp)
                     if audio is None:
                         audio = decode_audio(fp, sampling_rate=16000)
@@ -3487,7 +3507,7 @@ def sessions_list():
     """List sessions in the active save location, newest first.
 
     A "session" is a stem that has a transcript (`<stem>.md`) and/or a recording
-    (`<stem>-MIC/SYS/MIXED.wav`). Enumerating by stem means a record-only session
+    (`<stem>.flac/.opus/.wav`, including legacy channels). Enumerating by stem means a record-only session
     (audio captured but not transcribed yet) still appears, ready to re-transcribe.
     Each row carries status flags: `recorded`, `transcribed`, `has_summary`.
 
@@ -3555,18 +3575,18 @@ def sessions_list():
         except OSError:
             pass
 
-    for p in sdir.glob("*.wav"):
-        low = p.name.lower()
-        suff = next((s for s in ("-mic.wav", "-sys.wav", "-mixed.wav") if low.endswith(s)), None)
-        # New recordings are a single stereo `<stem>.wav`; legacy ones are per-source
-        # `<stem>-MIC/-SYS/-MIXED.wav`. Either way, map back to the session stem.
-        stem = p.name[:-len(suff)] if suff is not None else p.name[:-4]
-        r = _row(stem)
-        r["recorded"] = True
-        try:
-            r["mtime"] = max(r["mtime"], p.stat().st_mtime)
-        except OSError:
-            pass
+    for ext in sinks.RECORDING_EXTENSIONS:
+        for p in sdir.glob("*" + ext):
+            # Current recordings are one stereo file. A failed fold or a legacy WAV can
+            # leave MIC/SYS/MIXED channels, which still map to the same session stem.
+            match = re.match(r"^(.+)-(?:mic|sys|mixed)\.(?:flac|opus|wav)$", p.name, re.IGNORECASE)
+            stem = match.group(1) if match else p.name[:-len(ext)]
+            r = _row(stem)
+            r["recorded"] = True
+            try:
+                r["mtime"] = max(r["mtime"], p.stat().st_mtime)
+            except OSError:
+                pass
 
     for stem, r in sessions.items():
         if (stem + "-summary.md") in md_names:
@@ -3656,6 +3676,7 @@ class SettingsPatch(BaseModel):
     agc_live: Optional[bool] = None
     mic_gate: Optional[bool] = None         # skip microphone chunks with no speech evidence before decoding
     record_sessions: Optional[bool] = None  # save the meeting audio on every live session. Declared here or pydantic drops it and the Settings switch silently does nothing.
+    recording_format: Optional[Literal["flac", "opus", "wav"]] = None  # next recording only
     summary_device: Optional[str] = None
     save_location: Optional[str] = None
     default_context: Optional[str] = None
@@ -4126,7 +4147,7 @@ def pick_path(kind: str = "file"):
                 chosen = filedialog.askopenfilename(
                     title="Choose a recording to transcribe",
                     filetypes=[
-                        ("Audio and video", "*.mp3 *.m4a *.wav *.mp4 *.mov *.ogg *.flac *.aac *.webm *.mkv *.avi"),
+                        ("Audio and video", "*.mp3 *.m4a *.wav *.mp4 *.mov *.ogg *.opus *.flac *.aac *.webm *.mkv *.avi"),
                         ("All files", "*.*"),
                     ],
                 )

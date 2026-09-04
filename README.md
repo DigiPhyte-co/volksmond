@@ -36,7 +36,8 @@ Meetings are recorded by default, so a live transcript that goes wrong can be re
 the audio instead of being lost. The recording is written to your own save folder on this
 computer and never leaves it, the live screen tells you it is recording for as long as it
 runs, and when the meeting ends Volksmond shows you where the file is and deletes it on one
-click. You can also switch recording off for good in Settings, under Data and privacy.
+click. Recordings use lossless FLAC by default, with compact Opus and uncompressed WAV options
+in Settings. You can also switch recording off for good in Settings, under Data and privacy.
 
 ## Licensing
 

@@ -164,7 +164,7 @@ function markSvg(size) {
 function freshLive() {
   return {
     running: false, recording: false, transcribing: false, sourceKind: null,
-    startedAt: null, outputPath: null, audioStem: null, tier: null, model: null, family: null,
+    startedAt: null, outputPath: null, audioStem: null, recordingFormat: "flac", tier: null, model: null, family: null,
     language: null, engine: null, stopping: false, segments: [], es: null, title: "", importName: "",
     micDevice: null, loopbackDevice: null, switching: false, reconfiguring: false,
     notes: "", notesOpen: false, notesTouched: false,
@@ -223,7 +223,7 @@ var S = {
   // recordingDeleted and recordingKept record the user's one choice at the end of the meeting;
   // downgraded says the live transcript ran part of the meeting on a smaller model.
   finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null,
-            recordingInfo: null, recordingDeleted: false, recordingKept: false, downgraded: false },
+            recordingInfo: null, recordingFormat: "flac", recordingDeleted: false, recordingKept: false, downgraded: false },
   reader: { name: "", title: "", text: "", summarising: false, summary: null },
   reminder: null,   // active calendar reminder: {subject, attendees, start, key}, or null
   upgrade: { keyState: "empty", value: "", msg: "" },
@@ -748,6 +748,7 @@ async function beginLive() {
     S.live.recordingStarted = !!resp.recording;   // latch: a session that starts already recording counts as having recorded
     S.live.sourceKind = "live"; S.live.startedAt = new Date().toISOString();
     S.live.outputPath = resp.output_path; S.live.audioStem = resp.audio_stem;
+    S.live.recordingFormat = resp.recording_format || ((S.settings && S.settings.recording_format) || "flac");
     S.live.tier = resp.tier; S.live.model = resp.model; S.live.family = resp.family; S.live.language = resp.language;
     S.live.engine = S.form.engine;
     S.live.title = S.form.title || "Live meeting";
@@ -814,6 +815,7 @@ async function startRecordOnly() {
     S.live.running = true; S.live.recording = true; S.live.transcribing = false;
     S.live.sourceKind = "live"; S.live.startedAt = new Date().toISOString();
     S.live.outputPath = resp.output_path; S.live.audioStem = resp.audio_stem;
+    S.live.recordingFormat = resp.recording_format || ((S.settings && S.settings.recording_format) || "flac");
     S.live.title = S.form.title || "Recording";
     S.live.micDevice = S.form.mic; S.live.loopbackDevice = S.form.loopback;
     go("recordonly"); startElapsed(); startLevels(); refreshLiveAec();
@@ -1014,11 +1016,13 @@ async function doStop(what) {
 function gotoFinish(outputPath, sinkError, downgraded) {
   saveNotesNow();                                  // flush any pending notes for this session
   var notesText = (S.live.notes || "").trim();
+  var recordingFormat = S.live.recordingFormat;
   var wasDowngraded = !!downgraded || !!S.live.downgraded;   // the stop response, or the last poll
   teardownLive();
   S.finish.outputPath = outputPath || S.live.outputPath;
   S.finish.title = S.live.title || topicFromName(baseName(S.finish.outputPath));
   S.finish.recordingStem = S.live.recordingStarted ? S.live.audioStem : null;   // latch, not the live flag: a recording that was stopped mid-session still has a file to surface
+  S.finish.recordingFormat = recordingFormat || "flac";
   S.finish.summary = null; S.finish.savedAs = null; S.finish.summarising = false;
   // Fresh keep-or-delete choice for THIS meeting, and the recording's real location and size,
   // fetched from the server (the file is finalised by the time the session stops running).
@@ -1039,11 +1043,13 @@ async function stopRecordOnly() {
   try {
     var resp = await api.post("/api/stop?what=all");
     var stem = S.live.audioStem;
+    var recordingFormat = S.live.recordingFormat;
     S.live.stopping = true; render();
     pollStatus(function (st) { return !st.running; }, function (st) {
       teardownLive();
       S.live.running = false; S.live.stopping = false;
       S.finish.recordingStem = stem;
+      S.finish.recordingFormat = recordingFormat || "flac";
       S.finish.outputPath = resp.output_path;
       S.finish.sinkError = (st && st.sink_error) || null;
       if (S.finish.sinkError) toast(S.finish.sinkError, true);
@@ -1943,6 +1949,7 @@ function refreshSilence() {
     if (rec !== S.live.recording) { S.live.recording = rec; changed = true; }
     var rs = !!st.recording_started;
     if (rs !== S.live.recordingStarted) { S.live.recordingStarted = rs; changed = true; }
+    if (st.recording_format && st.recording_format !== S.live.recordingFormat) { S.live.recordingFormat = st.recording_format; changed = true; }
     // Latched server flag: once the engine has dropped to a smaller model, keep it. Nothing on the
     // live screen changes, so it never forces a render; the finish screen reads it as the fallback
     // when the stop response did not carry it (a reload mid-session, say).
@@ -2017,6 +2024,7 @@ async function recordFromHere() {
     // The stem must reach the client or the finish screen's re-transcribe handoff has nothing to
     // point at (S.finish.recordingStem is derived from S.live.audioStem).
     if (resp && resp.audio_stem) S.live.audioStem = resp.audio_stem;
+    if (resp && resp.recording_format) S.live.recordingFormat = resp.recording_format;
     // Re-assert on confirmed success: a status poll landing in the in-flight window could have
     // reconciled recording back to false before the server committed. The 2xx means it is on.
     S.live.recording = true;
@@ -2154,7 +2162,7 @@ function homeView() {
         onclick: function () { S.form.title = ""; S.form.context = null; go("pre"); } }),
       entry({ ic: "upload", title: "Upload a recording to transcribe", cta: "Choose a file",
         body: "Pick an audio or video file you already have. Volksmond transcribes it locally, just like a live meeting.",
-        formats: [".mp3", ".m4a", ".wav", ".mp4", ".mov", ".ogg"],
+        formats: [".mp3", ".m4a", ".wav", ".flac", ".opus", ".mp4", ".mov", ".ogg"],
         onclick: importFromPicker }),
       entry({ ic: "disk", title: "Record only, transcribe later", cta: "Start recording",
         body: "For machines that cannot keep up live. Volksmond records the audio cleanly, and you transcribe it when you are back at a desk.",
@@ -2649,7 +2657,7 @@ function recordOnlyView() {
       el("div", { class: "rec-pulse" }, el("div", { class: "core" }, el("i"))),
       recTimerEl,
       el("p", { class: "ink-2", style: { maxWidth: "420px", textAlign: "center" }, text: "Recording cleanly. No transcript is being made right now. When you stop, you can transcribe it here." }),
-      S.live.outputPath ? el("div", { class: "ink-3", style: { fontSize: "12px" } }, ["Saving to ", el("span", { class: "mono", text: baseName(S.live.audioStem || S.live.outputPath) + ".wav" })]) : null,
+      S.live.outputPath ? el("div", { class: "ink-3", style: { fontSize: "12px" } }, ["Saving to ", el("span", { class: "mono", text: recordingFileName(S.live.audioStem || S.live.outputPath, null, S.live.recordingFormat) })]) : null,
     ]));
     var footer = el("div", { class: "live-footer", style: { justifyContent: "center" } }, [
       S.live.stopping
@@ -2664,7 +2672,7 @@ function recordOnlyView() {
     el("div", { class: "row gap-12" }, [
       el("div", { class: "tone-tile ok", style: { width: "40px", height: "40px" } }, icon("check", 20)),
       el("div", {}, [el("h1", { style: { fontSize: "24px" }, text: "Recording saved." }),
-        S.finish.outputPath ? el("div", { class: "ink-3 mono", style: { fontSize: "12px", marginTop: "4px" }, text: baseName(stem || S.finish.outputPath) + ".wav" }) : null]),
+        S.finish.outputPath ? el("div", { class: "ink-3 mono", style: { fontSize: "12px", marginTop: "4px" }, text: recordingFileName(stem || S.finish.outputPath, S.finish.recordingInfo, S.finish.recordingFormat) }) : null]),
     ]),
     el("div", { class: "card disclosure accent", style: { padding: "20px" } }, [
       el("div", { class: "row gap-12", style: { marginBottom: "10px" } }, [
@@ -2673,7 +2681,7 @@ function recordOnlyView() {
       ]),
       el("p", { class: "ink-2", style: { fontSize: "13px" }, text: "Volksmond will read the file and write it out. Slower than live, but more accurate. You can keep working while it runs. Stays on this computer." }),
       el("div", { class: "row gap-8", style: { marginTop: "16px" } }, [
-        el("button", { class: "btn primary", onclick: function () { if (stem) { S.importStem = stem; S.importPath = null; S.importName = baseName(stem) + ".wav"; S.form.title = S.live.title || ""; go("importpre"); } else { toast("Recording path missing.", true); } } }, "Transcribe this recording now"),
+        el("button", { class: "btn primary", onclick: function () { if (stem) { S.importStem = stem; S.importPath = null; S.importName = recordingFileName(stem, S.finish.recordingInfo, S.finish.recordingFormat); S.form.title = S.live.title || ""; go("importpre"); } else { toast("Recording path missing.", true); } } }, "Transcribe this recording now"),
         el("button", { class: "btn ghost", onclick: function () { go("home"); } }, "Transcribe later"),
       ]),
     ]),
@@ -2713,6 +2721,12 @@ function importingView() {
 }
 
 /* ── finish & save ────────────────────────────────────────── */
+function recordingFileName(stem, info, recordingFormat) {
+  if (info && info.name) return info.name;
+  var format = recordingFormat || ((S.settings && S.settings.recording_format) || "flac");
+  var ext = format === "opus" ? ".opus" : (format === "wav" ? ".wav" : ".flac");
+  return baseName(stem) + ext;
+}
 // Ask the server where this session's recording is and how big it is. Best effort: if it cannot
 // answer, the finish card falls back to the file name it already knows and offers the same choice.
 function refreshRecordingInfo(stem) {
@@ -2751,7 +2765,7 @@ function recordingCard() {
     ]));
   }
   var info = S.finish.recordingInfo || {};
-  var fileName = info.name || (baseName(stem) + ".wav");
+  var fileName = recordingFileName(stem, info, S.finish.recordingFormat);
   var size = info.bytes ? fmtBytes(info.bytes) : "";
   var where = el("div", {}, [
     el("div", { class: "ink-3 mono", style: { fontSize: "11.5px", marginTop: "4px" }, text: info.path || fileName }),
@@ -2795,7 +2809,7 @@ function retranscribeFinishRecording() {
   if (!stem) { toast("Recording path missing.", true); return; }
   S.importStem = stem;
   S.importPath = null;
-  S.importName = baseName(stem) + ".wav";
+  S.importName = recordingFileName(stem, S.finish.recordingInfo, S.finish.recordingFormat);
   S.form.title = S.finish.title || "";
   go("importpre");
 }
@@ -3940,6 +3954,7 @@ function dataCard(st) {
       el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: pickSaveFolder }, "Change")),
     ]),
     recordDefaultRow(st),
+    recordingFormatRow(st),
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("lock", 18)),
       el("div", { class: "body" }, [el("div", { class: "t", text: "Nothing leaves this computer" }),
@@ -3969,6 +3984,23 @@ function recordDefaultRow(st) {
     el("div", { class: "ctl" }, toggleEl(on, function () {
       S.form.record = !on;
       saveSettings({ record_sessions: !on });
+    })),
+  ]);
+}
+function recordingFormatRow(st) {
+  var options = [
+    ["flac", "Lossless (FLAC), default: about 115 MB per hour"],
+    ["opus", "Compact (Opus): about 15 MB per hour"],
+    ["wav", "Uncompressed (WAV): about 230 MB per hour"],
+  ];
+  return el("div", { class: "set-row" }, [
+    el("div", { class: "ic" }, icon("disk", 18)),
+    el("div", { class: "body" }, [
+      el("div", { class: "t", text: "Recording format" }),
+      el("div", { class: "s", text: "Changes take effect on the next recording, not partway through a file." }),
+    ]),
+    el("div", { class: "ctl" }, selectEl(options, st.recording_format || "flac", function (v) {
+      saveSettings({ recording_format: v });
     })),
   ]);
 }
@@ -4579,6 +4611,7 @@ function adoptRunning(status) {
   S.live.aecAvailable = !!status.aec_live_available;
   S.live.aecActive = !!status.aec_live_active;
   S.live.sysState = status.sys_state || null;   // system-audio capture health at reload time
+  S.live.recordingFormat = status.recording_format || ((S.settings && S.settings.recording_format) || "flac");
   // /api/status does not carry the recording stem; the server derives it from the transcript
   // path (output_path minus ".md"), so reconstruct it for the record-only finish flow.
   S.live.audioStem = (status.recording_started && status.output_path) ? status.output_path.replace(/\.md$/, "") : null;
@@ -4627,9 +4660,11 @@ function adoptRunning(status) {
         }
         // Record-only ended: mirror stopRecordOnly's completion.
         var stem = S.live.audioStem;
+        var recordingFormat = S.live.recordingFormat;
         teardownLive();
         S.live.running = false;
         S.finish.recordingStem = stem;
+        S.finish.recordingFormat = recordingFormat || "flac";
         S.finish.outputPath = S.live.outputPath;
         S.finish.sinkError = (st && st.sink_error) || null;
         if (S.finish.sinkError) toast(S.finish.sinkError, true);

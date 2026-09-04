@@ -70,6 +70,9 @@ for pkg in ("google.protobuf", "aiofiles", "soxr"):
 hiddenimports += collect_submodules("live_transcribe")
 hiddenimports += ["scipy.signal", "anyio", "h11", "sniffio", "clr",
                   "livekit.rtc.apm", "google._upb._message"]
+# The recorder imports soundfile lazily so a broken libsndfile can fall back to WAV. Declaring it
+# here triggers hook-soundfile.py, which collects the wheel's bundled libsndfile DLL.
+hiddenimports += ["soundfile"]
 # pywin32, imported lazily in two places. PyInstaller's built-in pywin32 hooks bundle the
 # supporting DLLs; these names just ensure the modules are pulled in despite the lazy imports.
 #
