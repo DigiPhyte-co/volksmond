@@ -10,6 +10,9 @@
 faster-whisper==1.2.1
 ctranslate2==4.7.2
 
+# Compressed local meeting recordings: FLAC by default, with Ogg/Opus and WAV options.
+soundfile==0.14.0
+
 # macOS ASR backend (Apple Silicon only): mlx-whisper runs Whisper on the Apple GPU
 # via Metal. BOTH marker guards are required (mlx targets Apple Silicon; this line
 # must never select on Windows or Intel builds). Transitively pulls `mlx` (upstream
