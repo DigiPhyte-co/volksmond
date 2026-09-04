@@ -22,6 +22,7 @@ revision can be pinned later via the optional "revision" field; we leave it unse
 import contextlib
 import os
 import shutil
+import sys
 import threading
 from pathlib import Path
 
@@ -146,26 +147,36 @@ def _repo_dir(repo_id):
 def _dir_size(p):
     """Bytes on disk under `p`, counting each real file ONCE. A HuggingFace cache from a dev-era
     download stores a file twice on the surface: the real bytes in blobs/<sha> AND a snapshots/<hash>/
-    symlink into it. os.walk lists both, and getsize follows the symlink to the real blob, so a naive
-    sum DOUBLES every symlinked file (the field bug: small read 0.97 GB, medium 3.1 GB, i.e. 2x their
-    true 0.48 / 1.53 GB). Dedupe by the resolved real path (os.path.realpath), so the blob and the
-    symlink that points at it collapse to one entry and are counted once; a materialised (real-file)
-    cache is naturally counted once too."""
+    pointer into it. os.walk lists both, and getsize follows the pointer to the real blob, so a naive
+    sum DOUBLES every shared file (the field bug: small read 0.97 GB, medium 3.1 GB, i.e. 2x their
+    true 0.48 / 1.53 GB). Dedupe two ways so both cache shapes collapse the pair to one entry:
+      - a symlink and its blob share a resolved real path (os.path.realpath), so the dev-era symlink
+        layout counts once;
+      - a materialised HARDLINK and its blob are two distinct real paths but ONE inode, so dedupe by
+        (st_dev, st_ino) as well, so the hardlink migration (F1) does not re-introduce the doubling.
+    A plain real-file cache is naturally counted once by either rule."""
     total = 0
-    seen = set()
+    seen_real = set()
+    seen_ino = set()
     try:
         for root, _dirs, files in os.walk(p):
             for f in files:
                 fp = os.path.join(root, f)
                 try:
                     real = os.path.realpath(fp)
-                    if real in seen:
-                        continue
-                    size = os.stat(fp).st_size
+                    st = os.stat(fp)
                 except OSError:
                     continue
-                seen.add(real)
-                total += size
+                if real in seen_real:
+                    continue
+                # st_ino is 0 on a filesystem that cannot report it; only dedupe on a real inode.
+                ino = (st.st_dev, st.st_ino) if st.st_ino else None
+                if ino is not None and ino in seen_ino:
+                    continue
+                seen_real.add(real)
+                if ino is not None:
+                    seen_ino.add(ino)
+                total += st.st_size
     except OSError:
         pass
     return total
@@ -208,36 +219,203 @@ def _weight_size(binp):
         return 0
 
 
+# Per-repository cache-mutation lock (F2). One lock per HF repo dir, created lazily under _LOCK and
+# shared by _materialise_snapshot (the presence probe, which acquires it NON-blocking) and the cache
+# writers - the download workers and delete() (which hold it for the duration). A probe that finds the
+# lock held by a writer skips mutation and reports presence from the current on-disk state, so a probe
+# can never remove or rewrite a blob while HuggingFace is reusing it or delete() is rmtree-ing it.
+_REPO_LOCKS = {}
+
+
+def _repo_lock(repo_dir):
+    """The threading.Lock guarding cache mutations for one repo dir, created on first use. Keyed by the
+    normalised absolute path so a probe (which derives the repo dir from the snapshot path) and a writer
+    (which derives it from the repo id) share the one lock."""
+    key = os.path.normcase(os.path.abspath(str(repo_dir)))
+    with _LOCK:
+        lk = _REPO_LOCKS.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _REPO_LOCKS[key] = lk
+        return lk
+
+
+@contextlib.contextmanager
+def _hold_repo_lock(repo_dir):
+    """Hold a repo's cache-mutation lock for the duration (blocking): used by the download workers and
+    delete() so a presence probe's non-blocking acquire fails and it skips mutation while they run."""
+    lock = _repo_lock(repo_dir)
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _is_materialisable(link, blobs_root):
+    """True iff `link` is a symlink whose ULTIMATE target (os.path.realpath resolves chained links and
+    junctions) is a regular file strictly beneath this repo's own blobs/ dir (F4). Everything else is
+    left untouched: a broken link, a self-referential link, an .incomplete download temp, a chained or
+    junction escape out of blobs/, or a target on another volume that realpath cannot place under it."""
+    try:
+        real = os.path.realpath(link)
+        if not os.path.isfile(real):
+            return False
+        if real.endswith(".incomplete"):
+            return False
+        real_n = os.path.normcase(os.path.abspath(real))
+        if real_n == os.path.normcase(os.path.abspath(link)):
+            return False
+        return real_n.startswith(blobs_root + os.sep)
+    except OSError:
+        return False
+
+
+def _replace_link_with_blob(link):
+    """Replace one validated snapshot symlink with a real file backed by its blob, WITHOUT removing the
+    blob: HuggingFace deliberately keeps blobs/ so other revisions (and other filenames) sharing the
+    blob keep working (F1). Prefer a hardlink to the canonical blob (same bytes, no extra space); fall
+    back to a copy only if os.link fails (cross-volume, unsupported FS). Build at a temp name in the
+    snapshot dir, then os.replace(temp, link) atomically drops it onto the link's name and removes the
+    symlink in one step. Returns True on success, False (blob and link both intact) on any failure."""
+    real = os.path.realpath(link)
+    tmp = os.path.join(os.path.dirname(link), "." + os.path.basename(link) + ".vmtmp")
+    try:
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+    except OSError:
+        pass
+    try:
+        try:
+            os.link(real, tmp)          # hardlink to the shared blob; the blob stays in blobs/
+        except OSError:
+            shutil.copyfile(real, tmp)  # cross-volume / unsupported FS: atomic copy instead
+        os.replace(tmp, link)           # atomic: real file at the link's name, symlink gone
+        return True
+    except OSError:
+        try:
+            if os.path.lexists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
 def _materialise_snapshot(path):
-    """Replace every symlinked file in a resolved HF snapshot dir with the real blob it points at, so
-    the frozen build can both SEE and LOAD the model. Dev-era downloads (made before Part A forced
+    """Replace every dev-era symlinked file in a resolved HF snapshot dir with a real file the frozen
+    build can open, WITHOUT destroying the shared blob. Dev-era downloads (made before Part A forced
     HF_HUB_DISABLE_SYMLINKS) stored each file as snapshots/<hash>/model.bin -> ../../blobs/<sha>; the
     frozen build's bundled runtime (MSVCP140 14.50) cannot open a Windows symlink, so ct2 fails with
     "Unable to open file 'model.bin'" at Begin, and the presence probe can also read such a cache as
-    not-installed. This migrates the layout in place (the deferred Part B) to the same real-files shape
-    Part A gives new downloads.
+    not-installed. This migrates the layout in place (the deferred Part B) to real files.
 
-    Each file is one same-volume rename: os.replace(blob, link) atomically drops the real blob onto the
-    link's name and removes the symlink in a single step, so a blob is never lost unless the move
-    succeeds. Idempotent (a real file is not a symlink, so it is left untouched) and best-effort (any
-    error on one file is swallowed and the rest proceed). A broken link (its target is gone) is left
-    as-is, so presence still falls back to not-present. See docs/volksmond-model-load-symlink-bug-2026-08-18.md."""
+    Platform-guarded (F1): only Windows needs this, and only Windows' frozen runtime cannot open a
+    symlink, so on macOS/Linux this is a pure no-op that never mutates the cache (ordinary symlinks are
+    valid there). Each file is one hardlink-then-atomic-replace (F1); the canonical blob is retained so
+    other revisions keep working. Concurrency-safe (F2): acquires the repo's cache-mutation lock
+    non-blocking and, if a download or delete holds it, skips mutation entirely and reports from the
+    current on-disk state. Target-checked (F4): only a link resolving to a regular file strictly under
+    this repo's own blobs/ is touched. Best-effort and idempotent (a real file is not a symlink).
+
+    Returns True iff, after this call, no symlinked regular file remains in the snapshot dir (nothing to
+    migrate, or every symlink materialised); False if any symlink was left in place (a held lock, a
+    rejected/broken target, or a per-file failure). See docs/volksmond-model-load-symlink-bug-2026-08-18.md."""
+    if sys.platform != "win32":
+        return True                      # symlinks are fine for the loader here: never mutate (F1)
     try:
         if not path or not os.path.isdir(path):
-            return
+            return True
+    except OSError:
+        return True
+    repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(path)))
+    blobs_root = os.path.normcase(os.path.abspath(os.path.join(repo_dir, "blobs")))
+    lock = _repo_lock(repo_dir)
+    if not lock.acquire(blocking=False):
+        # A download or delete owns this repo: do not mutate. Report from on-disk state (F2).
+        return not _has_symlinked_regular_file(path)
+    try:
+        all_done = True
         for name in os.listdir(path):
             link = os.path.join(path, name)
             try:
                 if not os.path.islink(link):
                     continue
-                real = os.path.realpath(link)
-                if not os.path.isfile(real) or os.path.abspath(real) == os.path.abspath(link):
-                    continue          # broken (or self-referential) link: leave it, fall back to not-present
-                os.replace(real, link)   # atomic: blob -> real file at the link's name, symlink gone
+                if not _is_materialisable(link, blobs_root):
+                    all_done = False    # broken / escaping / .incomplete: leave it (F4)
+                    continue
+                if not _replace_link_with_blob(link):
+                    all_done = False
+            except OSError:
+                all_done = False
+                continue
+        return all_done
+    finally:
+        lock.release()
+
+
+def _has_symlinked_regular_file(path):
+    """True iff any entry in `path` is a symlink whose target is a regular file (a not-yet-materialised
+    dev-era link). Used only to answer the probe's return value when a writer holds the repo lock and we
+    must not mutate: we still report honestly whether real files are present."""
+    try:
+        for name in os.listdir(path):
+            link = os.path.join(path, name)
+            try:
+                if os.path.islink(link) and os.path.isfile(os.path.realpath(link)):
+                    return True
             except OSError:
                 continue
     except OSError:
         pass
+    return False
+
+
+# The files the loader must be able to OPEN, so on Windows presence requires each to be a real file (not
+# a symlink the frozen runtime cannot open). ct2: model.bin + config.json + tokenizer.json + any
+# vocabulary.* present. MLX: config.json + whichever weights file is present. A vocabulary/weights file
+# that is not in the snapshot at all is not required by this gate; one that IS present must be real.
+_CT2_REQUIRED = ("model.bin", "config.json", "tokenizer.json")
+_CT2_REQUIRED_PREFIX = ("vocabulary.",)
+_MLX_REQUIRED = ("config.json",)
+_MLX_WEIGHTS = ("weights.safetensors", "weights.npz")
+
+
+def _required_still_symlink(path, kind):
+    """True iff any loader-required file for `kind` ("ct2" | "mlx") is still a symlink in `path` (the
+    Windows gate for F3: a partial migration that materialised model.bin but left config.json linked
+    must NOT read as present, because the frozen runtime cannot open the link and Begin would fail after
+    preparation reported complete). Fail-safe: any error -> True (treat as not-ready)."""
+    try:
+        names = set(os.listdir(path))
+    except OSError:
+        return True
+    if kind == "mlx":
+        required = [n for n in _MLX_REQUIRED if n in names]
+        required += [n for n in _MLX_WEIGHTS if n in names]
+    else:
+        required = [n for n in _CT2_REQUIRED if n in names]
+        required += [n for n in names if n.startswith(_CT2_REQUIRED_PREFIX)]
+    for name in required:
+        try:
+            if os.path.islink(os.path.join(path, name)):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def ensure_snapshot_loadable(path):
+    """Neutral materialise-and-check for a resolved ct2 snapshot dir, shared by voicedl._present and
+    transcribe.model_present (F5) so the Models page and the live CPU downgrade ladder judge presence
+    the same way. Materialise any dev-era symlinks (Windows only, best-effort, under the repo lock),
+    then report True iff a non-trivial model.bin is really there AND (on Windows) no loader-required
+    file is still a symlink. No network. Any failure -> False (fail-safe: re-fetch beats a load crash)."""
+    _materialise_snapshot(path)
+    if not _snapshot_has_weights(path):
+        return False
+    if sys.platform == "win32" and _required_still_symlink(path, "ct2"):
+        return False
+    return True
 
 
 def _snapshot_has_weights(path):
@@ -273,10 +451,10 @@ def _present(model):
         path = _download_model(model, local_only=True)
     except Exception:
         return False
-    # Migrate a dev-era symlinked snapshot to real files so the frozen build can load it (and reads it
-    # as installed): idempotent and best-effort, so a materialised or already-real cache is untouched.
-    _materialise_snapshot(path)
-    return _snapshot_has_weights(path)
+    # Migrate a dev-era symlinked snapshot to real files so the frozen build can load it, then confirm
+    # a real model.bin AND (on Windows) that no loader-required file was left a symlink (F3). The one
+    # helper transcribe.model_present routes through too (F5), so the ladder gets the same answer.
+    return ensure_snapshot_loadable(path)
 
 
 def _snapshot_has_mlx_weights(path):
@@ -307,9 +485,14 @@ def _mlx_present(repo):
         path = snapshot_download(repo, local_files_only=True)
     except Exception:
         return False
-    # Same dev-era symlink migration as the ct2 path (idempotent, best-effort) before the MLX check.
+    # Same dev-era symlink migration as the ct2 path (Windows only, idempotent, best-effort) before the
+    # MLX check, then the same F3 gate: on Windows a required file left as a symlink is not-present.
     _materialise_snapshot(path)
-    return _snapshot_has_mlx_weights(path)
+    if not _snapshot_has_mlx_weights(path):
+        return False
+    if sys.platform == "win32" and _required_still_symlink(path, "mlx"):
+        return False
+    return True
 
 
 def asr_download_target(family, size):
@@ -582,7 +765,10 @@ def delete(model):
         for d in dirs:
             if d.exists():
                 try:
-                    shutil.rmtree(d)
+                    # Hold the repo lock across the rmtree (F2) so a presence probe of the same repo
+                    # skips its migration instead of racing a blob out from under the removal.
+                    with _hold_repo_lock(d):
+                        shutil.rmtree(d)
                 except OSError as e:
                     # Surface the failure (e.g. a Windows file lock) instead of reporting a
                     # silent success that did not actually free any space.
@@ -616,8 +802,10 @@ def _run(model):
             return
         # Download the exact files faster-whisper will load, into the same cache it
         # reads, so the first Begin loads without a network round-trip. faster-whisper
-        # (via HuggingFace) verifies each file as it goes.
-        _download_model(model, local_only=False)
+        # (via HuggingFace) verifies each file as it goes. Held under the repo lock (F2)
+        # so a concurrent presence probe skips mutation while HuggingFace writes the cache.
+        with _hold_repo_lock(_repo_dir(_repo_id(model))):
+            _download_model(model, local_only=False)
         _set(state="done", downloaded=total)
     except Exception as e:
         _set(state="error", error=str(e))
@@ -645,7 +833,8 @@ def _run_mlx(repo, revision, version, total):
     installs (a blank `version` means an unversioned upstream repo; nothing is recorded).
     Same _STATE contract as the ct2 workers."""
     try:
-        _download_mlx_repo(repo)
+        with _hold_repo_lock(_repo_dir(repo)):   # F2: presence probes skip mutation while we write
+            _download_mlx_repo(repo)
         got = _ref_main_sha(repo)
         if revision and revision not in ("main", "") and got and got != revision:
             _set(state="error", error="The downloaded model did not match the published version. Please try again later.")
@@ -883,8 +1072,10 @@ def _run_fluister(repo, revision, version, total):
         # Sync the repo's main ref to the latest published files. snapshot_download re-fetches only
         # the files whose hash changed (e.g. a new model.bin for v2). Because load_model() reads the
         # cache with local_files_only (no revision), syncing refs/main is what lets the offline load
-        # pick up the update WITHOUT threading a revision through the whole engine.
-        _download_model(repo, local_only=False)
+        # pick up the update WITHOUT threading a revision through the whole engine. Held under the
+        # repo lock (F2) so a presence probe skips mutation while HuggingFace writes the cache.
+        with _hold_repo_lock(_repo_dir(repo)):
+            _download_model(repo, local_only=False)
         got = _ref_main_sha(repo)
         # Pin verification (supply-chain guard): when the manifest names a specific commit, refuse to
         # record the update if the bytes we got are not that commit. A "main"/blank pin accepts main.

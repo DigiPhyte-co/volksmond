@@ -332,7 +332,13 @@ def model_present(model_id):
     the HuggingFace cache with local_files_only. In both cases a real model.bin has to be there,
     because hf_hub reports a snapshot as present as soon as refs/main survives, even when an
     interrupted download left the weights missing (the same trap voicedl._present guards). Any
-    error means "not present": never claim a model on missing evidence."""
+    error means "not present": never claim a model on missing evidence.
+
+    The cache path routes through voicedl.ensure_snapshot_loadable (F5), the ONE materialise-and-check
+    the Models page uses, so a dev-era symlinked small/base/tiny rung the ladder swaps to is migrated to
+    real files (Windows) and read the same way here as there, not followed as a symlink the frozen
+    runtime cannot open. voicedl imports transcribe at module load, so the import is lazy to avoid a
+    circular import (fluister_present reaches back the same way)."""
     if not model_id:
         return False
     if os.path.isdir(model_id):
@@ -342,7 +348,11 @@ def model_present(model_id):
         path = snapshot_download(model_id, local_files_only=True)
     except Exception:
         return False
-    return _has_ct2_weights(path)
+    try:
+        from . import voicedl
+        return voicedl.ensure_snapshot_loadable(path)
+    except Exception:
+        return _has_ct2_weights(path)
 
 
 def _has_ct2_weights(path, min_bytes=1_000_000):
