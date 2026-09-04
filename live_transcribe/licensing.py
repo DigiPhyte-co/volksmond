@@ -42,7 +42,7 @@ _PUBLIC_KEY_HEX = "2f2cd9f8bba37db0222e396ff887b94f27604f8d1e0e607d58f4c6013109c
 
 # The package major version a licence is checked against. Bump on a paid major
 # release so older perpetual licences resolve to "upgrade available", not "valid".
-APP_VERSION = "1.13.3"
+APP_VERSION = "1.14.0"
 APP_MAJOR = 1
 
 _LICENSE_PATH = paths.data_dir() / "license.key"
