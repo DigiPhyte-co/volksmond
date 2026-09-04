@@ -9,8 +9,9 @@
  */
 "use strict";
 
-// Where "Report a bug or request a feature" sends. Privacy-first mailto: it
-// only carries the app version and OS, never logs or transcripts.
+// Where "Report a bug or request a feature" sends. Privacy-first mailto: the body
+// carries the app version, the OS, and one line describing the hardware. Logs go in
+// the diagnostics zip, which the USER attaches; transcripts never go anywhere.
 var FEEDBACK_EMAIL = "volksmond@digiphyte.com";
 // The business / licensing page: current pricing and what a Business licence covers.
 // Personal use is free, so this is only ever a "learn or buy" link, opened in the browser.
@@ -129,6 +130,7 @@ var IP = {
   pencil: '<path d="M4 20l1.2-4.2L16 5a2 2 0 0 1 3 3L8.2 18.8z"/><path d="M14 7l3 3"/>',
   calendar: '<rect x="4" y="5" width="16" height="16" rx="2"/><path d="M4 9.5h16M8 3v4M16 3v4"/>',
   bell: '<path d="M6.5 10.5a5.5 5.5 0 0 1 11 0c0 4 1.5 5.5 1.5 5.5H5s1.5-1.5 1.5-5.5z"/><path d="M10 19a2 2 0 0 0 4 0"/>',
+  trash: '<path d="M5 7h14M10 7V4.5h4V7M6.8 7l.9 13h8.6l.9-13"/><path d="M10.5 10.5v6M13.5 10.5v6"/>',
 };
 function icon(name, size) {
   size = size || 16;
@@ -162,13 +164,19 @@ function markSvg(size) {
 function freshLive() {
   return {
     running: false, recording: false, transcribing: false, sourceKind: null,
-    startedAt: null, outputPath: null, audioStem: null, tier: null, model: null, family: null,
+    startedAt: null, outputPath: null, audioStem: null, recordingFormat: "flac", tier: null, model: null, family: null,
     language: null, engine: null, stopping: false, segments: [], es: null, title: "", importName: "",
     micDevice: null, loopbackDevice: null, switching: false, reconfiguring: false,
     notes: "", notesOpen: false, notesTouched: false,
     // Live AEC toggle: rendered from the ENGINE'S confirmed state (/api/status, /api/aec-live),
     // never from stored settings, so it can never show a value the engine does not have.
     aecAvailable: false, aecActive: false, aecBusy: false, noticeShown: "",
+    // Live mic gate, on the same terms as the AEC toggle above: rendered from the ENGINE'S
+    // confirmed state (/api/status, /api/mic-gate), never from stored settings. Null until the
+    // engine exists, which is what hides the control. Shape once set:
+    // {on, mode: "normal"|"gentle"|"off", skipped, decoded}. micGateHintSeq is the last
+    // safety-valve hint this client has already shown, so a reload never re-fires an old one.
+    micGate: null, micGateBusy: false, micGateHintSeq: 0,
     // Outstanding long-silence warning from the server ({minutes, count, at}), or null.
     // Server-owned: the watcher lives there, so this is only ever a copy of /api/status.
     silenceNudge: null,
@@ -196,6 +204,11 @@ function freshLive() {
     // family, size, label, downloaded, total, stalled }; prepareStalledClient is set by the
     // client-side watchdog when the byte count has not moved for a long time.
     preparing: false, prepare: null, prepareStalledClient: false,
+    // Server-owned latched flag: true once the engine has dropped to a smaller model this
+    // session. Latched like recordingStarted, and independent of the struggle banner (a muted
+    // banner does not un-degrade the transcript). The finish screen reads it to offer a
+    // re-transcribe from the recording.
+    downgraded: false,
   };
 }
 var S = {
@@ -206,7 +219,11 @@ var S = {
   starting: { active: false, kind: null, title: "", error: null, startedAt: null },
   form: { title: "", language: "af", moreLang: null, tier: "auto", device: "auto", engine: "auto", participants: [], terms: [], context: null, record: false, aec: false, agcLive: true, stereoSplit: false, mic: null, loopback: null, advancedOpen: false },
   setup: { stage: "welcome", choice: "transcribe" },
-  finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null },
+  // recordingInfo is {exists, path, name, bytes} from /api/recording (null until it answers);
+  // recordingDeleted and recordingKept record the user's one choice at the end of the meeting;
+  // downgraded says the live transcript ran part of the meeting on a smaller model.
+  finish: { outputPath: null, title: "", summary: null, savedAs: null, summarising: false, recordingStem: null, sinkError: null,
+            recordingInfo: null, recordingFormat: "flac", recordingDeleted: false, recordingKept: false, downgraded: false },
   reader: { name: "", title: "", text: "", summarising: false, summary: null },
   reminder: null,   // active calendar reminder: {subject, attendees, start, key}, or null
   upgrade: { keyState: "empty", value: "", msg: "" },
@@ -255,6 +272,12 @@ function fmtElapsed(sinceIso) {
   var h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
   if (h > 0) return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
   return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+}
+// m:ss from a plain seconds count (the model-load elapsed counter). Not fmtElapsed: that one takes
+// an ISO start time, and the server owns the load clock here, not the browser.
+function fmtSecs(secs) {
+  var t = Math.max(0, Math.floor(secs || 0));
+  return Math.floor(t / 60) + ":" + String(t % 60).padStart(2, "0");
 }
 function fmtBytes(n) {
   if (!n) return ""; if (n < 1024) return n + " B";
@@ -461,6 +484,9 @@ function refreshLiveAec() {
     if (!st || !st.running) return;
     S.live.aecAvailable = !!st.aec_live_available;
     S.live.aecActive = !!st.aec_live_active;
+    // Same poll, same posture: the mic gate is engine-confirmed too, and this is the first read
+    // of it after Begin (a hint cannot have fired yet, so adopt the sequence silently).
+    adoptMicGate(st, true);
     if (S.route === "live" || S.route === "recordonly") render();
   }).catch(function () {});
 }
@@ -496,6 +522,66 @@ function liveAecToggle() {
     S.live.aecBusy ? el("span", { class: "spinner sm" }) : toggleEl(!!S.live.aecActive, toggleLiveAec),
   ]);
 }
+// The safety valve's one-shot messages, keyed by the mode it stepped down to.
+var MIC_GATE_HINTS = {
+  gentle: "Your microphone is quiet, mic gate set to gentle",
+  off: "Mic gate switched off for this meeting: your microphone is very quiet",
+};
+// Adopt /api/status's mic_gate object into S.live and surface any new safety-valve hint.
+// Returns true when something the UI draws has changed, so pollers can render() once for all of
+// their fields. `silent` (a page reload adopting the current status) takes the hint sequence
+// WITHOUT toasting, so a hint that fired before the reload is never shown twice.
+function adoptMicGate(st, silent) {
+  var g = st && st.mic_gate;
+  if (!g) return false;
+  var was = S.live.micGate;
+  var now = { on: !!g.on, mode: g.mode || "normal", skipped: g.skipped || 0, decoded: g.decoded || 0 };
+  var changed = !was || was.on !== now.on || was.mode !== now.mode || was.skipped !== now.skipped;
+  S.live.micGate = now;
+  var seq = g.hint_seq || 0;
+  if (seq > (S.live.micGateHintSeq || 0)) {
+    S.live.micGateHintSeq = seq;
+    if (!silent && MIC_GATE_HINTS[g.hint]) toast(MIC_GATE_HINTS[g.hint]);
+  }
+  return changed;
+}
+// Toggle the mic gate mid-meeting. Like the AEC toggle: the UI reflects the CONFIRMED new state
+// from the server, not an optimistic flip, and the server persists the choice as the new default.
+async function toggleLiveMicGate() {
+  if (S.live.micGateBusy || !S.live.micGate) return;
+  S.live.micGateBusy = true; render();
+  var want = !S.live.micGate.on;
+  try {
+    var resp = await api.post("/api/mic-gate", { enabled: want });
+    adoptMicGate({ mic_gate: resp }, true);
+    if (S.settings) S.settings.mic_gate = S.live.micGate.on;
+    if (resp.persisted === false) toast("Mic gate changed for this meeting, but the choice could not be saved as your default.");
+    else toast(S.live.micGate.on ? "Mic gate on." : "Mic gate off.");
+  } catch (e) {
+    toast(e.message || "Could not change the mic gate.", true);
+  } finally {
+    S.live.micGateBusy = false; render();
+  }
+}
+// Compact in-meeting mic-gate control for the live audio strip, with the running count of chunks
+// it has skipped so the user can see it working. Hidden until the engine reports its state.
+function liveMicGateToggle() {
+  var g = S.live.micGate;
+  if (!g) return null;
+  var n = g.skipped || 0;
+  return el("div", { class: "row gap-6", style: { alignItems: "center", flex: "0 0 auto" },
+    title: tr("Skips microphone audio with no speech in it so the far end gets the CPU. Switch it off if it ever cuts you off.") }, [
+    el("span", { class: "ink-3", style: { fontSize: "11.5px" }, text: "Mic gate" }),
+    g.on && g.mode === "gentle" ? el("span", { class: "ink-3", style: { fontSize: "11px", opacity: ".8" }, text: "gentle" }) : null,
+    S.live.micGateBusy ? el("span", { class: "spinner sm" }) : toggleEl(!!g.on, toggleLiveMicGate),
+    // The count and its label are separate spans so the label alone is an i18n key: an exact-key
+    // translation table cannot hold "18 quiet chunks skipped".
+    n > 0 ? el("span", { class: "ink-3", style: { fontSize: "11px", whiteSpace: "nowrap" } }, [
+      el("span", { text: String(n) }),
+      el("span", { style: { marginLeft: "3px" }, text: n === 1 ? "quiet chunk skipped" : "quiet chunks skipped" }),
+    ]) : null,
+  ]);
+}
 // Compact strip for the live + record-only screens: per source, a dropdown to switch the
 // device on the fly and a level meter. An empty device list degrades to "not detected".
 function liveAudioStrip() {
@@ -524,6 +610,7 @@ function liveAudioStrip() {
     channel("mic", "mic", dev.mics, S.live.micDevice, dev.default_mic_index, "vm-meter-mic"),
     channel("loopback", "speaker", dev.loopbacks, S.live.loopbackDevice, dev.default_loopback_index, "vm-meter-sys"),
     liveAecToggle(),
+    liveMicGateToggle(),
   ]);
 }
 // Compact strip on the live screen to change the LANGUAGE and MODEL mid-meeting. Language alone
@@ -661,6 +748,7 @@ async function beginLive() {
     S.live.recordingStarted = !!resp.recording;   // latch: a session that starts already recording counts as having recorded
     S.live.sourceKind = "live"; S.live.startedAt = new Date().toISOString();
     S.live.outputPath = resp.output_path; S.live.audioStem = resp.audio_stem;
+    S.live.recordingFormat = resp.recording_format || ((S.settings && S.settings.recording_format) || "flac");
     S.live.tier = resp.tier; S.live.model = resp.model; S.live.family = resp.family; S.live.language = resp.language;
     S.live.engine = S.form.engine;
     S.live.title = S.form.title || "Live meeting";
@@ -727,6 +815,7 @@ async function startRecordOnly() {
     S.live.running = true; S.live.recording = true; S.live.transcribing = false;
     S.live.sourceKind = "live"; S.live.startedAt = new Date().toISOString();
     S.live.outputPath = resp.output_path; S.live.audioStem = resp.audio_stem;
+    S.live.recordingFormat = resp.recording_format || ((S.settings && S.settings.recording_format) || "flac");
     S.live.title = S.form.title || "Recording";
     S.live.micDevice = S.form.mic; S.live.loopbackDevice = S.form.loopback;
     go("recordonly"); startElapsed(); startLevels(); refreshLiveAec();
@@ -903,7 +992,7 @@ async function doStop(what) {
         function (st) { return !st.running || (!st.stopping && !st.transcribing); },
         function (st) {
           S.live.stopping = false;
-          if (!st.running) { gotoFinish(resp.output_path, st && st.sink_error); }
+          if (!st.running) { gotoFinish(resp.output_path, st && st.sink_error, resp && resp.downgraded); }
           else { S.live.recording = true; go("recordonly"); }
         }
       );
@@ -913,7 +1002,7 @@ async function doStop(what) {
     S.live.stopping = true; render();
     pollStatus(
       function (st) { return !st.running; },
-      function (st) { gotoFinish(resp.output_path, st && st.sink_error); },
+      function (st) { gotoFinish(resp.output_path, st && st.sink_error, resp && resp.downgraded); },
       function (st) {
         if (st.running && st.stopping && elapsedEl) {
           var n = typeof st.pending === "number" ? st.pending : 0;
@@ -924,14 +1013,22 @@ async function doStop(what) {
     );
   } catch (e) { toast(e.message || "Could not stop.", true); }
 }
-function gotoFinish(outputPath, sinkError) {
+function gotoFinish(outputPath, sinkError, downgraded) {
   saveNotesNow();                                  // flush any pending notes for this session
   var notesText = (S.live.notes || "").trim();
+  var recordingFormat = S.live.recordingFormat;
+  var wasDowngraded = !!downgraded || !!S.live.downgraded;   // the stop response, or the last poll
   teardownLive();
   S.finish.outputPath = outputPath || S.live.outputPath;
   S.finish.title = S.live.title || topicFromName(baseName(S.finish.outputPath));
   S.finish.recordingStem = S.live.recordingStarted ? S.live.audioStem : null;   // latch, not the live flag: a recording that was stopped mid-session still has a file to surface
+  S.finish.recordingFormat = recordingFormat || "flac";
   S.finish.summary = null; S.finish.savedAs = null; S.finish.summarising = false;
+  // Fresh keep-or-delete choice for THIS meeting, and the recording's real location and size,
+  // fetched from the server (the file is finalised by the time the session stops running).
+  S.finish.recordingInfo = null; S.finish.recordingDeleted = false; S.finish.recordingKept = false;
+  S.finish.downgraded = wasDowngraded;
+  if (S.finish.recordingStem) refreshRecordingInfo(S.finish.recordingStem);
   S.finish.sinkError = sinkError || null;
   S.finish.notes = notesText; S.finish.hasNotes = !!notesText; S.finish.includeNotes = true;
   S.live.running = false;
@@ -946,11 +1043,13 @@ async function stopRecordOnly() {
   try {
     var resp = await api.post("/api/stop?what=all");
     var stem = S.live.audioStem;
+    var recordingFormat = S.live.recordingFormat;
     S.live.stopping = true; render();
     pollStatus(function (st) { return !st.running; }, function (st) {
       teardownLive();
       S.live.running = false; S.live.stopping = false;
       S.finish.recordingStem = stem;
+      S.finish.recordingFormat = recordingFormat || "flac";
       S.finish.outputPath = resp.output_path;
       S.finish.sinkError = (st && st.sink_error) || null;
       if (S.finish.sinkError) toast(S.finish.sinkError, true);
@@ -1148,42 +1247,88 @@ function openExternal(url) {
   else { window.open(url, "_blank", "noopener"); }
 }
 function openStoreListing() { openExternal(STORE_PRODUCT_URI); }
+// Ask the server to write the diagnostics zip. Returns the response ({path, folder,
+// name}) or null on failure; the caller decides what to say. Nothing is uploaded: the
+// file is written to this machine's Downloads folder and only ever travels if the user
+// attaches it to an email themselves.
+async function saveDiagnostics(quiet) {
+  try {
+    var r = await api.post("/api/diagnostics");
+    if (!quiet) toast("Diagnostics saved to " + r.path);
+    return r;
+  } catch (e) {
+    if (!quiet) toast(e.message || "Could not save diagnostics.", true);
+    return null;
+  }
+}
+// The email body. mailto: cannot attach a file and Outlook truncates a long body, so
+// this stays short: the version line, one machine line (CPU, cores, RAM, GPU, install
+// kind) and where the user can find the zip to attach.
+function feedbackBody(af, version, plat, machine, diagPath) {
+  return (af ? "Beskryf die fout of die funksie wat jy graag wil hê:" : "Describe the bug or the feature you would like:") +
+    "\n\n\n----------------------------------------\n" +
+    "Volksmond version " + version + "\n" +
+    (machine ? machine + "\n" : "") + plat + "\n" +
+    (diagPath
+      ? (af ? "Heg asseblief hierdie lêer aan: " : "Please attach this file: ") + diagPath
+      : (af ? "Heg asseblief die diagnostiese lêer aan (Stoor diagnostiek in Volksmond, dan kyk in Aflaaie)."
+            : "Please attach the diagnostics file (use Save diagnostics in Volksmond, then look in Downloads).")) + "\n";
+}
 function reportBug() {
   // No phone-home: the app never sends anything. It either hands a prefilled draft to
   // the user's default mail app (mailto), or copies a report to the clipboard for them
-  // to paste into webmail. The send always happens outside the app.
+  // to paste into webmail. The send always happens outside the app, and the diagnostics
+  // zip is only ever attached by the user.
   var info = S.appInfo || {};
   var version = info.version || "?", plat = info.platform || "?";
   var af = LANG === "af";
   var subject = "Volksmond feedback (v" + version + ")";
-  var body =
-    (af ? "Beskryf die fout of die funksie wat jy graag wil hê:" : "Describe the bug or the feature you would like:") +
-    "\n\n\n----------------------------------------\n" +
-    "Volksmond version " + version + "\n" + plat + "\n" +
-    (af ? "(Geen logs of transkripsies is aangeheg nie. Voeg self enigiets nuttig by.)"
-        : "(No logs or transcripts are attached. Add anything helpful yourself.)") + "\n";
-  var mailto = "mailto:" + FEEDBACK_EMAIL + "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
-  var reportText = "To: " + FEEDBACK_EMAIL + "\nSubject: " + subject + "\n\n" + body;
+  var machine = "", diagPath = "";
+  function body() { return feedbackBody(af, version, plat, machine, diagPath); }
+  function mailtoUrl() {
+    return "mailto:" + FEEDBACK_EMAIL + "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body());
+  }
+  function reportText() { return "To: " + FEEDBACK_EMAIL + "\nSubject: " + subject + "\n\n" + body(); }
+
+  var pathLine = el("div", { class: "mono", style: { fontSize: "11.5px", wordBreak: "break-all", marginTop: "4px" } },
+    raw(af ? "Nog nie gestoor nie." : "Not saved yet."));
+  var openBtn = el("button", { class: "btn primary", onclick: async function () {
+    openBtn.disabled = true;
+    var r = await saveDiagnostics(true);
+    openBtn.disabled = false;
+    if (r) { diagPath = r.path; clear(pathLine); append(pathLine, raw(r.path)); }
+    else { toast("Could not save diagnostics. Sending the report without it.", true); }
+    openExternal(mailtoUrl());
+    modal.remove();
+  } }, [icon("note", 14), "Save diagnostics and open email"]);
 
   var modal = el("div", { class: "modal-backdrop", onclick: function (e) { if (e.target === modal) modal.remove(); } }, [
     el("div", { class: "modal" }, [
       el("h2", { text: "Report a bug or idea" }),
       el("p", { class: "ink-3", style: { margin: "8px 0 14px", fontSize: "13px" }, text: "Nothing is sent automatically. The app never phones home, you send this yourself." }),
-      el("div", { style: { display: "flex", alignItems: "center", gap: "10px", padding: "10px 12px", background: "var(--surface-2)", borderRadius: "8px", marginBottom: "16px" } }, [
+      el("div", { style: { display: "flex", alignItems: "center", gap: "10px", padding: "10px 12px", background: "var(--surface-2)", borderRadius: "8px", marginBottom: "12px" } }, [
         el("span", { style: { color: "var(--ink-3)", display: "inline-flex" } }, icon("bug", 16)),
         el("div", {}, [
           el("div", { style: { fontSize: "12px", color: "var(--ink-3)" }, text: "Send it to" }),
           el("div", { class: "mono", style: { fontSize: "13.5px" }, text: FEEDBACK_EMAIL }),
         ]),
       ]),
+      el("div", { style: { padding: "10px 12px", background: "var(--surface-2)", borderRadius: "8px", marginBottom: "16px" } }, [
+        el("div", { style: { fontSize: "12.5px" }, text: "We save a small diagnostics file to your Downloads folder. Please attach it to the email: it is what lets us tell you what went wrong." }),
+        el("div", { class: "s", style: { fontSize: "11.5px", marginTop: "6px" }, text: "It holds the app logs, your settings, and what this computer is. No transcripts, no notes, no audio, no licence key." }),
+        pathLine,
+      ]),
       el("div", { class: "row gap-8", style: { justifyContent: "flex-end", flexWrap: "wrap" } }, [
         el("button", { class: "btn ghost", onclick: function () { modal.remove(); } }, "Close"),
-        el("button", { class: "btn ghost", onclick: function () { copyText(reportText); } }, [icon("copy", 14), "Copy report"]),
-        el("button", { class: "btn primary", onclick: function () { openExternal(mailto); modal.remove(); } }, [icon("note", 14), "Open email"]),
+        el("button", { class: "btn ghost", onclick: function () { copyText(reportText()); } }, [icon("copy", 14), "Copy report"]),
+        openBtn,
       ]),
     ]),
   ]);
   APP.appendChild(modal);
+  // The machine line needs a GPU probe (a subprocess), so it is fetched when the modal
+  // opens rather than on every app load. If it never arrives the body simply omits it.
+  api.get("/api/diagnostics").then(function (d) { machine = d.summary || ""; }).catch(function () {});
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -1725,7 +1870,12 @@ function startReadinessPoll() {
 }
 function stopReadinessPoll() { if (readinessTimer) { clearInterval(readinessTimer); readinessTimer = null; } }
 // Signature of the prepare object so a steady poll (same phase/bytes) never forces a re-render.
-function prepareSig(p) { return p ? (String(p.phase) + "|" + String(p.model) + "|" + String(p.downloaded) + "|" + String(p.total) + "|" + (p.stalled ? "1" : "0")) : ""; }
+// The load's elapsed seconds are part of it, rounded to whole seconds, because a counter that does
+// not tick is worse than none: that is one small re-render per poll, only while the model loads.
+function prepareSig(p) {
+  return p ? (String(p.phase) + "|" + String(p.model) + "|" + String(p.downloaded) + "|" + String(p.total)
+    + "|" + (p.stalled ? "1" : "0") + "|" + String(Math.floor(p.elapsed || 0)) + "|" + (p.slow ? "1" : "0")) : "";
+}
 // Adopt the server's transcription-readiness + prepare progress onto S.live; returns true if
 // anything changed (so the caller can re-render). Shared by the readiness poll and the silence
 // reconcile, so a steady state never forces a re-render and the two stay in step.
@@ -1799,10 +1949,18 @@ function refreshSilence() {
     if (rec !== S.live.recording) { S.live.recording = rec; changed = true; }
     var rs = !!st.recording_started;
     if (rs !== S.live.recordingStarted) { S.live.recordingStarted = rs; changed = true; }
+    if (st.recording_format && st.recording_format !== S.live.recordingFormat) { S.live.recordingFormat = st.recording_format; changed = true; }
+    // Latched server flag: once the engine has dropped to a smaller model, keep it. Nothing on the
+    // live screen changes, so it never forces a render; the finish screen reads it as the fallback
+    // when the stop response did not carry it (a reload mid-session, say).
+    if (st.downgraded) S.live.downgraded = true;
     // H1: system-audio capture health. Absent (file/record-only sessions never set it server-side)
     // is treated the same as "active" so it never renders a stale warning.
     var ss = st.sys_state || null;
     if (ss !== S.live.sysState) { S.live.sysState = ss; changed = true; }
+    // The mic-gate counter and mode, plus any hint the quiet-mic safety valve has just latched.
+    // Not silent: this is the poll that is meant to surface it.
+    if (adoptMicGate(st, false)) changed = true;
     // t0-capture: also adopt model readiness / load error here as a slower self-healing backstop to
     // the 1.5s readiness poll (which stops once ready), so a lost poll cannot leave the chip stuck.
     if (adoptReadiness(st)) changed = true;
@@ -1866,6 +2024,7 @@ async function recordFromHere() {
     // The stem must reach the client or the finish screen's re-transcribe handoff has nothing to
     // point at (S.finish.recordingStem is derived from S.live.audioStem).
     if (resp && resp.audio_stem) S.live.audioStem = resp.audio_stem;
+    if (resp && resp.recording_format) S.live.recordingFormat = resp.recording_format;
     // Re-assert on confirmed success: a status poll landing in the in-flight window could have
     // reconciled recording back to false before the server committed. The 2xx means it is on.
     S.live.recording = true;
@@ -1913,7 +2072,17 @@ function struggleBanner() {
   // this session, there is already audio to re-transcribe, so drop the record affordance and switch
   // the copy. (Same condition that hides the standalone footer button.)
   var hasRec = !!(S.live.recording || S.live.recordingStarted);
-  var body = hasRec
+  var n = S.live.struggleNudge || {};
+  var body;
+  if (n.old_size && n.old_size === n.new_size)
+    // A shed event, not a model change: the engine ran out of smaller models in this family and
+    // is skipping audio to stay live rather than dropping to a model that would invent text.
+    body = hasRec
+      ? "Volksmond is skipping some audio to stay live. Your recording still has all of it and can be re-transcribed at full accuracy afterward."
+      : "Volksmond is skipping some audio to stay live. Record now so nothing is lost, and re-transcribe at full accuracy afterward.";
+  else if (n.indicative)
+    body = "Live text is now rough (smaller model). The recording has everything, re-transcribe it afterwards.";
+  else body = hasRec
     ? "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Your recording can be re-transcribed at full accuracy afterward."
     : "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Record now and re-transcribe at full accuracy afterward.";
   var actions = [];
@@ -1993,7 +2162,7 @@ function homeView() {
         onclick: function () { S.form.title = ""; S.form.context = null; go("pre"); } }),
       entry({ ic: "upload", title: "Upload a recording to transcribe", cta: "Choose a file",
         body: "Pick an audio or video file you already have. Volksmond transcribes it locally, just like a live meeting.",
-        formats: [".mp3", ".m4a", ".wav", ".mp4", ".mov", ".ogg"],
+        formats: [".mp3", ".m4a", ".wav", ".flac", ".opus", ".mp4", ".mov", ".ogg"],
         onclick: importFromPicker }),
       entry({ ic: "disk", title: "Record only, transcribe later", cta: "Start recording",
         body: "For machines that cannot keep up live. Volksmond records the audio cleanly, and you transcribe it when you are back at a desk.",
@@ -2011,7 +2180,7 @@ function preView() {
       el("div", { class: "tone-tile", style: { width: "36px", height: "36px", flex: "0 0 auto", background: "var(--record-soft)", color: "var(--record)" } }, icon("dot", 16)),
       el("div", { class: "grow" }, [
         el("div", { style: { fontWeight: "600", fontSize: "13.5px" }, text: "Record the audio" }),
-        el("p", { class: "ink-2", style: { fontSize: "12px", marginTop: "3px" }, text: "Keeps the audio on this machine until you stop. Lets you transcribe or summarise it again later, more accurately." }),
+        el("p", { class: "ink-2", style: { fontSize: "12px", marginTop: "3px" }, text: "On by default. The audio stays on this computer, and if the live transcript goes wrong you can redo it from the recording. Keep or delete it when the meeting ends." }),
       ]),
       toggleEl(S.form.record, function () { S.form.record = !S.form.record; render(); }, true),
     ]),
@@ -2371,15 +2540,25 @@ function preparePanel(failMsg) {
     progressBlock = el("div", { style: { width: "100%", maxWidth: "420px" } }, [
       el("div", { style: { fontWeight: "600", fontSize: "13px", textAlign: "center" } },
         [el("span", { text: "Downloading" }), raw(" " + (p.label || p.model || ""))]),
-      total ? voiceProgressBar(pct) : el("div", { class: "track", style: { marginTop: "10px" } }, el("div", { class: "indeterminate" })),
+      total ? downloadProgressBar(pct) : el("div", { class: "track", style: { marginTop: "10px" } }, el("div", { class: "indeterminate" })),
       el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "6px", textAlign: "center" },
         text: total ? trFmt("{done} of {total} ({pct}%)", { done: fmtGB(dl), total: fmtGB(total), pct: pct })
                     : (fmtGB(dl) + " " + tr("downloaded so far")) }),
     ]);
   } else {
+    // Loading. The server owns the clock (p.elapsed), so the counter keeps counting across a page
+    // reload and matches the budget the server is actually holding it to. The hint appears only
+    // once the server says the wait is a long one (CPU past its hint threshold), so a fast machine
+    // never sees it.
     progressBlock = el("div", { style: { width: "100%", maxWidth: "420px" } }, [
-      el("div", { style: { fontWeight: "600", fontSize: "13px", textAlign: "center" }, text: "Loading into memory" }),
+      el("div", { style: { fontWeight: "600", fontSize: "13px", textAlign: "center" } }, [
+        el("span", { text: "Loading into memory" }),
+        p.elapsed ? el("span", { class: "mono ink-3", style: { marginLeft: "8px", fontWeight: "500" } },
+          raw(fmtSecs(p.elapsed))) : null,
+      ]),
       el("div", { class: "track", style: { marginTop: "10px" } }, el("div", { class: "indeterminate" })),
+      p.slow ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "6px", textAlign: "center" },
+        text: "First load on this computer can take a few minutes. It is faster next time." }) : null,
     ]);
   }
   return el("div", { class: "rec-stage", style: { maxWidth: "520px", margin: "0 auto" } }, [
@@ -2443,7 +2622,7 @@ function liveView() {
   // recording mid-session. recordingStarted is latched, so once a session has recorded the button
   // stays gone (a restart would clobber the WAV). Independent of the banner; both call recordFromHere().
   var recSlot;
-  if (S.live.recording) recSlot = el("span", { class: "rec-ind" }, [el("i"), "Recording audio"]);
+  if (S.live.recording) recSlot = el("span", { class: "rec-ind", title: tr("The audio is being saved to your save folder on this computer. You can keep or delete it when the meeting ends.") }, [el("i"), "Recording to this computer"]);
   else if (S.live.transcribing && !S.live.recordingStarted) recSlot = el("button", { class: "btn sm record", onclick: function () { recordFromHere(); } }, [icon("dot", 12), "Record from here"]);
   else recSlot = null;
 
@@ -2478,7 +2657,7 @@ function recordOnlyView() {
       el("div", { class: "rec-pulse" }, el("div", { class: "core" }, el("i"))),
       recTimerEl,
       el("p", { class: "ink-2", style: { maxWidth: "420px", textAlign: "center" }, text: "Recording cleanly. No transcript is being made right now. When you stop, you can transcribe it here." }),
-      S.live.outputPath ? el("div", { class: "ink-3", style: { fontSize: "12px" } }, ["Saving to ", el("span", { class: "mono", text: baseName(S.live.audioStem || S.live.outputPath) + ".wav" })]) : null,
+      S.live.outputPath ? el("div", { class: "ink-3", style: { fontSize: "12px" } }, ["Saving to ", el("span", { class: "mono", text: recordingFileName(S.live.audioStem || S.live.outputPath, null, S.live.recordingFormat) })]) : null,
     ]));
     var footer = el("div", { class: "live-footer", style: { justifyContent: "center" } }, [
       S.live.stopping
@@ -2493,7 +2672,7 @@ function recordOnlyView() {
     el("div", { class: "row gap-12" }, [
       el("div", { class: "tone-tile ok", style: { width: "40px", height: "40px" } }, icon("check", 20)),
       el("div", {}, [el("h1", { style: { fontSize: "24px" }, text: "Recording saved." }),
-        S.finish.outputPath ? el("div", { class: "ink-3 mono", style: { fontSize: "12px", marginTop: "4px" }, text: baseName(stem || S.finish.outputPath) + ".wav" }) : null]),
+        S.finish.outputPath ? el("div", { class: "ink-3 mono", style: { fontSize: "12px", marginTop: "4px" }, text: recordingFileName(stem || S.finish.outputPath, S.finish.recordingInfo, S.finish.recordingFormat) }) : null]),
     ]),
     el("div", { class: "card disclosure accent", style: { padding: "20px" } }, [
       el("div", { class: "row gap-12", style: { marginBottom: "10px" } }, [
@@ -2502,7 +2681,7 @@ function recordOnlyView() {
       ]),
       el("p", { class: "ink-2", style: { fontSize: "13px" }, text: "Volksmond will read the file and write it out. Slower than live, but more accurate. You can keep working while it runs. Stays on this computer." }),
       el("div", { class: "row gap-8", style: { marginTop: "16px" } }, [
-        el("button", { class: "btn primary", onclick: function () { if (stem) { S.importStem = stem; S.importPath = null; S.importName = baseName(stem) + ".wav"; S.form.title = S.live.title || ""; go("importpre"); } else { toast("Recording path missing.", true); } } }, "Transcribe this recording now"),
+        el("button", { class: "btn primary", onclick: function () { if (stem) { S.importStem = stem; S.importPath = null; S.importName = recordingFileName(stem, S.finish.recordingInfo, S.finish.recordingFormat); S.form.title = S.live.title || ""; go("importpre"); } else { toast("Recording path missing.", true); } } }, "Transcribe this recording now"),
         el("button", { class: "btn ghost", onclick: function () { go("home"); } }, "Transcribe later"),
       ]),
     ]),
@@ -2542,6 +2721,98 @@ function importingView() {
 }
 
 /* ── finish & save ────────────────────────────────────────── */
+function recordingFileName(stem, info, recordingFormat) {
+  if (info && info.name) return info.name;
+  var format = recordingFormat || ((S.settings && S.settings.recording_format) || "flac");
+  var ext = format === "opus" ? ".opus" : (format === "wav" ? ".wav" : ".flac");
+  return baseName(stem) + ext;
+}
+// Ask the server where this session's recording is and how big it is. Best effort: if it cannot
+// answer, the finish card falls back to the file name it already knows and offers the same choice.
+function refreshRecordingInfo(stem) {
+  api.get("/api/recording?stem=" + encodeURIComponent(baseName(stem)))
+    .then(function (info) { S.finish.recordingInfo = info; if (S.route === "finish") render(); })
+    .catch(function () {});
+}
+// Delete the recording, now. No confirmation dialog: the meeting is over, the button says what it
+// does, and the transcript, notes and summary are all untouched. The card then says it is gone.
+async function deleteRecording() {
+  var stem = S.finish.recordingStem;
+  if (!stem) return;
+  try {
+    await api.post("/api/recording/delete", { stem: baseName(stem) });
+    S.finish.recordingDeleted = true;
+    S.finish.recordingInfo = null;
+    toast("Recording deleted from this computer.");
+    refreshSessions();
+    render();
+  } catch (e) { toast(e.message || "Could not delete the recording.", true); }
+}
+// The keep-or-delete card, shown at the end of any meeting that recorded. Recording is on by
+// default, so this is the moment the promise is kept: you see where the audio is, how big it is,
+// and you decide. If the live transcript degraded to a smaller model, the same card offers to redo
+// it from the recording through the normal file-transcription flow.
+function recordingCard() {
+  var stem = S.finish.recordingStem;
+  if (!stem) return null;
+  if (S.finish.recordingDeleted) {
+    return el("div", { class: "card", style: { padding: "16px" } }, el("div", { class: "row gap-12" }, [
+      el("div", { class: "tone-tile ok", style: { width: "36px", height: "36px" } }, icon("check", 18)),
+      el("div", {}, [
+        el("div", { style: { fontWeight: "600" }, text: "Recording deleted." }),
+        el("div", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "2px" }, text: "The audio is off this computer. Your transcript and notes are still saved." }),
+      ]),
+    ]));
+  }
+  var info = S.finish.recordingInfo || {};
+  var fileName = recordingFileName(stem, info, S.finish.recordingFormat);
+  var size = info.bytes ? fmtBytes(info.bytes) : "";
+  var where = el("div", {}, [
+    el("div", { class: "ink-3 mono", style: { fontSize: "11.5px", marginTop: "4px" }, text: info.path || fileName }),
+    size ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "2px" }, text: trFmt("{size} on this computer", { size: size }) }) : null,
+  ]);
+  var head = el("div", { class: "row gap-12" }, [
+    el("div", { class: "tone-tile accent", style: { width: "36px", height: "36px" } }, icon("mic", 18)),
+    el("div", { class: "grow" }, [
+      el("div", { style: { fontWeight: "600" }, text: S.finish.recordingKept ? "Recording kept on this computer" : "The audio of this meeting was recorded" }),
+      where,
+    ]),
+  ]);
+  var body = [head];
+  if (!S.finish.recordingKept) {
+    // Two equal buttons, keep first and focused: the safe choice must be the easy one, and delete
+    // must never be a mis-click away from being the default. "Keep THE recording" deliberately, not
+    // "Keep recording": that phrase already means "carry on recording" on the silence banner, and
+    // one file-deleting button must never be able to read as the other.
+    var keepBtn = el("button", { class: "btn primary grow", onclick: function () { S.finish.recordingKept = true; render(); } }, [icon("check", 15), "Keep the recording"]);
+    setTimeout(function () { try { keepBtn.focus(); } catch (e) {} }, 0);
+    body.push(el("div", { class: "row gap-8", style: { marginTop: "14px" } }, [
+      keepBtn,
+      el("button", { class: "btn record grow", onclick: deleteRecording }, [icon("trash", 15), "Delete the recording"]),
+    ]));
+  }
+  if (S.finish.downgraded) {
+    body.push(el("div", { style: { marginTop: "14px", paddingTop: "12px", borderTop: "1px solid var(--line)" } }, [
+      el("div", { class: "ink-2", style: { fontSize: "12.5px" }, text: "The live transcript ran on a smaller model for part of this meeting. Re-transcribe from the recording now?" }),
+      el("div", { class: "row gap-8", style: { marginTop: "10px" } }, [
+        el("button", { class: "btn", onclick: function () { retranscribeFinishRecording(); } }, [icon("note", 15), "Re-transcribe from the recording"]),
+      ]),
+    ]));
+  }
+  return el("div", { class: "card", style: { padding: "18px" } }, body);
+}
+// Hand the recording to the SAME file-transcription flow the record-only handoff uses (the import
+// screen, then /api/transcribe-file). A file run is never adaptive, so it uses the full model at
+// the quality this machine is set to instead of the smaller one the live pass fell back to.
+function retranscribeFinishRecording() {
+  var stem = S.finish.recordingStem;
+  if (!stem) { toast("Recording path missing.", true); return; }
+  S.importStem = stem;
+  S.importPath = null;
+  S.importName = recordingFileName(stem, S.finish.recordingInfo, S.finish.recordingFormat);
+  S.form.title = S.finish.title || "";
+  go("importpre");
+}
 function finishView() {
   var name = baseName(S.finish.outputPath);
   return el("div", { class: "screen center" }, el("div", { class: "screen-inner col-mid stack", style: { gap: "16px" } }, [
@@ -2566,6 +2837,7 @@ function finishView() {
         el("button", { class: "btn ghost", onclick: async function () { try { var t = await api.text("/sessions/" + encodeURIComponent(name)); copyText(t); } catch (e) { toast(e.message, true); } } }, [icon("copy", 15), "Copy"]),
       ]),
     ]),
+    recordingCard(),
     summariseCard(name, "finish"),
     el("div", { class: "row", style: { marginTop: "4px" } }, [
       el("span", { class: "grow" }),
@@ -3150,6 +3422,15 @@ function transcriptionCard(st) {
       ]),
       el("div", { class: "ctl" }, toggleEl(st.aec === true, function () { saveSettings({ aec: !(st.aec === true) }); })),
     ]),
+    el("div", { class: "set-row" }, [
+      el("div", { class: "ic" }, icon("mic", 18)),
+      el("div", { class: "body" }, [
+        el("div", { class: "t", text: "Skip quiet mic audio (mic gate)" }),
+        el("div", { class: "s", text: "Skips microphone audio with no speech in it so the far end gets the CPU. Switch it off if it ever cuts you off." }),
+      ]),
+      // "" and 0 are not values here, so only an explicit false turns it off: the default is on.
+      el("div", { class: "ctl" }, toggleEl(st.mic_gate !== false, function () { saveSettings({ mic_gate: st.mic_gate === false }); })),
+    ]),
     el("div", { class: "set-row", style: { display: "block" } }, [
       el("div", { class: "t", style: { marginBottom: "4px" }, text: "Default context, names and jargon" }),
       el("div", { class: "s", style: { marginBottom: "8px" }, text: "Applied to every meeting to help accuracy. Stored on this computer only." }),
@@ -3249,7 +3530,8 @@ function summaryDownloadPanel(manage) {
 }
 /* ── voice (transcription) model download, shared by setup and settings ─── */
 var VOICE_LABELS = {
-  "base":   { title: "Lite",         note: "The smallest and fastest, but the roughest. Only for very old or low-power computers." },
+  "tiny":   { title: "Minimal",      note: "The fastest and the roughest. A live safety net for a slow computer, not a transcript to rely on." },
+  "base":   { title: "Lite",         note: "Very fast and quite rough. For old or low-power computers, and the step above Minimal when the live view is falling behind." },
   "small":  { title: "Light",        note: "Light and quick, easy on memory. Good everyday accuracy on most laptops." },
   "medium": { title: "Balanced",     note: "A good balance of speed and accuracy on a typical computer. The usual sweet spot." },
   "large-v3-turbo": { title: "High quality", note: "Near the best accuracy, but lighter and faster. Great on a strong CPU or any GPU." },
@@ -3276,11 +3558,11 @@ function pollVoiceDownload() {
   }, 1000);
 }
 function updateVoiceProgress(p) {
-  var pct = p.total ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0;
+  var pct = modelProgressPct(p);
   var bar = document.getElementById("vm-vdl-bar");
   if (bar) bar.style.width = pct + "%";
-  var txt = document.getElementById("vm-vdl-text");
-  if (txt) txt.textContent = fmtGB(p.downloaded) + " of " + fmtGB(p.total) + "  (" + pct + "%)";
+  var status = document.getElementById("vm-vdl-status");
+  if (status) status.textContent = "Downloading " + pct + "%";
 }
 function loadVoiceModels() {
   S._loadingVM = true; S._vmError = false;
@@ -3288,11 +3570,24 @@ function loadVoiceModels() {
     .then(function (d) { S.voiceModels = d; S._loadingVM = false; render(); })
     .catch(function () { S._loadingVM = false; S._vmError = true; render(); });
 }
-function voiceProgressBar(pct) {
+function downloadProgressBar(pct) {
   return el("div", { style: { height: "8px", borderRadius: "999px", background: "var(--line)", overflow: "hidden", marginTop: "10px" } },
     el("div", { id: "vm-vdl-bar", style: { height: "100%", width: pct + "%", background: "var(--accent)", transition: "width .3s ease" } }));
 }
-function voiceDownloadPanel(manage) {
+function modelProgressPct(p) {
+  return (p && p.total) ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0;
+}
+function modelProgressMatches(p, family, key, repo) {
+  if (!p || !p.state) return false;
+  if (family === "fluister") return p.kind === "fluister" && (p.model === key || p.repo === repo);
+  if (family === "swivuriso") return p.kind === "swivuriso";
+  return (p.kind === "whisper" || !p.kind) && p.model === key;
+}
+function shortVoiceError(error) {
+  var text = String(error || "Could not download model.");
+  return text.length > 56 ? text.slice(0, 53) + "..." : text;
+}
+function voiceDownloadPanel() {
   if (!S.voiceModels) {
     if (S._vmError) {
       return el("div", { class: "stack", style: { gap: "6px" } }, [
@@ -3305,140 +3600,100 @@ function voiceDownloadPanel(manage) {
   }
   var d = S.voiceModels; var models = (d.models || []).slice(); var p = d.progress || {};
   var downloading = p.state === "downloading";
-  models.sort(function (a, b) { return (b.recommended ? 1 : 0) - (a.recommended ? 1 : 0); }); // recommended first
-  return el("div", { class: "stack", style: { gap: "10px" } }, models.map(function (m) {
-    var meta = VOICE_LABELS[m.model] || { title: m.model, note: "" };
-    var isThis = downloading && (p.kind === "whisper" || !p.kind) && p.model === m.model;
-    var pct = (isThis && p.total) ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0;
+  models.sort(function (a, b) { return (b.recommended ? 1 : 0) - (a.recommended ? 1 : 0); });
+  return el("div", { class: "model-setup-list" }, models.map(function (m) {
+    var meta = VOICE_LABELS[m.model] || { title: m.model };
+    var isThis = downloading && modelProgressMatches(p, "whisper", m.model);
+    var pct = modelProgressPct(p);
     var usable = !(m.model === "large-v3" && d.is_gpu === false);
-    return el("div", { class: "card", style: { padding: "14px", opacity: usable ? "1" : "0.6" } }, [
-      el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "flex-start", gap: "12px" } }, [
-        el("div", { class: "grow" }, [
-          el("div", { style: { fontWeight: "600" } }, [
-            el("span", { text: meta.title }),
-            m.recommended ? el("span", { class: "chip accent", style: { marginLeft: "8px" }, text: "Recommended" }) : null,
-            el("span", { class: "chip", style: { marginLeft: "8px" } }, raw(fmtGB((m.present && m.size_on_disk) ? m.size_on_disk : m.approx_bytes))),
-          ]),
-          el("div", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "2px" }, text: meta.note }),
-          (!usable) ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "4px" }, text: "Needs a graphics card (GPU). Choose another for this computer." }) : null,
+    return el("div", { class: "model-setup-row", style: { opacity: usable ? "1" : "0.6" } }, [
+      el("div", { class: "grow" }, [
+        el("div", { style: { fontWeight: "600" } }, [
+          el("span", { text: meta.title }),
+          m.recommended ? el("span", { class: "chip accent", style: { marginLeft: "8px" }, text: "Recommended" }) : null,
         ]),
-        m.present
-          ? el("div", { class: "row gap-8", style: { alignItems: "center", flex: "0 0 auto" } }, [
-              el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]),
-              manage ? el("button", { class: "btn ghost sm", onclick: function () { confirmRemoveVoice(m); } }, "Remove") : null,
-            ])
-          : (usable ? el("button", { class: "btn", onclick: function () { if (downloading) return; startVoiceDownload(m.model); } }, isThis ? "Downloading" : "Download") : null),
+        (!usable) ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "3px" }, text: "Needs a graphics card (GPU). Choose another for this computer." }) : null,
       ]),
-      isThis ? voiceProgressBar(pct) : null,
-      isThis ? el("div", { id: "vm-vdl-text", class: "ink-3", style: { fontSize: "11.5px", marginTop: "4px" } }, raw(fmtGB(p.downloaded) + " of " + fmtGB(p.total) + "  (" + pct + "%)")) : null,
+      isThis ? el("div", { class: "model-table-status" }, [
+        el("span", { id: "vm-vdl-status", class: "chip accent", text: "Downloading " + pct + "%" }),
+        el("span", { class: "model-table-progress" }, el("span", { id: "vm-vdl-bar", style: { width: pct + "%" } })),
+      ]) : m.present ? el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]) : (usable ? el("button", { class: "btn sm", onclick: function () { if (!downloading) startVoiceDownload(m.model); } }, "Download") : null),
     ]);
   }));
 }
-// A short, honest "what am I getting" explanation of the model families, so a person who does not
-// want to think about models understands what runs for their language. The SIZE they download below
-// applies to whichever family their language uses (Afrikaans -> Fluister, else -> Whisper).
-function modelFamiliesNote() {
-  function li(text) { return el("li", { style: { marginBottom: "3px" }, text: text }); }
-  return el("div", { class: "card", style: { padding: "12px 14px", marginBottom: "12px", background: "var(--surface-2)" } }, [
-    el("div", { class: "row gap-8", style: { alignItems: "center", marginBottom: "6px" } }, [
-      el("span", { class: "tone-tile accent", style: { width: "26px", height: "26px", flex: "0 0 auto" } }, icon("sparkle", 13)),
-      el("div", { style: { fontWeight: "600", fontSize: "13px" }, text: "Three model families, chosen by language" }),
-    ]),
-    el("ul", { style: { margin: "0", paddingLeft: "18px", fontSize: "12px", lineHeight: "1.55", color: "var(--ink-2)" } }, [
-      li("Fluister, our Afrikaans-tuned model: best for Afrikaans and mixed Afrikaans and English meetings. It downloads automatically the first time you transcribe Afrikaans."),
-      li("Swivuriso, by African Next Voices (DSFSI): one model for seven South African languages (isiZulu, isiXhosa, Sesotho, Setswana, Xitsonga, isiNdebele, Tshivenda). Beta."),
-      li("English and other languages use standard Whisper, the model you download below."),
-      li("The size you pick (speed against accuracy) applies to whichever family your language needs."),
-    ]),
-  ]);
-}
-// ── Settings: one consistent model card per family ──────────────────────────
-// All three families (Afrikaans/Fluister, the other South African languages/Swivuriso, general
-// Whisper) render with the SAME card via voiceModelRow: title, download size, description, and
-// Installed/Download + Remove. Built from the backend catalogues (d.fluister, d.swivuriso, d.models).
-function vmChip(cls, text) { return el("span", { class: "chip " + cls, style: { marginLeft: "8px" }, text: text }); }
-function vmPct(p) { return (p && p.total) ? Math.min(100, Math.round((p.downloaded || 0) * 100 / p.total)) : 0; }
-function voiceModelSectionHeader(title, rightEl, sub) {
-  return el("div", { style: { marginTop: "4px", marginBottom: "8px" } }, [
-    el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "center" } }, [
-      el("div", { style: { fontWeight: "600", fontSize: "13px" }, text: title }),
-      rightEl || null,
-    ]),
-    sub ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "3px" }, text: sub }) : null,
-  ]);
-}
-// o: title, badges[], sizeBytes, present, description, note, downloading, isThis, pct, p,
-//    onDownload, onRemove, status (element shown when present, before Remove), disabled, disabledNote.
-function voiceModelRow(o) {
-  var right;
-  if (o.present) {
-    right = el("div", { class: "row gap-8", style: { alignItems: "center", flex: "0 0 auto" } }, [
-      o.status || el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]),
-      o.onRemove ? el("button", { class: "btn ghost sm", onclick: o.onRemove }, "Remove") : null,
+function voiceTableStatus(row, p, update) {
+  var matches = modelProgressMatches(p, row.family, row.key, row.repo);
+  if (matches && p.state === "downloading") {
+    var pct = modelProgressPct(p);
+    return el("div", { class: "model-table-status" }, [
+      el("span", { id: "vm-vdl-status", class: "chip accent", text: "Downloading " + pct + "%" }),
+      el("span", { class: "model-table-progress" }, el("span", { id: "vm-vdl-bar", style: { width: pct + "%" } })),
     ]);
-  } else if (o.disabled) {
-    right = null;
-  } else {
-    right = el("button", { class: "btn", onclick: function () { if (o.downloading) return; o.onDownload(); } }, o.isThis ? "Downloading" : "Download");
   }
-  var title = [el("span", { text: o.title })].concat(o.badges || []).concat([
-    el("span", { class: "chip", style: { marginLeft: "8px" } }, raw(fmtGB(o.sizeBytes))),
-  ]);
-  return el("div", { class: "card", style: { padding: "14px", opacity: o.disabled ? "0.6" : "1" } }, [
-    el("div", { class: "row", style: { justifyContent: "space-between", alignItems: "flex-start", gap: "12px" } }, [
-      el("div", { class: "grow" }, [
-        el("div", { style: { fontWeight: "600" } }, title),
-        o.description ? el("div", { class: "ink-2", style: { fontSize: "12.5px", marginTop: "2px" }, text: o.description }) : null,
-        o.note ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "4px" }, text: o.note }) : null,
-        o.disabledNote ? el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "4px" }, text: o.disabledNote }) : null,
-      ]),
-      right,
-    ]),
-    o.isThis ? voiceProgressBar(o.pct) : null,
-    o.isThis ? el("div", { id: "vm-vdl-text", class: "ink-3", style: { fontSize: "11.5px", marginTop: "4px" } }, raw(fmtGB(o.p.downloaded) + " of " + fmtGB(o.p.total) + "  (" + o.pct + "%)")) : null,
-  ]);
+  if (matches && p.state === "error") return el("span", { class: "chip warn", title: String(p.error || "") }, "Error: " + shortVoiceError(p.error));
+  if (update && update.update_available) return el("span", { class: "chip warn" }, "Update available");
+  return row.present ? el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]) : el("span", { class: "chip muted" }, "Not downloaded");
 }
-// Afrikaans (Fluister) is OURS, so unlike stock Whisper it improves over time: a manual "Check for
-// updates" offers an opt-in newer version (the only time the app reaches our server about models, and
-// only on click). Loads from the local cache (local_files_only), so a newer Fluister can ONLY arrive
-// through this opt-in. Each of the four sizes is a consistent card with Download / Installed + Remove.
-function afrikaansModelSection() {
-  var d = S.voiceModels; if (!d) return null;
-  var p = d.progress || {}; var downloading = p.state === "downloading";
-  var fl = (d.fluister || []).slice();
-  // For Afrikaans we recommend High quality (the large-v3-turbo Fluister tune), NOT Best (large-v3):
-  // our turbo tune is the Afrikaans sweet spot (it beats large-v3 on real Afrikaans, is GPU-optional
-  // and faster). This override is display-only and scoped to the Fluister section; the hardware
-  // recommended_model still drives the general Whisper section and the first-run auto-download.
-  var fluisterRec = "large-v3-turbo";
-  var anyInstalled = fl.some(function (m) { return m.present; });
-  var ups = {}; ((S.modelUpdates && S.modelUpdates.updates) || []).forEach(function (u) { ups[u.repo] = u; });
-  var checking = S._checkingModelUpdates;
-  // The offline-only edition compiles out the model-update route, so hide its button there.
-  var checkBtn = (anyInstalled && !offlineBuild()) ? el("button", { class: "btn ghost sm", disabled: checking, onclick: function () { checkModelUpdates(); } }, checking ? "Checking" : "Check for updates") : null;
-  fl.sort(function (a, b) { return (b.size === fluisterRec ? 1 : 0) - (a.size === fluisterRec ? 1 : 0); });
-  return el("div", { style: { marginBottom: "14px" } }, [
-    voiceModelSectionHeader("Afrikaans model (Fluister)", checkBtn, "Our Afrikaans-tuned model. Best for Afrikaans and mixed Afrikaans and English."),
-    el("div", { class: "stack", style: { gap: "10px" } }, fl.map(function (m) {
-      var meta = VOICE_LABELS[m.size] || { title: m.size, note: "" };
-      var u = ups[m.repo];
-      var isThis = downloading && p.kind === "fluister" && p.model === m.size;
-      var badges = [];
-      if (m.size === fluisterRec) badges.push(vmChip("accent", "Recommended"));
-      var status = null;
-      if (u && u.update_available) status = el("button", { class: "btn sm", disabled: downloading, onclick: function () { if (downloading) return; startFluisterUpdate(m.size); } }, isThis ? "Updating" : ("Update → v" + u.latest));
-      else if (S.modelUpdates) status = el("span", { class: "chip ok" }, [icon("check", 12), "Up to date"]);
-      return voiceModelRow({
-        title: meta.title, badges: badges,
-        sizeBytes: (m.present && m.size_on_disk) ? m.size_on_disk : m.approx_bytes,
-        present: m.present, description: meta.note,
-        downloading: downloading, isThis: isThis, pct: vmPct(p), p: p,
-        onDownload: function () { startFluisterDownload(m.size); },
-        onRemove: function () { confirmRemoveVoiceItem(meta.title + " (Fluister)", m.repo, m.size_on_disk || m.approx_bytes); },
-        status: status,
-      });
+function voiceTableRows(d) {
+  // The "Auto" chip marks the size the app auto-picks on this hardware (d.recommended_model, a size
+  // name like "medium"). That size can exist in more than one family, so the Fluister row and the
+  // Whisper row for it BOTH carry the "Auto" chip: one per family, which is the intended behaviour.
+  var qualityOrder = ["large-v3", "large-v3-turbo", "medium", "small", "base", "tiny"];
+  var rank = function (size) { var i = qualityOrder.indexOf(size); return i < 0 ? qualityOrder.length : i; };
+  var rows = [];
+  (d.fluister || []).slice().sort(function (a, b) { return rank(a.size) - rank(b.size); }).forEach(function (m) {
+    rows.push({ family: "fluister", key: m.size, repo: m.repo, present: m.present, bytes: (m.present && m.size_on_disk) ? m.size_on_disk : m.approx_bytes,
+      label: "Fluister " + m.size, languages: "Afrikaans + English", auto: m.size === d.recommended_model,
+      onDownload: function () { startFluisterDownload(m.size); },
+      onRemove: function () { confirmRemoveVoiceItem("Fluister " + m.size, m.repo, m.size_on_disk || m.approx_bytes); } });
+  });
+  if (d.swivuriso) {
+    var sv = d.swivuriso;
+    rows.push({ family: "swivuriso", key: "turbo", repo: sv.repo, present: sv.present, bytes: (sv.present && sv.size_on_disk) ? sv.size_on_disk : sv.approx_bytes,
+      label: "Swivuriso turbo (beta)", languages: "isiZulu, isiXhosa, Sesotho + 4",
+      onDownload: startSwivurisoDownload,
+      onRemove: function () { confirmRemoveVoiceItem("Swivuriso", sv.repo, sv.size_on_disk || sv.approx_bytes); } });
+  }
+  (d.models || []).slice().sort(function (a, b) { return rank(a.model) - rank(b.model); }).forEach(function (m) {
+    rows.push({ family: "whisper", key: m.model, present: m.present, bytes: (m.present && m.size_on_disk) ? m.size_on_disk : m.approx_bytes,
+      label: "Whisper " + m.model, languages: "Multilingual", auto: m.model === d.recommended_model,
+      gpuNote: m.model === "large-v3" && d.is_gpu === false,
+      onDownload: function () { startVoiceDownload(m.model); },
+      onRemove: function () { confirmRemoveVoice(m); } });
+  });
+  return rows;
+}
+function voiceModelTable() {
+  if (!S.voiceModels) return voiceDownloadPanel();
+  var d = S.voiceModels; var p = d.progress || {}; var downloading = p.state === "downloading";
+  var updates = {}; ((S.modelUpdates && S.modelUpdates.updates) || []).forEach(function (u) { updates[u.repo] = u; });
+  return el("div", { class: "model-table-wrap" }, el("table", { class: "model-table" }, [
+    el("thead", {}, el("tr", {}, ["Model", "Languages", "Size", "Status", "Action"].map(function (label) { return el("th", { text: label }); }))),
+    el("tbody", {}, voiceTableRows(d).map(function (row) {
+      var update = row.family === "fluister" ? updates[row.repo] : null;
+      // While a download runs, suppress the actions that would start a second one (Download and
+      // Update) on every row, and every action on the row that is actually downloading. Remove
+      // stays live for OTHER installed rows so the user can still free space; the backend refuses a
+      // delete while an engine is loaded and returns a friendly message on that path.
+      var isDownloadingRow = downloading && modelProgressMatches(p, row.family, row.key, row.repo);
+      var action = null;
+      if (isDownloadingRow) action = null;
+      else if (!downloading && row.present && update && update.update_available) action = el("button", { class: "btn ghost sm", onclick: function () { startFluisterUpdate(row.key); } }, "Update");
+      else if (row.present) action = el("button", { class: "btn ghost sm", onclick: row.onRemove }, "Remove");
+      else if (!downloading && !row.gpuNote) action = el("button", { class: "btn ghost sm", onclick: row.onDownload }, "Download");
+      return el("tr", { class: row.gpuNote ? "model-table-disabled" : "" }, [
+        el("td", { class: "model-table-name" }, [
+          el("span", { text: row.label }),
+          row.auto ? el("span", { class: "chip accent", title: "Auto selection: " + (d.recommended_tier || ""), text: "Auto" }) : null,
+          row.gpuNote ? el("span", { class: "model-table-note", text: "Needs a graphics card (GPU)" }) : null,
+        ]),
+        el("td", { text: row.languages }),
+        el("td", { class: "mono", text: fmtGB(row.bytes) }),
+        el("td", {}, voiceTableStatus(row, p, update)),
+        el("td", { class: "model-table-action" }, action),
+      ]);
     })),
-  ]);
+  ]));
 }
 function startFluisterDownload(size) {
   api.post("/api/voice-model/fluister-download", { size: size })
@@ -3460,55 +3715,44 @@ function startFluisterUpdate(size) {
     .then(function () { pollVoiceDownload(); render(); })
     .catch(function (e) { toast(e.message || "Could not start the update.", true); });
 }
-// The other South African languages (Swivuriso, by DSFSI / African Next Voices). One model covers
-// all seven; only High quality is available. We did not train it, so it carries its own name +
-// credit (MIT), and is beta. Same consistent card as the rest, with Download / Installed + Remove.
-function saLanguagesSection() {
-  var d = S.voiceModels; if (!d || !d.swivuriso) return null;
-  var sv = d.swivuriso; var p = d.progress || {}; var downloading = p.state === "downloading";
-  var isThis = downloading && p.kind === "swivuriso";
-  return el("div", { style: { marginBottom: "14px" } }, [
-    voiceModelSectionHeader("Other South African languages (Swivuriso)", el("span", { class: "chip", text: "Beta" }), null),
-    el("div", { style: { fontSize: "11.5px", color: "var(--ink-3)", marginBottom: "8px" } }, raw("isiZulu, isiXhosa, Sesotho, Setswana, Xitsonga, isiNdebele, Tshivenda")),
-    voiceModelRow({
-      title: "High quality",
-      sizeBytes: (sv.present && sv.size_on_disk) ? sv.size_on_disk : sv.approx_bytes,
-      present: sv.present,
-      description: "One model covers all seven South African languages, on auto-detect. Only High quality is available.",
-      note: "Model by DSFSI, African Next Voices. MIT licence.",
-      downloading: downloading, isThis: isThis, pct: vmPct(p), p: p,
-      onDownload: function () { startSwivurisoDownload(); },
-      onRemove: function () { confirmRemoveVoiceItem("South African languages (Swivuriso)", sv.repo, sv.size_on_disk || sv.approx_bytes); },
-    }),
-  ]);
-}
 function startSwivurisoDownload() {
   api.post("/api/voice-model/swivuriso-download")
     .then(function () { pollVoiceDownload(); render(); })
     .catch(function (e) { toast(e.message || "Could not start the download.", true); });
 }
-function voiceModelCard() {
-  return el("div", { class: "card settings-card" }, [
-    el("div", { class: "card-title section-label", text: "Transcription model, on this machine" }),
-    el("div", { class: "set-row", style: { display: "block" } }, [
-      el("div", { class: "t", style: { marginBottom: "4px" }, text: "Download or switch model" }),
-      el("div", { class: "s", style: { marginBottom: "10px" }, text: "Volksmond transcribes on this computer. Download the model that suits your machine; the recommended one is marked. Bigger is more accurate, but slower and larger to download. Remove any you no longer need to free space." }),
-      modelFamiliesNote(),
-      afrikaansModelSection(),
-      saLanguagesSection(),
-      voiceModelSectionHeader("General Whisper models", null, "For English and other languages."),
-      voiceDownloadPanel(true),
-    ]),
-    el("div", { class: "set-row" }, [
-      el("div", { class: "ic" }, icon("folder", 18)),
-      el("div", { class: "body" }, [el("div", { class: "t", text: "Where models are stored" }),
-        el("div", { class: "s mono", style: { fontSize: "11px", wordBreak: "break-all" } }, raw((S.appInfo && S.appInfo.voice_models_dir) || "")),
-        el("div", { class: "s", style: { fontSize: "11px", marginTop: "4px" }, text: "You can delete these folders by hand to free space if you ever need to." })]),
-      el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: function () { api.post("/api/open-folder?which=voice_models").catch(function () {}); } }, "Open")),
+function modelFamiliesDetails() {
+  return el("details", { class: "model-family-details" }, [
+    el("summary", { text: "About the three model families" }),
+    el("div", { class: "s" }, [
+      el("div", { text: "Fluister is tuned for Afrikaans and mixed Afrikaans and English." }),
+      el("div", { text: "Swivuriso covers seven other South African languages. Beta." }),
+      el("div", { text: "Whisper covers English and other languages." }),
     ]),
   ]);
 }
-/* ── NVIDIA CUDA (optional GPU acceleration) ─── shared by setup + settings ─── */
+function voiceModelCard() {
+  var d = S.voiceModels;
+  var anyFluisterInstalled = !!(d && (d.fluister || []).some(function (m) { return m.present; }));
+  var checking = S._checkingModelUpdates;
+  var checkBtn = (anyFluisterInstalled && !offlineBuild())
+    ? el("button", { class: "btn ghost sm", disabled: checking, onclick: checkModelUpdates }, checking ? "Checking" : "Check for updates")
+    : null;
+  return el("div", { class: "card settings-card" }, [
+    el("div", { class: "card-title section-label model-table-header" }, [
+      el("span", { text: "Transcription models, on this machine" }),
+      checkBtn,
+    ]),
+    voiceModelTable(),
+    modelFamiliesDetails(),
+    el("div", { class: "set-row model-storage-row" }, [
+      el("div", { class: "ic" }, icon("folder", 18)),
+      el("div", { class: "body" }, [el("div", { class: "t", text: "Where models are stored" }),
+        el("div", { class: "s mono", style: { fontSize: "11px", wordBreak: "break-all" } }, raw((S.appInfo && S.appInfo.voice_models_dir) || ""))]),
+      el("div", { class: "ctl" }, el("button", { class: "btn ghost sm", onclick: function () { api.post("/api/open-folder?which=voice_models").catch(function () {}); } }, "Open folder")),
+    ]),
+  ]);
+}
+/* NVIDIA CUDA (optional GPU acceleration), shared by setup and settings */
 var _cudaTimer = null;
 function loadCuda() {
   api.get("/api/cuda").then(function (d) { S.cuda = d; render(); }).catch(function () {});
@@ -3671,12 +3915,55 @@ function dataCard(st) {
         el("div", { class: "s", style: { fontSize: "11.5px", marginTop: "6px" }, text: "For maximum privacy, choose a folder that a cloud provider does not sync (OneDrive, Google Drive, Dropbox, and the like)." })]),
       el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: pickSaveFolder }, "Change")),
     ]),
+    recordDefaultRow(st),
+    recordingFormatRow(st),
     el("div", { class: "set-row" }, [
       el("div", { class: "ic" }, icon("lock", 18)),
-      el("div", { class: "body" }, [el("div", { class: "t", text: "Audio is off by default" }),
-        el("div", { class: "s", text: "Recording is only kept when you switch it on for a meeting. The privacy promise holds otherwise." })]),
-      el("div", { class: "ctl" }, el("span", { class: "chip ok" }, [icon("check", 12), "On by you only"])),
+      el("div", { class: "body" }, [el("div", { class: "t", text: "Nothing leaves this computer" }),
+        el("div", { class: "s", text: "Audio, transcripts, notes and summaries are written to your save folder and stay there. No account, no cloud, no third party ever receives them." })]),
+      el("div", { class: "ctl" }, el("span", { class: "chip ok" }, [icon("check", 12), "Local only"])),
     ]),
+    el("div", { class: "set-row" }, [
+      el("div", { class: "ic" }, icon("bug", 18)),
+      el("div", { class: "body" }, [el("div", { class: "t", text: "Save diagnostics" }),
+        el("div", { class: "s", text: "Writes a small zip to your Downloads folder with the app logs, your settings and what this computer is. Attach it when you report a problem. No transcripts, no notes, no audio, no licence key, and nothing is sent anywhere." })]),
+      el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: function () { saveDiagnostics(false); } }, "Save")),
+    ]),
+  ]);
+}
+// One-click switch for the recording default. On (an unset setting counts as on) every meeting
+// saves its audio, so a transcript that goes wrong can be redone from the file; off means no
+// session records unless you switch it on for that meeting. Flipping it also moves the
+// pre-meeting toggle, so Settings and the next meeting always agree.
+function recordDefaultRow(st) {
+  var on = st.record_sessions !== false;
+  return el("div", { class: "set-row" }, [
+    el("div", { class: "ic" }, icon("mic", 18)),
+    el("div", { class: "body" }, [
+      el("div", { class: "t", text: "Record the audio of every meeting" }),
+      el("div", { class: "s", text: "On, so that a transcript that goes wrong can be redone from the audio afterwards. The recording stays on this computer, the live screen shows you while it runs, and you can delete it with one click when the meeting ends." }),
+    ]),
+    el("div", { class: "ctl" }, toggleEl(on, function () {
+      S.form.record = !on;
+      saveSettings({ record_sessions: !on });
+    })),
+  ]);
+}
+function recordingFormatRow(st) {
+  var options = [
+    ["flac", "Lossless (FLAC), default: about 115 MB per hour"],
+    ["opus", "Compact (Opus): about 15 MB per hour"],
+    ["wav", "Uncompressed (WAV): about 230 MB per hour"],
+  ];
+  return el("div", { class: "set-row" }, [
+    el("div", { class: "ic" }, icon("disk", 18)),
+    el("div", { class: "body" }, [
+      el("div", { class: "t", text: "Recording format" }),
+      el("div", { class: "s", text: "Changes take effect on the next recording, not partway through a file." }),
+    ]),
+    el("div", { class: "ctl" }, selectEl(options, st.recording_format || "flac", function (v) {
+      saveSettings({ recording_format: v });
+    })),
   ]);
 }
 async function pickSaveFolder() {
@@ -4228,6 +4515,10 @@ async function boot() {
     S.form.engine = S.settings.engine || "auto";
     S.form.aecLive = !!S.settings.aec_live;
     S.form.agcLive = S.settings.agc_live !== false;   // default ON (an old settings file has no key)
+    // Recording is ON unless the user switched it off in Settings. Same "unset means on" read as
+    // agcLive: a settings file that has never carried record_sessions has never chosen, so it
+    // records, and only an explicit false turns the pre-meeting toggle off.
+    S.form.record = S.settings.record_sessions !== false;
     S.form.aec = !!S.settings.aec;
   }
   if (S.devices) {
@@ -4282,6 +4573,7 @@ function adoptRunning(status) {
   S.live.aecAvailable = !!status.aec_live_available;
   S.live.aecActive = !!status.aec_live_active;
   S.live.sysState = status.sys_state || null;   // system-audio capture health at reload time
+  S.live.recordingFormat = status.recording_format || ((S.settings && S.settings.recording_format) || "flac");
   // /api/status does not carry the recording stem; the server derives it from the transcript
   // path (output_path minus ".md"), so reconstruct it for the record-only finish flow.
   S.live.audioStem = (status.recording_started && status.output_path) ? status.output_path.replace(/\.md$/, "") : null;
@@ -4291,6 +4583,8 @@ function adoptRunning(status) {
   S.live.silenceNudge = status.silence_nudge || null;   // a nudge that fired before this reload
   S.live.struggleNudge = status.struggle_nudge || null; // same, for a downgrade that fired before this reload
   S.live.recordingStarted = !!status.recording_started; // latched: recording is or was active this session
+  adoptMicGate(status, true);                           // silent: a valve hint from before the reload is history
+  S.live.downgraded = !!status.downgraded;              // latched: the engine dropped to a smaller model before this reload
   if (status.source_kind !== "file") { startLevels(); startSilencePoll(); }
   if (status.source_kind === "file") {
     S.route = "importing";
@@ -4328,9 +4622,11 @@ function adoptRunning(status) {
         }
         // Record-only ended: mirror stopRecordOnly's completion.
         var stem = S.live.audioStem;
+        var recordingFormat = S.live.recordingFormat;
         teardownLive();
         S.live.running = false;
         S.finish.recordingStem = stem;
+        S.finish.recordingFormat = recordingFormat || "flac";
         S.finish.outputPath = S.live.outputPath;
         S.finish.sinkError = (st && st.sink_error) || null;
         if (S.finish.sinkError) toast(S.finish.sinkError, true);

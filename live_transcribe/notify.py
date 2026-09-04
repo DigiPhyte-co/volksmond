@@ -43,6 +43,8 @@ import sys
 import threading
 from collections import deque
 
+from . import edition
+
 # WM_APP is 0x8000. WM_APP+1 is our "drain the queue" message, posted by show() and
 # handled on the pump thread; WM_APP+2 is the tray icon's uCallbackMessage, through
 # which the shell reports clicks on the icon and on the balloon.
@@ -65,7 +67,11 @@ NIN_BALLOONTIMEOUT = 1028
 NIN_BALLOONUSERCLICK = 1029
 
 HWND_MESSAGE = -3          # parent for a message-only window: no paint, no taskbar, no focus
-TOOLTIP = "Volksmond"      # tray icon hover text
+TOOLTIP = edition.DISPLAY_NAME   # tray icon hover text: "Volksmond Fast Track" on the direct
+                                 # download, plain "Volksmond" on the Store, offline and mac
+                                 # builds. The whole point of the Fast Track name is that two
+                                 # installs on one machine can be told apart, and the tray icon
+                                 # is one of the places a user looks.
 _ICON_ID = 1
 _INIT_TIMEOUT = 5.0        # seconds to wait for the pump thread to create its window
 
@@ -316,14 +322,25 @@ def focus_app() -> bool:
 # --- the real backend ------------------------------------------------------
 
 def _icon_path():
-    """Absolute path to volksmond.ico, or None. Frozen builds carry it next to the app
-    (sys._MEIPASS); a source run has it in the project root beside live_transcribe/."""
+    """Absolute path to this edition's .ico, or None. Frozen builds carry it next to the app
+    (sys._MEIPASS); a source run has it in the project root beside live_transcribe/.
+
+    The direct-download edition wears the inverted Fast Track icon and the others wear the
+    original (live_transcribe/edition.py), so ask which one before falling back to the original:
+    the tray icon must match the taskbar icon, or a notification would look like the other
+    edition's. The fallback also covers an older bundle that carries only volksmond.ico."""
     from pathlib import Path
+
+    from . import edition
+    names = [edition.ICON_FILE]
+    if "volksmond.ico" not in names:
+        names.append("volksmond.ico")
     candidates = []
     meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        candidates.append(Path(meipass) / "volksmond.ico")
-    candidates.append(Path(__file__).resolve().parent.parent / "volksmond.ico")
+    for name in names:
+        if meipass:
+            candidates.append(Path(meipass) / name)
+        candidates.append(Path(__file__).resolve().parent.parent / name)
     for p in candidates:
         try:
             if p.is_file():

@@ -4,7 +4,8 @@ Singleton-state design: only one session at a time (live or file). The server
 holds the engine, audio capture, recorder, and sinks; HTTP endpoints start/stop
 the session and stream segments to the browser via Server-Sent Events.
 
-A session can transcribe live, record live (off by default, POPIA), do both, or
+A session can transcribe live, record live (ON by default, see config
+record_sessions and _record_default), do both, or
 transcribe an existing file. Transcripts and recordings save to the user's chosen
 save_location (validated; falls back to a per-platform default folder, see
 _sessions_dir).
@@ -139,7 +140,7 @@ class _State:
         self.recording: bool = False
         # Latch: has recording EVER been active this session (a start-time recording OR a mid-session
         # record-from-here)? Stays True after a what="recording" stop, so a second record-from-here
-        # cannot reuse the session stem and TRUNCATE the first <stem>.wav on its close. Surfaced as
+        # cannot reuse the session stem and TRUNCATE the first recording on its close. Surfaced as
         # /api/status "recording_started"; cleared only by reset() for a fresh session.
         self.recording_started: bool = False
         self.record_raw_mic: bool = False   # live AEC + recording: recorder takes the raw MIC_RAW,
@@ -175,6 +176,12 @@ class _State:
         # reset() clears them.
         self.struggle_nudge: Optional[dict] = None
         self.struggle_notified: bool = False
+        # Latch: did the engine drop to a smaller model at any point this session? Set on the FIRST
+        # downgrade and never cleared while the session lives, independent of the nudge (a user who
+        # switched the banner off still degraded, and still deserves the offer). Reported by
+        # /api/status and by the stop response, which is what the finish screen reads to offer a
+        # re-transcribe from the recording. Session-scoped, so reset() clears it.
+        self.downgraded: bool = False
         # t0-capture: capture (and recording, if on) start the instant Begin is clicked, while the
         # transcription model loads on a background thread. `preparing` is True from Begin until that
         # engine is ready (or errors); `prepare_error` carries a short model-load failure message for
@@ -236,6 +243,7 @@ class _State:
         self.silence_nudge = None
         self.struggle_nudge = None
         self.struggle_notified = False
+        self.downgraded = False
         # t0-capture: clear the preparing flag, any load error, and drop the pending-audio hold so a
         # never-loaded model's buffer cannot outlive its session (and its RAM is freed at finalise).
         self.preparing = False
@@ -298,7 +306,23 @@ PREPARE_DOWNLOAD_STALL_SECONDS = 60
 # allow a much longer grace before declaring a stall; a genuine mid-download stall (bytes far below
 # total, flat) still fails at PREPARE_DOWNLOAD_STALL_SECONDS.
 PREPARE_VERIFY_GRACE_SECONDS = 180
-PREPARE_LOAD_TIMEOUT_SECONDS = 120
+# Load budget, BY DEVICE (WP-1). The slow part of a load is not the constructor, it is the first
+# inference: CTranslate2 materialises the weights lazily, so the real cost lands in the warm-up done
+# inside the model build lock. Measured on a Ryzen 7 7700X: medium ~35 s, small ~16 s, base ~5 s. A
+# laptop CPU is 2 to 4x slower, so a first medium load there is 70 to 140 s and a whole cold start
+# (disk read on a slow SSD, antivirus, a busy machine) can be minutes. A CUDA or Metal load is a few
+# seconds, so a long budget there would only hide a real hang. One flat 120 s therefore declared
+# failure on a perfectly healthy CPU laptop that just needed another two minutes.
+#
+# The budget is the point at which we GIVE UP, not the point at which we tell the user it is slow:
+# while the load thread is alive the prepare state stays "loading" with an elapsed counter, and on
+# CPU a soft hint appears after PREPARE_LOAD_SLOW_HINT_SECONDS. See load_budget_seconds().
+PREPARE_LOAD_TIMEOUT_SECONDS = 120        # CUDA / Metal (and the historical default)
+PREPARE_LOAD_TIMEOUT_SECONDS_CPU = 600    # CPU: generous, because a healthy first load is minutes
+PREPARE_LOAD_SLOW_HINT_SECONDS = 60       # CPU only: "first load can take a few minutes" hint
+# How often the load watchdog wakes to publish the elapsed counter into STATE.prepare. The UI polls
+# /api/status about every 1.5 s, so one second is fine and costs one short lock hold per tick.
+_PREPARE_LOAD_POLL_SECONDS = 1.0
 # A DIFFERENT model may already own the single global download slot (a Settings download). We wait for
 # it rather than fight, but only for a bounded time: an indefinitely-occupied slot would starve this
 # session forever (another "loads indefinitely"), so past this we surface a distinct retryable error and
@@ -306,6 +330,24 @@ PREPARE_LOAD_TIMEOUT_SECONDS = 120
 PREPARE_FOREIGN_SLOT_TIMEOUT_SECONDS = 180
 # How often the background builder polls voicedl.progress() into STATE.prepare while downloading.
 _PREPARE_POLL_SECONDS = 0.5
+
+
+def load_device_for(tier):
+    """The backend a tier loads on: "cpu", "cuda" or "mlx". Unknown tiers are treated as CPU, which
+    is the conservative answer (the generous budget, and pre-warm skips nothing it should warm)."""
+    try:
+        return (transcribe.TIER_CONFIG.get(tier) or {}).get("device") or "cpu"
+    except Exception:
+        return "cpu"
+
+
+def load_budget_seconds(tier=None, device=None):
+    """How long the model LOAD may run before it is called a failure, for this tier/device.
+
+    Pass a tier (the usual case) or a device directly. One function so the CPU/GPU split lives in
+    exactly one place and the numbers are testable without building a model."""
+    dev = device or load_device_for(tier)
+    return PREPARE_LOAD_TIMEOUT_SECONDS_CPU if dev == "cpu" else PREPARE_LOAD_TIMEOUT_SECONDS
 
 # Human-readable quality label per model size, mirroring the picker's four tiers (voicedl._OFFER):
 # Fast=small, Balanced=medium, High quality=large-v3-turbo, Best=large-v3. base/tiny are internal
@@ -344,6 +386,62 @@ class _PendingAudio:
         # finalise_if_empty). While it is >0, cap enforcement drops the NEWEST (right) chunk, never the
         # protected front; while it is 0 (the common case) append() drops the OLDEST exactly as before.
         self._protected = 0
+        # Span of audio EVICTED at the cap, so a drop can be admitted in the transcript instead of
+        # only in the console log (WP-1 no-silent-loss). Earliest t_start and latest chunk end seen
+        # across every eviction; the SPAN is the honest number because MIC and SYS overlap in time.
+        self._dropped_lo = None
+        self._dropped_hi = None
+
+    def _note_dropped(self, audio, t_start):
+        """Record the time span of one evicted chunk (called under the lock)."""
+        try:
+            dur = len(audio) / 16000.0
+        except TypeError:
+            dur = 0.0
+        try:
+            t0 = float(t_start)
+        except (TypeError, ValueError):
+            return
+        self._dropped_lo = t0 if self._dropped_lo is None else min(self._dropped_lo, t0)
+        hi = t0 + dur
+        self._dropped_hi = hi if self._dropped_hi is None else max(self._dropped_hi, hi)
+
+    def dropped_span(self):
+        """(t_start, seconds) of the audio evicted at the cap, or (None, 0.0) if nothing was."""
+        with self._lock:
+            if self._dropped_lo is None:
+                return None, 0.0
+            return self._dropped_lo, max(0.0, (self._dropped_hi or self._dropped_lo) - self._dropped_lo)
+
+    def clear_dropped(self):
+        """Forget the evicted span once it has been reported, so a later build (a retry after a
+        catch-up failure reuses this same buffer) cannot write the same gap line twice."""
+        with self._lock:
+            self._dropped_lo = None
+            self._dropped_hi = None
+
+    def held_span(self):
+        """(t_start, seconds) covered by the audio still held, or (None, 0.0) when empty. Used to
+        state plainly in the transcript how much was never transcribed live when a session is
+        stopped before the model ever finished loading."""
+        with self._lock:
+            if not self._buf:
+                return None, 0.0
+            lo = hi = None
+            for _s, audio, t_start in self._buf:
+                try:
+                    t0 = float(t_start)
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    dur = len(audio) / 16000.0
+                except TypeError:
+                    dur = 0.0
+                lo = t0 if lo is None else min(lo, t0)
+                hi = (t0 + dur) if hi is None else max(hi, t0 + dur)
+            if lo is None:
+                return None, 0.0
+            return lo, max(0.0, (hi or lo) - lo)
 
     def _warn_once(self, newest):
         if self._warned:
@@ -366,6 +464,7 @@ class _PendingAudio:
                     self._samples -= len(new_audio)
                 except TypeError:
                     pass
+                self._note_dropped(new_audio, _t)
                 self._warn_once(newest=True)
         else:
             while self._samples > self._max and len(self._buf) > 1:
@@ -374,6 +473,7 @@ class _PendingAudio:
                     self._samples -= len(old_audio)
                 except TypeError:
                     pass
+                self._note_dropped(old_audio, _t)
                 self._warn_once(newest=False)
 
     def append(self, source, audio, t_start):
@@ -458,6 +558,128 @@ def _engine_alive(engine):
         return bool(engine.is_alive())
     except Exception:
         return True
+
+
+# --- one model load in flight per build key (WP-1) --------------------------------------------
+# A prepare that finds a load already running for its exact build key ATTACHES to it: same thread,
+# same result. Before this, a Retry after a load timeout started a SECOND Engine, which could only
+# sit on transcribe._BUILD_LOCK until the first one finished and then take the cache hit, so the
+# user paid the whole first load again in wall-clock time before anything was transcribed. An
+# already-FINISHED load whose engine nobody claimed is also attachable, so a Retry clicked after a
+# slow load quietly completed gets that engine instantly instead of building another.
+# A FAILED load is never attachable: Retry must genuinely try again.
+_LOAD_LOCK = threading.Lock()
+_LOAD_INFLIGHT = {}     # key -> {"thread": Thread, "result": dict, "started": monotonic}
+
+
+def _load_in_flight(key):
+    """Is a load for `key` still running, or finished with an engine nobody has claimed? Small,
+    read-only view of the registry for tests and callers that only want the fact."""
+    with _LOAD_LOCK:
+        rec = _LOAD_INFLIGHT.get(key)
+        if rec is None:
+            return False
+        return bool(rec["thread"].is_alive() or "engine" in rec["result"])
+
+
+def _start_or_attach_load(key, make_engine):
+    """Return (thread, result, started_at, attached) for the model load of `key`.
+
+    Starts a load only when there is not already a usable one: a live thread, or a finished one
+    whose engine is still unclaimed. `result` is filled with "engine" or "error" by the thread.
+    `started_at` is the ORIGINAL start, so an attached caller reports the true elapsed time."""
+    with _LOAD_LOCK:
+        rec = _LOAD_INFLIGHT.get(key)
+        if rec is not None and (rec["thread"].is_alive() or "engine" in rec["result"]):
+            return rec["thread"], rec["result"], rec["started"], True
+        result = {}
+
+        def _load():
+            try:
+                result["engine"] = make_engine()
+            except Exception as e:   # surfaced as prepare_error by the caller; never crashes the app
+                result["error"] = e
+
+        t = threading.Thread(target=_load, daemon=True, name="engine-load")
+        _LOAD_INFLIGHT[key] = {"thread": t, "result": result, "started": time.monotonic()}
+        t.start()
+        return t, result, _LOAD_INFLIGHT[key]["started"], False
+
+
+def _clear_load(key, result):
+    """Forget the in-flight record for `key`, but only if it is still the one that produced
+    `result` (identity-guarded, so a newer load started meanwhile is never dropped)."""
+    with _LOAD_LOCK:
+        rec = _LOAD_INFLIGHT.get(key)
+        if rec is not None and rec["result"] is result:
+            _LOAD_INFLIGHT.pop(key, None)
+
+
+def _reset_loads():
+    """Forget every in-flight load record. For tests, which reuse one process and must not let one
+    case's abandoned fake engine be attached to by the next."""
+    with _LOAD_LOCK:
+        _LOAD_INFLIGHT.clear()
+
+
+def _fmt_gap(seconds):
+    """A duration in the plain style the app uses elsewhere: "47 s", "10 min", "5 min 27 s"."""
+    s = int(round(max(0.0, float(seconds))))
+    if s < 60:
+        return f"{s} s"
+    if s % 60 == 0:
+        return f"{s // 60} min"
+    return f"{s // 60} min {s % 60} s"
+
+
+def _note_untranscribed(md_sink, browser_sink, t_start, seconds, recording):
+    """Write ONE honest line into the transcript where live transcription did not happen.
+
+    Silence in a transcript reads as silence in the room, which is the one thing the app must never
+    imply. Every path that gives up on held audio (a stop before the model ever loaded, an eviction
+    at the pending-buffer cap) calls this, so a gap is always stated rather than left blank. Written
+    straight to the sinks in the same shape and voice as the engine's own notices (see
+    transcribe._emit_notice); the recorder is untouched, so when recording is on the audio itself is
+    still on disk and can be transcribed afterwards."""
+    if seconds is None or seconds < 1.0:
+        return   # sub-second rounding noise is not a gap worth a line
+    tail = ("the recording still has them" if recording
+            else "there is no recording of them")
+    seg = transcribe.Segment(
+        source="SYS", t_start=float(t_start or 0.0), t_end=float(t_start or 0.0),
+        text=f"[engine: {_fmt_gap(seconds)} before the model loaded were not transcribed live, {tail}]")
+    for sink in (md_sink, browser_sink):
+        if sink is None:
+            continue
+        try:
+            sink(seg)
+        except Exception as e:
+            print(f"[start] could not record the untranscribed-audio notice: {e}", flush=True)
+
+
+def _mark_abandoned_backlog(md_sink, browser_sink, pb, recording):
+    """The pending buffer is about to be thrown away with no engine to replay it into (a Stop while
+    the model was still loading). Say so in the transcript instead of leaving a silent hole."""
+    if pb is None:
+        return
+    t_start, seconds = pb.held_span()
+    if seconds <= 0:
+        return
+    print(f"[start] {_fmt_gap(seconds)} of held audio was never transcribed (stopped before the "
+          f"model finished loading); noting the gap in the transcript.", flush=True)
+    _note_untranscribed(md_sink, browser_sink, t_start, seconds, recording)
+
+
+def _mark_dropped_backlog(md_sink, browser_sink, pb, recording):
+    """Some held audio was evicted at the pending-buffer cap while the model loaded. The replay can
+    never bring it back, so state the gap once, at the point the engine goes live."""
+    if pb is None:
+        return
+    t_start, seconds = pb.dropped_span()
+    if seconds <= 0:
+        return
+    pb.clear_dropped()      # reported once, never twice (a retry reuses this same buffer)
+    _note_untranscribed(md_sink, browser_sink, t_start, seconds, recording)
 
 
 def _drain_pending_into_engine(engine, pb):
@@ -765,7 +987,15 @@ def _on_downgrade(engine, old_size, new_size):
     the banner's new_size in place (keeping the original old_size, the full-quality model the
     session began degrading from) but never re-fires the toast, and a banner the user has already
     dismissed is not re-raised. `recording` is captured at emit time (STATE.recording), so the
-    frontend can drop the record offer when the session is already recording."""
+    frontend can drop the record offer when the session is already recording.
+
+    The STATE.downgraded latch is set FIRST, before the nudge gate: turning the banner off silences
+    the surfacing, not the fact, and the finish screen's "re-transcribe from the recording" offer
+    keys off the fact. Same identity guard as the nudge, so a stale engine cannot mark the current
+    session as degraded."""
+    with STATE.lock:
+        if not STATE.stopping and STATE.engine is engine:
+            STATE.downgraded = True
     if not _struggle_nudge_on():
         return None
     published = None
@@ -785,6 +1015,13 @@ def _on_downgrade(engine, old_size, new_size):
             "old_size": prior["old_size"] if prior else old_size,
             "new_size": new_size,
             "recording": STATE.recording,
+            # Read off the engine rather than passed in, so the callback signature stays as it has
+            # always been. `indicative` is true once the ladder is below `small`: still the right
+            # model family, but small enough that the live text should be read as a rough guide.
+            # `shed_seconds` is the audio the engine dropped to catch up (0 unless it had to);
+            # old_size == new_size means THIS event was a shed, not a model change.
+            "indicative": bool(getattr(engine, "indicative", False)),
+            "shed_seconds": round(float(getattr(engine, "shed_seconds", 0.0) or 0.0)),
         }
         published = STATE.struggle_nudge
         fire_toast = not STATE.struggle_notified
@@ -803,6 +1040,24 @@ def _on_downgrade(engine, old_size, new_size):
     return published
 
 
+def _record_default() -> bool:
+    """Whether a live session saves its audio when the client does not say either way.
+
+    ON unless the user has explicitly switched recording off. The distinction that matters is
+    "unset" versus "false": config.load() merges the saved file over DEFAULTS, so an install whose
+    settings.json has never carried a "record_sessions" key reads True (it has never chosen, so it
+    records), while a user who turned it off has False on disk and keeps it off. A settings file we
+    cannot read at all is treated as unset, for the same reason: a meeting is easier to delete than
+    to recover.
+
+    The recording is written to the save location on this computer and never leaves it.
+    """
+    try:
+        return config.load().get("record_sessions", True) is not False
+    except Exception:
+        return True
+
+
 class StartRequest(BaseModel):
     topic: str = ""
     tier: str = "auto"            # "auto" | "gpu" | "cpu-strong" | "cpu-mid"
@@ -815,7 +1070,8 @@ class StartRequest(BaseModel):
     context_override: Optional[str] = None
     mic_device: Optional[str] = None
     loopback_device: Optional[str] = None
-    record: bool = False          # also save the audio (POPIA: needs consent)
+    record: Optional[bool] = None  # save the audio too. None -> the record_sessions setting
+                                   # (_record_default, ON unless the user switched it off).
     transcribe: bool = True       # False == record-only (for machines too slow to keep up live)
     aec_live: Optional[bool] = None  # live echo cancellation (None -> settings default)
     agc_live: Optional[bool] = None  # live mic auto-gain (None -> settings default)
@@ -939,10 +1195,15 @@ def _build_output_path(topic: str) -> Path:
 
 @app.get("/", response_class=HTMLResponse)
 def index():
+    from .. import edition
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     # Hand the page the CSRF token so app.js can echo it on unsafe requests.
     tag = f'<meta name="vm-csrf" content="{CSRF_TOKEN}" />'
-    return html.replace("</head>", f"  {tag}\n</head>", 1)
+    html = html.replace("</head>", f"  {tag}\n</head>", 1)
+    # Then this edition's identity: the direct-download build gets the "Volksmond Fast Track"
+    # tab title and the inverted tab icon, so it is distinguishable from a Store install on the
+    # same machine. Every other edition gets the page back unchanged.
+    return edition.brand_page(html)
 
 
 @app.get("/api/status")
@@ -978,8 +1239,17 @@ def status():
             "struggle_nudge": STATE.struggle_nudge,
             # True iff recording is, or has ever been, active this session (start-time or a
             # mid-session record-from-here). The live screen and finish handoff key off it, and once
-            # true /api/record-from-here refuses (re-recording the same stem would truncate the WAV).
+            # true /api/record-from-here refuses (re-recording the same stem would truncate the file).
             "recording_started": STATE.recording_started,
+            "recording_format": (
+                STATE.recorder.recording_format if STATE.recorder is not None
+                else (_recording_format_for_stem(STATE.output_path.stem)
+                      if STATE.recording_started and STATE.output_path is not None else None)
+            ),
+            # True once the engine has dropped to a smaller model this session (latched,
+            # independent of whether the struggle banner is switched on). The finish screen uses
+            # it to offer a re-transcribe of the recording at full quality.
+            "downgraded": STATE.downgraded,
             # t0-capture: transcription-model readiness. Capture (and recording, if on) are already
             # live from Begin; while the model loads on the background thread the UI shows a
             # "preparing" state and polls this. model_ready is the AUTHORITATIVE flag (set at phase-1
@@ -1006,6 +1276,16 @@ def status():
             # expose this yet (or a mock in tests) reports as 'active' so the UI never raises a
             # false warning. The live screen banners only on the last two values.
             resp["sys_state"] = getattr(STATE.capture, "sys_state", "active")
+        # Live mic-gate truth for the in-meeting toggle and its counter, on the same terms as AEC:
+        # the ENGINE'S own state, pulled fresh, never the stored setting. Shape:
+        # {on, mode: normal|gentle|off, skipped, decoded, hint, hint_seq}. Absent (null) until the
+        # engine exists, which is what the UI keys off to hide the control.
+        eng = _gate_engine()
+        if eng is not None:
+            try:
+                resp["mic_gate"] = eng.mic_gate_state()
+            except Exception:
+                pass
         if STATE.stopping and STATE.engine is not None:
             resp["pending"] = STATE.engine.pending()
         return resp
@@ -1164,7 +1444,7 @@ def silence_nudge_action(req: SilenceNudgeRequest):
 def record_from_here():
     """Start recording audio partway through a running live transcription ("I forgot to record", or
     the struggle nudge's offer). Captures IDENTICALLY to a start-time recording: the AEC-cleaned MIC
-    + SYS folded to one L/R stereo <stem>.wav, reusing the session stem so it lands as a normal
+    + SYS folded to one L/R stereo recording, reusing the session stem so it lands as a normal
     History row and re-transcribes unchanged.
 
     Records strictly from the click on: the recorder is given the session-clock time of THIS call as
@@ -1185,7 +1465,7 @@ def record_from_here():
             raise HTTPException(status_code=409, detail="This session is already recording.")
         if STATE.recording_started:
             # Recorded earlier this session and stopped: a new recorder on the same stem would
-            # truncate the finalised <stem>.wav on close, losing the first take. Record once.
+            # truncate the finalised recording on close, losing the first take. Record once.
             raise HTTPException(status_code=409, detail="This session has already recorded audio.")
         cap = STATE.capture
         t0 = getattr(cap, "_t0", None)
@@ -1200,7 +1480,8 @@ def record_from_here():
         # and both channels start at 0 aligned to this shared anchor.
         anchor = time.monotonic() - t0
         stem = STATE.output_path.with_suffix("")
-        rec = sinks.AudioRecorder(stem, anchor=anchor)
+        rec = sinks.AudioRecorder(stem, anchor=anchor,
+                                  recording_format=config.load().get("recording_format", "flac"))
         # Attach order matters: _feed reads STATE.recorder / STATE.recording LOCK-FREE every chunk,
         # so publish the recorder BEFORE the flag; the next captured chunk of each source then
         # begins writing. Never the reverse (recording=True with recorder=None). Stop closes this
@@ -1212,8 +1493,90 @@ def record_from_here():
         # the fact that we are now recording (the frontend also drops it optimistically).
         STATE.struggle_nudge = None
         audio_stem = str(stem)
+        recording_format = rec.recording_format
     # audio_stem must reach the client: the finish-screen re-transcribe handoff keys off it.
-    return {"recording": True, "audio_stem": audio_stem}
+    # recording_format lets the client label/name the recording the same way a start-time recording
+    # does (app.js reads resp.recording_format straight after the POST).
+    return {"recording": True, "audio_stem": audio_stem, "recording_format": recording_format}
+
+
+def _recording_candidates(stem: str, include_channels=False):
+    """Allowed recording paths for a validated session stem, newest formats first."""
+    _validate_session_filename(stem + ".md")
+    root = _sessions_dir()
+    paths = [root / (stem + ext) for ext in sinks.RECORDING_EXTENSIONS]
+    if include_channels:
+        paths += [root / f"{stem}-{source}{ext}"
+                  for ext in sinks.RECORDING_EXTENSIONS for source in ("MIC", "SYS")]
+        paths.append(root / f"{stem}-MIXED.wav")  # legacy v1.2 to v1.6 recording
+    return paths
+
+
+def _recording_path(stem: str) -> Path:
+    """Return an existing recording in FLAC, Opus or WAV, or the FLAC default path.
+
+    Validation happens before any path is built, so a client-provided stem cannot escape
+    the sessions folder. Existing WAV recordings remain discoverable after the default
+    changes, and runtime WAV fallback files are found without trusting the saved setting.
+    """
+    candidates = _recording_candidates(stem)
+    return next((path for path in candidates if path.is_file()), candidates[0])
+
+
+def _recording_format_for_stem(stem: str) -> str:
+    return sinks.recording_format_from_suffix(_recording_path(stem).suffix)
+
+
+class RecordingRequest(BaseModel):
+    stem: str
+
+
+@app.get("/api/recording")
+def recording_info(stem: str):
+    """Where a session's recording is and how big it is, for the finish screen's keep-or-delete
+    choice. Reads the file's size only, never its audio. exists=False once it has been deleted,
+    or when the session never recorded."""
+    p = _recording_path(stem)
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return {"stem": stem, "exists": False, "path": str(p), "name": p.name, "bytes": 0,
+                "format": sinks.recording_format_from_suffix(p.suffix)}
+    return {"stem": stem, "exists": True, "path": str(p), "name": p.name, "bytes": size,
+            "format": sinks.recording_format_from_suffix(p.suffix)}
+
+
+@app.post("/api/recording/delete")
+def recording_delete(req: RecordingRequest):
+    """Delete a session's recording from this computer, now.
+
+    Recording is on by default, so the promise that pays for it is that one click at the end of a
+    meeting really removes the audio. Deleted means gone from disk, not hidden and not moved to a
+    recycle bin we control. The transcript, the notes and any summary are untouched; only the audio
+    goes. The per-source -MIC/-SYS/-MIXED channels are removed too: they only survive when the
+    stereo fold failed, and leaving them behind would make "deleted" a lie.
+
+    A failed unlink is a 500, deliberately: the user must never be told the audio is gone while it
+    is still on disk. 409 while that same session is still running (its recorder holds the file)."""
+    p = _recording_path(req.stem)
+    with STATE.lock:
+        if (STATE.running and STATE.output_path is not None
+                and STATE.output_path.stem == p.stem):
+            raise HTTPException(status_code=409,
+                                detail="That session is still running. Stop it first, then delete the recording.")
+    freed, removed = 0, []
+    for cand in _recording_candidates(req.stem, include_channels=True):
+        try:
+            size = cand.stat().st_size
+        except OSError:
+            continue   # not there: nothing to delete
+        try:
+            cand.unlink()
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Could not delete {cand.name}: {e}")
+        freed += size
+        removed.append(cand.name)
+    return {"stem": req.stem, "deleted": bool(removed), "removed": removed, "freed": freed}
 
 
 class StruggleNudgeRequest(BaseModel):
@@ -1273,6 +1636,60 @@ def set_aec_live(req: AecLiveRequest):
         persisted = False
         print(f"[aec-live] toggle applied but the setting could not be saved: {e}", flush=True)
     return {"aec_live_available": avail, "aec_live_active": active, "persisted": persisted}
+
+
+def _apply_mic_gate_setting(engine):
+    """Start a freshly built engine from the user's saved mic-gate preference (default on).
+
+    The env switch stays the escape hatch a support session can reach for, so it WINS: set
+    SA_LIVE_MIC_SPEECH_GATE at all and the stored setting is left alone. Never fatal - a settings
+    file that cannot be read must not cost anyone their meeting."""
+    if os.environ.get("SA_LIVE_MIC_SPEECH_GATE") is not None:
+        return
+    try:
+        engine.set_mic_gate(bool(config.load().get("mic_gate", True)))
+    except Exception as e:
+        print(f"[mic-gate] could not apply the saved setting, leaving the default: {e}", flush=True)
+
+
+def _gate_engine():
+    """The engine whose mic gate the UI is talking about, or None.
+
+    STATE.engine is only published after the t0-capture backlog has drained, so during catch-up the
+    live engine is the private STATE.preparing_engine. Both are the same object in the end; taking
+    whichever exists is what makes the toggle work from the moment transcription goes live rather
+    than minutes later. No lock: this is a single attribute read, and every caller holds STATE.lock
+    or does not need to."""
+    return STATE.engine if STATE.engine is not None else STATE.preparing_engine
+
+
+class MicGateRequest(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/mic-gate")
+def set_mic_gate(req: MicGateRequest):
+    """Turn the MIC speech gate on or off DURING a session, without ending it.
+
+    The gate is a DECODE filter that skips microphone chunks holding no speech evidence, so both
+    values are a per-chunk flip on the transcription worker: no capture change, no audio gap,
+    effective on the next chunk. It never touches the recording (the recorder is fed ahead of the
+    engine queue) and it never touches the far end. The choice is persisted as the new default the
+    same way the live AEC toggle persists its own. Returns the CONFIRMED engine state, which the UI
+    renders; a failed save is reported in `persisted` rather than failing the request."""
+    with STATE.lock:
+        eng = _gate_engine()
+        if not (STATE.running and not STATE.stopping and eng is not None):
+            raise HTTPException(status_code=409, detail="The mic gate can only be changed while a meeting is being transcribed.")
+        state = eng.set_mic_gate(bool(req.enabled))
+    persisted = True
+    try:
+        config.update({"mic_gate": bool(req.enabled)})
+    except Exception as e:
+        persisted = False
+        print(f"[mic-gate] toggle applied but the setting could not be saved: {e}", flush=True)
+    state["persisted"] = persisted
+    return state
 
 
 class ReconfigureRequest(BaseModel):
@@ -1428,6 +1845,64 @@ def warm_up(req: WarmUpRequest):
     # (e.g. Afrikaans falling back to a downloaded Whisper), not the language-default family.
     tier, engine_override = resolve_tier_engine(quality, device, language, engine_pref)
     return transcribe.warm_up_async(tier, language, engine_override or engine_pref)
+
+
+def prewarm_at_startup():
+    """Warm the CPU model the next Begin will load, at APP START rather than at the first Begin.
+
+    On CPU the load is minutes and it is otherwise paid in full, with the meeting already running, at
+    the worst possible moment. Starting it when the app opens means the first session usually finds a
+    warm model, and when it does not it is at least already part-way through.
+
+    Deliberately narrow:
+      * CPU tiers only. A CUDA or Metal load is a few seconds, so there is nothing to hide there.
+      * Only a model already on disk. This never downloads anything: no network at app start.
+      * The tier is resolved exactly as Begin resolves it, from saved settings, so an explicit model
+        choice is honoured and never overridden by a guess.
+      * A no-op while a session is running, and idempotent against the pre-meeting screen's
+        /api/warm-up (transcribe.warm_up_async returns early when that model is cached or warming),
+        so the two can never double-warm. A user who then changes the model simply warms the new one;
+        the wasted work is one background load of a model they had selected at the time.
+    Returns a small dict describing what it did, so it is testable without a model.
+    SA_LIVE_PREWARM=0 turns it off.
+    """
+    if os.environ.get("SA_LIVE_PREWARM", "1") == "0":
+        return {"state": "skipped", "why": "disabled"}
+    try:
+        with STATE.lock:
+            if STATE.running:
+                return {"state": "skipped", "why": "session running"}
+        settings = config.load()
+        quality = settings.get("tier") or "auto"
+        device = settings.get("device") or "auto"
+        language = settings.get("language") or None
+        engine_pref = settings.get("engine") or "auto"
+        tier, engine_override = resolve_tier_engine(quality, device, language, engine_pref)
+        effective_engine = engine_override or engine_pref
+        if load_device_for(tier) != "cpu":
+            return {"state": "skipped", "why": "not a CPU tier", "tier": tier}
+        # Present-on-disk is the gate: pre-warm must never start a download.
+        plan = _resolve_download_plan(tier, language, effective_engine)
+        if not plan.get("present"):
+            return {"state": "skipped", "why": "model not downloaded", "tier": tier}
+        print(f"[warmup] pre-warming {plan.get('model')} for {tier} at app start (CPU)", flush=True)
+        return transcribe.warm_up_async(tier, language, effective_engine)
+    except Exception as e:      # best-effort: a pre-warm problem must never affect starting the app
+        print(f"[warmup] pre-warm at start skipped: {e}", flush=True)
+        return {"state": "skipped", "why": str(e)}
+
+
+def _prewarm_on_startup():
+    """ASGI startup hook: run the pre-warm decision OFF the startup path. Resolving the tier can
+    probe the GPU and the download plan touches the disk, so even the decision runs on its own
+    thread; the server binds and serves the UI without waiting for any of it."""
+    threading.Thread(target=prewarm_at_startup, daemon=True, name="prewarm").start()
+
+
+# Registered on the router directly (rather than the deprecated @app.on_event decorator) so any ASGI
+# host that runs the lifespan - uvicorn in web/__main__.py, and the desktop shell through it - pays
+# the same start-up pre-warm.
+app.router.on_startup.append(_prewarm_on_startup)
 
 
 class PreflightRequest(BaseModel):
@@ -1732,8 +2207,10 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
     WP-2 adds a real two-phase prepare BEFORE the engine is wired up: a "downloading" phase (only when
     the model is not already cached) that polls voicedl.progress() into STATE.prepare and gives up with
     a retryable error if no bytes arrive for PREPARE_DOWNLOAD_STALL_SECONDS, then a "loading" phase
-    (the Engine build, now a fast local_files_only cache hit) bounded by a PREPARE_LOAD_TIMEOUT_SECONDS
-    watchdog. Either failure leaves capture + recording running and is retryable via /api/prepare/retry.
+    (the Engine build) bounded by a device-aware budget (load_budget_seconds: minutes on CPU, where a
+    healthy first load genuinely takes that long, seconds-scale on CUDA/Metal). Either failure leaves
+    capture + recording running and is retryable via /api/prepare/retry, and a retry ATTACHES to a load
+    already in flight rather than queueing a second Engine behind it (_start_or_attach_load).
     WP-1 flips STATE.model_ready True at phase-1 end (engine built + started), independent of the
     backlog drain, so a slow CPU can never leave the UI stuck on "preparing"."""
     from .. import voicedl
@@ -1881,27 +2358,41 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
                 last_change = now
             time.sleep(_PREPARE_POLL_SECONDS)
 
-    # --- phase "loading": build the Engine (a fast local_files_only cache hit now the files are
-    # present), bounded by a watchdog so a load that never returns becomes a retryable error instead of
-    # an endless spinner. The build runs in a sub-thread we join with a timeout; on timeout we bail and
-    # leave that thread to finish or die on its own (rare pathological case; documented seam).
+    # --- phase "loading": build the Engine. On a warm cache this is quick; on CPU it is dominated by
+    # the first inference and can honestly take minutes (see load_budget_seconds). The load runs in a
+    # sub-thread that we watch rather than blind-join, so that:
+    #   * while the thread is ALIVE the prepare state stays "loading" with an elapsed counter, never
+    #     the error screen: a slow machine is not a failure;
+    #   * a repeat prepare (Retry) ATTACHES to the live load instead of starting a second Engine, which
+    #     would only queue behind the first on the model build lock. That queueing is exactly what
+    #     turned a 120 s timeout into a multi-minute wait after Retry;
+    #   * only a dead thread (exception surfaced) or an exhausted budget becomes an error.
     _set_prepare("loading")
     if not _still_ours():
         return
-    build = {}
-
-    def _load():
-        try:
-            build["engine"] = transcribe.Engine(tier=tier, language=language,
-                                                 initial_prompt=prompt, engine=engine_pref)
-        except Exception as e:   # surfaced as prepare_error below; never crashes the app or session
-            build["error"] = e
-
-    lt = threading.Thread(target=_load, daemon=True, name="engine-load")
-    lt.start()
-    lt.join(PREPARE_LOAD_TIMEOUT_SECONDS)
+    device = load_device_for(tier)
+    budget = load_budget_seconds(device=device)
+    lt, build, load_started, attached = _start_or_attach_load(
+        (tier, language, prompt, engine_pref),
+        lambda: transcribe.Engine(tier=tier, language=language,
+                                  initial_prompt=prompt, engine=engine_pref))
+    if attached:
+        print(f"[start] attaching to the model load already in flight for {tier} "
+              f"({time.monotonic() - load_started:.0f}s so far)", flush=True)
+    while lt.is_alive():
+        elapsed = time.monotonic() - load_started
+        if elapsed >= budget:
+            break
+        if not _still_ours():
+            return               # stop/switch/new-start: leave the load running for whoever is next
+        # Honest waiting: publish the elapsed seconds (and, on CPU, the "this is normal" hint) so the
+        # UI can count up instead of pretending nothing is happening or claiming a failure.
+        _set_prepare("loading", elapsed=round(elapsed, 1), budget=budget,
+                     slow=bool(device == "cpu" and elapsed >= PREPARE_LOAD_SLOW_HINT_SECONDS))
+        lt.join(_PREPARE_LOAD_POLL_SECONDS)
     if lt.is_alive():
-        _fail("Loading the transcription model timed out. Please try again.")
+        _fail(f"The transcription model did not finish loading after {_fmt_gap(budget)}. "
+              f"Please try again.")
         return
     if "error" in build:
         _fail(f"Could not load the transcription model: {build['error']}")
@@ -1910,6 +2401,10 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
     if engine is None:
         _fail("Could not load the transcription model on this computer.")
         return
+    # This build owns the engine now; drop the in-flight record so the NEXT prepare starts a fresh
+    # load rather than attaching to a finished one and handing out an engine already in use.
+    _clear_load((tier, language, prompt, engine_pref), build)
+    _apply_mic_gate_setting(engine)
 
     def _release_prep_engine():
         # Drop the private handle ONLY if it still points at THIS build's engine (identity-guarded like
@@ -2065,6 +2560,11 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
         _release_prep_engine()
         return
 
+    # If the load ran long enough for the buffer to hit its cap, some early audio was evicted and no
+    # replay can bring it back. Say so once, here, so the transcript never presents an eviction as
+    # silence (the console warning alone is invisible to the person reading the transcript).
+    _mark_dropped_backlog(md_sink, browser_sink, pb, bool(STATE.recording))
+
     # --- phase 2: drain the buffer into the engine, in order, OUTSIDE STATE.lock, until a pass comes
     # back empty and the atomic flip publishes the engine. Because STATE.engine is still None, any
     # _feed running now is still APPENDING to pb, so live-during-drain chunks queue behind the backlog
@@ -2188,7 +2688,9 @@ def start(req: StartRequest):
         STATE.notice = None
 
         transcribe_on = bool(req.transcribe)
-        record_on = bool(req.record)
+        # An explicit record flag from the client wins (the pre-meeting toggle); omitted means
+        # "use the saved preference", which records unless the user turned it off.
+        record_on = bool(req.record) if req.record is not None else _record_default()
         if not transcribe_on and not record_on:
             raise HTTPException(status_code=400, detail="Nothing to do: enable transcription or recording.")
 
@@ -2212,7 +2714,9 @@ def start(req: StartRequest):
             except Exception:
                 model_name = family = None
 
-        recorder = sinks.AudioRecorder(output_path.with_suffix("")) if record_on else None
+        recording_format = config.load().get("recording_format", "flac")
+        recorder = (sinks.AudioRecorder(output_path.with_suffix(""), recording_format=recording_format)
+                    if record_on else None)
 
         # Publish state BEFORE capture starts so the feed sees consistent flags. For a transcription
         # session the engine is still None here and `preparing` is True: that is the signal _feed uses
@@ -2318,6 +2822,7 @@ def start(req: StartRequest):
             "recording": record_on,
             "transcribing": transcribe_on,
             "audio_stem": str(output_path.with_suffix("")) if record_on else None,
+            "recording_format": recorder.recording_format if recorder is not None else None,
             # t0-capture: capture is live now; transcription may still be loading its model. False here
             # tells the UI to show "preparing" and poll /api/status until model_ready flips true. A
             # record-only session has nothing to load, so it is ready immediately.
@@ -2326,22 +2831,24 @@ def start(req: StartRequest):
 
 
 def _expand_recording_channels(files):
-    """When an uploaded file is ONE channel of a saved Volksmond recording (named
-    <stem>-MIC/-SYS/-MIXED.wav), pull in its sibling channels from the same folder, so a single-file
-    upload still transcribes BOTH sides (and can cancel echo, which needs the MIC + SYS pair). The
-    summed -MIXED is dropped to avoid double-counting once the separate channels are present. A
-    normal media file with no such sibling is returned unchanged. Read-only; the caller's own
-    is_file() filter still applies afterwards."""
+    """Pull in sibling MIC/SYS channels for any supported Volksmond recording.
+
+    A selected FLAC, Opus or WAV channel brings in both sides from the same folder. A
+    legacy MIXED WAV is dropped once separate channels exist, avoiding double-counting.
+    Normal media files with no channel suffix pass through unchanged.
+    """
     extra = []
+    channel_re = re.compile(r"^(.+)-(?:mic|sys|mixed)\.(?:flac|opus|wav)$", re.IGNORECASE)
     for f in list(files):
-        m = re.match(r"^(.+)-(?:mic|sys|mixed)\.wav$", Path(f).name, re.IGNORECASE)
+        m = channel_re.match(Path(f).name)
         if not m:
             continue
         prefix = m.group(1).lower() + "-"
         try:
             for p in sorted(Path(f).parent.iterdir()):
                 n = p.name.lower()
-                if p.is_file() and n.startswith(prefix) and n.endswith(".wav") and not n.endswith("-mixed.wav"):
+                if (p.is_file() and n.startswith(prefix) and channel_re.match(p.name)
+                        and not n.endswith("-mixed.wav")):
                     extra.append(str(p))
         except OSError:
             pass
@@ -2350,7 +2857,7 @@ def _expand_recording_channels(files):
     seen, merged = set(), []
     for f in files + extra:
         if Path(f).name.lower().endswith("-mixed.wav"):
-            continue   # the summed track double-counts once we have the separate channels
+            continue
         key = os.path.normcase(os.path.abspath(f))
         if key not in seen:
             seen.add(key)
@@ -2360,7 +2867,7 @@ def _expand_recording_channels(files):
 
 class TranscribeFileRequest(BaseModel):
     paths: list[str] = []          # explicit file paths (one for import, several for a recording)
-    stem: Optional[str] = None     # alternatively a recording stem; globs <stem>-*.wav
+    stem: Optional[str] = None     # alternatively a recording stem; resolves FLAC, Opus or WAV
     topic: str = ""
     tier: str = "auto"
     device: str = "auto"
@@ -2395,15 +2902,16 @@ def transcribe_file(req: TranscribeFileRequest):
         candidate = Path(req.stem).name + ".md"
         _validate_session_filename(candidate)
         base = candidate[:-3]
-        stereo = sdir / (base + ".wav")
+        stereo = _recording_path(base)
         if stereo.is_file():
-            # New format: one stereo recording (left = MIC, right = SYS), already echo-cancelled.
+            # One stereo recording (left = MIC, right = SYS), already echo-cancelled.
             files.append(str(stereo))
         else:
-            # Legacy format: the per-source channels (-MIC/-SYS), never the summed -MIXED.wav
-            # (it is the same audio summed, so including it would double-count).
-            files += sorted(str(p) for p in sdir.glob(base + "-*.wav")
-                            if not p.name.lower().endswith("-mixed.wav"))
+            # Failed finalisation can leave per-source channels. Accept every current format
+            # plus legacy WAV channels, but never the old summed MIXED file.
+            channel_re = re.compile(r"^.+-(?:mic|sys)\.(?:flac|opus|wav)$", re.IGNORECASE)
+            files += sorted(str(p) for p in _recording_candidates(base, include_channels=True)
+                            if p.is_file() and channel_re.match(p.name))
     elif files:
         files = _expand_recording_channels(files)
     files = [f for f in files if Path(f).is_file()]
@@ -2435,6 +2943,8 @@ def transcribe_file(req: TranscribeFileRequest):
             engine = transcribe.Engine(tier=tier, language=language, initial_prompt=prompt, adaptive=False, engine=engine_pref)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Could not load model ({tier}): {e}")
+        # Same saved preference on the re-transcribe path, so the setting means one thing.
+        _apply_mic_gate_setting(engine)
         if base and output_path.exists():
             # Regenerating replaces the prior transcript (the audio is kept as the source of
             # truth). Remove it only now the engine has loaded, so a load failure never loses
@@ -2497,22 +3007,18 @@ def transcribe_file(req: TranscribeFileRequest):
                     print(f"[transcribe-file] quiet-channel boost: {name} +{g:.1f} dB "
                           f"{where} active median", flush=True)
                 return out
-            # New single stereo recording (<stem>.wav: left = MIC, right = SYS), already
-            # echo-cancelled at capture. Split the channels and skip offline AEC entirely.
+            # A saved stereo recording has left = MIC and right = SYS in every current
+            # format. PyAV decodes WAV, FLAC and Ogg/Opus through the same path, keeping
+            # re-transcription independent of the writer library and selected extension.
             if base and len(files) == 1:
-                import wave as _wave
                 import numpy as _np
-                ok, raw = False, b""
+                ok, mic_ch, sys_ch = False, None, None
                 try:
-                    with _wave.open(files[0], "rb") as w:
-                        ok = (w.getnchannels() == 2 and w.getframerate() == 16000)
-                        if ok:
-                            raw = w.readframes(w.getnframes())
+                    mic_ch, sys_ch = decode_audio(files[0], sampling_rate=16000, split_stereo=True)
+                    ok = not _np.array_equal(mic_ch, sys_ch)
                 except Exception:
                     ok = False
                 if ok:
-                    data = _np.frombuffer(raw, dtype="<i2").astype(_np.float32).reshape(-1, 2) / 32768.0
-                    mic_ch, sys_ch = data[:, 0], data[:, 1]
                     # Cross-channel bleed gate. Even on headphones the far side leaks into the MIC at
                     # low level; Whisper transcribes that leak as garbled ghost lines the text de-dup
                     # cannot catch (different words). Silence those MIC frames before transcribing.
@@ -2633,8 +3139,8 @@ def transcribe_file(req: TranscribeFileRequest):
                 if aec_on:
                     from .. import aec as _aec
                     if _aec.available():
-                        mic_fp = next((f for f in files if f.lower().endswith("-mic.wav")), None)
-                        sys_fp = next((f for f in files if f.lower().endswith("-sys.wav")), None)
+                        mic_fp = next((f for f in files if re.search(r"-mic\.(?:flac|opus|wav)$", f, re.IGNORECASE)), None)
+                        sys_fp = next((f for f in files if re.search(r"-sys\.(?:flac|opus|wav)$", f, re.IGNORECASE)), None)
                         if mic_fp and sys_fp:
                             try:
                                 mic_audio = decode_audio(mic_fp, sampling_rate=16000)
@@ -2647,7 +3153,8 @@ def transcribe_file(req: TranscribeFileRequest):
                                 print(f"[transcribe-file] echo cancellation skipped: {e}", flush=True)
                 for fp in files:
                     low = fp.lower()
-                    src = "MIC" if low.endswith("-mic.wav") else ("SYS" if low.endswith("-sys.wav") else "FILE")
+                    src = ("MIC" if re.search(r"-mic\.(?:flac|opus|wav)$", low) else
+                           ("SYS" if re.search(r"-sys\.(?:flac|opus|wav)$", low) else "FILE"))
                     audio = decoded.get(fp)
                     if audio is None:
                         audio = decode_audio(fp, sampling_rate=16000)
@@ -2809,9 +3316,18 @@ def stop(what: str = "all"):
             pb = STATE.pending_audio
             build_thread = STATE.build_thread
             preparing_case = engine is None and prep_eng is not None
+            # No engine at all (the model never finished loading) and audio still held: there is
+            # nowhere to replay it, so the gap gets STATED in the transcript rather than left blank.
+            abandoned_pb = pb if (engine is None and prep_eng is None) else None
+            browser_sink = STATE.browser_sink
+            was_recording = bool(STATE.recording)
             pending = (prep_eng.pending() if prep_eng else (engine.pending() if engine else 0))
+            # Read the downgrade latch here, under the lock and before the drain thread resets the
+            # session: the finish screen needs it to offer a re-transcribe from the recording.
+            downgraded = STATE.downgraded
 
             def _drain_transcription():
+                _mark_abandoned_backlog(md_sink, browser_sink, abandoned_pb, was_recording)
                 if preparing_case:
                     # Wait for the builder to RELEASE the private engine - return from its thread - before
                     # draining it, so we are the SOLE feeder (no two-feeder race). The builder releases
@@ -2887,12 +3403,14 @@ def stop(what: str = "all"):
 
             threading.Thread(target=_drain_transcription, daemon=True, name="stop-transcription").start()
             return {"stopped": "transcription", "stopping": True, "pending": pending,
-                    "recording": STATE.recording, "output_path": out}
+                    "recording": STATE.recording, "output_path": out,
+                    "downgraded": downgraded}
 
         # what == "all"
         if STATE.stopping:
             pending = STATE.engine.pending() if STATE.engine else 0
-            return {"stopping": True, "pending": pending, "output_path": out}
+            return {"stopping": True, "pending": pending, "output_path": out,
+                    "downgraded": STATE.downgraded}
         STATE.stopping = True
         _silence_signal()   # the session is over; the watcher must not outlive the drain
         engine = STATE.engine
@@ -2907,7 +3425,14 @@ def stop(what: str = "all"):
         pb = STATE.pending_audio
         build_thread = STATE.build_thread
         preparing_case = engine is None and prep_eng is not None
+        # No engine at all (the model never finished loading): the held backlog has nowhere to go, so
+        # the transcript says how much was never transcribed instead of just ending short.
+        no_engine_case = engine is None and prep_eng is None
+        browser_sink = STATE.browser_sink
         pending = (engine.pending() if engine else (prep_eng.pending() if prep_eng else 0))
+        # Same reason as the partial stop above: read the downgrade latch under the lock, before
+        # the drain thread resets the session out from under it.
+        downgraded = STATE.downgraded
 
     def _drain_and_close():
         # Stop capturing FIRST (flushes the final partial chunk into the engine
@@ -2919,6 +3444,11 @@ def stop(what: str = "all"):
                 cap.stop()
         except Exception:
             pass
+        if no_engine_case:
+            # Stopped before the model ever loaded. cap.stop() has just flushed the last chunk into the
+            # buffer, so this covers the whole span; done here, before md_sink.close(), so the notice is
+            # part of the saved transcript.
+            _mark_abandoned_backlog(md_sink, browser_sink, pb, rec is not None)
         if preparing_case:
             # Model still catching up: cap.stop() above flushed the final chunk into pending_audio (the
             # engine is unpublished, so _feed buffers it). Wait for the builder to RELEASE the private
@@ -2957,7 +3487,7 @@ def stop(what: str = "all"):
 
     _bump_session_count()  # one completed live/record session; file transcription is counted on its own completion
     threading.Thread(target=_drain_and_close, daemon=True, name="stop-drain").start()
-    return {"stopping": True, "pending": pending, "output_path": out}
+    return {"stopping": True, "pending": pending, "output_path": out, "downgraded": downgraded}
 
 
 def _parse_session_filename(name: str) -> dict:
@@ -2980,7 +3510,7 @@ def sessions_list():
     """List sessions in the active save location, newest first.
 
     A "session" is a stem that has a transcript (`<stem>.md`) and/or a recording
-    (`<stem>-MIC/SYS/MIXED.wav`). Enumerating by stem means a record-only session
+    (`<stem>.flac/.opus/.wav`, including legacy channels). Enumerating by stem means a record-only session
     (audio captured but not transcribed yet) still appears, ready to re-transcribe.
     Each row carries status flags: `recorded`, `transcribed`, `has_summary`.
 
@@ -3048,18 +3578,18 @@ def sessions_list():
         except OSError:
             pass
 
-    for p in sdir.glob("*.wav"):
-        low = p.name.lower()
-        suff = next((s for s in ("-mic.wav", "-sys.wav", "-mixed.wav") if low.endswith(s)), None)
-        # New recordings are a single stereo `<stem>.wav`; legacy ones are per-source
-        # `<stem>-MIC/-SYS/-MIXED.wav`. Either way, map back to the session stem.
-        stem = p.name[:-len(suff)] if suff is not None else p.name[:-4]
-        r = _row(stem)
-        r["recorded"] = True
-        try:
-            r["mtime"] = max(r["mtime"], p.stat().st_mtime)
-        except OSError:
-            pass
+    for ext in sinks.RECORDING_EXTENSIONS:
+        for p in sdir.glob("*" + ext):
+            # Current recordings are one stereo file. A failed fold or a legacy WAV can
+            # leave MIC/SYS/MIXED channels, which still map to the same session stem.
+            match = re.match(r"^(.+)-(?:mic|sys|mixed)\.(?:flac|opus|wav)$", p.name, re.IGNORECASE)
+            stem = match.group(1) if match else p.name[:-len(ext)]
+            r = _row(stem)
+            r["recorded"] = True
+            try:
+                r["mtime"] = max(r["mtime"], p.stat().st_mtime)
+            except OSError:
+                pass
 
     for stem, r in sessions.items():
         if (stem + "-summary.md") in md_names:
@@ -3105,8 +3635,12 @@ def open_folder(which: str = "sessions"):
 
     which: "sessions" (default, transcripts + recordings) | "voice_models" (the
     Whisper model cache) | "summary_models" (the local summary GGUFs), so the user
-    can find and remove models on disk themselves."""
-    if which == "voice_models":
+    can find and remove models on disk themselves | "diagnostics" (where the
+    diagnostics zip is written, so the user can attach it to an email)."""
+    if which == "diagnostics":
+        from .. import diagnostics
+        target = str(diagnostics.default_bundle_dir())
+    elif which == "voice_models":
         from .. import voicedl
         p = Path(voicedl.cache_dir())
         try:
@@ -3143,6 +3677,9 @@ class SettingsPatch(BaseModel):
     aec: Optional[bool] = None
     aec_live: Optional[bool] = None
     agc_live: Optional[bool] = None
+    mic_gate: Optional[bool] = None         # skip microphone chunks with no speech evidence before decoding
+    record_sessions: Optional[bool] = None  # save the meeting audio on every live session. Declared here or pydantic drops it and the Settings switch silently does nothing.
+    recording_format: Optional[Literal["flac", "opus", "wav"]] = None  # next recording only
     summary_device: Optional[str] = None
     save_location: Optional[str] = None
     default_context: Optional[str] = None
@@ -3554,6 +4091,33 @@ def app_info():
     }
 
 
+@app.get("/api/diagnostics")
+def diagnostics_summary():
+    """One short machine line (CPU, cores, RAM, GPU, install kind) for the feedback
+    email. Computed on demand, not on app load, because the GPU part shells nvidia-smi.
+    Read-only and non-sensitive: no licence, no paths, no user content."""
+    from .. import diagnostics
+    return {"summary": diagnostics.summary_line(),
+            "install": diagnostics.install_kind(),
+            "folder": str(diagnostics.default_bundle_dir())}
+
+
+@app.post("/api/diagnostics")
+def diagnostics_save():
+    """Write the diagnostics zip to the user's Downloads folder and say where it went.
+
+    Nothing is uploaded; the file lands on the user's own disk and only travels if the
+    user attaches it to an email themselves. Contents are a fixed allow-list (logs,
+    redacted settings, the system header, a model inventory): never a transcript, a
+    note or an audio file. See live_transcribe/diagnostics.py."""
+    from .. import diagnostics
+    try:
+        p = diagnostics.save_bundle()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not write the diagnostics file: {e}")
+    return {"path": str(p), "folder": str(p.parent), "name": p.name}
+
+
 @app.post("/api/pick")
 def pick_path(kind: str = "file"):
     """Open a native OS picker on this machine and return the chosen absolute path.
@@ -3586,7 +4150,7 @@ def pick_path(kind: str = "file"):
                 chosen = filedialog.askopenfilename(
                     title="Choose a recording to transcribe",
                     filetypes=[
-                        ("Audio and video", "*.mp3 *.m4a *.wav *.mp4 *.mov *.ogg *.flac *.aac *.webm *.mkv *.avi"),
+                        ("Audio and video", "*.mp3 *.m4a *.wav *.mp4 *.mov *.ogg *.opus *.flac *.aac *.webm *.mkv *.avi"),
                         ("All files", "*.*"),
                     ],
                 )

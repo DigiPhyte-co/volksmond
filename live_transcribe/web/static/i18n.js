@@ -189,6 +189,8 @@ window.VM_I18N = {
     "Your saved default context is applied automatically. Add anything specific to this meeting here.":
       "Jou gestoorde verstekkonteks word outomaties toegepas. Voeg enigiets spesifiek tot hierdie vergadering hier by.",
     "Record the audio": "Neem die klank op",
+    "On by default. The audio stays on this computer, and if the live transcript goes wrong you can redo it from the recording. Keep or delete it when the meeting ends.":
+      "Standaard aan. Die klank bly op hierdie rekenaar, en as die lewendige transkripsie verkeerd loop kan jy dit uit die opname oordoen. Hou of vee dit uit wanneer die vergadering klaar is.",
     "Keeps the audio on this machine until you stop. Lets you transcribe or summarise it again later, more accurately.":
       "Hou die klank op hierdie masjien tot jy stop. Laat jou dit later weer transkribeer of opsom, meer akkuraat.",
     "Courtesy line you could say": "Beleefdheidsin wat jy kan sê",
@@ -224,6 +226,9 @@ window.VM_I18N = {
     "Stop and save": "Stop en stoor",
     "Stop": "Stop",
     "Recording audio": "Neem klank op",
+    "Recording to this computer": "Neem op na hierdie rekenaar",
+    "The audio is being saved to your save folder on this computer. You can keep or delete it when the meeting ends.":
+      "Die klank word na jou stoorgids op hierdie rekenaar gestoor. Jy kan dit hou of uitvee wanneer die vergadering klaar is.",
     "Saving to ": "Stoor na ",
     "Listening. The transcript appears here as people talk.":
       "Luister. Die transkripsie verskyn hier soos mense praat.",
@@ -238,6 +243,8 @@ window.VM_I18N = {
       "Die klank word nou op hierdie rekenaar vasgevang en opgeneem.",
     "The transcription model is still loading. The transcript fills in from the start the moment it is ready, and if you are recording, the audio is saved from the very beginning.":
       "Die transkripsiemodel laai nog. Die transkripsie vul van voor af in sodra dit gereed is, en as jy opneem, word die klank van heel voor af gestoor.",
+    "First load on this computer can take a few minutes. It is faster next time.":
+      "Die eerste laai op hierdie rekenaar kan 'n paar minute duur. Dit is vinniger volgende keer.",
     "Could not load the transcription model on this computer.":
       "Kon nie die transkripsiemodel op hierdie rekenaar laai nie.",
     "The download stalled. Check your connection and try again.":
@@ -294,6 +301,21 @@ window.VM_I18N = {
     "Transcribe later": "Transkribeer later",
     "You can transcribe a recording any time from ": "Jy kan 'n opname enige tyd transkribeer vanaf ",
     ". Recordings are kept until you delete them.": ". Opnames word gehou tot jy hulle uitvee.",
+
+    // Finish screen: keep or delete this meeting's recording, and the offer to redo the
+    // transcript from it when the live pass ran on a smaller model.
+    "The audio of this meeting was recorded": "Die klank van hierdie vergadering is opgeneem",
+    "Recording kept on this computer": "Opname op hierdie rekenaar gehou",
+    "Keep the recording": "Hou die opname",
+    "Delete the recording": "Vee die opname uit",
+    "Recording deleted.": "Opname uitgevee.",
+    "The audio is off this computer. Your transcript and notes are still saved.":
+      "Die klank is van hierdie rekenaar af. Jou transkripsie en notas is steeds gestoor.",
+    "Recording deleted from this computer.": "Opname van hierdie rekenaar af uitgevee.",
+    "Could not delete the recording.": "Kon nie die opname uitvee nie.",
+    "The live transcript ran on a smaller model for part of this meeting. Re-transcribe from the recording now?":
+      "Die lewendige transkripsie het vir 'n deel van hierdie vergadering op 'n kleiner model geloop. Hertranskribeer nou uit die opname?",
+    "Re-transcribe from the recording": "Hertranskribeer uit die opname",
 
     // Importing
     "Cancel": "Kanselleer",
@@ -442,10 +464,12 @@ window.VM_I18N = {
     "Save transcripts and recordings to": "Stoor transkripsies en opnames na",
     "For maximum privacy, choose a folder that a cloud provider does not sync (OneDrive, Google Drive, Dropbox, and the like).":
       "Vir maksimum privaatheid, kies 'n gids wat 'n wolkverskaffer nie sinkroniseer nie (OneDrive, Google Drive, Dropbox, en dies meer).",
-    "Audio is off by default": "Klank is standaard af",
-    "Recording is only kept when you switch it on for a meeting. The privacy promise holds otherwise.":
-      "Opname word net gehou wanneer jy dit vir 'n vergadering aanskakel. Andersins geld die privaatheidsbelofte.",
-    "On by you only": "Net deur jou aan",
+    "Record the audio of every meeting": "Neem die klank van elke vergadering op",
+    "On, so that a transcript that goes wrong can be redone from the audio afterwards. The recording stays on this computer, the live screen shows you while it runs, and you can delete it with one click when the meeting ends.":
+      "Aan, sodat 'n transkripsie wat verkeerd loop naderhand uit die klank oorgedoen kan word. Die opname bly op hierdie rekenaar, die lewendige skerm wys jou terwyl dit loop, en jy kan dit met een klik uitvee wanneer die vergadering klaar is.",
+    "Nothing leaves this computer": "Niks verlaat hierdie rekenaar nie",
+    "Audio, transcripts, notes and summaries are written to your save folder and stay there. No account, no cloud, no third party ever receives them.":
+      "Klank, transkripsies, notas en opsommings word na jou stoorgids geskryf en bly daar. Geen rekening, geen wolk, geen derde party ontvang dit ooit nie.",
     "Danger zone, these settings can send data off your computer":
       "Gevaarsone, hierdie instellings kan data van jou rekenaar af stuur",
     "Online API key for a future fallback": "Aanlyn API-sleutel vir 'n toekomstige terugval",
@@ -506,11 +530,14 @@ window.VM_I18N = {
       "'n DigiPhyte-produk, gebou in Suid-Afrika. Alle transkripsie gebeur op hierdie masjien tensy jy uitdruklik inteken.",
 
     // Voice (transcription) model download
+    "Minimal": "Minimaal",
     "Lite": "Lig (basies)",
     "Light": "Lig",
     "High quality": "Hoë gehalte",
-    "The smallest and fastest, but the roughest. Only for very old or low-power computers.":
-      "Die kleinste en vinnigste, maar die growwe. Net vir baie ou of lae-krag rekenaars.",
+    "The fastest and the roughest. A live safety net for a slow computer, not a transcript to rely on.":
+      "Die vinnigste en die growwe. 'n Lewendige veiligheidsnet vir 'n stadige rekenaar, nie 'n transkripsie om op staat te maak nie.",
+    "Very fast and quite rough. For old or low-power computers, and the step above Minimal when the live view is falling behind.":
+      "Baie vinnig en taamlik grof. Vir ou of lae-krag rekenaars, en die trap bo Minimaal wanneer die lewendige aansig agter raak.",
     "Light and quick, easy on memory. Good everyday accuracy on most laptops.":
       "Lig en vinnig, maklik op geheue. Goeie alledaagse akkuraatheid op die meeste skootrekenaars.",
     "A good balance of speed and accuracy on a typical computer. The usual sweet spot.":
@@ -677,6 +704,24 @@ window.VM_I18N = {
     "Could not change echo cancellation.": "Kon nie eggo-kansellering verander nie.",
     "Echo cancellation changed for this meeting, but the choice could not be saved as your default.": "Eggo-kansellering is vir hierdie vergadering verander, maar die keuse kon nie as jou verstek gestoor word nie.",
 
+    // Mic gate: the live toggle, its counter, and the quiet-mic safety valve's two hints
+    "Mic gate": "Mikrofoonhek",
+    "gentle": "sag",
+    "Skip quiet mic audio (mic gate)": "Slaan stil mikrofoonklank oor (mikrofoonhek)",
+    "Skips microphone audio with no speech in it so the far end gets the CPU. Switch it off if it ever cuts you off.":
+      "Slaan mikrofoonklank sonder spraak oor sodat die ander kant die SVE kry. Skakel dit af as dit jou ooit afsny.",
+    "quiet chunk skipped": "stil stukkie oorgeslaan",
+    "quiet chunks skipped": "stil stukkies oorgeslaan",
+    "Mic gate on.": "Mikrofoonhek aan.",
+    "Mic gate off.": "Mikrofoonhek af.",
+    "Could not change the mic gate.": "Kon nie die mikrofoonhek verander nie.",
+    "Mic gate changed for this meeting, but the choice could not be saved as your default.":
+      "Die mikrofoonhek is vir hierdie vergadering verander, maar die keuse kon nie as jou verstek gestoor word nie.",
+    "Your microphone is quiet, mic gate set to gentle":
+      "Jou mikrofoon is sag, die mikrofoonhek is op sag gestel",
+    "Mic gate switched off for this meeting: your microphone is very quiet":
+      "Die mikrofoonhek is vir hierdie vergadering afgeskakel: jou mikrofoon is baie sag",
+
     // Stereo interview mode (upload option: one speaker per channel)
     "Stereo interview mode": "Stereo-onderhoudmodus",
     "For phone recordings where the two speakers sit in the left and right channels (e.g. Samsung Interview mode). Transcribes each side separately, labelled Speaker L and Speaker R. A mono file is transcribed as a single track.":
@@ -744,6 +789,12 @@ window.VM_I18N = {
       "Volksmond het na 'n ligter, vinniger model oorgeskakel om lewendig te bly, so hierdie deel is dalk minder akkuraat. Neem nou op en hertranskribeer daarna teen volle akkuraatheid.",
     "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Your recording can be re-transcribed at full accuracy afterward.":
       "Volksmond het na 'n ligter, vinniger model oorgeskakel om lewendig te bly, so hierdie deel is dalk minder akkuraat. Jou opname kan daarna teen volle akkuraatheid hertranskribeer word.",
+    "Live text is now rough (smaller model). The recording has everything, re-transcribe it afterwards.":
+      "Die lewendige teks is nou grof (kleiner model). Die opname het alles, hertranskribeer dit agterna.",
+    "Volksmond is skipping some audio to stay live. Your recording still has all of it and can be re-transcribed at full accuracy afterward.":
+      "Volksmond slaan van die klank oor om lewendig te bly. Jou opname het steeds alles en kan daarna teen volle akkuraatheid hertranskribeer word.",
+    "Volksmond is skipping some audio to stay live. Record now so nothing is lost, and re-transcribe at full accuracy afterward.":
+      "Volksmond slaan van die klank oor om lewendig te bly. Neem nou op sodat niks verlore gaan nie, en hertranskribeer daarna teen volle akkuraatheid.",
     "Record from here": "Neem van hier af op",
     "Keep going": "Gaan voort",
     "Don't warn again": "Moenie weer waarsku nie",

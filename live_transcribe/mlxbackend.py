@@ -3,13 +3,14 @@
 mlx-whisper exposes a module-level `transcribe(audio, path_or_hf_repo=...)` that
 returns a plain dict, not a model object. This module wraps it in the exact
 `WhisperModel.transcribe(audio, language=, initial_prompt=, vad_filter=,
-beam_size=, **GUARD) -> (segments, info)` duck type the Engine, warm-up and the
+vad_parameters=, beam_size=, **GUARD) -> (segments, info)` duck type the Engine, warm-up and the
 tests already speak, so nothing in `Engine._run`, the hallucination guards or
 the fan-out changes when a session runs on Metal.
 
 mlx-whisper differences the adapter absorbs (pinned by tests/test_mlx_backend.py):
-  - no `vad_filter` and no `beam_size`: both are dropped silently (noted once at
-    build time, never per chunk). Losing in-decoder VAD is accepted by design,
+  - no `vad_filter`, no `vad_parameters` and no `beam_size`: all dropped silently
+    (noted once at build time, never per chunk). Losing in-decoder VAD is accepted
+    by design (and with it the per-source MIC VAD tightening),
     the engine pre-gates silence with _chunk_is_silence and every post-ASR
     hallucination guard stays active.
   - `log_prob_threshold` is spelled `logprob_threshold`.
@@ -36,7 +37,7 @@ MLX_REPOS = {
 # The kwarg surface the adapter translates, as module constants so the tests pin
 # them: names renamed for mlx-whisper, and names it has no equivalent for.
 KWARG_RENAMES = {"log_prob_threshold": "logprob_threshold"}
-DROPPED_KWARGS = frozenset({"vad_filter", "beam_size"})
+DROPPED_KWARGS = frozenset({"vad_filter", "vad_parameters", "beam_size"})
 
 
 def mlx_model_for(ct2_model_id):

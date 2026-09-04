@@ -99,14 +99,18 @@ def pick_tier(explicit):
             return "gpu"
     except Exception:
         pass
-    # No GPU. Start AMBITIOUS based on core count, the engine measures its
-    # real-time factor and auto-downgrades along CPU_LADDER (medium->small->base
-    # ->tiny) if it can't keep up, so we don't have to guess the CPU's speed
-    # exactly. A capable CPU keeps the bigger model; a slow one ratchets down.
-    cores = os.cpu_count() or 0
-    if cores >= 8:
-        return "cpu-mid"    # medium start; downgrades to small/base if it lags
-    return "cpu"            # small start for modest CPUs (downgrades live if it lags)
+    # No GPU. Start at "cpu" (small) on EVERY machine, whatever the core count.
+    #
+    # This used to start an 8-core-or-better box at "cpu-mid" (medium) and lean on the live ladder
+    # to walk it back down. Measured 2026-09-03 on a Ryzen 7 7700X, the fastest desktop we test on:
+    # medium holds real time on ONE source and fails outright on two (MIC + SYS feed one engine, so
+    # the budget is the SUM: 1.31 at the old 30 s/beam 5 defaults, still 0.58 at the new 20 s/beam
+    # 1 ones, i.e. only 1.7x headroom on a desktop that a customer laptop is 2 to 4x slower than).
+    # Small is 0.18 on the same two-source test: 5.7x headroom, and it survives a laptop 4x slower.
+    # So "ambitious, it will correct itself" was buying a guaranteed mid-meeting downgrade, and the
+    # downgrade is never free (a rung change costs a model load and the transcript says so).
+    # Medium stays one click away as an explicit Quality choice ("cpu-mid").
+    return "cpu"
 
 
 # UI quality keys are model SIZES (plus "auto"); map them to a concrete tier per device.
@@ -121,9 +125,10 @@ _QUALITY_TO_GPU_TIER = {
 
 
 def _cpu_auto_tier():
-    """CPU 'auto' quality: ambitious by core count; the engine downgrades live if it lags."""
-    cores = os.cpu_count() or 0
-    return "cpu-mid" if cores >= 8 else "cpu"
+    """CPU 'auto' quality: small on every CPU, whatever the core count. See pick_tier for the
+    measurement; medium cannot hold two live sources even on our fastest desktop, so starting
+    there only bought a downgrade partway through the meeting. Medium stays hand-selectable."""
+    return "cpu"
 
 
 def _best_size_for(language, engine="auto"):
@@ -146,9 +151,10 @@ _FAMILY_SIZE_ORDER = {
     "fluister": ["small", "medium", "large-v3", "large-v3-turbo"],
     "whisper":  ["small", "medium", "large-v3-turbo", "large-v3"],
 }
-# Sizes CPU 'auto' may START at (cheapest -> costliest). The live ceiling is _cpu_auto_tier()'s size
-# (medium on >=8 cores, else small); turbo/large-v3 are deliberately absent (too slow to hold real-
+# Sizes CPU 'auto' may START at (cheapest -> costliest). The live ceiling is _cpu_auto_tier()'s size,
+# which is now small on every CPU; turbo/large-v3 are deliberately absent (too slow to hold real-
 # time on CPU), so the downloaded-size pick can never exceed the ceiling and stall a live meeting.
+# base/tiny are absent for the opposite reason: they are live-ladder rungs, never a starting point.
 _CPU_AUTO_ORDER = ["small", "medium"]
 
 

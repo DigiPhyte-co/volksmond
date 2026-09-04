@@ -142,7 +142,8 @@ def test_guard_kwarg_mapping():
     with _fake_mlx() as calls, _snapshot_local():
         m = mlxbackend.MlxWhisperModel("mlx-community/whisper-large-v3-mlx")
         m.transcribe(_audio(), language="af", initial_prompt="Volksmond, DigiPhyte",
-                     vad_filter=True, beam_size=5, **transcribe.GUARD)
+                     vad_filter=True, vad_parameters=transcribe.MIC_VAD,
+                     beam_size=5, **transcribe.GUARD)
     kw = calls[0]["kwargs"]
     # Renamed: faster-whisper's log_prob_threshold is mlx-whisper's logprob_threshold.
     assert kw["logprob_threshold"] == transcribe.GUARD["log_prob_threshold"]
@@ -151,7 +152,7 @@ def test_guard_kwarg_mapping():
     assert kw["temperature"] == tuple(transcribe.GUARD["temperature"])
     assert isinstance(kw["temperature"], tuple)
     # Dropped: mlx-whisper has neither of these.
-    assert "vad_filter" not in kw and "beam_size" not in kw
+    assert "vad_filter" not in kw and "vad_parameters" not in kw and "beam_size" not in kw
     # Pass-throughs and fixed kwargs.
     assert kw["condition_on_previous_text"] is False
     assert kw["no_speech_threshold"] == transcribe.GUARD["no_speech_threshold"]
@@ -166,7 +167,7 @@ def test_guard_kwarg_mapping():
 def test_dropped_and_renamed_constants_pinned():
     # The adapter's translation tables are the contract WP-M3/M4 build on; pin them.
     from live_transcribe import mlxbackend
-    assert mlxbackend.DROPPED_KWARGS == frozenset({"vad_filter", "beam_size"})
+    assert mlxbackend.DROPPED_KWARGS == frozenset({"vad_filter", "vad_parameters", "beam_size"})
     assert mlxbackend.KWARG_RENAMES == {"log_prob_threshold": "logprob_threshold"}
     print("  OK  DROPPED_KWARGS / KWARG_RENAMES pinned")
 

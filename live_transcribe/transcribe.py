@@ -6,6 +6,7 @@ memory at one model's footprint and simplifies the data flow. If GPU under-
 utilisation becomes a problem in V1 with a snappier chunk size, we can run
 two model instances; not worth it for V0.
 """
+import contextlib
 import os
 import queue
 import re
@@ -20,6 +21,9 @@ from . import cudadl
 cudadl.register_dll_dir()
 
 from faster_whisper import WhisperModel
+# Imported as a MODULE (not just the class) because the CPU encoder window below has to rebind
+# one name inside it; see _pad_or_trim.
+import faster_whisper.transcribe as _fw_transcribe
 
 # The fuzzy word matcher the end-of-session echo strip already uses; the live fuzzy echo veto
 # (fuzzy_echo_veto below) reuses it so both places call the same two words "the same word".
@@ -44,11 +48,19 @@ def _fluister(repo, local, stock):
 
 # size -> canonical Fluister HuggingFace repo. The single source of truth for the repo ids, so the
 # voice-model catalogue and the update manifest (voicedl) resolve exactly the repos this engine loads.
+#
+# base and tiny are here for ONE reason: they are the bottom two rungs of the live CPU ladder
+# (CPU_LADDER), and stock base/tiny are unusable on Afrikaans. Measured on a five minute Afrikaans
+# slice against a large-v3 reference: stock base scores WER 0.91 and answers in Dutch, stock tiny
+# 1.47 with a dozen loop lines; the Fluister forms of the same sizes score 0.58 and 0.78. A ladder
+# that steps out of the family to "keep up" buys speed by inventing text, so it must not exist.
 FLUISTER_REPOS = {
     "large-v3":       "digiphyte/fluister-large-v3",
     "large-v3-turbo": "digiphyte/fluister-turbo",
     "medium":         "digiphyte/fluister-medium",
     "small":          "digiphyte/fluister-small",
+    "base":           "digiphyte/fluister-base",
+    "tiny":           "digiphyte/fluister-tiny",
 }
 
 # size -> Fluister model id: the hosted HF repo (downloaded on first use), or the local ct2 build
@@ -58,6 +70,8 @@ _FLUISTER = {
     "large-v3-turbo": _fluister(FLUISTER_REPOS["large-v3-turbo"], r"C:\Users\seanf\.cache\af-lora-turbo-ct2-int8", "large-v3-turbo"),
     "medium":         _fluister(FLUISTER_REPOS["medium"], r"C:\Users\seanf\.cache\af-lora-medium-ct2-int8", "medium"),
     "small":          _fluister(FLUISTER_REPOS["small"], r"C:\Users\seanf\.cache\af-lora-small-ct2-int8", "small"),
+    "base":           _fluister(FLUISTER_REPOS["base"], r"C:\Users\seanf\.cache\af-lora-base-ct2-int8", "base"),
+    "tiny":           _fluister(FLUISTER_REPOS["tiny"], r"C:\Users\seanf\.cache\af-lora-tiny-ct2-int8", "tiny"),
 }
 
 
@@ -182,6 +196,81 @@ TIER_CONFIG = {
 }
 
 
+# ── CPU decode defaults: a 20 s encoder window and beam 1 ──────────────────
+# Measured 2026-09-03 on one five minute Afrikaans slice, CPU int8, 8 threads, WER against a
+# large-v3 GPU reference, 15 s audio chunks throughout:
+#
+#   model  window beam   RTF     WER
+#   small   30 s    5   0.159   0.345    <- the old default
+#   small   20 s    1   0.072   0.373
+#   medium  30 s    5   0.442   0.289    <- the old default
+#   medium  20 s    1   0.191   0.307
+#
+# A 20 s window costs nothing in WER (medium is fractionally BETTER at 0.282 vs 0.289 at beam 5)
+# and saves 16-27 %; beam 1 costs about +0.02 WER and saves another 41-46 %. Together they roughly
+# halve the CPU cost, which is what lets a laptop hold real time on two sources at once. 15 s was
+# also measured and is catastrophic (WER 1.4-1.9, doubled word counts, the model emitting
+# timestamps past the end of its own window): never go below 20 s.
+#
+# GPU work (CUDA and Metal) is untouched at Whisper's native 30 s / beam 5. The window is applied
+# per MODEL, not per process: only a ct2 model built for device="cpu" carries _vm_encoder_frames,
+# and only a decode wrapped in encoder_window() sees the shortened pad length.
+CPU_ENCODER_WINDOW_S = 20
+CPU_BEAM_SIZE = 1
+DEFAULT_BEAM_SIZE = 5              # GPU / MLX, and any caller that asks for a beam explicitly
+
+# faster-whisper pads every mel window back to 3000 frames (30 s) before handing it to the encoder:
+# generate_segments() calls the module-level pad_or_trim() with no length, so shrinking the feature
+# extractor alone does NOT shrink what the encoder actually sees. The only seam is that name. It is
+# rebound ONCE, process-wide, to a wrapper that keeps the stock 3000 unless the CALLING THREAD has
+# asked for a shorter window (encoder_window() sets a thread-local from the model's own attribute).
+# Thread-local rather than a global flag on purpose: a CUDA or Metal engine decoding in the same
+# process, on its own worker thread, must keep the full 30 s window and never be able to observe
+# the CPU one. An explicit length (faster-whisper passes none today) always wins.
+_ENCODER_WINDOW = threading.local()
+_FW_PAD_OR_TRIM = _fw_transcribe.pad_or_trim
+
+
+def _pad_or_trim(array, length=None, *, axis=-1):
+    if length is None:
+        length = getattr(_ENCODER_WINDOW, "frames", None) or 3000
+    return _FW_PAD_OR_TRIM(array, length, axis=axis)
+
+
+_pad_or_trim._vm_patched = True
+if not getattr(_fw_transcribe.pad_or_trim, "_vm_patched", False):
+    _fw_transcribe.pad_or_trim = _pad_or_trim
+
+
+def set_encoder_window(model, seconds):
+    """Point a ct2 model's feature extractor at a `seconds`-long encoder window and record the
+    resulting mel width on the model as _vm_encoder_frames (what encoder_window() then honours).
+
+    Returns the mel frame count, or None for a model with no ct2 feature extractor (the MLX
+    adapter), which is left exactly as it is."""
+    fe = getattr(model, "feature_extractor", None)
+    if fe is None:
+        return None
+    fe.chunk_length = seconds
+    fe.n_samples = seconds * fe.sampling_rate
+    fe.nb_max_frames = fe.n_samples // fe.hop_length
+    model._vm_encoder_frames = fe.nb_max_frames
+    return fe.nb_max_frames
+
+
+@contextlib.contextmanager
+def encoder_window(model):
+    """Run a decode with this model's shortened encoder window (a no-op for any model without
+    one, i.e. every CUDA/Metal model). Yields the mel frame count, or None."""
+    frames = getattr(model, "_vm_encoder_frames", None)
+    prev = getattr(_ENCODER_WINDOW, "frames", None)
+    _ENCODER_WINDOW.frames = frames
+    try:
+        yield frames
+    finally:
+        _ENCODER_WINDOW.frames = prev
+
+
 # ── model cache + warm-up ──────────────────────────────────────────────────
 # Building a WhisperModel is the slow part of starting a session. Two costs hide here:
 #  1. With no local_files_only, faster-whisper revalidates the model against HuggingFace
@@ -199,7 +288,7 @@ _WARM_LOCK = threading.Lock()     # guards _WARM only (kept separate so status r
 _WARM = {"state": "idle", "tier": None, "model": None}   # state: idle|warming|ready|error; model = resolved id being warmed
 
 
-def _build_model(model_name, device, compute_type, cpu_threads):
+def _build_model(model_name, device, compute_type, cpu_threads, local_only=False):
     if device == "mlx":
         # Apple Metal via the mlx-whisper adapter. Imported lazily so Windows (where the
         # mlx packages have no wheels and are never installed) pays nothing for this
@@ -218,23 +307,72 @@ def _build_model(model_name, device, compute_type, cpu_threads):
         kw["cpu_threads"] = cpu_threads
         kw["num_workers"] = 1
     # Local cache only: never touch the network for an already-downloaded model. Fall back
-    # to a normal (network-allowed) load only if it genuinely is not on disk yet.
+    # to a normal (network-allowed) load only if it genuinely is not on disk yet - and never
+    # when the caller said local_only, which is how the live ladder guarantees it will not stop
+    # to download a model in the middle of a meeting.
     try:
-        return WhisperModel(model_name, local_files_only=True, **kw)
+        m = WhisperModel(model_name, local_files_only=True, **kw)
     except Exception as e:
+        if local_only:
+            raise
         print(f"[engine] {model_name} not in local cache ({e}); allowing a download", flush=True)
-        return WhisperModel(model_name, local_files_only=False, **kw)
+        m = WhisperModel(model_name, local_files_only=False, **kw)
+    if device == "cpu":
+        # Every CPU model, everywhere (live, file import, warm-up), gets the measured CPU
+        # window. See CPU_ENCODER_WINDOW_S.
+        set_encoder_window(m, CPU_ENCODER_WINDOW_S)
+    return m
 
 
-def load_model(model_name, device, compute_type, cpu_threads=8):
+def model_present(model_id):
+    """True when `model_id` can be loaded WITHOUT touching the network.
+
+    The live ladder's usability test: a rung that is not already on this machine is skipped, never
+    downloaded mid-meeting. A bare directory is judged directly; anything else is resolved through
+    the HuggingFace cache with local_files_only. In both cases a real model.bin has to be there,
+    because hf_hub reports a snapshot as present as soon as refs/main survives, even when an
+    interrupted download left the weights missing (the same trap voicedl._present guards). Any
+    error means "not present": never claim a model on missing evidence.
+
+    The cache path routes through voicedl.ensure_snapshot_loadable (F5), the ONE materialise-and-check
+    the Models page uses, so a dev-era symlinked small/base/tiny rung the ladder swaps to is migrated to
+    real files (Windows) and read the same way here as there, not followed as a symlink the frozen
+    runtime cannot open. voicedl imports transcribe at module load, so the import is lazy to avoid a
+    circular import (fluister_present reaches back the same way)."""
+    if not model_id:
+        return False
+    if os.path.isdir(model_id):
+        return _has_ct2_weights(model_id)
+    try:
+        from huggingface_hub import snapshot_download
+        path = snapshot_download(model_id, local_files_only=True)
+    except Exception:
+        return False
+    try:
+        from . import voicedl
+        return voicedl.ensure_snapshot_loadable(path)
+    except Exception:
+        return _has_ct2_weights(path)
+
+
+def _has_ct2_weights(path, min_bytes=1_000_000):
+    try:
+        binp = os.path.join(path, "model.bin")
+        return os.path.isfile(binp) and os.path.getsize(binp) > min_bytes
+    except Exception:
+        return False
+
+
+def load_model(model_name, device, compute_type, cpu_threads=8, local_only=False):
     """Return a cached WhisperModel for these settings, building it (from the local cache,
     no network) if needed. Safe from both the warm-up thread and session start; the build
-    lock makes a Begin during warm-up wait for the warm model instead of building a second."""
+    lock makes a Begin during warm-up wait for the warm model instead of building a second.
+    local_only=True refuses the network fallback and raises instead (the live ladder)."""
     key = (model_name, device, compute_type)
     with _BUILD_LOCK:
         m = _MODEL_CACHE.get(key)
         if m is None:
-            m = _build_model(model_name, device, compute_type, cpu_threads)
+            m = _build_model(model_name, device, compute_type, cpu_threads, local_only=local_only)
             # Bound memory: drop the oldest cache slot. The just-built model, and any model a
             # live session still holds, stay alive via their own references; only the slot goes.
             while len(_MODEL_CACHE) >= _CACHE_MAX:
@@ -283,8 +421,11 @@ def _warm_run(tier, cfg, model_id, language, fam):
             if warm_lang is None and fam != "swivuriso":
                 warm_lang = "af"   # historic warm token for auto-detect; a fixed token skips detection on zeros
             try:
-                list(m.transcribe(np.zeros(16000, dtype=np.float32), language=warm_lang,
-                                  vad_filter=False, beam_size=1)[0])
+                # Inside encoder_window so a CPU model warms at the SAME mel width it will decode
+                # at (20 s), rather than autotuning ctranslate2 for a shape it never sees again.
+                with encoder_window(m):
+                    list(m.transcribe(np.zeros(16000, dtype=np.float32), language=warm_lang,
+                                      vad_filter=False, beam_size=1)[0])
             except Exception:
                 pass
         with _WARM_LOCK:
@@ -356,12 +497,38 @@ BACKPRESSURE_BEAM_THRESHOLD = 6
 # CPU adaptive model ladder (highest-quality -> fastest). When a CPU start model
 # can't hold real-time, the engine steps DOWN this ladder until it keeps up -
 # never back up (avoids oscillation). large-v3/turbo are deliberately NOT in the
-# ladder: too slow to be a sane CPU live floor. `tiny` is the last-resort rung -
-# rough, but guarantees real-time on almost anything, which still beats dropping
-# audio. GPU tiers never downgrade (they keep up).
+# ladder: too slow to be a sane CPU live floor. GPU tiers never downgrade (they keep up).
+#
+# Three rules the ladder obeys, all of them learned the hard way on a CPU-only laptop that walked
+# medium -> small -> base -> tiny inside half an hour and produced Dutch-flavoured loops:
+#
+#  1. IN-FAMILY ONLY. A rung is only taken when it resolves to the SAME family the session started
+#     in. For an Afrikaans session that means Fluister the whole way down (which is why
+#     FLUISTER_REPOS now carries base and tiny); a stock-Whisper session keeps the stock ladder.
+#     Speed bought by leaving the family is not speed, it is fabrication.
+#  2. PRESENT ONLY. A rung is usable only if it is already on this machine (model_present). No
+#     model is ever downloaded in the middle of a meeting; an absent rung is skipped.
+#  3. SHED, DO NOT DEGRADE. Below the last usable rung there is no smaller model to take, so the
+#     engine drops the OLDEST queued audio instead (see _maybe_shed) and says so in the transcript.
+#     Missing audio you can see beats invented text you cannot.
 CPU_LADDER = ["medium", "small", "base", "tiny"]
 DOWNGRADE_RTF = 0.95     # rolling real-time factor above this = not keeping up
-DOWNGRADE_WINDOW = 4     # consecutive chunks of evidence required before a step down
+DOWNGRADE_WINDOW = 4     # eligible chunks of evidence required before a step down
+# Minimum wall clock between rung changes. The field cascade was self-feeding: a freshly built
+# ct2 model pays its whole load cost on its FIRST inference (measured 35 s for medium, 16 s for
+# small on a desktop), that single sample poisons a 4-sample window, and the ladder immediately
+# stepped again. The first sample on a new model is now discarded outright (_cold_decode) AND a
+# step has to earn a full window of fresh evidence over at least this long.
+DOWNGRADE_MIN_SECONDS = 90.0
+# Backlog bound, in seconds of audio waiting to be transcribed. Past this the engine is no longer
+# live in any useful sense, so the shed valve drops the oldest queued audio back down to the bound.
+# Three 15 s chunks per source plus the one in flight, i.e. about 45 s of lag, is the point where
+# the "live" text stops being live.
+SHED_BACKLOG_SECONDS = 45.0
+# Past this rung the live text is indicative only: still the right family, but small enough that it
+# should be read as a rough guide and re-transcribed from the recording afterwards. Surfaced to the
+# UI as `indicative` on the downgrade payload.
+INDICATIVE_BELOW = "small"
 
 # Hold each MIC segment this long before showing it in the LIVE view, so a speaker echo lands
 # just after its cleaner SYS original instead of jumbled in front of it (the system channel
@@ -541,6 +708,220 @@ def _silence_floor_db(ring, t_hi, static_db=-45.0):
     if lvl is None:
         return static_db
     return min(-35.0, max(-55.0, lvl - 30.0))
+
+
+# --- MIC speech-evidence gate (WP-3) --------------------------------------------------------
+# Arms 1 and 2 of _chunk_is_silence both judge a chunk on its LOUDEST raw frame, so one door
+# bang, one keyboard click or one cough keeps a whole 15 s chunk of room tone. Measured on a
+# 67 min CPU capture: only 8 to 12 min of the MIC channel was near-end speech, yet in a 10 min
+# window the peak tests kept 36 of 40 MIC chunks; decoding them cost MORE than the far end
+# (RTF 0.89 on MIC against 0.42 on SYS) and produced the loops and the prompt echo that made up
+# that session's entire junk budget.
+#
+# Arm 3 swaps the peak for CONTINUITY: speech occupies frames, a transient does not. A MIC chunk
+# is decoded only when at least MIC_EVIDENCE_SECONDS of its raw 100 ms ring frames clear an
+# evidence threshold.
+#
+# The threshold is the room's own p10 floor (measured strictly BEFORE the chunk, so a chunk is
+# never judged against itself) plus MIC_EVIDENCE_MARGIN_DB, but never above
+# MIC_EVIDENCE_CEILING_DB. The cap is what makes the arm safe in both directions:
+#   quiet room - the floor sits well below the cap, so the threshold follows the room down and a
+#                quiet talker still clears it (measured floors on the incident capture: -53 to
+#                -59 dBFS, thresholds -35 to -39, near-end speech -22.8 dBFS mean);
+#   noisy room - the floor rises to within 20 dB of the cap, room frames clear the threshold on
+#                their own, and the arm goes inert rather than eating a quiet talker.
+# 20 dB: near-end speech on that capture sat about 30 dB above its own p10 room tone, so this is
+# the midpoint, leaving 13 to 16 dB of headroom below real speech.
+#
+# MIC only, by design. The far end is a digital signal at a known level with no microphone, no
+# room and no AGC; there is no measured junk to gate there and no basis for these constants.
+MIC_EVIDENCE_MARGIN_DB = 20.0     # above this channel's own p10 room tone ...
+MIC_EVIDENCE_CEILING_DB = -35.0   # ... but never above this (the noisy-room escape)
+MIC_EVIDENCE_SECONDS = 0.5        # of frames that must clear it before the chunk is decoded
+
+# --- the quiet-mic safety valve (WP-7) -------------------------------------------------------
+# The gate above is relative, so a quiet mic in a QUIET room is already safe: the threshold rides
+# the room down with it. The case it cannot ride down for is a quiet mic in a room loud enough
+# that MIC_EVIDENCE_CEILING_DB caps the threshold. Then the bar stops following the room and a
+# soft talker can sit just under it, chunk after chunk. That is the one way this arm can cut
+# someone off, so it watches for exactly that signature and stands itself down.
+#
+# The signature, per chunk, is two things TOGETHER: the chunk was skipped, AND it held sustained
+# activity in the band just under the threshold (the same "enough frames" test the evidence arm
+# uses, applied to [thr - MIC_GATE_NEAR_BAND_DB, thr)). A dead-quiet room fails the second half,
+# its frames sit at the floor far below the band, so an empty room never trips the valve. Pairing
+# the two is what separates "someone is talking under the bar" from "nobody is talking".
+#
+# Two steps, one way only. It never escalates back automatically: a user who has been cut off
+# once must not be cut off again by the same arm re-arming itself.
+#   normal -> gentle : margin 12 dB, evidence 0.3 s. Still a gate, with the bar about 8 dB lower.
+#   gentle -> off    : the arm goes inert for the rest of the session.
+# Each step clears the window, so the next step is judged on its own fresh MIC_GATE_WINDOW chunks.
+MIC_GATE_GENTLE_MARGIN_DB = 12.0  # gentle mode's margin over the room floor (normal: 20)
+MIC_GATE_GENTLE_SECONDS = 0.3     # gentle mode's evidence requirement (normal: 0.5)
+MIC_GATE_WINDOW = 8               # the valve looks at the last N MIC chunks the arm judged ...
+MIC_GATE_TRIP = 6                 # ... and trips when this many were skipped AND near the line
+MIC_GATE_NEAR_BAND_DB = 12.0      # "just under the line" = within this far below the threshold
+
+# Arm 1's relative qualifier (MIC only). The absolute -45 dBFS floor was calibrated on a mic at a
+# healthy level; a low-gain one puts its speech AND its room under that line together, so the
+# absolute test alone cut the talker before arm 3 or the valve could see them at all (measured:
+# -18 dB of attenuation, 33 of 40 chunks skipped as "absolute", arm 3 never reached). The floor is
+# now a CEILING on a relative test - skip only when the chunk also failed to rise this far above
+# the room tone it arrived into - so the cut needs both "quiet in absolute terms" and "nothing
+# happened here". 6 dB, not arm 2's 8: this arm is the coarser of the two and should defer.
+ABS_FLOOR_MARGIN_DB = 6.0         # above the room floor, and arm 1 keeps the chunk ...
+ABS_FLOOR_GENTLE_MARGIN_DB = 3.0  # ... halved once the valve has stepped down to gentle
+
+# Per-source silero VAD options (faster-whisper 1.2.1 VadOptions). The library defaults -
+# threshold 0.5, min_speech_duration_ms 0, min_silence_duration_ms 2000, speech_pad_ms 400 -
+# only split a chunk on a silence LONGER THAN TWO SECONDS and keep speech regions of any length,
+# so a near-silent 15 s mic chunk arrives at the decoder as one merged "speech" region: measured
+# on the incident capture, 86% of the MIC channel passed the VAD as speech in 39 such regions.
+# MIC gets a tighter set; SYS keeps the library defaults (vad_parameters=None), which is what it
+# has always run and what every existing SYS measurement was taken on.
+#
+# `threshold` is deliberately NOT raised. Raising it is where quiet real speech dies, and the
+# problem measured here is region MERGING, not the per-frame speech probability.
+MIC_VAD = dict(
+    threshold=0.5,                # unchanged, on purpose (see above)
+    min_speech_duration_ms=250,   # a sub-quarter-second region is a click or a bump, not a word
+    min_silence_duration_ms=500,  # split on a half-second gap instead of waiting for two seconds
+    speech_pad_ms=200,            # half the default padding, so a split is not merged back
+)
+
+
+def vad_options_for(source):
+    """The VAD options this source decodes with: the tightened set for MIC, None (the
+    faster-whisper defaults) for SYS and for anything else."""
+    return MIC_VAD if source == "MIC" else None
+
+
+def _logtxt(text, n=40):
+    """How a rejected segment's TEXT appears in the log: a length, not the words.
+
+    The guards below (prompt leak, echo veto, cross-channel echo, loop guard) each logged the
+    first 40 characters of what they dropped. That is meeting content, and the diagnostics
+    bundle ships the raw log files, so it left the machine in a file the user emails us while
+    the UI promises "No transcripts, no notes". What actually diagnoses these guards is the
+    count, the source, the timestamp and the reason; the words are a development convenience.
+
+    Set SA_LIVE_LOG_TEXT=1 for a support session (read per call, so it can be flipped without a
+    rebuild) and the text comes back. Off by default, and the bundle sanitises these lines
+    anyway (diagnostics._sanitise_log) so an old log or a flagged run cannot leak through it.
+    """
+    text = text or ""
+    if os.environ.get("SA_LIVE_LOG_TEXT") == "1":
+        return repr(text[:n])
+    return f"<{len(text)} chars>"
+
+
+def _gate_log(engine, source, t_start, skipped, why, stats=None):
+    """Return `skipped` after counting it and logging it under SA_LIVE_MIC_GATE_DEBUG.
+
+    Every ring-fed gate decision funnels through here, which is why the MIC session counters and
+    the quiet-mic safety valve live here too rather than at each of the arms' return statements.
+    `stats` is arm 3's measurement dict (see mic_speech_evidence) and is passed ONLY by arm 3, so
+    it doubles as the "this decision is the valve's business" marker.
+
+    Numbers only: never any audio and never any transcribed text. Module-level, and every
+    attribute read through getattr, so the half-Engine stubs the gate tests build (which borrow
+    _chunk_is_silence unbound) keep working untouched.
+    """
+    if source == "MIC":
+        _mic_gate_count(engine, skipped, stats)
+    if getattr(engine, "_mic_gate_debug", False):
+        print(f"[gate] {source} @ {t_start:.1f}s {'skip' if skipped else 'keep'} [{why}]", flush=True)
+    return skipped
+
+
+def _mic_gate_count(engine, skipped, stats):
+    """Tally one MIC decode decision and, for an arm-3 decision, feed the safety valve.
+
+    Counts EVERY ring-fed MIC decision, whichever arm made it, because "quiet chunks skipped" is
+    what the user is shown and a chunk skipped by the absolute arm is just as skipped. The valve,
+    by contrast, only ever sees arm 3's own decisions (stats is not None), because arm 3 is the
+    only thing it can stand down.
+
+    Module-level and defensive throughout: a stub engine without these attributes gets them
+    created, and any surprise leaves the gate itself untouched (a counter must never be able to
+    break a transcription).
+    """
+    try:
+        engine.mic_gate_skipped = getattr(engine, "mic_gate_skipped", 0) + (1 if skipped else 0)
+        engine.mic_gate_decoded = getattr(engine, "mic_gate_decoded", 0) + (0 if skipped else 1)
+        if stats is None:
+            return
+        hist = getattr(engine, "_mic_gate_recent", None)
+        if hist is None:
+            hist = deque(maxlen=MIC_GATE_WINDOW)
+            engine._mic_gate_recent = hist
+        hist.append(bool(skipped) and bool(stats.get("near")))
+        _mic_gate_valve(engine, hist)
+    except Exception:
+        return
+
+
+def _mic_gate_valve(engine, hist):
+    """Step the gate down one level when the last MIC_GATE_WINDOW chunks show the quiet-mic
+    signature: MIC_GATE_TRIP of them skipped WITH sustained activity just under the threshold.
+
+    One-way, one step per full window (the window is cleared on every step), and it latches a
+    one-shot hint for the UI to toast rather than writing anything into the transcript.
+    """
+    if len(hist) < MIC_GATE_WINDOW or sum(1 for near_skip in hist if near_skip) < MIC_GATE_TRIP:
+        return
+    hist.clear()
+    if getattr(engine, "_mic_gate_level", "normal") == "normal":
+        engine._mic_gate_level = "gentle"
+        hint = "gentle"
+    else:
+        engine._mic_speech_gate = False
+        hint = "off"
+    engine.mic_gate_hint = hint
+    engine.mic_gate_hint_seq = getattr(engine, "mic_gate_hint_seq", 0) + 1
+    print(f"[gate] quiet-mic safety valve: mic gate -> {hint}", flush=True)
+
+
+def mic_speech_evidence(ring, t_start, t_hi,
+                        margin_db=MIC_EVIDENCE_MARGIN_DB,
+                        ceiling_db=MIC_EVIDENCE_CEILING_DB,
+                        need_s=MIC_EVIDENCE_SECONDS,
+                        stats=None):
+    """(verdict, detail) for arm 3. verdict True = speech evidence, False = none, None = inert.
+
+    Inert whenever the evidence would have to be guessed: no room-tone baseline before the chunk
+    (see noise_floor_before - nothing earlier, or under 10 s of history), or no ring frames
+    covering the window at all. Never gate on missing evidence.
+
+    `detail` is a short numbers-only string for the debug log: no audio, no text.
+
+    `stats`, when a dict is passed in, is filled with this chunk's measurement for the quiet-mic
+    safety valve: floor, thr, n_evid, n_near, need and `near` (True when the frames sitting in
+    [thr - MIC_GATE_NEAR_BAND_DB, thr) are sustained enough to have cleared the evidence bar had
+    the bar been that much lower). An out-parameter rather than a third return value on purpose:
+    the two-tuple is pinned API. Costs one extra pass over frames already in memory, no audio
+    maths and no decoding.
+    """
+    floor = ring.noise_floor_before(t_start)
+    if floor is None:
+        return None, "no baseline"
+    frames = ring.frames_in(t_start, t_hi)
+    if not frames:
+        return None, "no frames"
+    thr = min(floor + margin_db, ceiling_db)
+    n_evid = sum(1 for d in frames if d >= thr)
+    # need_s worth of ring frames, derived from the ring's own resolution rather than a constant
+    # shared with capture_core (10 frames/s today), and never more than a third of a short chunk:
+    # a 1 s tail must not have to spend half its frames proving itself.
+    dur = max(t_hi - t_start, 1e-6)
+    need = min(max(1, int(round(need_s * len(frames) / dur))), max(1, len(frames) // 3))
+    if stats is not None:
+        n_near = sum(1 for d in frames if thr - MIC_GATE_NEAR_BAND_DB <= d < thr)
+        stats.update(floor=floor, thr=thr, n_evid=n_evid, n_near=n_near, need=need,
+                     frames=len(frames), near=n_near >= need)
+    return (n_evid >= need,
+            f"floor={floor:.0f} thr={thr:.0f} evid={n_evid}/{len(frames)} need={need}")
 
 
 def sys_echo_veto(mic_audio, sys_ring, abs_start, abs_end, word_count, sr=16000,
@@ -742,6 +1123,35 @@ _LEAK_NGRAM = 5                # anchor/long-prompt match length; below 5 common
 _LEAK_NGRAM_COVERAGE = 0.75    # matched n-gram spans must cover this much of the content tokens
 _LEAK_UNIT_MAX = 4             # a "unit" is a name/jargon term; longer -> prose, n-gram it instead
 _LEAK_LONG_PROMPT = 60         # a prompt longer than this is prose -> n-gram-only (safety valve)
+
+# Mode C (WP-3), the short anchor-echo drop. Modes A and B both need the leak to be MOST of the
+# segment: A wants 0.80 coverage by whole prompt units, B wants 0.75 coverage by 5-grams. The
+# residue they miss is the short scatter - three or four of the anchor's own distinctive words
+# in a row, in no order the anchor ever used ("Afrikaans, kodewissel, dankie"), which covers no
+# n-gram and matches no unit. Whisper emits these on non-speech, never mid-conversation.
+#
+# The terms are DERIVED from AF_ANCHOR_PROMPT, never listed a second time: its tokens of at least
+# _LEAK_ANCHOR_MINLEN characters. Six is where the anchor stops being ordinary conversation: it
+# keeps kodewisseling / vergadering / besigheid / kollegas / afrikaans / engels / sprekers /
+# dankie and leaves out baie, nogal, ons, hulle, julle, sjoe, more, tog. A token also matches by
+# prefix in either direction, so the truncation Whisper actually emits ("kodewissel") counts.
+#
+# The anchor labels its own two halves, and the split matters. Everything after "Algemene woorde"
+# ("common words") is, by the constant's own declaration, ordinary Afrikaans: "ons kinders is
+# baie lekker vandag" is a real sentence built entirely from it. So at least one hit must come
+# from the INSTRUCTION half - the half that talks ABOUT the transcription (afrikaans, engels,
+# kodewisseling, sprekers, nederlands, gesprek) and that a speaker has no reason to recite.
+#
+# Safety, measured 2026-09-03 on the incident capture: 0 of 53 segments of genuine Afrikaans
+# (the GPU large-v3 far-end reference, 918 words, plus both far-end CPU decodes) trip this, while
+# it catches the prompt-echo lines in the near-end junk. Four bounds buy that: only short
+# segments, at least two DISTINCT anchor terms, at least one of them from the instruction half,
+# and an escape for any segment still carrying _LEAK_ANCHOR_MIN_OWN words of the speaker's own.
+_LEAK_ANCHOR_SPLIT = "Algemene woorde"   # the anchor's own label for its ordinary-Afrikaans half
+_LEAK_ANCHOR_MINLEN = 6        # anchor tokens shorter than this are ordinary speech, never terms
+_LEAK_ANCHOR_MAX_TOKENS = 12   # only short segments; real sentences are longer than the scatter
+_LEAK_ANCHOR_MIN_HITS = 2      # distinct spoken terms; one is a speaker legitimately saying it
+_LEAK_ANCHOR_MIN_OWN = 5       # words NOT in the prompt that keep any segment, however many hits
 
 # Short, language-agnostic (EN+AF) filler list, derived from the observed leaks: these are
 # the words that pad a leak ("and Danica Freimond.", "... , yeah.") and must not count
@@ -960,6 +1370,13 @@ class PromptLeakMatcher:
         self._units = []      # Mode A: normalised token tuples, matched as contiguous n-grams
         self._vocab = set()   # Mode A: every token of those units (see the F7 note in is_leak)
         self._ngrams = set()  # Mode B: every _LEAK_NGRAM-length n-gram of the anchor / long prompt
+        # Mode C: the anchor's terms, the subset of them from its instruction half, and every
+        # token of the whole prompt (anchor plus user prompt) so "words of the speaker's own"
+        # means own, not merely non-anchor.
+        head = (anchor or "").split(_LEAK_ANCHOR_SPLIT)[0]
+        self._anchor_terms = sorted({t for t in _norm_tokens(anchor) if len(t) >= _LEAK_ANCHOR_MINLEN})
+        self._anchor_head = {t for t in self._anchor_terms if t in set(_norm_tokens(head))}
+        self._prompt_vocab = set(_norm_tokens(anchor)) | set(_norm_tokens(user_prompt))
         toks = _norm_tokens(user_prompt)
         if len(toks) > _LEAK_LONG_PROMPT:
             # Safety valve: a pasted agenda, not a name list. Unit/coverage matching over a
@@ -1002,6 +1419,8 @@ class PromptLeakMatcher:
         if not toks:
             return False
         if self._ngram_leak(toks):
+            return True
+        if self._anchor_echo(toks):
             return True
         if not self._units:
             return False
@@ -1050,6 +1469,36 @@ class PromptLeakMatcher:
         if cov < _LEAK_COVERAGE:
             return False
         return len(content) >= _LEAK_MIN_CONTENT or matched_len > 1
+
+    def _anchor_echo(self, toks):
+        """Mode C: a SHORT segment that is a scatter of the anchor's own distinctive terms.
+
+        Additive to modes A and B and deliberately narrow (see the _LEAK_ANCHOR_* notes): a
+        segment of at most _LEAK_ANCHOR_MAX_TOKENS tokens carrying at least
+        _LEAK_ANCHOR_MIN_HITS DISTINCT spoken words that are anchor terms, at least one of them
+        matching the anchor's instruction half, and fewer than _LEAK_ANCHOR_MIN_OWN tokens
+        that are not in the prompt at all.
+        Inert on a non-af session, where there is no anchor.
+        """
+        if not self._anchor_terms or len(toks) > _LEAK_ANCHOR_MAX_TOKENS:
+            return False
+        hit, head = set(), False
+        for t in set(toks):
+            for term in self._anchor_terms:
+                # Either direction, because Whisper truncates the anchor's long words as often
+                # as it extends them ("kodewissel" for "kodewisseling", "afrikaanse" for
+                # "afrikaans"). The MINLEN floor on both sides keeps this off short words.
+                if t == term or (len(t) >= _LEAK_ANCHOR_MINLEN
+                                 and (t.startswith(term) or term.startswith(t))):
+                    # Count the SPOKEN token, never the terms it matched: prefix matching lets a
+                    # single "Afrikaans" hit both "afrikaans" and "afrikaanse", and counting terms
+                    # would turn one word into the two the drop requires.
+                    hit.add(t)
+                    head = head or term in self._anchor_head
+        if len(hit) < _LEAK_ANCHOR_MIN_HITS or not head:
+            return False
+        own = sum(1 for t in toks if t not in self._prompt_vocab)
+        return own < _LEAK_ANCHOR_MIN_OWN
 
     def _ngram_leak(self, toks):
         """Mode B: the anchor / long prompt / long unit, matched as contiguous n-grams.
@@ -1153,14 +1602,36 @@ class Segment:
     text: str
 
 
+def _chunk_seconds(item, sr=16000):
+    """Audio seconds in a queued chunk. 0.0 for anything that is not real audio (test stubs feed
+    ints and strings), so the backlog accounting can never raise on the worker thread."""
+    try:
+        return len(item[1]) / float(sr)
+    except Exception:
+        return 0.0
+
+
+def _mmss(seconds):
+    """Session-relative seconds as m:ss, for notices a reader has to line up with the transcript."""
+    try:
+        s = max(0, int(round(seconds)))
+    except Exception:
+        return "?"
+    return f"{s // 60}:{s % 60:02d}"
+
+
 class Engine:
-    def __init__(self, tier, language="af", initial_prompt=None, cpu_threads=8, beam_size=5, adaptive=True, engine="auto"):
+    def __init__(self, tier, language="af", initial_prompt=None, cpu_threads=8, beam_size=None, adaptive=True, engine="auto"):
         self.engine = (engine or "auto").lower()
         if tier not in TIER_CONFIG:
             raise ValueError(f"Unknown tier {tier!r}; choose from {list(TIER_CONFIG)}")
         self.tier = tier
         self.language = language
-        self.beam_size = beam_size
+        # beam_size=None means "this device's measured default": 1 on CPU (see CPU_BEAM_SIZE,
+        # roughly halves the cost for about +0.02 WER), 5 everywhere else. An explicit value from
+        # the caller is always honoured, on either device.
+        self.beam_size = beam_size if beam_size is not None else (
+            CPU_BEAM_SIZE if TIER_CONFIG[tier]["device"] == "cpu" else DEFAULT_BEAM_SIZE)
         # adaptive=True (live): cut beam + downgrade the model under backlog to keep
         # up with real time. adaptive=False (file import): not real time, so never
         # trade quality for speed - keep the chosen model and full beam size.
@@ -1195,6 +1666,17 @@ class Engine:
         self._compute_type = cfg["compute_type"]
         self._cpu_threads = cpu_threads
         self._rtf = deque(maxlen=DOWNGRADE_WINDOW)  # recent real-time factors (CPU downgrade)
+        # ── live ladder + shed valve state (CPU only) ──
+        # Chunks the shed valve pulled back out of the queue so it could drop the OLDEST first.
+        # Only the worker touches it, producers only ever put on the queue, and it is always
+        # drained before the queue, so it holds strictly older chunks and FIFO order is preserved.
+        self._front = deque()
+        self._last_rung_change = time.monotonic()   # DOWNGRADE_MIN_SECONDS is measured from here
+        self._cold_decode = True      # first decode on a freshly built model: its RTF is load cost
+        self._last_feed = {}          # source -> monotonic of that source's previous chunk
+        self._swap = None             # at most ONE next-rung model being built off the worker
+        self.shed_seconds = 0.0       # total audio the shed valve dropped this session
+        self.shed_events = 0
         self.subscribers = []
         self.on_downgrade = None               # optional callback(old_size, new_size), fired on the
                                                # worker thread after a successful CPU auto-downgrade.
@@ -1212,6 +1694,25 @@ class Engine:
         # losing the other. "0" makes arm 2 fully inert, ring included.
         self._xchan_veto2 = os.environ.get("SA_LIVE_XCHAN_VETO2", "1") != "0"
         self._silence_gate = os.environ.get("SA_LIVE_SILENCE_GATE", "1") != "0"
+        # Arm 3 of the silence gate (MIC speech evidence) and its per-chunk decision log. The
+        # arm has its own switch so a support session can restore the peak-only gate without
+        # losing arms 1 and 2; the log is off by default because it is one line per MIC chunk.
+        self._mic_speech_gate = os.environ.get("SA_LIVE_MIC_SPEECH_GATE", "1") != "0"
+        self._mic_gate_debug = os.environ.get("SA_LIVE_MIC_GATE_DEBUG", "0") != "0"
+        # The gate is live-switchable now (set_mic_gate / mic_gate_state), so the env var above is
+        # only the STARTING value; the web layer overrides it from the saved setting and the user
+        # can flip it mid-meeting. _mic_speech_gate stays the on/off flag under its own name so the
+        # worker keeps reading one attribute per chunk (no lock: a bool assignment is atomic and
+        # the next chunk picks it up, which is exactly the contract).
+        self._mic_gate_level = "normal"   # "normal" | "gentle", stepped down by the safety valve
+        self._mic_gate_recent = deque(maxlen=MIC_GATE_WINDOW)  # the valve's window (near-miss skips)
+        self.mic_gate_skipped = 0         # MIC chunks not decoded this session
+        self.mic_gate_decoded = 0         # MIC chunks decoded this session
+        # One-shot hint for the UI, latched by the valve and pulled (never pushed) by /api/status:
+        # a sequence number the client compares against the last one it showed. Pull, so the engine
+        # stays ignorant of the web layer and nothing has to be cleared.
+        self.mic_gate_hint = None         # None | "gentle" | "off"
+        self.mic_gate_hint_seq = 0
         self._prompt_leak_on = os.environ.get("SA_LIVE_PROMPT_LEAK_GUARD", "1") != "0"
         self._loop_guard_on = os.environ.get("SA_LIVE_LOOP_GUARD", "1") != "0"
         self._recent = RecentEmissions()   # cross-segment loop history, per source
@@ -1233,6 +1734,39 @@ class Engine:
         self._prompt_leak = PromptLeakMatcher(
             user_prompt, AF_ANCHOR_PROMPT if language == "af" else None)
 
+    @property
+    def indicative(self):
+        """True once the active model sits BELOW `small` on the ladder, i.e. the live text should
+        be read as a rough guide and the recording re-transcribed afterwards. Still the session's
+        own family (the ladder never leaves it), just a model small enough to say so."""
+        try:
+            return CPU_LADDER.index(self.size) > CPU_LADDER.index(INDICATIVE_BELOW)
+        except ValueError:
+            return False
+
+    def _is_burst(self, source, audio):
+        """True when this chunk arrived FASTER than real time for its source.
+
+        The evidence that separates a replay/catch-up burst from a machine that genuinely cannot
+        keep up. Live capture hands over one chunk per chunk-duration per source, so the gap
+        between two chunks of the SAME source is about the chunk length; a burst feed (a replay
+        harness, a buffered flush after a device glitch) closes that gap to nothing. Measured per
+        source on purpose: MIC and SYS both feed this one engine, so a cross-source gap is
+        near zero even in a perfectly healthy live session.
+
+        The RTF of a burst-fed chunk is a real measurement of the model, but it is not evidence
+        about holding REAL TIME, so it is excluded from the downgrade window."""
+        now = time.monotonic()
+        prev = self._last_feed.get(source)
+        self._last_feed[source] = now
+        if prev is None:
+            return False
+        try:
+            dur = len(audio) / 16000.0
+        except Exception:
+            return False
+        return dur > 0 and (now - prev) < 0.5 * dur
+
     def _ring_for(self, source):
         """This source's energy ring, or None when it has none (or the kill switch is off).
 
@@ -1253,7 +1787,11 @@ class Engine:
         1. Absolute: the loudest frame never reached the speech floor (see _silence_floor_db).
            That is the point of WP-4 - live AGC lifts a silent room's chunk energy over the
            -45 dBFS floor, so the chunk-fed gate was effectively dead on a quiet mic, the exact
-           condition Whisper fabricates on.
+           condition Whisper fabricates on. On MIC that floor is a CEILING on a relative test
+           rather than a cut of its own (see ABS_FLOOR_MARGIN_DB): a low-gain microphone puts
+           its speech and its room under -45 dBFS together, so the chunk must ALSO have failed
+           to rise above the room tone before it is skipped. The quiet-mic safety valve owns
+           this arm as well: gentle halves the margin and off stands it down.
         2. Dead channel (relative): the loudest frame sits <= `dead_margin_db` above this
            channel's room tone as measured STRICTLY BEFORE the chunk (ring p10 of the frames
            preceding t_start), i.e. nothing here rose meaningfully above the background it
@@ -1267,11 +1805,21 @@ class Engine:
            which this arm stays inert. The last two are what keep the first chunk of a sustained
            quiet talker: at -40 dBFS throughout, p10 and peak are both -40, and a
            self-referential baseline would call that a dead channel and eat real speech.
+        3. MIC ONLY - speech evidence (WP-3): both tests above key off the loudest frame, which
+           one door bang, one keyboard click or one cough is enough to satisfy for a whole 15 s
+           chunk of room tone. This one asks instead how MANY frames cleared an evidence
+           threshold, because speech occupies frames and a transient does not. See
+           mic_speech_evidence for the threshold and the two ways it stays inert. Its own switch,
+           SA_LIVE_MIC_SPEECH_GATE=0, restores the peak-only behaviour of arms 1 and 2.
 
         Without a ring (uploads, ring-less paths, SA_LIVE_RAW_MIC_RING=0 for EITHER source) it
         falls back to `_is_silence(audio)` verbatim, which keeps its four pinned tests untouched.
         A ring with no frames covering the window also falls back: never gate on missing evidence.
-        Both tests share SA_LIVE_SILENCE_GATE=0.
+        All three tests share SA_LIVE_SILENCE_GATE=0.
+
+        Skipping is a DECODE decision only. The recorder is fed from the capture callback, ahead
+        of the engine queue (web/app.py _feed, __main__.py feed), so a chunk the gate skips is
+        already on disk in full and the saved audio is unchanged by any of this.
         """
         # The gate is the one consumer that honours SA_LIVE_RAW_MIC_RING for BOTH sources: the
         # switch exists to restore pre-WP-4 gate behaviour wholesale, and a switch that left SYS
@@ -1287,11 +1835,85 @@ class Engine:
         peak = ring.max_db(t_start, t_hi)
         if peak is None:
             return _is_silence(audio)
-        if peak < _silence_floor_db(ring, t_hi):
-            return True
         floor = ring.noise_floor_before(t_start)
-        return (floor is not None and peak <= dead_ceiling_db
-                and (peak - floor) <= dead_margin_db)
+        abs_floor = _silence_floor_db(ring, t_hi)
+        if peak < abs_floor:
+            if source != "MIC":
+                return _gate_log(self, source, t_start, True, "absolute")
+            # MIC: the absolute floor is a CEILING on a relative test, not a cut of its own.
+            # Measured at -18 dB of mic attenuation on a real capture: 33 of 40 chunks were cut
+            # here, arm 3 never got to run on any of them and the safety valve therefore never
+            # saw the quiet mic it exists for. A low-gain microphone puts EVERYTHING - speech
+            # and room alike - under -45 dBFS, so an absolute floor alone cannot tell a quiet
+            # talker from an empty room. What can is the room's own tone: skip only when nothing
+            # in the chunk rose meaningfully above the floor it arrived into.
+            # The valve owns this arm too. Gentle halves the margin, and off (whether the valve
+            # stepped there or the user did) stands it down entirely, or the escalation would
+            # hand a cut-off user from one arm to another. Arm 1 feeds the valve no near-miss
+            # evidence, deliberately: post-fix it only fires ON the room floor, which is the
+            # dead-room signature, never a talker under the bar. That evidence is arm 3's.
+            armed = bool(getattr(self, "_mic_speech_gate", True))
+            gentle = getattr(self, "_mic_gate_level", "normal") == "gentle"
+            margin = ABS_FLOOR_GENTLE_MARGIN_DB if gentle else ABS_FLOOR_MARGIN_DB
+            if armed and (floor is None or (peak - floor) <= margin):
+                # floor is None (session start, under 10 s of history) keeps the old absolute cut:
+                # with no room tone to compare against there is nothing better to do, and this is
+                # what the pinned first-chunk cases expect.
+                why = "absolute" if floor is None else f"absolute peak={peak:.0f} floor={floor:.0f}"
+                return _gate_log(self, source, t_start, True, why)
+        if (floor is not None and peak <= dead_ceiling_db
+                and (peak - floor) <= dead_margin_db):
+            return _gate_log(self, source, t_start, True, f"dead peak={peak:.0f} floor={floor:.0f}")
+        # Arm 3 (MIC only): continuity, not peak. Additive - it can only skip a chunk the two
+        # peak arms already decided to keep, never rescue one they skipped.
+        if source == "MIC" and getattr(self, "_mic_speech_gate", True):
+            # Read the level per chunk, not once per session: the safety valve steps it down from
+            # under this very call, and a live toggle can flip the flag between two chunks.
+            gentle = getattr(self, "_mic_gate_level", "normal") == "gentle"
+            stats = {}
+            verdict, why = mic_speech_evidence(
+                ring, t_start, t_hi,
+                margin_db=MIC_GATE_GENTLE_MARGIN_DB if gentle else MIC_EVIDENCE_MARGIN_DB,
+                need_s=MIC_GATE_GENTLE_SECONDS if gentle else MIC_EVIDENCE_SECONDS,
+                stats=stats)
+            if verdict is not None:
+                return _gate_log(self, source, t_start, not verdict, f"evidence {why}", stats)
+            return _gate_log(self, source, t_start, False, f"evidence inert ({why})")
+        return _gate_log(self, source, t_start, False, f"peak={peak:.0f}")
+
+    def mic_gate_state(self):
+        """The mic gate as the UI must render it: the ENGINE'S own state, never a stored setting.
+
+        mode is "normal" | "gentle" | "off"; gentle is the quiet-mic safety valve's first step.
+        skipped/decoded are this session's MIC chunk counts. hint/hint_seq carry the valve's
+        one-shot message: the client toasts when hint_seq moves past the one it last showed, so
+        nothing needs clearing and a page reload cannot re-fire an old hint.
+        """
+        on = bool(getattr(self, "_mic_speech_gate", True))
+        return {
+            "on": on,
+            "mode": (getattr(self, "_mic_gate_level", "normal") if on else "off"),
+            "skipped": int(getattr(self, "mic_gate_skipped", 0)),
+            "decoded": int(getattr(self, "mic_gate_decoded", 0)),
+            "hint": getattr(self, "mic_gate_hint", None),
+            "hint_seq": int(getattr(self, "mic_gate_hint_seq", 0)),
+        }
+
+    def set_mic_gate(self, on):
+        """Turn the MIC speech gate on or off, effective on the NEXT chunk. Returns mic_gate_state().
+
+        Decoding only: the recorder is fed ahead of this queue, so neither value changes a single
+        sample of what is saved. Turning it back on restores the level the valve last chose (gentle
+        stays gentle) rather than jumping back to normal, because "never escalate automatically"
+        would be hollow if an off/on flick undid the valve's finding. The window is cleared either
+        way, so the valve judges what happens next, not what happened before the switch."""
+        self._mic_speech_gate = bool(on)
+        try:
+            self._mic_gate_recent.clear()
+        except AttributeError:
+            self._mic_gate_recent = deque(maxlen=MIC_GATE_WINDOW)
+        return self.mic_gate_state()
+
 
     def subscribe(self, fn):
         self.subscribers.append(fn)
@@ -1319,11 +1941,22 @@ class Engine:
         self._worker.join(timeout=timeout)  # timeout=None -> wait until fully drained
 
     def pending(self):
-        """Approximate chunks still to transcribe (queued + the one in flight)."""
-        n = self._queue.qsize()
+        """Approximate chunks still to transcribe (shed buffer + queued + the one in flight)."""
+        n = self._queue.qsize() + len(self._front)
         if self._busy:
             n += 1
         return n
+
+    def _backlog_seconds(self):
+        """Seconds of audio still waiting to be transcribed (shed buffer + queue). The real-time
+        contract, and what the shed valve bounds. Chunks that are not real audio count as 0."""
+        total = sum(_chunk_seconds(i) for i in self._front if i is not None)
+        try:
+            with self._queue.mutex:          # read-only snapshot; producers only ever append
+                queued = list(self._queue.queue)
+        except Exception:
+            queued = []
+        return total + sum(_chunk_seconds(i) for i in queued if i is not None)
 
     def is_alive(self):
         """True while the transcription worker thread is running."""
@@ -1340,8 +1973,11 @@ class Engine:
         """
         if self._stop.is_set():
             return False  # shutting down, don't accept new audio while we drain
+        # Stamped with its arrival time and whether it arrived faster than real time, so the
+        # downgrade window can judge live evidence only (see _is_burst).
+        item = (source, audio, t_start, time.monotonic(), self._is_burst(source, audio))
         try:
-            self._queue.put((source, audio, t_start), block=block, timeout=timeout)
+            self._queue.put(item, block=block, timeout=timeout)
             return True
         except queue.Full:
             if not block:
@@ -1439,6 +2075,10 @@ class Engine:
         self._rebuild_prompt_leak(self._user_prompt, self.language)
         self._recent.clear()  # a model/language flip legitimately changes output style
         self._rtf.clear()   # judge the (possibly new) model fresh; never downgrade on the old RTF
+        if ch["model"] is not None:
+            self._cold_decode = True            # the new model pays its load cost on its first decode
+            self._last_rung_change = time.monotonic()
+            self._swap = None                   # a ladder build in flight is stale now: drop it
         lang_name = {"af": "Afrikaans", "en": "English"}.get(self.language, self.language or "auto-detect")
         self._emit_notice(t_start, f"[engine: now {self.family} {self.size}, language {lang_name}]")
 
@@ -1500,58 +2140,212 @@ class Engine:
         """Emit a system notice into the transcript (e.g. a model change)."""
         self._fanout(Segment(source="SYS", t_start=t_start, t_end=t_start, text=text))
 
-    def _maybe_downgrade(self, t_start):
-        """Step down CPU_LADDER when sustained RTF shows we can't hold real-time.
+    def _notify_downgrade(self, old_size, new_size):
+        """Fire on_downgrade best-effort. Fully decoupled, exactly like the segment subscribers:
+        this runs on the worker thread, so the callback body does its own thread-safe hand-off. A
+        None callback (CLI, file import, tests) is a no-op; a raising callback must never take the
+        transcription worker down with it. The UI reads self.indicative / self.shed_seconds off
+        the engine when it builds its payload, so this signature stays as it has always been."""
+        cb = self.on_downgrade
+        if cb is None:
+            return
+        try:
+            cb(old_size, new_size)
+        except Exception as e:
+            print(f"[engine] on_downgrade callback error: {e}", flush=True)
 
-        Only fires on CPU. Ratchets down only, never back up, to avoid
-        oscillation. The new (smaller) model also chews through the queued
-        backlog faster, which is how the session catches back up.
+    def _next_rung(self):
+        """The next USABLE rung below the current model, or None when there is none left.
+
+        Usable means both of the ladder's hard rules at once: it resolves to the family this
+        session is already running (never a stock model under an Afrikaans session), and it is
+        already on this machine (never a mid-meeting download). A rung that fails either test is
+        skipped and the search carries on down; when nothing is left the caller sheds instead.
+        Returns (size, model_id, family)."""
+        try:
+            idx = CPU_LADDER.index(self.size)
+        except ValueError:
+            idx = -1  # start size above the ladder (turbo/large-v3) -> first rung is next
+        for size in CPU_LADDER[idx + 1:]:
+            # Keep the family AND the user's engine choice: a forced-Fluister or forced-Whisper
+            # session must NOT silently flip to language-based auto when the size drops a rung.
+            model_id, fam = resolve_model(size, self.language, self.engine)
+            if fam != self.family:
+                print(f"[engine] ladder: skipping {size} ({fam}, not {self.family})", flush=True)
+                continue
+            if not model_present(model_id):
+                print(f"[engine] ladder: skipping {size} ({model_id} is not on this machine)", flush=True)
+                continue
+            return size, model_id, fam
+        return None
+
+    def _begin_swap(self, size, model_id, family):
+        """Start building the next rung on a HELPER thread and return at once, so the worker keeps
+        decoding on the current model while the new one loads. A ct2 build plus its first inference
+        costs tens of seconds (measured 35 s for medium, 16 s for small), and doing that on the
+        worker used to stall transcription outright at the exact moment the session was already
+        behind. At most one build is ever in flight, so memory is bounded at one extra model."""
+        if self._swap is not None:
+            return
+        swap = {"size": size, "model_id": model_id, "family": family,
+                "model": None, "error": None, "done": threading.Event()}
+        self._swap = swap
+        threading.Thread(target=self._swap_run, args=(swap,), daemon=True, name="rung-swap").start()
+
+    def _swap_run(self, swap):
+        try:
+            # local_only: the ladder never downloads. _next_rung already checked, this is the
+            # belt-and-braces half of the same rule.
+            swap["model"] = load_model(swap["model_id"], "cpu", self._compute_type,
+                                       cpu_threads=self._cpu_threads, local_only=True)
+        except Exception as e:
+            swap["error"] = e
+        finally:
+            swap["done"].set()
+
+    def _install_swap(self, t_start):
+        """Install a finished helper-thread build. Worker thread only, so self.model stays
+        single-writer. Returns True when the rung actually changed."""
+        swap = self._swap
+        if swap is None or not swap["done"].is_set():
+            return False
+        self._swap = None                       # drop the reference either way: one build in flight
+        self._last_rung_change = time.monotonic()
+        if swap["model"] is None:
+            print(f"[engine] downgrade load failed ({swap['size']}): {swap['error']}", flush=True)
+            return False
+        old_size = self.size   # capture BEFORE the swap: the callback reports the size we left
+        self.model = swap["model"]
+        self.size = swap["size"]
+        self.model_name = swap["model_id"]
+        self.family = swap["family"]
+        self.is_fluister = swap["family"] == "fluister"
+        self._rtf.clear()
+        # A different model legitimately changes output style, so the cross-segment loop history
+        # from the old one is not evidence about the new one (_apply_pending_change has always
+        # done this for a language/model change; the ladder used to forget to).
+        self._recent.clear()
+        self._cold_decode = True                # the first decode pays this model's load cost
+        self._emit_notice(t_start, f"[engine: switched to '{self.size}' model to keep up with the audio]")
+        self._notify_downgrade(old_size, self.size)
+        return True
+
+    def _maybe_downgrade(self, t_start):
+        """Step down CPU_LADDER when sustained, honest evidence says we can't hold real-time.
+
+        Only fires on CPU. Ratchets down only, never back up, to avoid oscillation. The new
+        (smaller) model also chews through the queued backlog faster, which is how the session
+        catches back up. See CPU_LADDER for the three rules the step itself obeys.
         """
         # Swivuriso is a single fixed model (size-independent), so there is no smaller rung to drop
         # to; never downgrade it.
         if self.family == "swivuriso":
             return
-        if not self.adaptive or not self._is_cpu or len(self._rtf) < self._rtf.maxlen:
+        if not self.adaptive or not self._is_cpu:
+            return
+        if self._install_swap(t_start):
+            return                              # just changed rung; judge the new one fresh
+        if self._swap is not None:
+            return                              # a rung is already being built off-thread
+        if time.monotonic() - self._last_rung_change < DOWNGRADE_MIN_SECONDS:
+            return                              # a step has to hold for a while before the next
+        if len(self._rtf) < self._rtf.maxlen:
             return
         avg = sum(self._rtf) / len(self._rtf)
         if avg <= DOWNGRADE_RTF:
             return
-        try:
-            idx = CPU_LADDER.index(self.size)
-        except ValueError:
-            idx = -1  # start size above the ladder (turbo/large-v3) -> first rung is next
-        if idx + 1 >= len(CPU_LADDER):
-            return  # already on the fastest rung; nothing more to give
-        new_size = CPU_LADDER[idx + 1]
-        # Keep the family AND the user's engine choice: a forced-Fluister or forced-Whisper session
-        # must NOT silently flip to language-based auto when the model size drops a rung.
-        new_model, new_family = resolve_model(new_size, self.language, self.engine)
-        print(f"[engine] CPU RTF ~{avg:.2f} (> {DOWNGRADE_RTF}); "
-              f"downgrading {self.size} -> {new_size}", flush=True)
-        try:
-            new = load_model(new_model, "cpu", self._compute_type, cpu_threads=self._cpu_threads)
-        except Exception as e:
-            print(f"[engine] downgrade load failed ({new_size}): {e}", flush=True)
-            return
-        old_size = self.size   # capture BEFORE the swap: the callback reports the size we left
-        self.model = new
-        self.size = new_size
-        self.model_name = new_model
-        self.family = new_family
-        self.is_fluister = new_family == "fluister"
-        self._rtf.clear()
-        self._emit_notice(t_start, f"[engine: switched to '{new_size}' model to keep up with the audio]")
-        # Surface the downgrade to whoever is listening (the web layer floats a banner + fires a
-        # one-time toast). Best-effort and fully decoupled, exactly like the segment subscribers:
-        # this runs on the worker thread, so the callback body does its own thread-safe hand-off.
-        # A None callback (CLI, file import, tests) is a no-op; a raising callback must never take
-        # the transcription worker down with it.
-        cb = self.on_downgrade
-        if cb is not None:
+        self._start_step(f"CPU RTF ~{avg:.2f} (> {DOWNGRADE_RTF})")
+
+    def _start_step(self, reason):
+        """Begin a step to the next usable rung, if the ladder is allowed to move and has one.
+
+        The two callers hold different evidence and both are honest: a full window of over-budget
+        RTF, and a shed event (the backlog blew past its bound on a live feed, which is the real
+        time contract failing in the most direct way there is). Everything else - swivuriso, the
+        minimum spacing, one build in flight, in-family, present-only - is checked here or in
+        _next_rung, so neither caller can bypass a rule."""
+        if self.family == "swivuriso" or not self.adaptive or not self._is_cpu:
+            return False
+        if self._swap is not None:
+            return False
+        if time.monotonic() - self._last_rung_change < DOWNGRADE_MIN_SECONDS:
+            return False
+        nxt = self._next_rung()
+        if nxt is None:
+            # Nothing usable left below this model. Do NOT reach outside the family or the local
+            # store for one: the shed valve handles it from here. Clear the window so the next
+            # decision is made on fresh evidence rather than a standing trigger.
+            self._rtf.clear()
+            return False
+        new_size, new_model, new_family = nxt
+        print(f"[engine] {reason}; downgrading {self.size} -> {new_size}", flush=True)
+        self._begin_swap(new_size, new_model, new_family)
+        self._rtf.clear()                       # don't re-trigger while the build runs
+        return True
+
+    def _drain_to_front(self):
+        """Move everything queued into the worker's own front buffer so the shed valve can drop the
+        OLDEST audio. queue.Queue only drops the NEWEST (a full queue refuses the put), which is
+        the wrong end: the newest chunk is the one the listener is waiting to see."""
+        while True:
             try:
-                cb(old_size, new_size)
-            except Exception as e:
-                print(f"[engine] on_downgrade callback error: {e}", flush=True)
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            if item is None:
+                self._stop.set()   # never lose the shutdown sentinel; the drained+stop check exits
+                continue
+            self._front.append(item)
+
+    def _maybe_shed(self, t_start):
+        """Drop the OLDEST queued audio when the backlog is past SHED_BACKLOG_SECONDS.
+
+        The last honest move. When the machine cannot keep up and there is no usable rung left
+        below the current model, the choice is between falling further and further behind (the live
+        view slides minutes into the past) and losing some audio. Losing audio wins, provided it is
+        SAID: the notice names how much and where, and the recording, if one is running, still has
+        every second of it. Live only (self.adaptive): a file import is not real time and must
+        never lose a chunk."""
+        if not self.adaptive or not self._is_cpu:
+            return
+        if self._stop.is_set():
+            # Shutting down and draining the tail. There is no real-time obligation left, and
+            # stop(drain=True) exists precisely so the last minutes of the session are not lost.
+            return
+        if self._backlog_seconds() <= SHED_BACKLOG_SECONDS:
+            return
+        self._drain_to_front()
+        dropped = 0.0
+        first = last = None
+        while self._front and self._backlog_seconds() > SHED_BACKLOG_SECONDS:
+            item = self._front.popleft()
+            if item is None:
+                continue
+            dur = _chunk_seconds(item)
+            if first is None:
+                first = item[2]
+            last = item[2] + dur
+            dropped += dur
+        if dropped <= 0:
+            return
+        self.shed_seconds += dropped
+        self.shed_events += 1
+        span = f" ({_mmss(first)} to {_mmss(last)})" if first is not None else ""
+        print(f"[engine] shed {dropped:.0f}s of backlog{span}; "
+              f"total shed {self.shed_seconds:.0f}s", flush=True)
+        self._emit_notice(t_start, f"[engine: skipped {dropped:.0f} s of audio{span} to catch up]")
+        # Surface it the same way a rung change is surfaced: same callback, same banner. Passing
+        # the current size for both sides says "nothing changed model-side, this is the shed
+        # valve", which is what the banner copy keys off.
+        self._notify_downgrade(self.size, self.size)
+        # A shed IS the real-time contract failing, and it is far more direct evidence than a
+        # rolling RTF average: the backlog went past its bound on a live feed. Measured on a ten
+        # minute two-source replay starting at medium on four threads, waiting for the RTF window
+        # alone left the session on medium for six minutes and 126 s of audio shed before it
+        # stepped; stepping on the shed itself cuts that to one shed event. Every ladder rule
+        # still applies (_start_step), so this can only ever take a rung that is in-family,
+        # present, and past the minimum spacing.
+        self._start_step(f"shed {dropped:.0f}s of backlog")
 
     def _run(self):
         # Loop until the sentinel, or (during shutdown) until the queue empties.
@@ -1559,17 +2353,23 @@ class Engine:
         # the queued backlog (the last minutes of the session). Instead we drain.
         while True:
             self._flush_pending_mic()   # release held MIC whose delay elapsed (ticks each ~0.5s)
-            try:
-                item = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                if self._stop.is_set():
-                    break  # shutdown requested and the backlog is fully drained
-                continue
+            if self._front:
+                item = self._front.popleft()   # chunks the shed valve pulled back: strictly older
+            else:
+                try:
+                    item = self._queue.get(timeout=0.5)
+                except queue.Empty:
+                    if self._stop.is_set():
+                        break  # shutdown requested and the backlog is fully drained
+                    continue
             if item is None:
                 break  # sentinel
             if self._abort.is_set():
                 continue  # hard abort: discard remaining items without transcribing
-            source, audio, t_start = item
+            # Tolerant unpack: on_chunk stamps arrival time + the burst flag, but a bare
+            # (source, audio, t_start) put straight on the queue still works.
+            source, audio, t_start = item[0], item[1], item[2]
+            burst = bool(item[4]) if len(item) > 4 else False
 
             # Apply a queued live language/model change before this chunk (worker-thread only, so
             # self.model stays single-writer, like the adaptive downgrade further down).
@@ -1598,15 +2398,22 @@ class Engine:
                 if self._silence_gate and self._chunk_is_silence(source, audio, t_start):
                     continue
                 t0 = time.monotonic()
-                segs, _info = self.model.transcribe(
-                    audio,
-                    language=self.language,
-                    initial_prompt=self.initial_prompt,
-                    vad_filter=True,
-                    beam_size=beam,
-                    **GUARD,
-                )
-                seg_list = list(segs)  # faster-whisper is lazy, this forces the actual compute
+                # encoder_window(): a CPU model decodes at its measured 20 s window (the mel is
+                # otherwise padded back to 30 s inside faster-whisper). Inert for CUDA/Metal.
+                with encoder_window(self.model) as _win_frames:
+                    _kw = {"chunk_length": _win_frames // 100} if _win_frames else {}
+                    segs, _info = self.model.transcribe(
+                        audio,
+                        language=self.language,
+                        initial_prompt=self.initial_prompt,
+                        vad_filter=True,
+                        # Per-source VAD: the tightened MIC set, the library defaults for SYS.
+                        vad_parameters=vad_options_for(source),
+                        beam_size=beam,
+                        **_kw,
+                        **GUARD,
+                    )
+                    seg_list = list(segs)  # faster-whisper is lazy, this forces the actual compute
                 elapsed = time.monotonic() - t0
 
                 for seg in seg_list:
@@ -1619,7 +2426,7 @@ class Engine:
                     # anchor). Toggle SA_LIVE_PROMPT_LEAK_GUARD=0.
                     if self._prompt_leak_on and self._prompt_leak.is_leak(text):
                         print(f"[engine] prompt-leak dropped {source} @ "
-                              f"{t_start + float(seg.start):.1f}s {text[:40]!r}", flush=True)
+                              f"{t_start + float(seg.start):.1f}s {_logtxt(text)}", flush=True)
                         continue
                     # Phrase-loop artifact: a segment that is mostly one repeated multi-word unit
                     # ("ek het nie ek het nie ...") is a quiet-mic hallucination, not speech.
@@ -1658,7 +2465,7 @@ class Engine:
                         _drop, _why = sys_echo_veto(_mic, self.sys_env, out.t_start, out.t_end, len(text.split()),
                                                     mic_ring=self._ring_for("MIC"))
                         if _drop:
-                            print(f"[engine] echo-veto dropped MIC @ {out.t_start:.1f}s [{_why}] {text[:40]!r}", flush=True)
+                            print(f"[engine] echo-veto dropped MIC @ {out.t_start:.1f}s [{_why}] {_logtxt(text)}", flush=True)
                             continue
                     # Arm 2: energy-armed fuzzy echo. Catches the quiet-but-GAPPY far end that arm
                     # 1 correctly refuses, by demanding the text echo what the far end just said on
@@ -1683,7 +2490,7 @@ class Engine:
                             self._ring_for("MIC"), self.sys_env, self._sys_text)
                         if _d2:
                             print(f"[engine] xchan-echo dropped MIC @ {out.t_start:.1f}s "
-                                  f"[own={_own:.1f} marg={_marg:.1f} ov={_ov:.2f}] {text[:40]!r}",
+                                  f"[own={_own:.1f} marg={_marg:.1f} ov={_ov:.2f}] {_logtxt(text)}",
                                   flush=True)
                             continue
                     # Cross-segment loop: this line is the 5th+ cycle of a short, fast
@@ -1695,7 +2502,7 @@ class Engine:
                         _p = self._recent.observe(source, text, out.t_start)
                         if _p:
                             print(f"[engine] loop-guard suppressed {source} @ {out.t_start:.1f}s "
-                                  f"p={_p} {text[:40]!r}", flush=True)
+                                  f"p={_p} {_logtxt(text)}", flush=True)
                             continue
                     self._route(out)
 
@@ -1703,9 +2510,15 @@ class Engine:
                 # step down to a faster model if we're sustained-slower than real-time.
                 if self._is_cpu:
                     audio_dur = len(audio) / 16000.0
-                    if audio_dur > 0:
+                    # Only LIVE, WARM samples are evidence about holding real time. A burst-fed
+                    # chunk was never a real-time obligation (see _is_burst), and the first decode
+                    # on a freshly built model is dominated by that model's one-off load cost -
+                    # counting either is how a single slow moment used to cascade the whole ladder.
+                    if audio_dur > 0 and not burst and not self._cold_decode:
                         self._rtf.append(elapsed / audio_dur)
+                    self._cold_decode = False
                     self._maybe_downgrade(t_start)
+                    self._maybe_shed(t_start)
             except Exception as e:
                 print(f"[engine] transcribe error on {source} chunk: {e}", flush=True)
             finally:

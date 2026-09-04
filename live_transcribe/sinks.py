@@ -28,6 +28,61 @@ def _read_wav_i16(path):
     return np.frombuffer(frames, dtype="<i2")
 
 
+RECORDING_FORMATS = {
+    "flac": (".flac", "FLAC", "PCM_16"),
+    "opus": (".opus", "OGG", "OPUS"),
+    "wav": (".wav", "WAV", "PCM_16"),
+}
+RECORDING_EXTENSIONS = tuple(spec[0] for spec in RECORDING_FORMATS.values())
+
+
+def normalise_recording_format(value):
+    """Return a supported recording format, defaulting invalid settings to FLAC."""
+    value = str(value or "").strip().lower()
+    return value if value in RECORDING_FORMATS else "flac"
+
+
+def recording_suffix(recording_format):
+    return RECORDING_FORMATS[normalise_recording_format(recording_format)][0]
+
+
+def recording_format_from_suffix(suffix):
+    suffix = str(suffix or "").lower()
+    return next((name for name, spec in RECORDING_FORMATS.items() if spec[0] == suffix), "flac")
+
+
+def _load_soundfile():
+    # Lazy by design: if the bundled libsndfile DLL is ever broken or missing, the
+    # recorder can still start immediately through the standard-library WAV path.
+    import soundfile
+    return soundfile
+
+
+class _SoundFileWriter:
+    """Small writeframes-compatible wrapper around soundfile.SoundFile."""
+
+    def __init__(self, soundfile, path, rate, channels, recording_format):
+        _suffix, container, subtype = RECORDING_FORMATS[recording_format]
+        self._path = str(path)
+        self._channels = channels
+        self._file = soundfile.SoundFile(
+            self._path, mode="w", samplerate=rate, channels=channels,
+            format=container, subtype=subtype,
+        )
+
+    def writeframes(self, frames):
+        audio = np.frombuffer(frames, dtype="<i2")
+        if self._channels == 2:
+            audio = audio.reshape(-1, 2)
+        self._file.write(audio)
+        # PyAV can decode FLAC's flushed blocks before close. Ogg/Opus writes its
+        # final page only on close, so a crash can lose its buffered tail.
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+
+
 class StdoutSink:
     """Prints segments to stdout, one per line."""
     def __call__(self, segment):
@@ -137,23 +192,33 @@ class MarkdownSink:
 
 
 class AudioRecorder:
-    """Writes 16k mono chunks to a WAV per source incrementally, then folds them
-    into ONE stereo file on close.
+    """Writes 16k mono chunks per source incrementally, then folds them into one file.
 
-    During the session each source streams to its own file (`<stem>-MIC.wav`,
-    `<stem>-SYS.wav`) so a crash mid-meeting still leaves recoverable audio. On
-    close, when both channels exist they are interleaved into a single
-    `<stem>.wav` (LEFT = your mic, RIGHT = everyone else) and the per-source files
-    are removed, leaving one clean playable file that still carries the MIC/SYS
-    split (left/right) for a diarised re-transcribe. With live AEC on (the default)
-    the mic channel is already echo-cancelled, so the stereo file needs no further
-    echo work.
+    During the session each source streams to its own file in the selected format,
+    so FLAC remains recoverable after a crash up to its last flushed block. Ogg/Opus
+    needs a clean close to write its final page. On close, both channels are folded
+    into one file (LEFT = your mic, RIGHT = everyone else) and the per-source files
+    are removed. The final file still carries the MIC/SYS split for a diarised
+    re-transcribe. With live AEC on (the default) the mic channel is already
+    echo-cancelled, so the stereo file needs no further echo work.
 
-    POPIA: only instantiated when the user passes --keep-audio, which requires
-    consent from everyone recorded. Audio is the highest-sensitivity artefact;
-    do not enable by default.
+    POPIA: the app records every live session by default (config record_sessions), because a
+    live transcript that fails is only recoverable from the audio. That is honest, not silent:
+    the file is written to the user's own save folder on this machine and never leaves it, the
+    live screen says it is recording for as long as it runs, the finish screen shows where the
+    file is and deletes it on one click, and Settings turns recording off for good. Audio is
+    still the highest-sensitivity artefact, so anything that touches it keeps those guarantees.
+
+    FLAC is the product default (SUFFIX) and keeps the recorder's exact 16-bit PCM.
+    Opus uses an Ogg container for much smaller speech recordings. WAV is the
+    standard-library escape hatch and remains the constructor default so low-level
+    alignment callers retain their byte-exact legacy behaviour. The web app always
+    passes the user's configured format explicitly.
     """
     TARGET_RATE = 16000
+    # Product default. Direct low-level callers keep WAV unless they pass recording_format;
+    # the web app always passes the saved preference, whose default is FLAC.
+    SUFFIX = ".flac"
     # Zero-fill a source only when its written samples lag the chunk's wall-clock
     # position (t_start) by more than this. The chunker derives t_start from the
     # session clock minus the buffered span, so its jitter is bounded by the WASAPI
@@ -163,11 +228,26 @@ class AudioRecorder:
     # for tens of seconds while no application renders audio.
     GAP_TOLERANCE_S = 2.0
     _FILL_BLOCK = TARGET_RATE * 10   # write gap silence in 10 s blocks to bound memory
+    _OPUS_RATES = {8000, 12000, 16000, 24000, 48000}
 
-    def __init__(self, path_stem, *, anchor=None):
+    def __init__(self, path_stem, *, anchor=None, recording_format="wav"):
         self.stem = Path(path_stem)
         self.stem.parent.mkdir(parents=True, exist_ok=True)
-        self._writers = {}     # source -> wave.Wave_write
+        self.recording_format = normalise_recording_format(recording_format)
+        self.SUFFIX = recording_suffix(self.recording_format)
+        self._soundfile = None
+        self._fallback_warned = False
+        if self.recording_format == "opus" and self.TARGET_RATE not in self._OPUS_RATES:
+            print(f"[recorder] Opus does not support {self.TARGET_RATE} Hz; using FLAC", flush=True)
+            self.recording_format = "flac"
+            self.SUFFIX = recording_suffix(self.recording_format)
+        if self.recording_format != "wav":
+            try:
+                self._soundfile = _load_soundfile()
+            except Exception as e:
+                self._fallback_to_wav(f"soundfile unavailable: {e}")
+        self._writers = {}     # source -> wave.Wave_write or _SoundFileWriter
+        self._source_paths = {}
         self._samples_written = {}   # source -> samples on disk, to place chunks on the session clock
         self._gap_warned = set()     # sources already warned about a backwards t_start
         self._lock = threading.Lock()
@@ -182,6 +262,51 @@ class AudioRecorder:
         self._anchor = anchor
         self.last_error = None      # human-readable write/close failure, surfaced in the UI
         atexit.register(self.close)
+
+    def _fallback_to_wav(self, reason):
+        self.recording_format = "wav"
+        self.SUFFIX = recording_suffix("wav")
+        if not self._fallback_warned:
+            self._fallback_warned = True
+            print(f"[recorder] warning: {reason}; using WAV so the meeting is still recorded", flush=True)
+
+    def _new_writer(self, path, channels):
+        if self.recording_format != "wav":
+            return _SoundFileWriter(
+                self._soundfile, path, self.TARGET_RATE, channels, self.recording_format,
+            )
+        writer = wave.open(str(path), "wb")
+        writer.setnchannels(channels)
+        writer.setsampwidth(2)
+        writer.setframerate(self.TARGET_RATE)
+        return writer
+
+    def _open_source_writer(self, source):
+        path = self.stem.with_name(f"{self.stem.name}-{source}{self.SUFFIX}")
+        try:
+            writer = self._new_writer(path, 1)
+        except Exception as e:
+            if self.recording_format == "wav":
+                raise
+            failed_format = self.recording_format
+            failed_path = path
+            self._fallback_to_wav(f"could not open the {failed_format.upper()} writer: {e}")
+            try:
+                failed_path.unlink()
+            except OSError:
+                pass
+            path = self.stem.with_name(f"{self.stem.name}-{source}{self.SUFFIX}")
+            writer = self._new_writer(path, 1)
+        self._source_paths[source] = path
+        return path, writer
+
+    def _read_source_i16(self, path):
+        if path.suffix.lower() == ".wav":
+            return _read_wav_i16(path)
+        data, rate = self._soundfile.read(str(path), dtype="int16", always_2d=False)
+        if rate != self.TARGET_RATE:
+            raise ValueError(f"unexpected recording rate {rate} Hz")
+        return np.asarray(data, dtype="<i2")
 
     def on_chunk(self, source, audio, t_start):
         if self._closed:
@@ -212,11 +337,12 @@ class AudioRecorder:
             w = self._writers.get(source)
             first = w is None      # this source's first retained chunk (drives the anchor placement)
             if w is None:
-                path = self.stem.with_name(f"{self.stem.name}-{source}.wav")
-                w = wave.open(str(path), "wb")
-                w.setnchannels(1)
-                w.setsampwidth(2)          # int16
-                w.setframerate(self.TARGET_RATE)
+                try:
+                    path, w = self._open_source_writer(source)
+                except Exception as e:
+                    self.last_error = f"Could not open the audio recording ({source}): {e}"
+                    print(f"[recorder] open error ({source}): {e}", flush=True)
+                    return
                 self._writers[source] = w
                 self._samples_written[source] = 0
                 print(f"[recorder] writing {path.name}", flush=True)
@@ -285,48 +411,66 @@ class AudioRecorder:
         self._finalise_recording()
 
     def _finalise_recording(self):
-        """Fold the per-source channels into a single `<stem>.wav` and remove them.
+        """Fold the per-source channels into one selected-format file and remove them.
 
-        Both channels -> stereo (LEFT = MIC / you, RIGHT = SYS / everyone else), so the one
-        file plays back cleanly AND still carries the diarisation split for a re-transcribe
-        (which reads left as MIC, right as SYS). A single channel -> that channel as a mono
-        `<stem>.wav`. Best-effort: on any failure the per-source files are left untouched as
-        the source of truth, and only removed once the single file is written.
+        Both channels become stereo (LEFT = MIC / you, RIGHT = SYS / everyone else), so the one
+        file plays back cleanly and still carries the diarisation split for a re-transcribe. A
+        single channel stays mono. Best-effort: on any failure the per-source files are left
+        untouched as the source of truth, and only removed once the single file is written.
         """
-        mic = self.stem.with_name(f"{self.stem.name}-MIC.wav")
-        sys_ = self.stem.with_name(f"{self.stem.name}-SYS.wav")
-        out = self.stem.with_name(f"{self.stem.name}.wav")
+        mic = self._source_paths.get("MIC")
+        sys_ = self._source_paths.get("SYS")
+        out = self.stem.with_name(f"{self.stem.name}{self.SUFFIX}")
+        mic = mic if mic is not None else out.with_name(f"{self.stem.name}-MIC{self.SUFFIX}")
+        sys_ = sys_ if sys_ is not None else out.with_name(f"{self.stem.name}-SYS{self.SUFFIX}")
         have_mic, have_sys = mic.is_file(), sys_.is_file()
         if not (have_mic or have_sys):
             return
+        writer = None
         try:
-            # `with` guarantees the writer is closed even if writeframes raises mid-write,
-            # so a partial-write failure leaves no leaked handle (and the per-source channels
-            # remain the source of truth).
-            with wave.open(str(out), "wb") as w:
-                w.setsampwidth(2)
-                w.setframerate(self.TARGET_RATE)
-                if have_mic and have_sys:
-                    # Both channels are already wall-clock aligned internally (on_chunk
-                    # zero-fills any no-delivery gap at its true position), so tail-padding
-                    # both to the same final length, the session duration as seen by the
-                    # longer channel, is all that is left to do.
-                    a, b = _read_wav_i16(mic), _read_wav_i16(sys_)
-                    n = max(len(a), len(b))
-                    a = np.pad(a, (0, n - len(a)))
-                    b = np.pad(b, (0, n - len(b)))
-                    stereo = np.empty(n * 2, dtype="<i2")
-                    stereo[0::2] = a          # left  = MIC (you)
-                    stereo[1::2] = b          # right = SYS (everyone else)
-                    w.setnchannels(2)
-                    w.writeframes(stereo.tobytes())
-                else:
-                    w.setnchannels(1)
-                    w.writeframes(_read_wav_i16(mic if have_mic else sys_).tobytes())
+            if have_mic and have_sys:
+                # Both channels are already wall-clock aligned internally (on_chunk
+                # zero-fills any no-delivery gap at its true position), so tail-padding
+                # both to the same final length, the session duration as seen by the
+                # longer channel, is all that is left to do.
+                a, b = self._read_source_i16(mic), self._read_source_i16(sys_)
+                n = max(len(a), len(b))
+                a = np.pad(a, (0, n - len(a)))
+                b = np.pad(b, (0, n - len(b)))
+                audio = np.empty(n * 2, dtype="<i2")
+                audio[0::2] = a          # left  = MIC (you)
+                audio[1::2] = b          # right = SYS (everyone else)
+                channels = 2
+            else:
+                audio = self._read_source_i16(mic if have_mic else sys_)
+                channels = 1
+            try:
+                writer = self._new_writer(out, channels)
+            except Exception as e:
+                if self.recording_format == "wav":
+                    raise
+                failed_format = self.recording_format
+                failed_out = out
+                self._fallback_to_wav(f"could not open the final {failed_format.upper()} writer: {e}")
+                try:
+                    failed_out.unlink()
+                except OSError:
+                    pass
+                out = self.stem.with_name(f"{self.stem.name}{self.SUFFIX}")
+                writer = self._new_writer(out, channels)
+            writer.writeframes(audio.tobytes())
+            writer.close()
+            writer = None
             print(f"[recorder] wrote {out.name}", flush=True)
         except Exception as e:
             print(f"[recorder] stereo fold skipped: {e}", flush=True)
             return
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
         # Only reached on a successful write: drop the per-source channels.
         for p in (mic, sys_):
             try:

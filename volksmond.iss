@@ -4,7 +4,18 @@
 ; build-app.ps1 passes MyAppVersion / MySourceDir / MyOutputDir via ISCC /D defines; the #ifndef
 ; fallbacks let the script also open and compile standalone in the Inno Setup IDE.
 
-#define MyAppName "Volksmond"
+; The connected (direct-download) edition is "Volksmond Fast Track": a DISPLAY name only, so it
+; is distinguishable from a Microsoft Store install of the same app on the same machine. Every
+; identifier an upgrade or the release pipeline depends on is deliberately unchanged:
+;   AppId               so a new version still replaces the existing install
+;   MyAppDirName        so a fresh install lands in the same folder as before
+;   MyAppExeName        Volksmond.exe
+;   OutputBaseFilename  Volksmond-Setup-<ver>.exe, which release.ps1 looks for by name and
+;                       publishes at the URL the shipped update manifest already points at
+#define MyAppName "Volksmond Fast Track"
+; The install folder name, deliberately NOT the display name: renaming it would send fresh
+; installs to a new folder while upgrades stayed in the old one.
+#define MyAppDirName "Volksmond"
 #define MyAppPublisher "DigiPhyte"
 #define MyAppURL "https://volksmond.digiphyte.com"
 #define MyAppExeName "Volksmond.exe"
@@ -31,7 +42,7 @@ AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 ; Per-user install: no admin prompt, anyone can install it (right for a download-and-run app).
 PrivilegesRequired=lowest
-DefaultDirName={localappdata}\Programs\{#MyAppName}
+DefaultDirName={localappdata}\Programs\{#MyAppDirName}
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}
 OutputDir={#MyOutputDir}
@@ -54,4 +65,4 @@ Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,Volksmond}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
