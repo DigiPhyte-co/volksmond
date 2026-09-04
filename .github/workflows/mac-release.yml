@@ -282,21 +282,27 @@ jobs:
           # from the bundle, so this also proves mlx_whisper imports without it) and exits
           # 1 on darwin-arm64 if the import fails. Asserting the OK line guards against an
           # older entry point that would ignore the env var and exit 0 some other way.
-          echo "==> Frozen MLX import smoke (VOLKSMOND_SMOKE=mlx)"
+          echo "==> Frozen import smoke (VOLKSMOND_SMOKE=mlx): soundfile + MLX"
           set +e
           SMOKE_OUT="$(VOLKSMOND_SMOKE=mlx "$EXE" 2>&1)"
           SMOKE_RC=$?
           set -e
           printf '%s\n' "$SMOKE_OUT"
           if [ "$SMOKE_RC" -ne 0 ]; then
-            echo "::error title=Bundle check::Frozen MLX smoke exited $SMOKE_RC. The bundle cannot import mlx.core/mlx_whisper (see output above)."
+            echo "::error title=Bundle check::Frozen smoke exited $SMOKE_RC. The bundle cannot open libsndfile (FLAC recording) or import mlx.core/mlx_whisper (see output above)."
+            exit 1
+          fi
+          # FLAC is the default recording format and every per-source channel is FLAC, so the
+          # bundled libsndfile MUST open; a bundle that fails this would silently record WAV.
+          if ! printf '%s' "$SMOKE_OUT" | grep -q "SOUNDFILE SMOKE OK"; then
+            echo "::error title=Bundle check::Frozen smoke did not print 'SOUNDFILE SMOKE OK' (bundled soundfile/libsndfile broken?)."
             exit 1
           fi
           if ! printf '%s' "$SMOKE_OUT" | grep -q "MLX SMOKE OK"; then
             echo "::error title=Bundle check::Frozen MLX smoke did not print 'MLX SMOKE OK' (entry point ignored VOLKSMOND_SMOKE?)."
             exit 1
           fi
-          echo "    frozen MLX import smoke OK"
+          echo "    frozen import smoke OK (soundfile + MLX)"
 
           if [ "$MODE" = "release" ]; then
             echo "==> Asserting Developer ID signature + entitlements (release mode)"

@@ -3275,22 +3275,29 @@ def stop(what: str = "all"):
         # Stopping the recorder must take effect immediately, even while
         # transcription is still draining, otherwise audio keeps recording until
         # the ASR backlog clears.
+        recording_partial = False   # a "stop recording" while transcription keeps running
+        rec_to_close = None         # recorder detached here, folded AFTER the lock releases
+        partial_resp = None
         if what == "recording":
             if STATE.recording:
                 STATE.recording = False
-                rec, STATE.recorder = STATE.recorder, None
-                if rec is not None:
-                    try:
-                        rec.close()
-                    except Exception:
-                        pass
-                    if rec.last_error:
-                        STATE.sink_error = rec.last_error
+                rec_to_close, STATE.recorder = STATE.recorder, None
             if STATE.transcribing or STATE.stopping:
-                return {"stopped": "recording", "recording": False,
-                        "transcribing": STATE.transcribing, "stopping": STATE.stopping,
-                        "output_path": out}
-            what = "all"  # nothing left running: fall through to finalise
+                # Detach the recorder under the lock but close() it OUTSIDE (below), because
+                # close() runs the per-source fold: decode both channels and re-encode a stereo
+                # file, about 6.6 s per 30 min of Opus, so folding while holding STATE.lock would
+                # stall /api/status and every other lock-taking endpoint for the whole fold.
+                recording_partial = True
+                partial_resp = {"stopped": "recording", "recording": False,
+                                "transcribing": STATE.transcribing, "stopping": STATE.stopping,
+                                "output_path": out}
+            else:
+                # Nothing left running: fall through to a full stop. Hand the detached recorder
+                # back so the finalise drain thread closes it off the request thread (the fold
+                # already runs there today, so this keeps that behaviour).
+                what = "all"
+                STATE.recorder = rec_to_close
+                rec_to_close = None
 
         # Narrow "stop transcription" to a full stop when nothing else is running.
         if what == "transcription" and not STATE.recording:
@@ -3406,33 +3413,49 @@ def stop(what: str = "all"):
                     "recording": STATE.recording, "output_path": out,
                     "downgraded": downgraded}
 
-        # what == "all"
-        if STATE.stopping:
-            pending = STATE.engine.pending() if STATE.engine else 0
-            return {"stopping": True, "pending": pending, "output_path": out,
-                    "downgraded": STATE.downgraded}
-        STATE.stopping = True
-        _silence_signal()   # the session is over; the watcher must not outlive the drain
-        engine = STATE.engine
-        cap = STATE.capture
-        md_sink = STATE.md_sink
-        rec = STATE.recorder
-        # Stop-during-catch-up (P1-3): if the model was still catching up, STATE.engine is None and the
-        # transcript-so-far lives only in the builder's private engine + the held backlog. Take both so
-        # the drain saves the transcript instead of losing it. stopping=True already makes _still_ours()
-        # false, so the builder bails (hands the engine off, does not discard it).
-        prep_eng = STATE.preparing_engine
-        pb = STATE.pending_audio
-        build_thread = STATE.build_thread
-        preparing_case = engine is None and prep_eng is not None
-        # No engine at all (the model never finished loading): the held backlog has nowhere to go, so
-        # the transcript says how much was never transcribed instead of just ending short.
-        no_engine_case = engine is None and prep_eng is None
-        browser_sink = STATE.browser_sink
-        pending = (engine.pending() if engine else (prep_eng.pending() if prep_eng else 0))
-        # Same reason as the partial stop above: read the downgrade latch under the lock, before
-        # the drain thread resets the session out from under it.
-        downgraded = STATE.downgraded
+        # what == "all" (skipped when this was a partial "stop recording": that path
+        # detached its recorder above and returns after the lock releases).
+        if not recording_partial:
+            if STATE.stopping:
+                pending = STATE.engine.pending() if STATE.engine else 0
+                return {"stopping": True, "pending": pending, "output_path": out,
+                        "downgraded": STATE.downgraded}
+            STATE.stopping = True
+            _silence_signal()   # the session is over; the watcher must not outlive the drain
+            engine = STATE.engine
+            cap = STATE.capture
+            md_sink = STATE.md_sink
+            rec = STATE.recorder
+            # Stop-during-catch-up (P1-3): if the model was still catching up, STATE.engine is None and the
+            # transcript-so-far lives only in the builder's private engine + the held backlog. Take both so
+            # the drain saves the transcript instead of losing it. stopping=True already makes _still_ours()
+            # false, so the builder bails (hands the engine off, does not discard it).
+            prep_eng = STATE.preparing_engine
+            pb = STATE.pending_audio
+            build_thread = STATE.build_thread
+            preparing_case = engine is None and prep_eng is not None
+            # No engine at all (the model never finished loading): the held backlog has nowhere to go, so
+            # the transcript says how much was never transcribed instead of just ending short.
+            no_engine_case = engine is None and prep_eng is None
+            browser_sink = STATE.browser_sink
+            pending = (engine.pending() if engine else (prep_eng.pending() if prep_eng else 0))
+            # Same reason as the partial stop above: read the downgrade latch under the lock, before
+            # the drain thread resets the session out from under it.
+            downgraded = STATE.downgraded
+
+    if recording_partial:
+        # Fold the recorder OUTSIDE STATE.lock (see the detach note above): the decode +
+        # stereo re-encode can take several seconds on a long meeting and must not hold the
+        # lock. The recorder is already detached from STATE, so no one else can touch it.
+        if rec_to_close is not None:
+            try:
+                rec_to_close.close()
+            except Exception:
+                pass
+            if rec_to_close.last_error:
+                with STATE.lock:
+                    STATE.sink_error = rec_to_close.last_error
+        return partial_resp
 
     def _drain_and_close():
         # Stop capturing FIRST (flushes the final partial chunk into the engine
@@ -3837,6 +3860,16 @@ def voice_models():
     from .. import voicedl
     cat = voicedl.catalogue_public()
     cat["progress"] = voicedl.progress()
+    # The size the Afrikaans auto-pick treats as best for Fluister. voicedl's recommended_model is
+    # the stock-Whisper tier model (best = large-v3 on a GPU), but Fluister's own best follows the
+    # engine's per-family order (_FAMILY_SIZE_ORDER["fluister"], best = large-v3-turbo: our v2 tune
+    # beats large-v3). Read it from that single source of truth so the "Auto" chip on the Fluister
+    # rows matches what the engine would actually pick, instead of re-deriving the order in JS.
+    try:
+        from ..__main__ import _FAMILY_SIZE_ORDER
+        cat["recommended_fluister_model"] = _FAMILY_SIZE_ORDER["fluister"][-1]
+    except Exception:
+        cat["recommended_fluister_model"] = None
     # Whether an Afrikaans session will actually run on a Fluister (Afrikaans-tuned) model yet,
     # so the UI can label the engine honestly (Fluister vs stock Whisper) before the tuned
     # models are hosted/installed.

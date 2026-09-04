@@ -85,7 +85,12 @@ hiddenimports += collect_submodules("live_transcribe")
 hiddenimports += ["scipy.signal", "anyio", "h11", "sniffio",
                   "livekit.rtc.apm", "google._upb._message",
                   # sounddevice is a CFFI binding; its backend + cffi runtime are lazy imports.
-                  "_sounddevice", "cffi", "_cffi_backend"]
+                  "_sounddevice", "cffi", "_cffi_backend",
+                  # The recorder imports soundfile lazily (a broken libsndfile falls back to WAV).
+                  # Declaring it triggers PyInstaller's hook-soundfile, which bundles the wheel's
+                  # libsndfile dylib, so FLAC recording (the default, and every per-source channel)
+                  # works in the frozen bundle instead of silently degrading to WAV.
+                  "soundfile"]
 
 # The web UI's static asset(s).
 datas += [(os.path.join("live_transcribe", "web", "static"),

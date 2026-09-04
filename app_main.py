@@ -95,12 +95,43 @@ def _mlx_smoke():
     return 0
 
 
+def _soundfile_smoke():
+    """CI/frozen smoke (any VOLKSMOND_SMOKE value): prove THIS frozen bundle can import soundfile
+    and open a FLAC through the bundled libsndfile. FLAC is the default recording format and every
+    per-source channel is written as FLAC, so a bundle that cannot open libsndfile would silently
+    fall back to WAV on every machine. Writes a tiny FLAC to a temp dir and reads its info back.
+    Exit code: 0 with 'SOUNDFILE SMOKE OK' on success; 1 on any failure (a packaging bug on every
+    platform, since soundfile ships in all editions). Runs only when VOLKSMOND_SMOKE is set."""
+    import tempfile
+    try:
+        import numpy as np
+        import soundfile as sf
+        with tempfile.TemporaryDirectory(prefix="vm-sf-smoke-") as d:
+            p = os.path.join(d, "smoke.flac")
+            sf.write(p, np.zeros(1600, dtype="int16"), 16000, format="FLAC", subtype="PCM_16")
+            info = sf.info(p)
+            if info.format != "FLAC" or info.samplerate != 16000:
+                print(f"SOUNDFILE SMOKE FAIL: unexpected {info.format} @ {info.samplerate} Hz")
+                return 1
+    except Exception as e:
+        print(f"SOUNDFILE SMOKE FAIL: {e!r}")
+        return 1
+    print("SOUNDFILE SMOKE OK")
+    return 0
+
+
 if __name__ == "__main__":
     # Redirect first so a windowed build has a valid stdout/stderr, then import:
     # any import-time failure in the app is then captured in the crash log too.
     _redirect_windowed_output()
-    if os.environ.get("VOLKSMOND_SMOKE") == "mlx":
-        sys.exit(_mlx_smoke())
+    if os.environ.get("VOLKSMOND_SMOKE"):
+        # soundfile/libsndfile must work in EVERY frozen edition (FLAC is the default and every
+        # per-source channel is FLAC), so it is checked first on any platform. The MLX check runs
+        # additionally when VOLKSMOND_SMOKE=mlx (mac bundle). Both print their own OK line.
+        rc = _soundfile_smoke()
+        if rc == 0 and os.environ.get("VOLKSMOND_SMOKE") == "mlx":
+            rc = _mlx_smoke()
+        sys.exit(rc)
     _log_launch_header()
     from live_transcribe.desktop import main
     sys.exit(main(sys.argv[1:]))

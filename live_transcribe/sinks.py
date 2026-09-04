@@ -194,12 +194,14 @@ class MarkdownSink:
 class AudioRecorder:
     """Writes 16k mono chunks per source incrementally, then folds them into one file.
 
-    During the session each source streams to its own file in the selected format,
-    so FLAC remains recoverable after a crash up to its last flushed block. Ogg/Opus
-    needs a clean close to write its final page. On close, both channels are folded
-    into one file (LEFT = your mic, RIGHT = everyone else) and the per-source files
-    are removed. The final file still carries the MIC/SYS split for a diarised
-    re-transcribe. With live AEC on (the default) the mic channel is already
+    During the session each source streams to its OWN per-source file as lossless FLAC,
+    whatever final format the user chose, so a crash leaves recoverable per-source audio
+    up to its last flushed block for every format (FLAC flushes block by block; it never
+    needs a clean close like Ogg/Opus). On close, both channels are folded into one file in
+    the chosen format (LEFT = your mic, RIGHT = everyone else) and the per-source files are
+    removed. Encoding to the chosen format happens ONCE, in that final fold, so Opus is not
+    encoded per-source and then re-encoded. The final file still carries the MIC/SYS split
+    for a diarised re-transcribe. With live AEC on (the default) the mic channel is already
     echo-cancelled, so the stereo file needs no further echo work.
 
     POPIA: the app records every live session by default (config record_sessions), because a
@@ -233,6 +235,7 @@ class AudioRecorder:
     def __init__(self, path_stem, *, anchor=None, recording_format="wav"):
         self.stem = Path(path_stem)
         self.stem.parent.mkdir(parents=True, exist_ok=True)
+        # `recording_format`/`SUFFIX` are the FINAL fold format (what the user chose).
         self.recording_format = normalise_recording_format(recording_format)
         self.SUFFIX = recording_suffix(self.recording_format)
         self._soundfile = None
@@ -241,6 +244,13 @@ class AudioRecorder:
             print(f"[recorder] Opus does not support {self.TARGET_RATE} Hz; using FLAC", flush=True)
             self.recording_format = "flac"
             self.SUFFIX = recording_suffix(self.recording_format)
+        # Per-source channel files are ALWAYS FLAC: lossless (so the chosen format is applied
+        # only once, in the final fold), crash-safe (flushed block by block, no clean close
+        # needed), and no rate guard needed. FLAC needs soundfile; if it is unavailable the
+        # whole recorder falls back to WAV (per-source WAV, fold WAV), the standard-library
+        # escape hatch. A caller that asked for WAV keeps WAV throughout, no soundfile needed.
+        self._source_format = "flac" if self.recording_format != "wav" else "wav"
+        self._source_suffix = recording_suffix(self._source_format)
         if self.recording_format != "wav":
             try:
                 self._soundfile = _load_soundfile()
@@ -264,16 +274,20 @@ class AudioRecorder:
         atexit.register(self.close)
 
     def _fallback_to_wav(self, reason):
+        # WAV for both the per-source files and the final fold: the standard-library escape
+        # hatch when soundfile/libsndfile cannot be used.
         self.recording_format = "wav"
         self.SUFFIX = recording_suffix("wav")
+        self._source_format = "wav"
+        self._source_suffix = recording_suffix("wav")
         if not self._fallback_warned:
             self._fallback_warned = True
             print(f"[recorder] warning: {reason}; using WAV so the meeting is still recorded", flush=True)
 
-    def _new_writer(self, path, channels):
-        if self.recording_format != "wav":
+    def _new_writer(self, path, channels, fmt):
+        if fmt != "wav":
             return _SoundFileWriter(
-                self._soundfile, path, self.TARGET_RATE, channels, self.recording_format,
+                self._soundfile, path, self.TARGET_RATE, channels, fmt,
             )
         writer = wave.open(str(path), "wb")
         writer.setnchannels(channels)
@@ -282,21 +296,22 @@ class AudioRecorder:
         return writer
 
     def _open_source_writer(self, source):
-        path = self.stem.with_name(f"{self.stem.name}-{source}{self.SUFFIX}")
+        # Per-source files are FLAC (or WAV under the fallback), never the chosen fold format.
+        path = self.stem.with_name(f"{self.stem.name}-{source}{self._source_suffix}")
         try:
-            writer = self._new_writer(path, 1)
+            writer = self._new_writer(path, 1, self._source_format)
         except Exception as e:
-            if self.recording_format == "wav":
+            if self._source_format == "wav":
                 raise
-            failed_format = self.recording_format
+            failed_format = self._source_format
             failed_path = path
             self._fallback_to_wav(f"could not open the {failed_format.upper()} writer: {e}")
             try:
                 failed_path.unlink()
             except OSError:
                 pass
-            path = self.stem.with_name(f"{self.stem.name}-{source}{self.SUFFIX}")
-            writer = self._new_writer(path, 1)
+            path = self.stem.with_name(f"{self.stem.name}-{source}{self._source_suffix}")
+            writer = self._new_writer(path, 1, self._source_format)
         self._source_paths[source] = path
         return path, writer
 
@@ -421,8 +436,10 @@ class AudioRecorder:
         mic = self._source_paths.get("MIC")
         sys_ = self._source_paths.get("SYS")
         out = self.stem.with_name(f"{self.stem.name}{self.SUFFIX}")
-        mic = mic if mic is not None else out.with_name(f"{self.stem.name}-MIC{self.SUFFIX}")
-        sys_ = sys_ if sys_ is not None else out.with_name(f"{self.stem.name}-SYS{self.SUFFIX}")
+        # Per-source files carry the per-source suffix (FLAC, or WAV under the fallback), not
+        # the fold SUFFIX, so probe for them with _source_suffix.
+        mic = mic if mic is not None else out.with_name(f"{self.stem.name}-MIC{self._source_suffix}")
+        sys_ = sys_ if sys_ is not None else out.with_name(f"{self.stem.name}-SYS{self._source_suffix}")
         have_mic, have_sys = mic.is_file(), sys_.is_file()
         if not (have_mic or have_sys):
             return
@@ -445,7 +462,7 @@ class AudioRecorder:
                 audio = self._read_source_i16(mic if have_mic else sys_)
                 channels = 1
             try:
-                writer = self._new_writer(out, channels)
+                writer = self._new_writer(out, channels, self.recording_format)
             except Exception as e:
                 if self.recording_format == "wav":
                     raise
@@ -457,7 +474,7 @@ class AudioRecorder:
                 except OSError:
                     pass
                 out = self.stem.with_name(f"{self.stem.name}{self.SUFFIX}")
-                writer = self._new_writer(out, channels)
+                writer = self._new_writer(out, channels, self.recording_format)
             writer.writeframes(audio.tobytes())
             writer.close()
             writer = None

@@ -2,7 +2,7 @@
 
 ## Unreleased (1.14)
 
-- **Meeting recordings are compressed by default.** New recordings use lossless 16-bit FLAC at about 115 MB per hour, with compact Ogg/Opus at about 15 MB per hour and uncompressed WAV at about 230 MB per hour available under Settings, Data and privacy. Existing WAV recordings remain visible and can still be re-transcribed. If soundfile or its bundled libsndfile cannot open, recording falls back to WAV with one warning so the meeting is not lost. FLAC files are flushed as recording proceeds; Ogg/Opus needs a clean stop to finalise its last page.
+- **Meeting recordings are compressed by default.** New recordings use lossless 16-bit FLAC at about 115 MB per hour, with compact Ogg/Opus at about 15 MB per hour and uncompressed WAV at about 230 MB per hour available under Settings, Data and privacy. Existing WAV recordings remain visible and can still be re-transcribed. If soundfile or its bundled libsndfile cannot open, recording falls back to WAV with one warning so the meeting is not lost. The per-source channel files are always written as lossless FLAC and flushed as recording proceeds, so a crash mid-meeting leaves recoverable per-source audio whatever format you chose; the chosen format is applied only to the final single file, written on a clean stop, so the Ogg/Opus tail-loss caveat (a clean close is needed to finalise its last page) now applies to that final file alone, and Opus is encoded once rather than twice.
 
 ## 2026-09-03, v1.13.3 (Fast Track only)
 
