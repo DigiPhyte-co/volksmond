@@ -301,7 +301,8 @@ def test_record_from_here_attaches_an_anchored_recorder_and_returns_the_stem():
         r = client.post("/api/record-from-here")
         assert r.status_code == 200, (r.status_code, r.text)
         expected_stem = str(Path(tmp) / "sess")
-        assert r.json() == {"recording": True, "audio_stem": expected_stem}, r.json()
+        assert r.json() == {"recording": True, "audio_stem": expected_stem,
+                            "recording_format": webapp.STATE.recorder.recording_format}, r.json()
         assert webapp.STATE.recording is True, "the recording flag must be set"
         assert webapp.STATE.recording_started is True, "the latch must be set"
         rec = webapp.STATE.recorder

@@ -248,7 +248,7 @@ class DesktopApi:
                     dtype,
                     allow_multiple=False,
                     file_types=(
-                        "Audio and video (*.mp3;*.m4a;*.wav;*.mp4;*.mov;*.ogg;*.flac;*.aac;*.webm;*.mkv;*.avi)",
+                        "Audio and video (*.mp3;*.m4a;*.wav;*.mp4;*.mov;*.ogg;*.opus;*.flac;*.aac;*.webm;*.mkv;*.avi)",
                         "All files (*.*)",
                     ),
                 )

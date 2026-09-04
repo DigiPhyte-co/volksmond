@@ -3635,12 +3635,15 @@ function voiceTableStatus(row, p, update) {
   return row.present ? el("span", { class: "chip ok" }, [icon("check", 12), "Installed"]) : el("span", { class: "chip muted" }, "Not downloaded");
 }
 function voiceTableRows(d) {
+  // The "Auto" chip marks the size the app auto-picks on this hardware (d.recommended_model, a size
+  // name like "medium"). That size can exist in more than one family, so the Fluister row and the
+  // Whisper row for it BOTH carry the "Auto" chip: one per family, which is the intended behaviour.
   var qualityOrder = ["large-v3", "large-v3-turbo", "medium", "small", "base", "tiny"];
   var rank = function (size) { var i = qualityOrder.indexOf(size); return i < 0 ? qualityOrder.length : i; };
   var rows = [];
   (d.fluister || []).slice().sort(function (a, b) { return rank(a.size) - rank(b.size); }).forEach(function (m) {
     rows.push({ family: "fluister", key: m.size, repo: m.repo, present: m.present, bytes: (m.present && m.size_on_disk) ? m.size_on_disk : m.approx_bytes,
-      label: "Fluister " + m.size, languages: "Afrikaans + English",
+      label: "Fluister " + m.size, languages: "Afrikaans + English", auto: m.size === d.recommended_model,
       onDownload: function () { startFluisterDownload(m.size); },
       onRemove: function () { confirmRemoveVoiceItem("Fluister " + m.size, m.repo, m.size_on_disk || m.approx_bytes); } });
   });
@@ -3668,9 +3671,15 @@ function voiceModelTable() {
     el("thead", {}, el("tr", {}, ["Model", "Languages", "Size", "Status", "Action"].map(function (label) { return el("th", { text: label }); }))),
     el("tbody", {}, voiceTableRows(d).map(function (row) {
       var update = row.family === "fluister" ? updates[row.repo] : null;
+      // While a download runs, suppress the actions that would start a second one (Download and
+      // Update) on every row, and every action on the row that is actually downloading. Remove
+      // stays live for OTHER installed rows so the user can still free space; the backend refuses a
+      // delete while an engine is loaded and returns a friendly message on that path.
+      var isDownloadingRow = downloading && modelProgressMatches(p, row.family, row.key, row.repo);
       var action = null;
-      if (!downloading && row.present && update && update.update_available) action = el("button", { class: "btn ghost sm", onclick: function () { startFluisterUpdate(row.key); } }, "Update");
-      else if (!downloading && row.present) action = el("button", { class: "btn ghost sm", onclick: row.onRemove }, "Remove");
+      if (isDownloadingRow) action = null;
+      else if (!downloading && row.present && update && update.update_available) action = el("button", { class: "btn ghost sm", onclick: function () { startFluisterUpdate(row.key); } }, "Update");
+      else if (row.present) action = el("button", { class: "btn ghost sm", onclick: row.onRemove }, "Remove");
       else if (!downloading && !row.gpuNote) action = el("button", { class: "btn ghost sm", onclick: row.onDownload }, "Download");
       return el("tr", { class: row.gpuNote ? "model-table-disabled" : "" }, [
         el("td", { class: "model-table-name" }, [

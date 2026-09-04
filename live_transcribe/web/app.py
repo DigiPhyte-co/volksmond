@@ -1493,8 +1493,11 @@ def record_from_here():
         # the fact that we are now recording (the frontend also drops it optimistically).
         STATE.struggle_nudge = None
         audio_stem = str(stem)
+        recording_format = rec.recording_format
     # audio_stem must reach the client: the finish-screen re-transcribe handoff keys off it.
-    return {"recording": True, "audio_stem": audio_stem}
+    # recording_format lets the client label/name the recording the same way a start-time recording
+    # does (app.js reads resp.recording_format straight after the POST).
+    return {"recording": True, "audio_stem": audio_stem, "recording_format": recording_format}
 
 
 def _recording_candidates(stem: str, include_channels=False):
