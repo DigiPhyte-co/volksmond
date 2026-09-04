@@ -14,6 +14,7 @@ Faster and more honest on CPU-only machines, and nothing lost when the live text
 - **Diagnostics.** The app log now rotates across launches (5 x 5 MB) with a header naming the version, install kind, OS, CPU, RAM and GPU. "Save diagnostics" writes a small zip (logs, operational settings only, model list) to Downloads, and the feedback email asks for it. No transcripts, notes, audio or meeting context are ever included.
 - **Fast Track edition.** The direct download is now "Volksmond Fast Track" with a white icon, so it is easy to tell apart from the Microsoft Store edition on the same machine. Upgrades replace the existing install as before.
 - Fixes: Settings can switch recording off (the API dropped the field); guard log lines no longer print transcript text; tray tooltip names the edition.
+- Fix: a voice model downloaded earlier as a symlinked HuggingFace cache (Developer Mode machines) is now migrated to real files the first time the Models page checks it, so it reads as installed, loads in the packaged app, and shows its true size instead of a doubled one.
 
 ## 2026-08-20, v1.13.2: honest model presence, and the loaded model made visible
 

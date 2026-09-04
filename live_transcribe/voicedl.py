@@ -144,14 +144,28 @@ def _repo_dir(repo_id):
 
 
 def _dir_size(p):
+    """Bytes on disk under `p`, counting each real file ONCE. A HuggingFace cache from a dev-era
+    download stores a file twice on the surface: the real bytes in blobs/<sha> AND a snapshots/<hash>/
+    symlink into it. os.walk lists both, and getsize follows the symlink to the real blob, so a naive
+    sum DOUBLES every symlinked file (the field bug: small read 0.97 GB, medium 3.1 GB, i.e. 2x their
+    true 0.48 / 1.53 GB). Dedupe by the resolved real path (os.path.realpath), so the blob and the
+    symlink that points at it collapse to one entry and are counted once; a materialised (real-file)
+    cache is naturally counted once too."""
     total = 0
+    seen = set()
     try:
         for root, _dirs, files in os.walk(p):
             for f in files:
+                fp = os.path.join(root, f)
                 try:
-                    total += os.path.getsize(os.path.join(root, f))
+                    real = os.path.realpath(fp)
+                    if real in seen:
+                        continue
+                    size = os.stat(fp).st_size
                 except OSError:
-                    pass
+                    continue
+                seen.add(real)
+                total += size
     except OSError:
         pass
     return total
@@ -184,6 +198,48 @@ def _download_model(model, local_only=False):
 _MIN_MODEL_BIN_BYTES = 1_000_000
 
 
+def _weight_size(binp):
+    """Resolved size (bytes) of a snapshot weight file, following a symlink to its real blob. The one
+    helper every presence check reads a weight file's size through, so the ct2 (model.bin) and MLX
+    (weights.*) rules agree: a symlinked file reports its real blob's size, a missing/broken one 0."""
+    try:
+        return os.stat(binp).st_size   # follows a symlink to the real blob
+    except OSError:
+        return 0
+
+
+def _materialise_snapshot(path):
+    """Replace every symlinked file in a resolved HF snapshot dir with the real blob it points at, so
+    the frozen build can both SEE and LOAD the model. Dev-era downloads (made before Part A forced
+    HF_HUB_DISABLE_SYMLINKS) stored each file as snapshots/<hash>/model.bin -> ../../blobs/<sha>; the
+    frozen build's bundled runtime (MSVCP140 14.50) cannot open a Windows symlink, so ct2 fails with
+    "Unable to open file 'model.bin'" at Begin, and the presence probe can also read such a cache as
+    not-installed. This migrates the layout in place (the deferred Part B) to the same real-files shape
+    Part A gives new downloads.
+
+    Each file is one same-volume rename: os.replace(blob, link) atomically drops the real blob onto the
+    link's name and removes the symlink in a single step, so a blob is never lost unless the move
+    succeeds. Idempotent (a real file is not a symlink, so it is left untouched) and best-effort (any
+    error on one file is swallowed and the rest proceed). A broken link (its target is gone) is left
+    as-is, so presence still falls back to not-present. See docs/volksmond-model-load-symlink-bug-2026-08-18.md."""
+    try:
+        if not path or not os.path.isdir(path):
+            return
+        for name in os.listdir(path):
+            link = os.path.join(path, name)
+            try:
+                if not os.path.islink(link):
+                    continue
+                real = os.path.realpath(link)
+                if not os.path.isfile(real) or os.path.abspath(real) == os.path.abspath(link):
+                    continue          # broken (or self-referential) link: leave it, fall back to not-present
+                os.replace(real, link)   # atomic: blob -> real file at the link's name, symlink gone
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
 def _snapshot_has_weights(path):
     """True iff `path` (a resolved snapshot dir) holds a non-trivial model.bin. Fail-safe: a falsy path,
     a non-directory, a missing/tiny model.bin, or any error -> False (treat as not-present, so an
@@ -192,7 +248,7 @@ def _snapshot_has_weights(path):
         if not path or not os.path.isdir(path):
             return False
         binp = os.path.join(path, "model.bin")
-        return os.path.isfile(binp) and os.path.getsize(binp) > _MIN_MODEL_BIN_BYTES
+        return os.path.isfile(binp) and _weight_size(binp) > _MIN_MODEL_BIN_BYTES
     except Exception:
         return False
 
@@ -217,6 +273,9 @@ def _present(model):
         path = _download_model(model, local_only=True)
     except Exception:
         return False
+    # Migrate a dev-era symlinked snapshot to real files so the frozen build can load it (and reads it
+    # as installed): idempotent and best-effort, so a materialised or already-real cache is untouched.
+    _materialise_snapshot(path)
     return _snapshot_has_weights(path)
 
 
@@ -232,7 +291,7 @@ def _snapshot_has_mlx_weights(path):
             return False
         for name in ("weights.safetensors", "weights.npz"):
             wp = os.path.join(path, name)
-            if os.path.isfile(wp) and os.path.getsize(wp) > _MIN_MODEL_BIN_BYTES:
+            if os.path.isfile(wp) and _weight_size(wp) > _MIN_MODEL_BIN_BYTES:
                 return True
         return False
     except Exception:
@@ -248,6 +307,8 @@ def _mlx_present(repo):
         path = snapshot_download(repo, local_files_only=True)
     except Exception:
         return False
+    # Same dev-era symlink migration as the ct2 path (idempotent, best-effort) before the MLX check.
+    _materialise_snapshot(path)
     return _snapshot_has_mlx_weights(path)
 
 
