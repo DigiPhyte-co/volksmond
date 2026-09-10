@@ -223,12 +223,15 @@ def test_mlx_explicit_quality():
 
 
 def test_mlx_chunk_seconds_and_tier_choices():
-    # mlx tiers are GPU-class for chunking, and are NOT reachable from the CLI/env surface.
-    assert M.default_chunk_seconds("mlx-turbo") == 8
-    assert M.default_chunk_seconds("mlx") == 8
+    # mlx-whisper pads every chunk to a fixed 30 s encoder window, so mlx tiers use a 15 s chunk
+    # (fills the window at no extra encoder cost) while cuda/gpu keep 8 s. mlx tiers stay
+    # unreachable from the CLI/env surface.
+    assert M.default_chunk_seconds("mlx-turbo") == 15
+    assert M.default_chunk_seconds("mlx") == 15
+    assert M.default_chunk_seconds("gpu") == 8
     assert M.default_chunk_seconds("cpu-mid") == 15
     assert "mlx" not in M.TIER_CHOICES and "mlx-turbo" not in M.TIER_CHOICES
-    print("  OK  default_chunk_seconds: mlx tiers are GPU-class (8 s); mlx tiers absent from TIER_CHOICES")
+    print("  OK  default_chunk_seconds: mlx tiers 15 s (fill fixed window), gpu 8 s; mlx tiers absent from TIER_CHOICES")
 
 
 def test_windows_regression_sweep():

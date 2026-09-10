@@ -432,8 +432,16 @@ def resolve_tier(quality, device="auto", language=None, engine="auto"):
 
 
 def default_chunk_seconds(tier):
-    # mlx tiers are GPU-class (Apple Metal): same snappy chunk size as CUDA.
-    return 8 if tier.startswith(("gpu", "mlx")) else 15
+    # CUDA/GPU tiers keep the snappy 8 s chunk. MLX (Apple Metal) is a special case: mlx-whisper
+    # always pads every chunk to a fixed 30 s encoder window (pad_or_trim to N_FRAMES, no early
+    # exit), so an 8 s chunk wastes ~73% of every encoder pass. A 15 s chunk fills far more of that
+    # fixed window at no extra encoder cost, at the price of the accepted 15 to 22.5 s caption
+    # latency. It must stay under 30 s even at the capture ceiling: capture MAX_CHUNK_MULTIPLIER is
+    # 1.5, so 15 * 1.5 = 22.5 s, safely inside the window (a chunk over 30 s would cost a second
+    # encoder pass and invert the gain). CPU tiers keep 15 unchanged.
+    if tier.startswith("mlx"):
+        return 15
+    return 8 if tier.startswith("gpu") else 15
 
 
 def default_output_path():
