@@ -142,6 +142,11 @@ def _gated_engine(gate, builds, name="fake-model"):
         def start(self):
             pass
 
+        def arm_struggle(self):
+            # _publish arms the struggle warning on the published engine; a no-op here keeps the
+            # publish thread from raising AttributeError (PytestUnhandledThreadExceptionWarning).
+            pass
+
         def stop(self, drain=True):
             pass
 
