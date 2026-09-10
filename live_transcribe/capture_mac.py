@@ -914,24 +914,47 @@ class AudioCapture(CaptureBase):
         # Ordering parity with capture_win, which stops its streams here and does
         # host-API teardown in _release_backend; the mac backend has no host-API
         # singleton to tear down, so both live here.
+        # Returns True only if all of that is CONFIRMED; per-resource exceptions are still
+        # swallowed so one failure cannot skip the rest, but they are reported rather than
+        # discarded (see the contract on CaptureBase._close_sources).
+        ok = True
         if self._mic_stream is not None:
             try:
                 self._mic_stream.stop()
                 self._mic_stream.close()
-            except Exception:
-                pass
+            except Exception as e:
+                ok = False
+                print(f"[MIC] could not close the microphone stream: {e}", flush=True)
             self._mic_stream = None
         if self._helper is not None:
             try:
                 self._helper.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                ok = False
+                print(f"[SYS] could not stop the system-audio helper: {e}", flush=True)
             self._helper = None
         # Join the deferred permission-wait thread, if any: helper.stop() above set the
         # stop flag, so its wait_started returns False and it exits without registering.
+        #
+        #
+        # But only if the wait had not ALREADY returned. _await_system_tap does not re-check for
+        # shutdown between wait_started() and _register_source("SYS") + _ensure_chunker("SYS"), so
+        # a grant landing in that instant can create a chunker after stop() has snapshotted
+        # _workers, and that chunker would never be joined. The join is bounded, so we cannot
+        # simply wait it out; we REPORT it instead, and the only consequence of the False is that
+        # the app keeps saying "Stopping" rather than asserting the microphone is off. Honest, and
+        # on this path that is all it needs to be.
+        # RESIDUAL, deliberately not fixed here (it wants a stopping latch re-checked inside
+        # _await_system_tap under the lifecycle lock, which is a capture-lifecycle change tracked
+        # as its own macOS item): the late thread can still register a source.
         if self._sys_await_thread is not None:
             try:
                 self._sys_await_thread.join(timeout=3.0)
             except Exception:
                 pass
+            if self._sys_await_thread.is_alive():
+                ok = False
+                print("[SYS] the deferred permission thread is still running after its join "
+                      "window; system audio may still be attaching", flush=True)
             self._sys_await_thread = None
+        return ok
