@@ -29,9 +29,19 @@ import numpy as np
 # MLX form (D3). Anything outside this map (local Fluister ct2 dirs, unmapped
 # sizes, Swivuriso) has no MLX form and runs on ct2 CPU on the Mac; that
 # fallback happens at selection time, never here.
+#
+# Two kinds of MLX repo live here, told apart by is_stock_mlx_repo(): our own
+# Afrikaans-tuned Fluister (digiphyte/*) and upstream stock Whisper
+# (mlx-community/*). The stock rungs are the Mac's lower gears for ENGLISH
+# sessions only; the selection/ladder code that enforces "never downgrade an
+# Afrikaans session onto stock Whisper" lands in a later package and reads
+# is_stock_mlx_repo to draw that line. Registering them here does not select them.
 MLX_REPOS = {
     "digiphyte/fluister-turbo": "digiphyte/fluister-turbo-mlx",
     "large-v3":                 "mlx-community/whisper-large-v3-mlx",
+    # Stock Whisper lower gears (English sessions only), 8-bit MLX form.
+    "medium":                   "mlx-community/whisper-medium-mlx-8bit",
+    "small":                    "mlx-community/whisper-small-mlx-8bit",
 }
 
 # The kwarg surface the adapter translates, as module constants so the tests pin
@@ -43,6 +53,16 @@ DROPPED_KWARGS = frozenset({"vad_filter", "vad_parameters", "beam_size"})
 def mlx_model_for(ct2_model_id):
     """The MLX repo for a ct2 model id, or None when no MLX form exists."""
     return MLX_REPOS.get(ct2_model_id)
+
+
+def is_stock_mlx_repo(repo_id):
+    """True iff `repo_id` is an upstream stock Whisper MLX repo (mlx-community/*), as opposed to
+    our own Afrikaans-tuned Fluister MLX repo (digiphyte/*). The later selection/ladder code uses
+    this to enforce the hard line that an Afrikaans session is NEVER auto-downgraded onto a stock
+    rung: stock rungs are English-only lower gears. Pure string test, no network, no cache probe.
+    A repo id not in MLX_REPOS (not one of ours at all) reads as not-stock (fail-safe: unknown ids
+    never pass the stock gate)."""
+    return repo_id in MLX_REPOS.values() and str(repo_id).startswith("mlx-community/")
 
 
 class _Seg:

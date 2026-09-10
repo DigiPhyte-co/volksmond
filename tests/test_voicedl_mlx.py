@@ -193,15 +193,20 @@ def test_asr_download_target_mlx_when_ready():
     orig = voicedl.accel
     try:
         voicedl.accel = _fake_accel(True)
-        # The two mapped pairs (the D3 map, via mlxbackend.MLX_REPOS as single source of truth).
+        # The mapped pairs (the D3 map, via mlxbackend.MLX_REPOS as single source of truth).
         assert voicedl.asr_download_target("fluister", "large-v3-turbo") == FLUISTER_TURBO_MLX
         assert voicedl.asr_download_target("whisper", "large-v3") == WHISPER_LARGE_MLX
         assert voicedl.asr_download_target("fluister", "large-v3-turbo") == \
             MLX_REPOS["digiphyte/fluister-turbo"]
         assert voicedl.asr_download_target("whisper", "large-v3") == MLX_REPOS["large-v3"]
-        # A map miss keeps the ct2 target even with MLX ready (D3: no special-casing).
+        # Stock English lower gears: whisper medium/small now map to their 8-bit mlx-community repos.
+        assert voicedl.asr_download_target("whisper", "medium") == MLX_REPOS["medium"]
+        assert voicedl.asr_download_target("whisper", "small") == MLX_REPOS["small"]
+        # A map miss keeps the ct2 target even with MLX ready (D3: no special-casing). Fluister
+        # medium is a Fluister repo id, distinct from the stock whisper "medium" key above; and
+        # stock "base" has no MLX form at all.
         assert voicedl.asr_download_target("fluister", "medium") == "digiphyte/fluister-medium"
-        assert voicedl.asr_download_target("whisper", "medium") == "medium"
+        assert voicedl.asr_download_target("whisper", "base") == "base"
         # An unknown Fluister size stays falsy so the callers' ValueError behaviour holds.
         assert not voicedl.asr_download_target("fluister", "nope")
     finally:
@@ -480,6 +485,42 @@ def test_start_fluister_update_targets_mlx_when_ready():
     print("  OK  start_fluister_update() applies the update to the MLX repo on a ready Mac")
 
 
+def test_every_mlx_repo_has_a_size_and_is_a_target():
+    # Every MLX repo id (the single source of truth in mlxbackend.MLX_REPOS) must be recognised as
+    # an MLX target AND carry a positive approx size in the table that governs its download total:
+    # stock upstream rungs (mlx-community/*) in _MLX_SIZES, our versioned Fluister MLX in
+    # _FLUISTER_SIZES. A repo with no size would show a zero-byte progress estimate.
+    from live_transcribe.mlxbackend import is_stock_mlx_repo
+    for repo in MLX_REPOS.values():
+        assert repo in voicedl._MLX_TARGETS, f"{repo} missing from _MLX_TARGETS"
+        if is_stock_mlx_repo(repo):
+            size = voicedl._MLX_SIZES.get(repo, 0)
+            table = "_MLX_SIZES"
+        else:
+            size = voicedl._FLUISTER_SIZES.get(repo, 0)
+            table = "_FLUISTER_SIZES"
+        assert size > 10_000_000, f"{repo} has no plausible size in {table} ({size})"
+    # The exact stock-rung and Fluister-MLX byte sizes registered this wave (from the HF API).
+    assert voicedl._MLX_SIZES["mlx-community/whisper-medium-mlx-8bit"] == 864_552_176
+    assert voicedl._MLX_SIZES["mlx-community/whisper-small-mlx-8bit"] == 295_627_784
+    assert voicedl._FLUISTER_SIZES["digiphyte/fluister-turbo-mlx"] == 863_659_701
+    print("  OK  every MLX_REPOS value is an _MLX_TARGETS member with a positive size in its table")
+
+
+def test_new_stock_mlx_rungs_are_known_targets():
+    # The new stock rungs must be deletable exactly like any other MLX target: recognised as known
+    # models (not mangled through _repo_id) and pointing at their own cache dir only.
+    for repo in ("mlx-community/whisper-medium-mlx-8bit", "mlx-community/whisper-small-mlx-8bit"):
+        assert repo in voicedl._MLX_TARGETS, repo
+        # start_download must still refuse the raw MLX repo id (Windows API-surface guard, codex L1).
+        try:
+            voicedl.start_download(repo)
+            assert False, f"start_download accepted MLX repo id {repo!r}"
+        except ValueError:
+            pass
+    print("  OK  new stock MLX rungs are _MLX_TARGETS; start_download still refuses their repo ids")
+
+
 if __name__ == "__main__":
     tests = (test_snapshot_has_mlx_weights_shapes,
              test_mlx_present_probes_local_cache_only,
@@ -493,7 +534,9 @@ if __name__ == "__main__":
              test_start_download_rejects_mlx_repo_ids,
              test_fluister_catalogue_targets_mlx_when_ready,
              test_model_update_status_considers_mlx_repo,
-             test_start_fluister_update_targets_mlx_when_ready)
+             test_start_fluister_update_targets_mlx_when_ready,
+             test_every_mlx_repo_has_a_size_and_is_a_target,
+             test_new_stock_mlx_rungs_are_known_targets)
     failures = 0
     for fn in tests:
         try:

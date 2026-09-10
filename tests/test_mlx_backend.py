@@ -209,11 +209,28 @@ def test_mlx_model_for_map():
     from live_transcribe import mlxbackend
     assert mlxbackend.mlx_model_for("digiphyte/fluister-turbo") == "digiphyte/fluister-turbo-mlx"
     assert mlxbackend.mlx_model_for("large-v3") == "mlx-community/whisper-large-v3-mlx"
+    # Stock English lower gears: medium/small now map to their 8-bit mlx-community repos.
+    assert mlxbackend.mlx_model_for("medium") == "mlx-community/whisper-medium-mlx-8bit"
+    assert mlxbackend.mlx_model_for("small") == "mlx-community/whisper-small-mlx-8bit"
     # No MLX form: unmapped sizes and local ct2 dirs miss the map (ct2 CPU fallback
     # happens at selection time, per D3).
-    assert mlxbackend.mlx_model_for("medium") is None
+    assert mlxbackend.mlx_model_for("base") is None
     assert mlxbackend.mlx_model_for(r"C:\Users\seanf\.cache\af-lora-turbo-ct2-int8") is None
-    print("  OK  mlx_model_for: mapped repos returned, local dirs and 'medium' -> None")
+    print("  OK  mlx_model_for: mapped repos returned (incl. stock medium/small), local dirs and 'base' -> None")
+
+
+def test_is_stock_mlx_repo_distinguishes_families():
+    from live_transcribe import mlxbackend
+    # Stock upstream Whisper (mlx-community/*) = the English-only lower gears.
+    assert mlxbackend.is_stock_mlx_repo("mlx-community/whisper-medium-mlx-8bit") is True
+    assert mlxbackend.is_stock_mlx_repo("mlx-community/whisper-small-mlx-8bit") is True
+    assert mlxbackend.is_stock_mlx_repo("mlx-community/whisper-large-v3-mlx") is True
+    # Our own Afrikaans-tuned Fluister MLX repo is NOT stock (the Afrikaans hard line).
+    assert mlxbackend.is_stock_mlx_repo("digiphyte/fluister-turbo-mlx") is False
+    # A repo id not in the map at all fails safe as not-stock (never passes the stock gate).
+    assert mlxbackend.is_stock_mlx_repo("mlx-community/whisper-tiny-mlx") is False
+    assert mlxbackend.is_stock_mlx_repo("digiphyte/fluister-turbo") is False
+    print("  OK  is_stock_mlx_repo: mlx-community/* in the map -> stock, Fluister/unknown -> not stock")
 
 
 # ── seam tests ─────────────────────────────────────────────────────────────
@@ -242,13 +259,27 @@ def test_tier_choices_unchanged():
     print("  OK  TIER_CHOICES untouched (mlx tiers unreachable from the CLI)")
 
 
-def test_default_chunk_seconds_mlx_is_gpu_class():
+def test_default_chunk_seconds_mlx_fills_encoder_window():
+    # mlx-whisper always pads to a fixed 30 s encoder window, so 8 s chunks waste ~73% of every
+    # pass. mlx tiers use 15 s (fills the window at no extra encoder cost); cuda/gpu keep 8 s.
     from live_transcribe.__main__ import default_chunk_seconds
-    assert default_chunk_seconds("mlx") == 8
-    assert default_chunk_seconds("mlx-turbo") == 8
-    assert default_chunk_seconds("gpu") == 8          # unchanged
-    assert default_chunk_seconds("cpu-strong") == 15  # unchanged
-    print("  OK  default_chunk_seconds: mlx tiers 8 s (GPU-class), others unchanged")
+    assert default_chunk_seconds("mlx") == 15
+    assert default_chunk_seconds("mlx-turbo") == 15
+    assert default_chunk_seconds("gpu") == 8            # unchanged
+    assert default_chunk_seconds("gpu-4gb") == 8        # unchanged
+    assert default_chunk_seconds("cpu-strong") == 15    # unchanged
+    print("  OK  default_chunk_seconds: mlx tiers 15 s (fill the fixed window), gpu 8 s, cpu 15 s")
+
+
+def test_mlx_chunk_stays_within_encoder_window():
+    # Guard: even at the capture ceiling a 15 s nominal chunk must stay under mlx-whisper's fixed
+    # 30 s window. Over 30 s costs a second encoder pass and inverts the whole gain.
+    from live_transcribe.__main__ import default_chunk_seconds
+    from live_transcribe.capture_core import MAX_CHUNK_MULTIPLIER
+    mlx_nominal = default_chunk_seconds("mlx")
+    assert mlx_nominal * MAX_CHUNK_MULTIPLIER <= 30, (mlx_nominal, MAX_CHUNK_MULTIPLIER)
+    print(f"  OK  mlx chunk ceiling {mlx_nominal} * {MAX_CHUNK_MULTIPLIER} = "
+          f"{mlx_nominal * MAX_CHUNK_MULTIPLIER} s <= 30 s window")
 
 
 def test_engine_drain_parity_on_mlx_tier():
@@ -353,9 +384,11 @@ if __name__ == "__main__":
                test_segment_contract,
                test_rejects_non_ndarray_audio,
                test_mlx_model_for_map,
+               test_is_stock_mlx_repo_distinguishes_families,
                test_import_stays_lazy_and_tiers_present,
                test_tier_choices_unchanged,
-               test_default_chunk_seconds_mlx_is_gpu_class,
+               test_default_chunk_seconds_mlx_fills_encoder_window,
+               test_mlx_chunk_stays_within_encoder_window,
                test_engine_drain_parity_on_mlx_tier,
                test_app_main_mlx_smoke_env_var,
                test_apply_pending_change_updates_device_identity):
