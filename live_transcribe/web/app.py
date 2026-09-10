@@ -186,6 +186,27 @@ class _State:
         # session-scoped, so reset() clears them.
         self.struggle_nudge: Optional[dict] = None
         self.struggle_notified: bool = False
+        # ASR worker failures. asr_errors is the running count of per-chunk transcription failures
+        # this session (transcribe.Engine.asr_errors, mirrored here so /api/status can report it
+        # after the engine has gone); asr_error_nudge is the ONE banner the UI renders once the
+        # count passes ASR_ERROR_THRESHOLD ({"count", "message", "log_path"}), updated in place as
+        # the count grows rather than re-raised per failure; asr_error_dismissed stops a dismissed
+        # banner coming back. All session-scoped, so reset() clears them.
+        self.asr_errors: int = 0
+        self.asr_error_nudge: Optional[dict] = None
+        self.asr_error_dismissed: bool = False
+        # Bounded Stop (see STOP_GRACE_SECONDS). stop_started_at is the monotonic clock the drain
+        # thread measures its grace and stall windows against; stop_phase is what the UI shows
+        # ("" | "closing" | "starting" | "draining" | "discarding"); stop_pending is the last backlog
+        # depth the drain thread published, which is what lets /api/status report a real number even
+        # while STATE.engine is None (the catch-up case, i.e. the countless "Finishing" bug);
+        # stop_slow flips True once the grace period is up, which is what raises the keep-waiting /
+        # discard choice; stop_discard is the event POST /api/stop-now sets to take the discard branch.
+        self.stop_started_at: Optional[float] = None
+        self.stop_phase: str = ""
+        self.stop_pending: Optional[int] = None
+        self.stop_slow: bool = False
+        self.stop_discard: Optional[threading.Event] = None
         # Latch: did the engine drop to a smaller model at any point this session? Set on the FIRST
         # downgrade and never cleared while the session lives, independent of the nudge (a user who
         # switched the banner off still degraded, and still deserves the offer). Reported by
@@ -254,6 +275,19 @@ class _State:
         self.silence_nudge = None
         self.struggle_nudge = None
         self.struggle_notified = False
+        self.asr_errors = 0
+        self.asr_error_nudge = None
+        self.asr_error_dismissed = False
+        # Bounded Stop: a finished session has nothing left to stop. Signal any waiting discard
+        # event first (same discipline as silence_stop above) so a drain thread parked on it can
+        # never outlive the session that owns it.
+        if self.stop_discard is not None:
+            self.stop_discard.set()
+        self.stop_discard = None
+        self.stop_started_at = None
+        self.stop_phase = ""
+        self.stop_pending = None
+        self.stop_slow = False
         self.downgraded = False
         # t0-capture: clear the preparing flag, any load error, and drop the pending-audio hold so a
         # never-loaded model's buffer cannot outlive its session (and its RAM is freed at finalise).
@@ -303,6 +337,45 @@ def _summary_running():
 # only has to cover a realistic model load/download; an unbounded buffer against a model that never
 # loads would OOM the app, so the cap is deliberate, not incidental.
 _PENDING_MAX_SAMPLES = 16000 * 60 * 20 * 2   # 20 min of both-source 16 kHz float32 samples
+
+# How often the pending-audio buffer may say, in the transcript, that it had to throw audio away.
+# The buffer keeps counting between markers and the next one carries the full total, so nothing is
+# unreported - it is only batched, so a sustained overflow writes one honest line a minute instead
+# of one per lost chunk.
+_EVICT_MARKER_INTERVAL = 60.0
+
+# --- bounded Stop -------------------------------------------------------------------------------
+# Stop used to be unbounded in three places: engine.stop(drain=True) joined the worker with no
+# timeout, build_thread.join() had no timeout, and the UI polled /api/status forever. On a Mac whose
+# graphics chip was busy with a screen share that meant Stop never came back and force-quitting the
+# window was the only way out (field report, 2026-08). The bounds below are what make Stop always
+# terminate, without ever silently throwing away work that is genuinely progressing.
+#
+# STOP_GRACE_SECONDS: how long the drain runs before Stop stops being a silent wait and becomes an
+# explicit CHOICE (/api/status reports stop_slow, the live screen offers "Keep waiting" or "Stop now
+# and discard"). Deliberately generous, because a big backlog is normal and not a fault: the field
+# report's 33 chunks are about six minutes of audio, and a contended machine running at ~2x real
+# time needs about twelve minutes to finish them honestly. Five minutes is long enough that an
+# ordinary tail (a handful of chunks) never raises the prompt, and short enough that a genuinely
+# stuck session asks for a decision while the user is still sitting in front of it.
+STOP_GRACE_SECONDS = 300.0
+# The drain is WEDGED rather than slow when the backlog has not shrunk by a single chunk for this
+# long: a dead worker, or a model call that never returns. Waiting cannot help, so the remaining
+# backlog is abandoned automatically and everything already transcribed is saved. This is what
+# guarantees Stop terminates with nobody at the keyboard.
+STOP_STALL_SECONDS = 180.0
+# Bounds on the two joins in the stop path. A worker wedged inside a model call cannot be killed
+# from Python, so past these we finalise WITHOUT it (it is a daemon thread and dies with the app)
+# instead of hanging the session forever. The transcript and the recording are closed either way.
+STOP_JOIN_SECONDS = 20.0
+STOP_BUILD_JOIN_SECONDS = 30.0
+# How often the drain thread re-reads the backlog while it waits.
+_STOP_POLL_SECONDS = 0.5
+
+# Per-chunk ASR failures before the UI says so. Small, because a backend that throws at all is
+# usually throwing on everything (a broken install, an out-of-memory graphics call), but not one:
+# a single bad chunk is not worth a banner.
+ASR_ERROR_THRESHOLD = 3
 
 # Bounded-failure thresholds for the background model prepare (WP-2). A first-run download that makes
 # NO progress for PREPARE_DOWNLOAD_STALL_SECONDS is treated as stalled (dead connection / HuggingFace
@@ -453,6 +526,12 @@ class _PendingAudio:
             if lo is None:
                 return None, 0.0
             return lo, max(0.0, (hi or lo) - lo)
+
+    def depth(self):
+        """How many chunks are held right now. Read by the stop path so a Stop during catch-up can
+        report a real number instead of a countless spinner."""
+        with self._lock:
+            return len(self._buf)
 
     def _warn_once(self, newest):
         if self._warned:
@@ -693,23 +772,238 @@ def _mark_dropped_backlog(md_sink, browser_sink, pb, recording):
     _note_untranscribed(md_sink, browser_sink, t_start, seconds, recording)
 
 
-def _drain_pending_into_engine(engine, pb):
+def _drain_pending_into_engine(engine, pb, discard=None):
     """Feed everything still held in the pending-audio buffer into `engine`, in order, so a Stop (or a
     partial 'stop transcription') during catch-up saves the whole transcript instead of discarding the
     backlog (P1-3). block=True so it never drops on the maxsize queue; bails only if the worker dies. The
     caller then calls engine.stop(drain=True) to flush the queue into the sink. MUST be called only after
     the background builder has been joined, so this is the SOLE feeder of the engine (no double-delivery,
-    no reorder)."""
+    no reorder).
+
+    `discard` is the stop path's "stop now and throw the rest away" event: this hand-over can block for
+    as long as the worker takes to make room, so it has to be interruptible too, or the user's answer
+    would not take effect until the very thing they are trying to escape had finished."""
     if pb is None or engine is None:
         return
     while True:
+        if discard is not None and discard.is_set():
+            return
         items = pb.take_all()
         if not items:
             return
         for (src, audio, t_start) in items:
+            if discard is not None and discard.is_set():
+                return
             while not engine.on_chunk(src, audio, t_start, block=True, timeout=0.5):
                 if not _engine_alive(engine):
                     return
+                if discard is not None and discard.is_set():
+                    return
+
+
+# --- bounded Stop: helpers ----------------------------------------------------------------------
+
+def _engine_stop(engine, drain, timeout=None):
+    """Call engine.stop(drain=..., timeout=...), defensively. Same posture as _engine_alive: the
+    timeout argument is an optimisation on top of the Engine contract, so an engine object that does
+    not take one still gets stopped, and a stop that raises never takes the stop path down with it."""
+    if engine is None:
+        return
+    try:
+        engine.stop(drain=drain, timeout=timeout)
+        return
+    except TypeError:
+        pass
+    except Exception:
+        return
+    try:
+        engine.stop(drain=drain)
+    except Exception:
+        pass
+
+
+def _engine_pending(engine):
+    """This engine's backlog depth, or None when it cannot say."""
+    if engine is None:
+        return None
+    try:
+        return int(engine.pending())
+    except Exception:
+        return None
+
+
+def _stop_pending():
+    """Chunks still to transcribe before Stop can finish, or None when that genuinely is not known.
+    Caller holds STATE.lock.
+
+    This used to be `STATE.engine.pending() if STATE.engine else <nothing>`, which is why a Stop
+    during catch-up reported no number at all: the engine is deliberately unpublished until the
+    backlog is caught up, so on the exact machine that needed the number most there was none. Now
+    it reads the live engine, falls back to the unpublished catch-up engine, adds whatever the
+    pending-audio hold is still carrying (during catch-up that buffer IS most of the backlog), and
+    finally falls back to the last figure the drain thread published. None is returned honestly -
+    the model never got far enough to have a backlog - and the UI says "still starting up" rather
+    than showing a fabricated zero."""
+    eng = STATE.engine or STATE.preparing_engine
+    held = None
+    if STATE.pending_audio is not None:
+        try:
+            held = STATE.pending_audio.depth()
+        except Exception:
+            held = None
+    depth = _engine_pending(eng)
+    if depth is not None:
+        return depth + (held or 0)
+    if held is not None:
+        return held
+    return STATE.stop_pending
+
+
+def _publish_stop_progress(pending, slow=None, phase=None):
+    """Publish the drain thread's view of Stop so /api/status can answer honestly. Takes STATE.lock
+    itself: this runs on the drain thread, never inside a request."""
+    with STATE.lock:
+        STATE.stop_pending = pending
+        if slow is not None:
+            STATE.stop_slow = slow
+        if phase is not None:
+            STATE.stop_phase = phase
+
+
+def _stop_pending_unlocked_hint(engine):
+    """The backlog figure the drain thread publishes: this engine's queue plus anything the
+    pending-audio hold is still carrying. Read without STATE.lock (the drain thread must not hold it
+    while it waits); both reads are individually safe and the number is a progress hint, not a
+    decision input."""
+    depth = _engine_pending(engine)
+    pb = STATE.pending_audio
+    held = None
+    if pb is not None:
+        try:
+            held = pb.depth()
+        except Exception:
+            held = None
+    if depth is None:
+        return held
+    return depth + (held or 0)
+
+
+def _drain_engine_bounded(engine, discard):
+    """Drain `engine`'s backlog and ALWAYS come back. Returns True if the whole backlog was
+    transcribed, False if the tail was abandoned.
+
+    The blocking drain runs on its own thread so this one stays free to publish progress and watch
+    for the two escapes. Three ways out, in priority order:
+
+      1. the worker finishes the backlog: the normal, honest end, nothing lost;
+      2. the user answers the keep-waiting / stop-now prompt with "stop now" (`discard` is set);
+      3. the backlog has not shrunk by a single chunk for STOP_STALL_SECONDS, i.e. the worker is
+         wedged rather than slow, so waiting demonstrably cannot help.
+
+    2 and 3 both abandon the rest through the engine's EXISTING hard-abort path (stop(drain=False)),
+    which discards the queued backlog; everything already transcribed has long since been fanned out
+    to the transcript sink, and the caller closes the recorder either way, so the audio file is
+    complete regardless. Past STOP_GRACE_SECONDS the drain flips STATE.stop_slow, which is what puts
+    the choice on screen.
+
+    A worker wedged inside a model call cannot be woken from Python, so the abort join is bounded
+    too and we finalise without it if it will not come back (it is a daemon thread and dies with the
+    app). Hanging the whole app on it was the field-report failure."""
+    if engine is None:
+        return True
+    done = threading.Event()
+
+    def _blocking_drain():
+        try:
+            _engine_stop(engine, drain=True)
+        finally:
+            done.set()
+
+    threading.Thread(target=_blocking_drain, daemon=True, name="stop-engine-drain").start()
+    started = time.monotonic()
+    last_depth, last_move, slow = _engine_pending(engine), started, False
+    _publish_stop_progress(_stop_pending_unlocked_hint(engine), slow=False, phase="draining")
+    abandon = None
+    while not done.wait(_STOP_POLL_SECONDS):
+        now = time.monotonic()
+        depth = _engine_pending(engine)
+        if depth != last_depth:
+            last_depth, last_move = depth, now
+        if not slow and (now - started) >= STOP_GRACE_SECONDS:
+            slow = True
+        _publish_stop_progress(_stop_pending_unlocked_hint(engine), slow=slow)
+        if discard is not None and discard.is_set():
+            abandon = "the user chose to stop now"
+            break
+        if (now - last_move) >= STOP_STALL_SECONDS:
+            abandon = (f"the transcriber has not finished a chunk in {STOP_STALL_SECONDS:.0f}s")
+            break
+    if abandon is None:
+        _publish_stop_progress(0, slow=False)
+        return True
+    print(f"[stop] {abandon}; abandoning the remaining "
+          f"{last_depth if last_depth is not None else '?'} chunk(s) so Stop can finish.", flush=True)
+    _publish_stop_progress(_stop_pending_unlocked_hint(engine), slow=False, phase="discarding")
+    _engine_stop(engine, drain=False, timeout=STOP_JOIN_SECONDS)
+    done.wait(STOP_JOIN_SECONDS)   # the blocking drain returns as soon as the worker exits
+    _publish_stop_progress(0, slow=False)
+    return False
+
+
+def _arm_stop():
+    """Start the bookkeeping a bounded Stop needs. Caller holds STATE.lock, at the moment
+    STATE.stopping flips True and BEFORE transcribing is cleared, since the phase is read off it.
+
+    The phase is decided here, once, and it is what lets the UI be honest when there is no number
+    to give: "closing" (a record-only session, nothing to transcribe, so Stop is just closing
+    files), "draining" (a live model working through its backlog, which is where a count exists),
+    or "starting" (the model never became ready, so there is a held backlog but no engine yet -
+    the exact case that used to render a countless spinner)."""
+    STATE.stop_started_at = time.monotonic()
+    if not (STATE.transcribing or STATE.model_ready or STATE.preparing):
+        STATE.stop_phase = "closing"
+    else:
+        STATE.stop_phase = "draining" if STATE.model_ready else "starting"
+    STATE.stop_pending = None
+    STATE.stop_slow = False
+    STATE.stop_discard = threading.Event()
+
+
+def _disarm_stop():
+    """Undo _arm_stop for a partial stop that leaves the session running (stop transcription while
+    recording continues). Caller holds STATE.lock. Signals the event first, exactly as reset() does,
+    so a drain thread parked on it cannot outlive the stop that created it."""
+    if STATE.stop_discard is not None:
+        STATE.stop_discard.set()
+    STATE.stop_discard = None
+    STATE.stop_started_at = None
+    STATE.stop_phase = ""
+    STATE.stop_pending = None
+    STATE.stop_slow = False
+
+
+def _join_builder(build_thread, engine):
+    """Wait for the background model builder to RELEASE `engine` before the stop path drains it, so
+    there is never a second feeder. Returns True when it released.
+
+    The builder checks ownership before every enqueue, so it hands off within about one chunk and
+    this returns promptly. The old code relied on that absolutely and joined with NO timeout, which
+    means the one case it did not cover - a builder wedged on a model call that never returns - hung
+    Stop forever with no way out but force-quitting the window. It is bounded now, and a timeout is
+    handled rather than waited on: hard-aborting the engine is safe even with a second feeder still
+    live, because on_chunk refuses everything once the stop flag is set, so the builder's next
+    enqueue fails, it sees the stop and returns. The un-transcribed backlog is lost in that case;
+    the transcript written so far is not."""
+    if build_thread is None:
+        return True
+    build_thread.join(STOP_BUILD_JOIN_SECONDS)
+    if not build_thread.is_alive():
+        return True
+    print(f"[stop] the model builder did not release the engine within {STOP_BUILD_JOIN_SECONDS:.0f}s; "
+          "abandoning the backlog so Stop can finish.", flush=True)
+    _publish_stop_progress(_stop_pending_unlocked_hint(engine), slow=False, phase="discarding")
+    _engine_stop(engine, drain=False, timeout=STOP_JOIN_SECONDS)
+    return False
 
 
 def _feed(source, audio, t_start):
@@ -1115,6 +1409,48 @@ def _on_gpu_struggle(engine):
     return published
 
 
+# --- ASR worker failures ------------------------------------------------------
+# transcribe.Engine catches a failing chunk, counts it and carries on (one bad chunk must never end
+# a meeting). Until now the ONLY trace was a line in volksmond.log, so a backend failing on every
+# chunk - a broken MLX install, an out-of-memory Metal call - looked exactly like a silent room: an
+# empty transcript and a calm "Listening" chip. This turns the count into one banner, updated in
+# place, that names the log file.
+
+
+def _log_path() -> str:
+    """Where the app's log actually is on THIS platform, for the banner to point at. Best-effort:
+    the banner is still worth showing if the path cannot be derived."""
+    try:
+        from ..paths import data_dir
+        return str(data_dir() / "volksmond.log")
+    except Exception:
+        return "volksmond.log"
+
+
+def _on_asr_error(engine, count, message):
+    """Engine.on_asr_error callback: count per-chunk transcription failures and, past
+    ASR_ERROR_THRESHOLD, raise ONE banner for them. Runs on the transcription worker thread, so it
+    takes STATE.lock and guards session identity exactly like _on_downgrade. Returns the published
+    nudge dict, or None.
+
+    Deliberately NOT one banner per failure: a broken backend throws on every chunk, so the banner
+    is raised once and its count updated in place from there. A banner the user has dismissed stays
+    dismissed for the session (the log line still records every failure). Accepts the unpublished
+    catch-up engine too - failing during catch-up is precisely when the user sees nothing at all."""
+    with STATE.lock:
+        if engine not in (STATE.engine, STATE.preparing_engine):
+            return None
+        STATE.asr_errors = int(count)
+        if count < ASR_ERROR_THRESHOLD or STATE.asr_error_dismissed:
+            return None
+        STATE.asr_error_nudge = {
+            "count": int(count),
+            "message": str(message or "")[:200],
+            "log_path": _log_path(),
+        }
+        return STATE.asr_error_nudge
+
+
 class StartRequest(BaseModel):
     topic: str = ""
     tier: str = "auto"            # "auto" | "gpu" | "cpu-strong" | "cpu-mid"
@@ -1312,6 +1648,11 @@ def status():
             # poll, one banner whose copy branches on the reason. `recording` is the session's
             # recording state when it was raised.
             "struggle_nudge": STATE.struggle_nudge,
+            # Per-chunk ASR failures this session, plus the single banner raised once they pass
+            # ASR_ERROR_THRESHOLD ({"count","message","log_path"}) or None. The raw count is
+            # published either way, so a support session can read it with the banner dismissed.
+            "asr_errors": STATE.asr_errors,
+            "asr_error_nudge": STATE.asr_error_nudge,
             # True iff recording is, or has ever been, active this session (start-time or a
             # mid-session record-from-here). The live screen and finish handoff key off it, and once
             # true /api/record-from-here refuses (re-recording the same stem would truncate the file).
@@ -1361,8 +1702,14 @@ def status():
                 resp["mic_gate"] = eng.mic_gate_state()
             except Exception:
                 pass
-        if STATE.stopping and STATE.engine is not None:
-            resp["pending"] = STATE.engine.pending()
+        if STATE.stopping:
+            # Progress while Stop finishes. This used to be reported ONLY when STATE.engine was set,
+            # so a Stop during catch-up (engine still unpublished) sent no `pending` at all and the
+            # UI rendered a bare, countless "Finishing" spinner that never moved. Now every stop
+            # answers with either a real number or an explicit null plus a phase that says why.
+            resp["pending"] = _stop_pending()
+            resp["stop_phase"] = STATE.stop_phase
+            resp["stop_slow"] = STATE.stop_slow
         return resp
 
 
@@ -1679,6 +2026,23 @@ def struggle_nudge_action(req: StruggleNudgeRequest):
         except Exception as e:
             print(f"[struggle] muted for the session but the setting could not be saved: {e}", flush=True)
     return {"struggle_nudge": None}
+
+
+@app.post("/api/asr-error-nudge")
+def asr_error_nudge_action():
+    """Dismiss the "transcription is failing" banner for the rest of this session.
+
+    Dismiss only, deliberately: unlike the struggle nudge there is no "don't warn again" setting to
+    persist, because a backend that cannot transcribe is a fault to fix, not a preference. The
+    failures keep being counted and logged either way; this only stops the banner coming back.
+
+    409 when there is no live session to answer for."""
+    with STATE.lock:
+        if not STATE.running or STATE.source_kind != "live":
+            raise HTTPException(status_code=409, detail="No live session is running.")
+        STATE.asr_error_nudge = None
+        STATE.asr_error_dismissed = True
+        return {"asr_error_nudge": None}
 
 
 class AecLiveRequest(BaseModel):
@@ -2603,6 +2967,11 @@ def _build_engine_async(session_token, tier, language, prompt, engine_pref, md_s
             cap = STATE.capture
             engine.on_downgrade = lambda old, new, _e=engine: _on_downgrade(_e, old, new)
             engine.on_struggle = lambda _e=engine: _on_gpu_struggle(_e)
+            # on_asr_error stops a backend failing on every chunk (a broken MLX install, an
+            # out-of-memory Metal call) looking like a quiet room. It accepts this engine while it
+            # is still the unpublished catch-up engine, which is exactly when the user has least to
+            # go on, so unlike on_downgrade it is live from here rather than from publish.
+            engine.on_asr_error = lambda n, msg, _e=engine: _on_asr_error(_e, n, msg)
             _sys_ring = transcribe.EnergyRing()
             engine.sys_env = _sys_ring
             if cap is not None:
@@ -3445,9 +3814,10 @@ def stop(what: str = "all"):
 
         if what == "transcription":
             if STATE.stopping:
-                pending = STATE.engine.pending() if STATE.engine else 0
-                return {"stopped": "transcription", "stopping": True, "pending": pending, "output_path": out}
+                return {"stopped": "transcription", "stopping": True, "pending": _stop_pending(),
+                        "stop_phase": STATE.stop_phase, "output_path": out}
             STATE.stopping = True
+            _arm_stop()               # before transcribing clears: the stop phase is read off it
             STATE.transcribing = False
             # Transcription is what owns the energy rings, so once it goes there is nothing
             # left to measure silence with: stop the watcher rather than leave it blind.
@@ -3468,7 +3838,8 @@ def stop(what: str = "all"):
             abandoned_pb = pb if (engine is None and prep_eng is None) else None
             browser_sink = STATE.browser_sink
             was_recording = bool(STATE.recording)
-            pending = (prep_eng.pending() if prep_eng else (engine.pending() if engine else 0))
+            pending = _stop_pending()
+            discard = STATE.stop_discard
             # Read the downgrade latch here, under the lock and before the drain thread resets the
             # session: the finish screen needs it to offer a re-transcribe from the recording.
             downgraded = STATE.downgraded
@@ -3479,22 +3850,17 @@ def stop(what: str = "all"):
                     # Wait for the builder to RELEASE the private engine - return from its thread - before
                     # draining it, so we are the SOLE feeder (no two-feeder race). The builder releases
                     # within ~one chunk of the stop: _replay checks ownership BEFORE every enqueue, then
-                    # hands its unsubmitted tail back to the buffer and returns (P1-3). We deliberately do
-                    # NOT bound-and-proceed - draining or stopping the engine while the builder might still
-                    # feed it is exactly the bug. In the (pre-enqueue-check makes it unreachable) event the
-                    # builder never returned, this join simply keeps the session in `stopping` rather than
-                    # reset/drain over a live builder. Recording (if on) is untouched; capture keeps running.
-                    if build_thread is not None:
-                        build_thread.join()
-                    _drain_pending_into_engine(prep_eng, pb)
-                    drained_engine = prep_eng
+                    # hands its unsubmitted tail back to the buffer and returns (P1-3). Bounded (see
+                    # _join_builder): a builder that never returns used to hang this thread forever, so
+                    # Stop never finished. Recording (if on) is untouched; capture keeps running.
+                    if not _join_builder(build_thread, prep_eng):
+                        drained_engine = None   # already hard-aborted; nothing left to drain
+                    else:
+                        _drain_pending_into_engine(prep_eng, pb, discard)
+                        drained_engine = prep_eng
                 else:
                     drained_engine = engine
-                try:
-                    if drained_engine is not None:
-                        drained_engine.stop(drain=True)
-                except Exception:
-                    pass
+                _drain_engine_bounded(drained_engine, discard)
                 try:
                     if md_sink is not None:
                         md_sink.close()
@@ -3520,6 +3886,7 @@ def stop(what: str = "all"):
                         STATE.sink_error = err
                     if STATE.recording:
                         STATE.stopping = False  # recording carries on; session still running
+                        _disarm_stop()          # ...so there is no Stop left to bound or discard
                     else:
                         # Recording was also stopped while we were draining: nothing
                         # is left running, so finalise. Stop capture OUTSIDE the lock
@@ -3555,17 +3922,18 @@ def stop(what: str = "all"):
 
             threading.Thread(target=_drain_transcription, daemon=True, name="stop-transcription").start()
             return {"stopped": "transcription", "stopping": True, "pending": pending,
-                    "recording": STATE.recording, "output_path": out,
+                    "stop_phase": STATE.stop_phase, "recording": STATE.recording, "output_path": out,
                     "downgraded": downgraded}
 
         # what == "all" (skipped when this was a partial "stop recording": that path
         # detached its recorder above and returns after the lock releases).
         if not recording_partial:
             if STATE.stopping:
-                pending = STATE.engine.pending() if STATE.engine else 0
-                return {"stopping": True, "pending": pending, "output_path": out,
+                return {"stopping": True, "pending": _stop_pending(),
+                        "stop_phase": STATE.stop_phase, "output_path": out,
                         "downgraded": STATE.downgraded}
             STATE.stopping = True
+            _arm_stop()
             _silence_signal()   # the session is over; the watcher must not outlive the drain
             engine = STATE.engine
             cap = STATE.capture
@@ -3583,7 +3951,9 @@ def stop(what: str = "all"):
             # the transcript says how much was never transcribed instead of just ending short.
             no_engine_case = engine is None and prep_eng is None
             browser_sink = STATE.browser_sink
-            pending = (engine.pending() if engine else (prep_eng.pending() if prep_eng else 0))
+            pending = _stop_pending()
+            stop_phase = STATE.stop_phase
+            discard = STATE.stop_discard
             # Same reason as the partial stop above: read the downgrade latch under the lock, before
             # the drain thread resets the session out from under it.
             downgraded = STATE.downgraded
@@ -3627,26 +3997,29 @@ def stop(what: str = "all"):
             # before md_sink.close(), so the notice is part of the saved transcript.
             _mark_abandoned_backlog(md_sink, browser_sink, pb, rec is not None)
         if preparing_case:
-            # Model still catching up: cap.stop() above flushed the final chunk into pending_audio (the
-            # engine is unpublished, so _feed buffers it). Wait for the builder to RELEASE the private
-            # engine - return from its thread - before draining it, so we are the SOLE feeder. The builder
-            # releases within ~one chunk of the stop (_replay checks ownership before every enqueue, then
-            # hands its unsubmitted tail back to the buffer), so this join returns promptly. We do NOT
-            # bound-and-proceed: draining or stopping the engine while the builder might still feed it is
-            # exactly the P1-3 bug, and resetting over a live builder would let a new session start on top
-            # of it. In the (unreachable) event the builder never returns, the session simply stays in
-            # `stopping` rather than corrupt state. Then a slow-CPU Stop saves the transcript from t0.
-            if build_thread is not None:
-                build_thread.join()
-            _drain_pending_into_engine(prep_eng, pb)
-            drained_engine = prep_eng
+            # Model still catching up: _confirm_capture_stopped above flushed the final chunk into
+            # pending_audio (the engine is unpublished, so _feed buffers it). Wait for the builder to
+            # RELEASE the private engine - return from its thread - before draining it, so we are the
+            # SOLE feeder. The builder releases within ~one chunk of the stop (_replay checks ownership
+            # before every enqueue, then hands its unsubmitted tail back to the buffer), so this join
+            # returns promptly. It is BOUNDED now (see _join_builder): the old unbounded join is what
+            # turned "the model never caught up" into "Stop never comes back and the window has to be
+            # force-quit". A builder that never returns is handled by hard-aborting the engine, which
+            # is safe because on_chunk refuses everything once stopping is set.
+            if not _join_builder(build_thread, prep_eng):
+                drained_engine = None       # already hard-aborted; nothing left to drain
+            else:
+                _drain_pending_into_engine(prep_eng, pb, discard)
+                drained_engine = prep_eng
         else:
             drained_engine = engine
-        try:
-            if drained_engine is not None:
-                drained_engine.stop(drain=True)
-        except Exception:
-            pass
+        # Bounded: finishes the backlog when it can, abandons it when the user says so or when the
+        # worker is provably wedged, and ALWAYS returns. Everything transcribed up to that point is
+        # already in md_sink, and rec.close() below finalises the recording either way, so the
+        # discard costs only the audio that was never transcribed - which is on disk when recording
+        # is on. Capture was already stopped and confirmed above, independently of this drain, so
+        # the recording indicator never outlives the microphone even when the drain is abandoned.
+        _drain_engine_bounded(drained_engine, discard)
         try:
             if md_sink is not None:
                 md_sink.close()
@@ -3673,7 +4046,34 @@ def stop(what: str = "all"):
 
     _bump_session_count()  # one completed live/record session; file transcription is counted on its own completion
     threading.Thread(target=_drain_and_close, daemon=True, name="stop-drain").start()
-    return {"stopping": True, "pending": pending, "output_path": out, "downgraded": downgraded}
+    return {"stopping": True, "pending": pending, "stop_phase": stop_phase, "output_path": out,
+            "downgraded": downgraded}
+
+
+@app.post("/api/stop-now")
+def stop_now():
+    """Answer the "this is taking a long time" prompt with "stop now": give up on the audio that has
+    not been transcribed yet and finish immediately.
+
+    Only reachable while a Stop is already in progress, which is the only time it means anything.
+    Everything transcribed so far is kept and saved, and the recording (if the session was recording)
+    is still finalised in full, so what is given up is exactly the un-transcribed tail. The drain
+    thread is watching this event, so it takes effect within a poll rather than at the end of the
+    very wait the user is trying to escape.
+
+    409 when nothing is stopping, which is also what the UI gets if the drain finished between the
+    prompt appearing and the click landing - the right answer for that race, since it means the
+    session finished properly and there was nothing to give up."""
+    with STATE.lock:
+        if not (STATE.running and STATE.stopping):
+            raise HTTPException(status_code=409, detail="There is no session finishing right now.")
+        ev = STATE.stop_discard
+        if ev is None:
+            raise HTTPException(status_code=409, detail="This session is already finishing up.")
+        ev.set()
+        STATE.stop_phase = "discarding"
+        STATE.stop_slow = False
+        return {"stopping": True, "stop_phase": "discarding", "pending": _stop_pending()}
 
 
 def _parse_session_filename(name: str) -> dict:

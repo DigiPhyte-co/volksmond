@@ -1776,6 +1776,14 @@ class Engine:
                                                # short-lived thread: it is raised from the worker AND
                                                # from the real-time capture thread, neither of which
                                                # may pay for what the listener does.
+        # Per-chunk ASR failures (stop-honesty iii). Before this they were caught and printed only,
+        # so a backend that threw on every chunk (a broken MLX install, an out-of-memory Metal call)
+        # looked exactly like a quiet room: no transcript, no warning, nothing to act on. The count
+        # is the honest signal; on_asr_error is the same optional worker-thread callback shape as
+        # on_downgrade, which the web layer turns into a single banner pointing at the log file.
+        self.asr_errors = 0
+        self.last_asr_error = ""
+        self.on_asr_error = None
         # Struggle-warning state. EVERY read and write of the five fields below happens under
         # _struggle_lock (see _struggle_evaluate, which is the only place they are touched after
         # construction): the two windows are sampled from different threads, and the ratchet is
@@ -2789,7 +2797,18 @@ class Engine:
                         self._rtf.append(elapsed / audio_dur)
                     self._maybe_warn_gpu_struggle()
             except Exception as e:
+                # A per-chunk failure used to end here, as a line in the log nobody reads. Count
+                # it and hand it out, so "the model is throwing on every chunk" can be told apart
+                # from "nobody is talking" without opening a file (web/app.py:_on_asr_error).
+                self.asr_errors += 1
+                self.last_asr_error = str(e)
                 print(f"[engine] transcribe error on {source} chunk: {e}", flush=True)
+                cb = self.on_asr_error
+                if cb is not None:
+                    try:
+                        cb(self.asr_errors, str(e))
+                    except Exception as e2:
+                        print(f"[engine] on_asr_error callback error: {e2}", flush=True)
             finally:
                 self._busy = False
 
