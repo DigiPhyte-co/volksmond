@@ -47,7 +47,10 @@ _SIZES = {
 # and the Windows API surface must not accept an MLX repo id (start_download routes the mapped
 # stock SIZES onto these repos on a ready Mac; the repo id itself is never a valid request).
 _MLX_SIZES = {
-    "mlx-community/whisper-large-v3-mlx": 3_090_000_000,   # fp16 form of stock large-v3
+    "mlx-community/whisper-large-v3-mlx":  3_090_000_000,   # fp16 form of stock large-v3
+    # Stock lower gears (English-only), 8-bit MLX. weights.npz totals from the HF API (2026-09-10).
+    "mlx-community/whisper-medium-mlx-8bit":  864_552_176,
+    "mlx-community/whisper-small-mlx-8bit":   295_627_784,
 }
 # The four quality tiers shown to the user (and on the meeting screen), lowest ->
 # highest accuracy: Fast=small, Balanced=medium, High quality=large-v3-turbo,
@@ -80,8 +83,8 @@ _FLUISTER_SIZES = {
     "tiny":              44_000_000,
     # MLX (Apple Metal) form of Fluister turbo. Only ever the download target on darwin-arm64
     # with the MLX runtime installed; keyed by repo id, never offered on Windows.
-    # TODO(sean): fp16-sized placeholder pending the fp16 vs q8 publishing call.
-    "digiphyte/fluister-turbo-mlx": 1_600_000_000,
+    # weights.safetensors byte size from the HF API (2026-09-10).
+    "digiphyte/fluister-turbo-mlx": 863_659_701,
 }
 
 # The MLX repo ids (values of mlxbackend.MLX_REPOS, the single source of truth for which

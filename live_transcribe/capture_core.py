@@ -214,12 +214,19 @@ class CaptureBase:
 
     def _close_sources(self):
         """Stop the platform's audio sources so no more blocks arrive.
-        Called first in stop(), before the AEC drain and chunker flush."""
+        Called first in stop(), before the AEC drain and chunker flush.
+
+        MUST return True only when every source actually closed. Keep swallowing the per-resource
+        exception (one bad stream must never skip the rest of the teardown) but REPORT it: stop()
+        turns this into the answer to "may we tell the user the microphone is off", and a silently
+        discarded close failure made that claim unearned."""
         raise NotImplementedError
 
     def _release_backend(self):
-        """Optional late teardown of the host audio API, called in stop()
-        after the stop event is set and before the chunkers are joined."""
+        """Optional late teardown of the host audio API, called in stop() after the stop event is
+        set and before the chunkers are joined. Same contract as _close_sources: return True on
+        success. The default (no host-API singleton to release) trivially succeeds."""
+        return True
 
     def _register_source(self, source, rate, channels):
         """Create the per-source buffer state for a newly opened device."""
@@ -412,19 +419,64 @@ class CaptureBase:
             self._workers.append(t)
 
     def stop(self):
+        """Shut the capture down. Returns True when that is CONFIRMED complete, False otherwise.
+
+        The answer is EVIDENCE for a claim the app makes to the user ("the microphone is off"),
+        not a licence to finalise anything early: nothing on disk depends on it. Confirmed is the
+        conjunction of what this class can actually check:
+          1. _close_sources() reported success, so every source it can check closed (and on macOS
+             no deferred permission thread is still running that could register a new source and
+             a new chunker behind our back);
+          2. _release_backend() reported success;
+          3. every thread in _workers joined, so each chunker has already made its final flush
+             into on_chunk. That join has always been bounded; a worker that outlived its window
+             used to pass silently.
+        A False costs only a screen that keeps saying "Stopping" instead of asserting the
+        microphone is off, which is the honest outcome when we cannot tell.
+
+        KNOWN GAP, macOS: _AudioTapHelper.stop() reports nothing, so (1) there covers the mic
+        stream but not the system-audio helper subprocess. Deliberately not chased: a confirmed
+        stop still means every chunker joined, so a block from a lingering helper would land in a
+        buffer with no drainer and reach neither the recording nor the transcript.
+
+        Never raises. A half-finished shutdown still has to set the stop event (it is what makes
+        the chunkers flush and exit) and still has to release the backend, and the caller needs an
+        answer it can act on rather than an exception it can only swallow. Before this, a raised
+        _close_sources() skipped both, leaving the chunkers running for the life of the process
+        and PortAudio never terminated. Every failure is printed and folded into a False return.
+        """
         # Stop the input streams first (no more native blocks arrive), then drain the AEC worker
         # into the chunk buffers, and only then signal the chunkers to flush - otherwise the
         # AEC could emit its tail after the chunkers had already flushed, losing the last words.
-        self._close_sources()
+        confirmed = True
+        try:
+            # The RETURN VALUE is the point. Both backends deliberately swallow their per-resource
+            # exceptions (one bad stream must not skip the rest of the teardown), so this call
+            # almost never raises and a try/except around it alone confirmed nothing at all.
+            if self._close_sources() is not True:
+                confirmed = False
+        except Exception as e:
+            confirmed = False
+            print(f"[capture] could not close the input sources cleanly: {e}", flush=True)
         if self._live_aec is not None:
             try:
                 self._live_aec.stop()
             except Exception:
                 pass
         self._stop_event.set()
-        self._release_backend()
+        try:
+            if self._release_backend() is not True:
+                confirmed = False
+        except Exception as e:
+            confirmed = False
+            print(f"[capture] could not release the audio backend: {e}", flush=True)
         for w in self._workers:
             w.join(timeout=BLOCK_SECONDS + 1.5)
+            if w.is_alive():
+                confirmed = False
+                print(f"[capture] {w.name} did not finish within its join window; its final chunk "
+                      f"may still be in flight", flush=True)
+        return confirmed
 
     # ---- shared plumbing ------------------------------------------------
 

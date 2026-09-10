@@ -584,6 +584,13 @@ html, body { margin: 0; padding: 0; height: 100%; }
 .sidebar .return-pill:hover { filter: brightness(0.97); }
 .sidebar .return-pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--record); animation: vm-pulse 1.6s ease-in-out infinite; flex: 0 0 auto; }
 .sidebar .return-pill .mono { font-weight: 500; font-size: 11px; margin-left: auto; font-variant-numeric: tabular-nums; }
+/* WP-2a: the microphone is shut but the session is still finishing. The pill stays as navigation
+   and stops reading as "recording in progress": warn colours, and the pulse OFF. ".finishing" is
+   a state modifier only, chosen so it matches no layout container (.live, .live-body, .live-split,
+   .live-header, .live-footer); if it ever collides, rename the modifier, never add specificity
+   (see the chip note above, which is the same trap twice burned). */
+.sidebar .return-pill.finishing { border-color: color-mix(in oklch, var(--warn) 30%, transparent); background: var(--warn-soft); color: var(--warn); }
+.sidebar .return-pill.finishing .dot { background: var(--warn); animation: none; }
 
 /* Transcript: document variant */
 .doc { max-width: 760px; margin: 0 auto; font-family: var(--font-transcript); font-size: 17px; line-height: 1.65; }
@@ -605,6 +612,10 @@ html, body { margin: 0; padding: 0; height: 100%; }
 .rec-pulse { width: 120px; height: 120px; border-radius: 50%; background: var(--record-soft); display: flex; align-items: center; justify-content: center; animation: vm-pulse 2.4s ease-in-out infinite; }
 .rec-pulse .core { width: 64px; height: 64px; border-radius: 50%; background: var(--record); display: flex; align-items: center; justify-content: center; }
 .rec-pulse .core i { width: 22px; height: 22px; border-radius: 4px; background: #fff; }
+/* WP-2a: mic shut, file still being written. Same state modifier as the sidebar pill: no pulse, no
+   record red, so the biggest thing on the screen stops claiming the room is still being taped. */
+.rec-pulse.finishing { background: var(--warn-soft); animation: none; }
+.rec-pulse.finishing .core { background: var(--warn); }
 .rec-timer { font-family: var(--font-mono); font-size: 32px; font-variant-numeric: tabular-nums; color: var(--ink); }
 
 /* Summary result */

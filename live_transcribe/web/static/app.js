@@ -184,6 +184,18 @@ function freshLive() {
     // ({old_size, new_size, recording}), or null. Server-owned, like silenceNudge: set when a
     // CPU session auto-downgrades to a lighter model to stay live.
     struggleNudge: null,
+    // Outstanding "transcription is failing" nudge from the server ({count, message, log_path}) or
+    // null: per-chunk ASR failures past the server's threshold. Server-owned, dismissed for the
+    // session only, because a backend that cannot transcribe is a fault, not a preference.
+    asrErrorNudge: null,
+    // Bounded Stop, mirrored from /api/status while stopping. stopPending is the backlog still to
+    // transcribe, or NULL when the server honestly does not know - never coerced to 0, because a
+    // fabricated zero is exactly what rendered the countless "Finishing" spinner. stopPhase says
+    // why there is no number ("closing" | "starting" | "draining" | "discarding"). stopSlow goes
+    // true once the drain passes its grace period, which is what raises the keep-waiting /
+    // stop-now choice; stopSlowAnswered is the local "keep waiting", since the server goes on
+    // reporting stopSlow for as long as the drain runs.
+    stopPending: null, stopPhase: "", stopSlow: false, stopSlowAnswered: false,
     // System-audio capture health, mirrored from /api/status ('active'|'disabled'|'pending'|
     // 'permission_denied'|'failed'), or null before the first poll. Unlike the nudges above this
     // is a continuous capture-health signal, not a one-shot server event, so dismissing its
@@ -209,6 +221,12 @@ function freshLive() {
     // banner does not un-degrade the transcript). The finish screen reads it to offer a
     // re-transcribe from the recording.
     downgraded: false,
+    // The wall-clock moment the SERVER confirmed the microphone closed (/api/status "capturing"
+    // went false), or null while it is still open. Latched once per session: a full Stop shuts
+    // capture immediately but can then spend many minutes transcribing the backlog, and every
+    // "recording" affordance on screen has to go dark at THIS moment, not when the drain ends.
+    // Doubles as the clock's end point, so the elapsed time freezes at the meeting's real length.
+    captureEndedAt: null,
   };
 }
 var S = {
@@ -266,9 +284,9 @@ function fmtTs(t) {
   var m = Math.floor(t / 60), s = t % 60;
   return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
 }
-function fmtElapsed(sinceIso) {
+function fmtElapsed(sinceIso, untilMs) {
   if (!sinceIso) return "00:00";
-  var secs = Math.max(0, Math.floor((Date.now() - new Date(sinceIso).getTime()) / 1000));
+  var secs = Math.max(0, Math.floor(((untilMs || Date.now()) - new Date(sinceIso).getTime()) / 1000));
   var h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
   if (h > 0) return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
   return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
@@ -279,6 +297,10 @@ function fmtSecs(secs) {
   var t = Math.max(0, Math.floor(secs || 0));
   return Math.floor(t / 60) + ":" + String(t % 60).padStart(2, "0");
 }
+// The session clock. It stops the moment the microphone closes, so a long Finishing never counts
+// on as if the meeting were still running; from then on it reports the meeting's real length.
+// One helper, so the header, the record-only timer and the sidebar pill cannot disagree.
+function liveElapsed() { return fmtElapsed(S.live.startedAt, S.live.captureEndedAt); }
 function fmtBytes(n) {
   if (!n) return ""; if (n < 1024) return n + " B";
   if (n < 1048576) return (n / 1024).toFixed(0) + " KB";
@@ -412,6 +434,41 @@ function pollStatus(predicateDone, onDone, onTick) {
   }
   if (pollTimer) clearTimeout(pollTimer);
   pollTimer = setTimeout(tick, 900);
+}
+
+/* ── honest "Finishing" wording ───────────────────────────── */
+// Stop used to render a bare "Finishing" with no number, because /api/status only sent `pending`
+// once the engine had been published and this page turned a missing value into 0. The server now
+// always answers with either a real count or an explicit null plus a phase saying why, and this is
+// the single place that turns those into words. A missing count is never dressed up as zero.
+// Returns the display string already translated (trFmt for the count branch so the {n} af keys in
+// i18n.js are live, tr for the fixed phrases), so every caller, including adoptStopProgress which
+// writes textContent directly, shows Afrikaans without translating again.
+function stopLabel(pending, phase) {
+  if (phase === "discarding") return tr("Finishing up");
+  if (typeof pending === "number" && pending > 0) {
+    return trFmt(pending === 1 ? "Finishing, {n} chunk left" : "Finishing, {n} chunks left", { n: pending });
+  }
+  if (phase === "starting") return tr("Finishing, still starting up");
+  if (typeof pending === "number") return tr("Finishing, almost done");
+  if (phase === "closing" || !phase) return tr("Finishing");
+  return tr("Finishing, working out what is left");
+}
+// Adopt a status poll's stop progress. Paints the chip and the button in place (cheap, like the
+// level meters), and returns true only when something changed that needs a real re-render: the
+// keep-waiting / stop-now choice appearing or going away.
+function adoptStopProgress(st) {
+  S.live.stopPending = (typeof st.pending === "number") ? st.pending : null;
+  S.live.stopPhase = st.stop_phase || "";
+  var label = stopLabel(S.live.stopPending, S.live.stopPhase);
+  var chip = document.getElementById("live-status-text");
+  if (chip) chip.textContent = label;
+  var btn = document.getElementById("stop-progress-text");
+  if (btn) btn.textContent = label;
+  var slow = !!st.stop_slow && !S.live.stopSlowAnswered;
+  if (slow === S.live.stopSlow) return false;
+  S.live.stopSlow = slow;
+  return true;
 }
 
 /* ── audio levels + live device switch ────────────────────── */
@@ -611,6 +668,25 @@ function liveAudioStrip() {
     channel("loopback", "speaker", dev.loopbacks, S.live.loopbackDevice, dev.default_loopback_index, "vm-meter-sys"),
     liveAecToggle(),
     liveMicGateToggle(),
+  ]);
+}
+// What the device strip becomes once the microphone is shut. It replaces it rather than sitting
+// beside it: dead meters and device pickers on a session that is no longer capturing are exactly
+// the "you are still being recorded" impression this work package exists to remove.
+// The words matter more than the pill going dark. Someone who pressed Stop and then kept talking
+// in the room needs to be told, in plain language, that the microphone is off, that nothing more
+// is going into the file, that what was already captured is safe, and that the only thing left is
+// transcribing what was said BEFORE Stop. A spinner and the word "Finishing" say none of that.
+function finishingStrip() {
+  return el("div", { class: "row gap-12", style: { alignItems: "flex-start", padding: "10px 16px", borderBottom: "1px solid var(--line)", background: "var(--surface-2)" } }, [
+    el("span", { style: { color: "var(--ok)", display: "inline-flex", flex: "0 0 auto", marginTop: "1px" } }, icon("lock", 15)),
+    el("div", { style: { minWidth: "0" } }, [
+      el("div", { style: { fontWeight: "600", fontSize: "12px" }, text: "Microphone off. Nothing more is being recorded." }),
+      el("div", { class: "ink-3", style: { fontSize: "11.5px", marginTop: "2px" },
+        text: S.live.transcribing
+          ? "The audio from this meeting is already saved on this computer. Volksmond is only transcribing what was said before you pressed Stop."
+          : "The audio from this meeting is already saved on this computer. Volksmond is finishing the file." }),
+    ]),
   ]);
 }
 // Compact strip on the live screen to change the LANGUAGE and MODEL mid-meeting. Language alone
@@ -879,9 +955,9 @@ async function startImport(arg) {
 function startElapsed() {
   if (elapsedTimer) clearInterval(elapsedTimer);
   elapsedTimer = setInterval(function () {
-    if (elapsedEl) elapsedEl.textContent = fmtElapsed(S.live.startedAt);
-    if (recTimerEl) recTimerEl.textContent = fmtElapsed(S.live.startedAt);
-    if (returnPillTimeEl) returnPillTimeEl.textContent = fmtElapsed(S.live.startedAt);
+    if (elapsedEl) elapsedEl.textContent = liveElapsed();
+    if (recTimerEl) recTimerEl.textContent = liveElapsed();
+    if (returnPillTimeEl) returnPillTimeEl.textContent = liveElapsed();
   }, 1000);
 }
 async function pickFile(kind) {
@@ -987,31 +1063,108 @@ async function doStop(what) {
       S.live.recording = false; toast("Recording stopped. Transcript continues."); render(); return;
     }
     if (what === "transcription") {
-      S.live.transcribing = false; S.live.stopping = true; render();
+      S.live.transcribing = false; S.live.stopping = true; seedStopProgress(resp); render();
       pollStatus(
         function (st) { return !st.running || (!st.stopping && !st.transcribing); },
         function (st) {
-          S.live.stopping = false;
+          S.live.stopping = false; S.live.stopSlow = false;
           if (!st.running) { gotoFinish(resp.output_path, st && st.sink_error, resp && resp.downgraded); }
           else { S.live.recording = true; go("recordonly"); }
-        }
+        },
+        function (st) { if (st.running && st.stopping && adoptStopProgress(st)) render(); }
       );
       return;
     }
-    // what === "all"
-    S.live.stopping = true; render();
+    // what === "all". Deliberately sets `stopping` and NOTHING else. Clearing S.live.recording
+    // here would be the client asserting the microphone is off before anything had confirmed it,
+    // which is the same unearned claim the server-side barrier exists to prevent, just moved into
+    // the page: a shutdown that then failed would show the pill falsely dark until the 10 s
+    // reconcile caught up. `stopping` renders its own distinct "Stopping" state (see liveView), so
+    // the pulsing red pill still goes at once without anything claiming more than it knows.
+    // adoptCapture, driven by the server's capturing=false plus its capture-end stamp, is what
+    // clears recording, freezes the clock and drops the meters. Being a beat slower to tell the
+    // truth is fine; being fast and wrong is the bug this whole work package is about.
+    S.live.stopping = true; seedStopProgress(resp); render();
     pollStatus(
       function (st) { return !st.running; },
-      function (st) { gotoFinish(resp.output_path, st && st.sink_error, resp && resp.downgraded); },
+      function (st) { S.live.stopSlow = false; gotoFinish(resp.output_path, st && st.sink_error, resp && resp.downgraded); },
       function (st) {
-        if (st.running && st.stopping && elapsedEl) {
-          var n = typeof st.pending === "number" ? st.pending : 0;
-          var node = document.getElementById("live-status-text");
-          if (node) node.textContent = n > 0 ? ("Finishing, " + n + " chunk" + (n === 1 ? "" : "s") + " left") : "Finishing";
-        }
+        var changed = adoptCapture(st);
+        if (st.running && st.stopping && adoptStopProgress(st)) changed = true;
+        if (changed) render();
       }
     );
   } catch (e) { toast(e.message || "Could not stop.", true); }
+}
+// The stop response already carries the first count, so the chip shows a real number from the very
+// first frame instead of a bare spinner for the second before the first poll lands.
+function seedStopProgress(resp) {
+  S.live.stopPending = (resp && typeof resp.pending === "number") ? resp.pending : null;
+  S.live.stopPhase = (resp && resp.stop_phase) || "";
+  S.live.stopSlow = false;
+  S.live.stopSlowAnswered = false;
+}
+// "Stop now": give up on the audio that has not been transcribed yet. Everything already
+// transcribed is saved and the recording (if any) is still finalised in full, so this costs only
+// the un-transcribed tail. Optimistic like the other banner answers: the card goes at once, and a
+// failed POST at worst means the choice comes back on the next poll.
+async function stopNowAndDiscard() {
+  S.live.stopSlow = false; S.live.stopSlowAnswered = true; S.live.stopPhase = "discarding";
+  render();
+  try { await api.post("/api/stop-now"); }
+  catch (e) { toast((e && e.message) || "Could not finish this session yet.", true); }
+}
+function keepWaitingForStop() {
+  // Local only: the server goes on reporting stop_slow for as long as the drain runs, so the
+  // answer has to be remembered here or the card would come straight back on the next poll.
+  S.live.stopSlow = false; S.live.stopSlowAnswered = true;
+  render();
+}
+// A floating warning card as ONE renderer taking {title, body, actions[], extra[], onClose}, so a
+// warning contributes only what is genuinely different about it. `extra` is optional extra body
+// nodes (a log path, say); `onClose` and `closeTitle` drive the corner X, dropped when no onClose.
+function warnBanner(spec) {
+  var body = [
+    el("div", { style: { fontWeight: "600", fontSize: "13.5px" }, text: spec.title }),
+    el("p", { class: "ink-3", style: { fontSize: "11.5px", margin: "4px 0 0" }, text: spec.body }),
+  ];
+  (spec.extra || []).forEach(function (node) { body.push(node); });
+  if (spec.actions && spec.actions.length) {
+    body.push(el("div", { class: "row gap-8", style: { marginTop: "10px", flexWrap: "wrap" } }, spec.actions));
+  }
+  return el("div", { style: { position: "fixed", top: "16px", left: "50%", transform: "translateX(-50%)", zIndex: "60", maxWidth: "460px", width: "calc(100% - 32px)" } },
+    el("div", { class: "card", style: { padding: "14px 16px", display: "flex", gap: "12px", alignItems: "flex-start", borderColor: "var(--warn)", boxShadow: "0 10px 34px rgba(0,0,0,0.20)" } }, [
+      el("div", { class: "tone-tile warn", style: { width: "34px", height: "34px", flex: "0 0 auto" } }, icon("alert", 17)),
+      el("div", { class: "grow" }, body),
+      spec.onClose
+        ? el("button", { class: "btn ghost sm", style: { flex: "0 0 auto", padding: "6px" }, onclick: spec.onClose, title: spec.closeTitle || "Dismiss" }, icon("x", 14))
+        : null,
+    ]));
+}
+// The choice the user never had when Stop hung with a countless spinner and force-quitting the
+// window was the only way out.
+function stopSlowBanner() {
+  // Built from translated fixed phrases plus the verbatim count (like trNotice), so the whole body
+  // renders in Afrikaans; an exact tr() of the finished concatenation never would.
+  var n = S.live.stopPending;
+  var left = (typeof n === "number" && n > 0)
+    ? (trFmt(n === 1 ? "There is {n} piece of audio still to transcribe." : "There are {n} pieces of audio still to transcribe.", { n: n }) + " ")
+    : "";
+  var body = tr("Volksmond is still finishing this meeting and this computer is slow at it.") + " " + left
+    + tr("You can wait for it, or stop now and keep everything transcribed so far. Audio that has not been transcribed yet would be left out.");
+  if (S.live.recording || S.live.recordingStarted) {
+    body += " " + tr("Your recording is saved either way, so the meeting can be transcribed again in full afterwards.");
+  }
+  return warnBanner({
+    title: "This is taking a while",
+    body: body,
+    actions: [
+      el("button", { class: "btn sm ghost", onclick: function () { keepWaitingForStop(); } }, "Keep waiting"),
+      el("button", { class: "btn sm record", onclick: function () { stopNowAndDiscard(); } }, [icon("stop", 12), "Stop now"]),
+    ],
+    onClose: function () { keepWaitingForStop(); },
+    closeTitle: "Keep waiting",
+  });
 }
 function gotoFinish(outputPath, sinkError, downgraded) {
   saveNotesNow();                                  // flush any pending notes for this session
@@ -1044,17 +1197,19 @@ async function stopRecordOnly() {
     var resp = await api.post("/api/stop?what=all");
     var stem = S.live.audioStem;
     var recordingFormat = S.live.recordingFormat;
-    S.live.stopping = true; render();
+    // Same rule as the full stop above: `stopping` only. The record-only screen renders its own
+    // "Stopping" state from it, and the server's confirmation is what says the mic is off.
+    S.live.stopping = true; seedStopProgress(resp); render();
     pollStatus(function (st) { return !st.running; }, function (st) {
       teardownLive();
-      S.live.running = false; S.live.stopping = false;
+      S.live.running = false; S.live.stopping = false; S.live.stopSlow = false;
       S.finish.recordingStem = stem;
       S.finish.recordingFormat = recordingFormat || "flac";
       S.finish.outputPath = resp.output_path;
       S.finish.sinkError = (st && st.sink_error) || null;
       if (S.finish.sinkError) toast(S.finish.sinkError, true);
       go("recordonly"); // now renders the "stopped" handoff
-    });
+    }, function (st) { if (adoptCapture(st)) render(); });
   } catch (e) { toast(e.message || "Could not stop recording.", true); }
 }
 
@@ -1413,6 +1568,17 @@ function render() {
   if (S.live.struggleNudge && S.route === "live") {
     APP.appendChild(struggleBanner());
   }
+  // Transcription is failing on this machine. Same inject point; unlike the nudges above it is
+  // about a fault rather than a trade-off, so its only answer is to acknowledge it.
+  if (S.live.asrErrorNudge && S.route === "live") {
+    APP.appendChild(asrErrorBanner());
+  }
+  // Stop has been running longer than the grace period. This one belongs on the record-only
+  // screen too: a session that stopped transcription first finishes its drain from there, and it
+  // is the same wait with the same two answers.
+  if (S.live.stopping && S.live.stopSlow && (S.route === "live" || S.route === "recordonly")) {
+    APP.appendChild(stopSlowBanner());
+  }
   // System audio not being captured (denied or failed): same live-screen-only reasoning, and
   // dismissible locally since there is nothing server-side to acknowledge (see sysState comment
   // in freshLive). codex H1.
@@ -1441,13 +1607,22 @@ function sidebar(active) {
   }
   // While a session runs, a pulsing pill on every OTHER screen leads straight back to it.
   // The elapsed time updates in place (startElapsed), never via render().
+  // Once the microphone is shut it stays as navigation but must stop reading as "recording in
+  // progress": the ".finishing" modifier drops the record colour and kills the pulse, and the
+  // label says what is actually happening. Deliberately NOT a name that matches a layout
+  // container (see the chip-modifier note in styles.css); a collision there is fixed by renaming
+  // the modifier, never by adding specificity.
   function returnPill() {
     if (!S.live.running) return null;
     if (S.route === "live" || S.route === "recordonly" || S.route === "importing") return null;
-    returnPillTimeEl = el("span", { class: "mono", text: fmtElapsed(S.live.startedAt) });
-    return el("button", { class: "return-pill", onclick: function () { go(liveRoute()); } }, [
+    var done = !!S.live.captureEndedAt;
+    returnPillTimeEl = el("span", { class: "mono", text: liveElapsed() });
+    return el("button", { class: "return-pill" + (done ? " finishing" : ""), onclick: function () { go(liveRoute()); } }, [
       el("span", { class: "dot" }),
-      el("span", { class: "rp-label", text: "Return to meeting" }),
+      // "Finishing" and not something longer: it is the word the live chip and the Stop button
+      // already use (so it is already translated), it is true of a record-only session too, and it
+      // is the only candidate that does not wrap to two lines in the sidebar's width.
+      el("span", { class: "rp-label", text: done ? "Finishing" : "Return to meeting" }),
       returnPillTimeEl,
     ]);
   }
@@ -1869,6 +2044,36 @@ function startReadinessPoll() {
   }, READINESS_POLL_MS);
 }
 function stopReadinessPoll() { if (readinessTimer) { clearInterval(readinessTimer); readinessTimer = null; } }
+// Adopt the server's "is the microphone actually open" answer (/api/status "capturing"). A full
+// Stop shuts capture at once and can then spend many minutes transcribing the backlog, so this is
+// what turns the recording pill, the clock, the meters and the sidebar pill off at the right
+// moment instead of when the drain finally ends. Latched: capturing only ever goes true -> false
+// within a session, and `capturing !== false` deliberately ignores a status that omits the field
+// (an older server, or the !running shape) rather than guessing. Returns true if anything changed.
+function adoptCapture(st) {
+  if (!st || st.capturing !== false || S.live.captureEndedAt) return false;
+  // Never latch off a session that has already ended: the idle status also reports capturing
+  // false, and the caller is about to hand over to the finish screen anyway.
+  if (st.running === false) return false;
+  // A file transcription never opens a microphone, so capturing is false for its ENTIRE run.
+  // Latching there would freeze a healthy import's clock and put "Finishing" in the sidebar
+  // while it is working normally. The field only carries meaning for a live source.
+  if (st.source_kind === "file" || S.live.sourceKind === "file") return false;
+  // Freeze the clock at the SERVER's capture-end moment, not at "when this page noticed". About a
+  // second apart in the normal case, but a page reloaded fifteen minutes into a long drain would
+  // otherwise report a meeting fifteen minutes longer than it was. Fall back to now only when the
+  // server supplied nothing usable (an older build, or an unparseable value: NaN is falsy, and a
+  // falsy captureEndedAt would silently un-latch everything below).
+  // Also reject an end that lands BEFORE the start: both are stamped from the same server clock,
+  // so that means the clock itself moved (an NTP step, a DST change) and the difference is not a
+  // meeting length. Showing 00:00 for a real meeting is worse than being a second late.
+  var endedAt = st.capture_ended_at ? new Date(st.capture_ended_at).getTime() : NaN;
+  var startedAt = S.live.startedAt ? new Date(S.live.startedAt).getTime() : 0;
+  S.live.captureEndedAt = endedAt >= startedAt ? endedAt : Date.now();
+  S.live.recording = false;             // the pill is bound to this; the mic is shut, so it goes
+  stopLevels();                         // the meters must not sit frozen on their last painted peak
+  return true;
+}
 // Signature of the prepare object so a steady poll (same phase/bytes) never forces a re-render.
 // The load's elapsed seconds are part of it, rounded to whole seconds, because a counter that does
 // not tick is worse than none: that is one small re-render per poll, only while the model loads.
@@ -1927,10 +2132,13 @@ function retryPrepare() {
   }).catch(function (e) { toast(e.message || "Could not retry.", true); });
 }
 function silenceSig(n) { return n ? (String(n.at || "") + "|" + String(n.count || 0)) : ""; }
-// The struggle nudge carries no timestamp; its identity is the model step plus whether
-// recording has since started, so any of those changing re-renders (a second downgrade, or
-// recording turning on so the banner switches to its "already recording" wording).
-function struggleSig(n) { return n ? (String(n.old_size || "") + "|" + String(n.new_size || "") + "|" + (n.recording ? "1" : "0")) : ""; }
+// The struggle nudge carries no timestamp; its identity is the reason plus the model step plus
+// whether recording has since started, so any of those changing re-renders (a second downgrade, a
+// switch of reason, or recording turning on so the banner switches to its "already recording"
+// wording). A gpu-busy nudge has no sizes; String(undefined || "") is "" and compares fine.
+function struggleSig(n) { return n ? (String(n.reason || "") + "|" + String(n.old_size || "") + "|" + String(n.new_size || "") + "|" + (n.recording ? "1" : "0")) : ""; }
+// The ASR-error nudge is one banner whose count grows, so its identity is just that count.
+function asrErrorSig(n) { return n ? String(n.count || 0) : ""; }
 function refreshSilence() {
   if (!S.live.running || S.live.sourceKind === "file") return;
   api.get("/api/status").then(function (st) {
@@ -1945,6 +2153,12 @@ function refreshSilence() {
     if (silenceSig(n) !== silenceSig(S.live.silenceNudge)) { S.live.silenceNudge = n; changed = true; }
     var g = st.struggle_nudge || null;
     if (struggleSig(g) !== struggleSig(S.live.struggleNudge)) { S.live.struggleNudge = g; changed = true; }
+    var ae = st.asr_error_nudge || null;
+    if (asrErrorSig(ae) !== asrErrorSig(S.live.asrErrorNudge)) { S.live.asrErrorNudge = ae; changed = true; }
+    // Capture liveness BEFORE the recording reconcile below: adoptCapture clears S.live.recording
+    // itself, and st.recording is already false by then, so the two agree instead of fighting.
+    // This poll is what used to re-assert the lie, so it is also the backstop that ends it.
+    if (adoptCapture(st)) changed = true;
     var rec = !!st.recording;
     if (rec !== S.live.recording) { S.live.recording = rec; changed = true; }
     var rs = !!st.recording_started;
@@ -2005,11 +2219,13 @@ function silenceBanner() {
 }
 
 /* ── model struggling to keep up during a live session ─────────── */
-// Parallel to the silence nudge: the server steps a CPU session down to a lighter, faster model
-// when it cannot hold real time, and publishes struggle_nudge on /api/status
-// ({old_size, new_size, recording}). The page notices it on the SAME poll (refreshSilence) and
-// offers the honest answers: start recording so the audio can be re-transcribed at full accuracy
-// afterward, or keep going. Recording can also be started from the standalone live-footer button.
+// Parallel to the silence nudge, with two causes behind one banner. The server publishes
+// struggle_nudge on /api/status, always carrying {reason, recording}: "cpu-downgrade" (it stepped a
+// CPU session down to a lighter, faster model to stay live, plus old_size/new_size) or "gpu-busy"
+// (a GPU session cannot hold real time, usually another program on the card; no sizes, because
+// nothing changed). The page notices it on the SAME poll (refreshSilence) and offers the honest
+// answers: start recording so the audio can be re-transcribed at full accuracy afterward, or keep
+// going. Recording can also be started from the standalone live-footer button.
 async function recordFromHere() {
   // Optimistic + double-click guard: flipping recording now hides BOTH triggers (this action's
   // banner button and the live-footer button), so a fast second click short-circuits here and
@@ -2074,7 +2290,13 @@ function struggleBanner() {
   var hasRec = !!(S.live.recording || S.live.recordingStarted);
   var n = S.live.struggleNudge || {};
   var body;
-  if (n.old_size && n.old_size === n.new_size)
+  if (n.reason === "gpu-busy")
+    // wp1: a GPU/MLX session that fell behind. It cannot cut the beam or downgrade, so there is no
+    // model-change or shed variant. The copy stays hedged about the cause, because all the server
+    // measured was queue depth and inference time, which cannot tell another program apart from
+    // throttling. No recording variant either: the record offer below is the whole remedy anyway.
+    body = "Your graphics card is unusually busy or slow, so Volksmond is falling behind. Another program may be using it.";
+  else if (n.old_size && n.old_size === n.new_size)
     // A shed event, not a model change: the engine ran out of smaller models in this family and
     // is skipping audio to stay live rather than dropping to a model that would invent text.
     body = hasRec
@@ -2102,6 +2324,47 @@ function struggleBanner() {
       // The corner X is the same as Keep going: dismiss this session's banner without muting.
       el("button", { class: "btn ghost sm", style: { flex: "0 0 auto", padding: "6px" }, onclick: function () { dismissStruggle("dismiss"); }, title: "Dismiss" }, icon("x", 14)),
     ]));
+}
+
+/* ── transcription failing on this machine ────────────────── */
+// The engine catches a failing chunk and carries on (one bad chunk must never end a meeting), so a
+// backend failing on EVERY chunk used to look exactly like a silent room: an empty transcript and a
+// calm "Listening" chip, with the only evidence in a log file nobody opens. The server counts the
+// failures and publishes one banner past its threshold; this renders it, count and all, and names
+// the log file so there is something to send when asking for help.
+async function dismissAsrError() {
+  // Optimistic like the other banner answers. Dismiss only: there is no "don't warn again" here,
+  // because a backend that cannot transcribe is a fault to fix, not a preference to set.
+  S.live.asrErrorNudge = null;
+  render();
+  try { await api.post("/api/asr-error-nudge"); } catch (e) {}
+}
+function asrErrorBanner() {
+  var n = S.live.asrErrorNudge || {};
+  var count = n.count || 0;
+  var hasRec = !!(S.live.recording || S.live.recordingStarted);
+  // Translated fixed phrases plus the verbatim count, so the whole body renders in Afrikaans.
+  var body = trFmt(count === 1
+    ? "Volksmond could not transcribe {n} piece of audio on this computer, so a part of this meeting will be missing from the transcript."
+    : "Volksmond could not transcribe {n} pieces of audio on this computer, so parts of this meeting will be missing from the transcript.",
+    { n: count });
+  body += " " + (hasRec
+    ? tr("The audio is still being recorded, so the meeting can be transcribed again afterwards.")
+    : tr("Record now so the meeting can be transcribed again afterwards."));
+  var actions = [];
+  if (!hasRec) actions.push(el("button", { class: "btn sm record", onclick: function () { recordFromHere(); } }, [icon("dot", 12), "Record from here"]));
+  actions.push(el("button", { class: "btn sm ghost", onclick: function () { dismissAsrError(); } }, "Got it"));
+  return warnBanner({
+    title: "Transcription is failing",
+    body: body,
+    // Named so there is something concrete to send when asking for help.
+    extra: [
+      el("p", { class: "ink-3", style: { fontSize: "11.5px", margin: "6px 0 0" }, text: "The details are in the log file:" }),
+      el("p", { class: "ink-3 mono", style: { fontSize: "11px", margin: "2px 0 0", wordBreak: "break-all" }, text: n.log_path || "volksmond.log" }),
+    ],
+    actions: actions,
+    onClose: function () { dismissAsrError(); },
+  });
 }
 
 /* ── system audio not captured (codex H1) ─────────────────── */
@@ -2574,13 +2837,16 @@ function liveView() {
   // model-load failure shows a clear but non-alarming chip; capture/recording carry on regardless.
   var fail = liveFailureMsg();
   var statusChip;
-  if (S.live.stopping) statusChip = el("span", { class: "chip warn" }, [el("span", { class: "dot" }), el("span", { id: "live-status-text", text: "Finishing" })]);
+  // "Stopping" until capture is confirmed shut, "Finishing" after. Not cosmetic: "Finishing"
+  // implies the meeting is over and only the transcript is outstanding, which is not yet known
+  // to be true. The chunk countdown replaces this text in place (see doStop) once it is.
+  if (S.live.stopping) statusChip = el("span", { class: "chip warn" }, [el("span", { class: "dot" }), el("span", { id: "live-status-text", text: S.live.captureEndedAt ? stopLabel(S.live.stopPending, S.live.stopPhase) : "Stopping" })]);
   else if (S.live.transcribing && fail) statusChip = el("span", { class: "chip warn" }, [icon("alert", 12), el("span", { text: "Transcription unavailable" })]);
   else if (S.live.transcribing && !S.live.modelReady) statusChip = el("span", { class: "chip prep" }, [el("span", { class: "dot" }), el("span", { text: "Preparing transcription model" })]);
   else if (S.live.transcribing) statusChip = el("span", { class: "chip rec" }, [el("span", { class: "dot" }), el("span", { text: "Listening" })]);
   else statusChip = el("span", { class: "chip ok" }, [el("span", { class: "dot" }), el("span", { text: "Saved" })]);
 
-  elapsedEl = el("span", { class: "mono", text: fmtElapsed(S.live.startedAt) });
+  elapsedEl = el("span", { class: "mono", text: liveElapsed() });
   var langLabel = (S.live.language === "auto" || !S.live.language) ? "Auto-detect" : langName(S.live.language);
 
   var header = el("div", { class: "live-header" }, [
@@ -2610,7 +2876,10 @@ function liveView() {
 
   var stopBtn;
   if (S.live.stopping) {
-    stopBtn = el("button", { class: "btn", disabled: true }, [el("span", { class: "spinner" }), "Finishing"]);
+    // The button is what the user stares at while a stop runs, so it carries the same honest
+    // wording as the chip rather than the bare "Finishing" that told them nothing for minutes.
+    stopBtn = el("button", { class: "btn", disabled: true }, [el("span", { class: "spinner" }),
+      el("span", { id: "stop-progress-text", text: stopLabel(S.live.stopPending, S.live.stopPhase) })]);
   } else if (S.live.recording) {
     stopBtn = el("button", { class: "btn primary", onclick: function () { S.stopMenuOpen = !S.stopMenuOpen; render(); }, id: "stop-anchor" }, [icon("stop", 14), "Stop", icon("chevDown", 14)]);
   } else {
@@ -2621,9 +2890,18 @@ function liveView() {
   // never recorded, a standalone "Record from here" button (for "I forgot to record") that starts
   // recording mid-session. recordingStarted is latched, so once a session has recorded the button
   // stays gone (a restart would clobber the WAV). Independent of the banner; both call recordFromHere().
+  // Three states, in the order they actually occur, and none of them overstates what is known:
+  //   stopping, not yet confirmed -> "Stopping". The pulsing red pill goes the instant Stop is
+  //     pressed (that is the WP-2a fix) but nothing yet says the microphone is off, because
+  //     nothing yet knows: a shutdown can fail, and a falsely dark indicator is the worse lie.
+  //   confirmed off -> nothing here at all; the strip above carries the plain statement.
+  //   recording -> the pill, as before.
+  // The record offer also goes while stopping: /api/record-from-here refuses during a stop, so it
+  // is a dead affordance as well as a contradiction of everything else on the screen.
   var recSlot;
-  if (S.live.recording) recSlot = el("span", { class: "rec-ind", title: tr("The audio is being saved to your save folder on this computer. You can keep or delete it when the meeting ends.") }, [el("i"), "Recording to this computer"]);
-  else if (S.live.transcribing && !S.live.recordingStarted) recSlot = el("button", { class: "btn sm record", onclick: function () { recordFromHere(); } }, [icon("dot", 12), "Record from here"]);
+  if (S.live.stopping && !S.live.captureEndedAt) recSlot = el("span", { class: "chip warn" }, [el("span", { class: "dot" }), el("span", { text: "Stopping" })]);
+  else if (S.live.recording) recSlot = el("span", { class: "rec-ind", title: tr("The audio is being saved to your save folder on this computer. You can keep or delete it when the meeting ends.") }, [el("i"), "Recording to this computer"]);
+  else if (S.live.transcribing && !S.live.recordingStarted && !S.live.stopping) recSlot = el("button", { class: "btn sm record", onclick: function () { recordFromHere(); } }, [icon("dot", 12), "Record from here"]);
   else recSlot = null;
 
   var footer = el("div", { class: "live-footer" }, [
@@ -2639,24 +2917,33 @@ function liveView() {
   if (S.live.notesOpen) { split.appendChild(splitHandle(split)); split.appendChild(notesCol()); }
   else { split.appendChild(notesRail()); }
 
-  return el("div", { class: "live" }, [header, liveAudioStrip(), liveTuneStrip(), split, footer]);
+  return el("div", { class: "live" }, [header, S.live.captureEndedAt ? finishingStrip() : liveAudioStrip(), liveTuneStrip(), split, footer]);
 }
 
 /* ── record only ──────────────────────────────────────────── */
 function recordOnlyView() {
   if (S.live.running) {
-    recTimerEl = el("div", { class: "rec-timer", text: fmtElapsed(S.live.startedAt) });
+    // Same three states as the live screen. micOff is CONFIRMED shut (the server said so), which
+    // is when every record-red signal here (the chip, the big pulsing blob, the strip) has to go.
+    // Between pressing Stop and that confirmation the blob deliberately keeps pulsing, because the
+    // microphone genuinely may still be open; only the chip changes, to say a stop is under way.
+    var micOff = !!S.live.captureEndedAt;
+    recTimerEl = el("div", { class: "rec-timer", text: liveElapsed() });
     var header = el("div", { class: "live-header" }, [
       el("div", {}, [
         el("div", { class: "ttl" }, [S.live.title ? raw(S.live.title) : "Recording"]),
-        el("div", { class: "meta" }, [el("span", { text: "Recording only, not transcribing yet" }), el("span", { text: "·" }), el("span", { text: "Local only" })]),
+        el("div", { class: "meta" }, [el("span", { text: micOff ? "Recording stopped" : "Recording only, not transcribing yet" }), el("span", { text: "·" }), el("span", { text: "Local only" })]),
       ]),
-      el("div", { class: "right" }, el("span", { class: "chip rec" }, [el("span", { class: "dot" }), "Recording"])),
+      el("div", { class: "right" }, micOff
+        ? el("span", { class: "chip warn" }, [el("span", { class: "dot" }), "Saving"])
+        : S.live.stopping
+          ? el("span", { class: "chip warn" }, [el("span", { class: "dot" }), "Stopping"])
+          : el("span", { class: "chip rec" }, [el("span", { class: "dot" }), "Recording"])),
     ]);
     var body = el("div", { class: "live-body" }, el("div", { class: "rec-stage" }, [
-      el("div", { class: "rec-pulse" }, el("div", { class: "core" }, el("i"))),
+      el("div", { class: "rec-pulse" + (micOff ? " finishing" : "") }, el("div", { class: "core" }, el("i"))),
       recTimerEl,
-      el("p", { class: "ink-2", style: { maxWidth: "420px", textAlign: "center" }, text: "Recording cleanly. No transcript is being made right now. When you stop, you can transcribe it here." }),
+      el("p", { class: "ink-2", style: { maxWidth: "420px", textAlign: "center" }, text: micOff ? "Saving the audio file. Nothing more is being recorded." : "Recording cleanly. No transcript is being made right now. When you stop, you can transcribe it here." }),
       S.live.outputPath ? el("div", { class: "ink-3", style: { fontSize: "12px" } }, ["Saving to ", el("span", { class: "mono", text: recordingFileName(S.live.audioStem || S.live.outputPath, null, S.live.recordingFormat) })]) : null,
     ]));
     var footer = el("div", { class: "live-footer", style: { justifyContent: "center" } }, [
@@ -2664,7 +2951,7 @@ function recordOnlyView() {
         ? el("button", { class: "btn", disabled: true }, [el("span", { class: "spinner" }), "Saving"])
         : el("button", { class: "btn record", onclick: stopRecordOnly }, [icon("stop", 14), "Stop recording"]),
     ]);
-    return el("div", { class: "live" }, [header, liveAudioStrip(), body, footer]);
+    return el("div", { class: "live" }, [header, micOff ? finishingStrip() : liveAudioStrip(), body, footer]);
   }
   // stopped: handoff (the shell supplies .main now that this route renders with the sidebar)
   var stem = S.finish.recordingStem;
@@ -2691,7 +2978,7 @@ function recordOnlyView() {
 
 /* ── importing ────────────────────────────────────────────── */
 function importingView() {
-  elapsedEl = el("span", { class: "mono", text: fmtElapsed(S.live.startedAt) });
+  elapsedEl = el("span", { class: "mono", text: liveElapsed() });
   var header = el("div", { class: "live-header" }, [
     el("div", { class: "row gap-10", style: { minWidth: "0" } }, [
       el("div", { class: "tone-tile accent", style: { width: "32px", height: "32px", flex: "0 0 auto" } }, icon("upload", 16)),
@@ -4585,11 +4872,15 @@ function adoptRunning(status) {
   seedFromTranscript();
   seedNotes();
   S.live.silenceNudge = status.silence_nudge || null;   // a nudge that fired before this reload
-  S.live.struggleNudge = status.struggle_nudge || null; // same, for a downgrade that fired before this reload
+  S.live.struggleNudge = status.struggle_nudge || null; // same, for a struggle warning raised before this reload (reason included)
+  S.live.asrErrorNudge = status.asr_error_nudge || null; // same, for transcription failures before this reload
   S.live.recordingStarted = !!status.recording_started; // latched: recording is or was active this session
   adoptMicGate(status, true);                           // silent: a valve hint from before the reload is history
   S.live.downgraded = !!status.downgraded;              // latched: the engine dropped to a smaller model before this reload
-  if (status.source_kind !== "file") { startLevels(); startSilencePoll(); }
+  // Reload landing INSIDE a drain: the microphone is already shut, so adopt that before the meters
+  // and the clock start, never after. Costs one call; without it a reload puts the pill back.
+  adoptCapture(status);
+  if (status.source_kind !== "file") { if (!S.live.captureEndedAt) startLevels(); startSilencePoll(); }
   if (status.source_kind === "file") {
     S.route = "importing";
     // Mirror startImport: surface the sticky server notice (e.g. "stereo requested but the file
@@ -4612,10 +4903,13 @@ function adoptRunning(status) {
   // the normal stop does when the drain finishes (a file import already polls to completion
   // above, so it never installs this second poll).
   if (status.stopping && status.source_kind !== "file") {
+    // Adopt the stop progress that is already on the status we were handed, so a reload lands on a
+    // real count instead of a bare spinner, and keep it honest on every later poll.
+    adoptStopProgress(status);
     pollStatus(
       function (st) { return !st.running || (!st.stopping && !st.transcribing); },
       function (st) {
-        S.live.stopping = false;
+        S.live.stopping = false; S.live.stopSlow = false;
         if (st.running) {
           // Transcription-only stop finished; the recording carries on (doStop "transcription").
           S.live.transcribing = false; S.live.recording = true; go("recordonly"); return;
@@ -4635,7 +4929,8 @@ function adoptRunning(status) {
         S.finish.sinkError = (st && st.sink_error) || null;
         if (S.finish.sinkError) toast(S.finish.sinkError, true);
         go("recordonly");
-      }
+      },
+      function (st) { if (st.running && st.stopping && adoptStopProgress(st)) render(); }
     );
   }
 }

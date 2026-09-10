@@ -193,6 +193,14 @@ TIER_CONFIG = {
     # here (the MLX repo holds its own precision) but keeps the cache key disambiguated.
     "mlx":        {"model": "large-v3",       "device": "mlx",  "compute_type": "fp16"},
     "mlx-turbo":  {"model": "large-v3-turbo", "device": "mlx",  "compute_type": "fp16"},
+    # MLX lower gears (English sessions only): the Metal auto-downgrade ladder steps a struggling
+    # English session onto these when the Apple GPU cannot hold real time (see MLX_LADDER and
+    # _maybe_downgrade_mlx). The concrete repos are the 8-bit stock forms (mlxbackend.MLX_REPOS
+    # maps medium/small to whisper-*-mlx-8bit), so compute_type is "q8" to name that precision
+    # honestly and disambiguate the cache key; the repo holds the real precision either way. An
+    # Afrikaans (Fluister) session is NEVER moved onto these: the ladder crosses no family.
+    "mlx-medium": {"model": "medium",         "device": "mlx",  "compute_type": "q8"},
+    "mlx-small":  {"model": "small",          "device": "mlx",  "compute_type": "q8"},
 }
 
 
@@ -363,6 +371,22 @@ def _has_ct2_weights(path, min_bytes=1_000_000):
         return False
 
 
+def _mlx_rung_present(mlx_repo):
+    """True when an MLX repo is fully cached locally, no network: the MLX twin of model_present, and
+    the live MLX ladder's usability test. An MLX snapshot holds weights.* (not the ct2 model.bin),
+    so model_present's ct2 rule would read it as absent; voicedl._present dispatches an MLX repo id
+    onto the MLX file-set rule instead. Lazy import to dodge the voicedl <-> transcribe cycle, the
+    same way model_present does; any error means not-present (fail-safe: never claim on thin
+    evidence, never download mid-meeting)."""
+    if not mlx_repo:
+        return False
+    try:
+        from . import voicedl
+        return voicedl._present(mlx_repo)
+    except Exception:
+        return False
+
+
 def load_model(model_name, device, compute_type, cpu_threads=8, local_only=False):
     """Return a cached WhisperModel for these settings, building it (from the local cache,
     no network) if needed. Safe from both the warm-up thread and session start; the build
@@ -497,7 +521,9 @@ BACKPRESSURE_BEAM_THRESHOLD = 6
 # CPU adaptive model ladder (highest-quality -> fastest). When a CPU start model
 # can't hold real-time, the engine steps DOWN this ladder until it keeps up -
 # never back up (avoids oscillation). large-v3/turbo are deliberately NOT in the
-# ladder: too slow to be a sane CPU live floor. GPU tiers never downgrade (they keep up).
+# ladder: too slow to be a sane CPU live floor. GPU tiers never downgrade: there is nothing faster
+# to step down to, so a starved GPU (or MLX) session WARNS instead (see STRUGGLE_QUEUE_HIGH /
+# _maybe_warn_gpu_struggle) rather than dropping a rung.
 #
 # Three rules the ladder obeys, all of them learned the hard way on a CPU-only laptop that walked
 # medium -> small -> base -> tiny inside half an hour and produced Dutch-flavoured loops:
@@ -529,6 +555,108 @@ SHED_BACKLOG_SECONDS = 45.0
 # should be read as a rough guide and re-transcribed from the recording afterwards. Surfaced to the
 # UI as `indicative` on the downgrade payload.
 INDICATIVE_BELOW = "small"
+
+# MLX (Apple Metal) adaptive ladder, ENGLISH sessions only. Locked at two rungs and no lower: the
+# Mac's stock lower gears are whisper-medium/small (mlxbackend.MLX_REPOS), and Metal never needs to
+# go as low as base/tiny the way a starved CPU does. The trigger is queue depth, not RTF (Metal
+# contention shows as a growing backlog, not a stable per-stream real-time factor), and the hard
+# line is enforced in _next_rung, not here: an Afrikaans (Fluister) rung has no stock MLX form, so
+# the ladder yields nothing for it and a Fluister session is NEVER crossed onto stock Whisper.
+MLX_LADDER = ["medium", "small"]
+
+# A live GPU session that cannot hold real time. Measured incident: other programs were sharing
+# the card for a whole meeting (a local LLM and a second transcriber, leaving it both compute-
+# contended and ~500 MB short of full), so Volksmond fell behind and silently dropped 350+ chunks
+# with no warning at all. There is no GPU ladder to step down, so this only WARNS.
+#
+# The signal is QUEUE GROWTH, not a real-time-factor threshold, because RTF alone cannot answer
+# "are we keeping up". ONE worker serves every capture source, so break-even depends on how many
+# feed it: with MIC and SYS each producing a chunk per chunk-length, arrivals are 2 per
+# chunk-length while the worker manages 1/RTF of them, so break-even is RTF 0.5; mic-only it is
+# 1.0. Any fixed threshold is therefore wrong for one of them, and wrong in the dangerous
+# direction: a two-channel session at RTF 0.6 grows its queue without bound and drops audio while
+# sitting quietly under a 0.7 trip. A queue that is deep AND still growing IS the harm, needs no
+# per-backend or per-source tuning, and stays true on cuda, mlx and anything added later.
+#
+# ONE rule, applied at two sampling points and two depths (see _struggle_evaluate):
+#
+#   completions (the worker, window STRUGGLE_COMPLETION_WINDOW): the sensitive one. Over 7 chunks
+#     queued and the depth still climbing means transcription is RUNNING but losing ground, the
+#     slow bleed.
+#   arrivals (on_chunk, window STRUGGLE_ARRIVAL_WINDOW): the safety net. Over STRUGGLE_QUEUE_HIGH
+#     and still climbing means loss is close, and it needs no completed chunk at all, so it still
+#     speaks when transcription is so slow (or so stalled) that the completion window never fills.
+#
+# Growth is newest against oldest across the window, which is what makes an inherited backlog safe:
+# one that is DRAINING has newest below oldest and cannot warn, whatever depth it started from, so
+# no baseline, floor or healthy-first precondition is needed to tell catch-up from starvation. The
+# arrival window is 8 rather than 4 because it must not be fooled by arrival jitter: the per-source
+# chunker threads pick their own silence boundaries and carry the tail forward (capture_core), so
+# emissions run 6 to 12 s, the sources drift in and out of phase, and depths step up and down by a
+# chunk or two around the trend. MEASURED against that behaviour (see the jitter test in
+# tests/test_struggle_signal.py), 8 arrivals spans ~28 s of a two-channel session and ~20 s at its
+# tightest, and a card fast enough to be recovering (RTF <= 0.25) never trips it while draining a
+# backlog of up to 30, which is the case this must not get wrong.
+#
+# RTF stays measured on every backend (see _run): the CPU ladder needs it and it is the useful
+# number in the diagnostic log line. It just no longer decides this warning.
+#
+# No VRAM probe anywhere in the trip: the incident was compute contention with our model resident
+# and running, which a VRAM threshold would have missed entirely while firing on a card that is
+# legitimately full but fast. Queue growth catches contention, memory pressure, thermal throttling
+# and a slow disk alike, because it measures the consequence instead of guessing the cause.
+QUEUE_MAXSIZE = 32              # bounded chunk queue: live capture drops past this rather than stall
+STRUGGLE_QUEUE_HIGH = QUEUE_MAXSIZE * 3 // 4   # producer-side "loss is imminent" mark (24 of 32)
+STRUGGLE_ARRIVAL_WINDOW = 8     # arrivals of evidence for the producer-side trend
+# The completion window is 12, and it is its OWN constant rather than DOWNGRADE_WINDOW (4), which
+# belongs to the CPU ladder and must not move. 4 was mis-sized for this second use: arrivals and
+# completions have different periods, so at 70 to 100% of capacity the depth wobbles UP inside any
+# 4 samples while the long-run trend is down, and a healthy session draining an inherited backlog
+# cried wolf. Measured on the event-driven chunker model (false positives over 160 runs: start
+# depths 10/20/26/30 x RTF 0.30 to 0.50 x 8 seeds; a run counts only if it warned, dropped nothing
+# and ended no deeper than it started):
+#
+#     window     4     6     8    10    12    16    20    24
+#     total     94    67    62    59    50    42    34    32
+#     RTF 0.30   4     0     0     0     0     0     0     0
+#     RTF 0.35  16     1     0     0     0     0     0     0
+#     RTF 0.40  32    24    21    18     9     4     1     1
+#     RTF 0.45  32    32    31    31    31    28    23    21
+#     RTF 0.50  10    10    10    10    10    10    10    10
+#
+# 8 clears the indefensible part (0.30 and 0.35 are comfortable drains) and 12 takes most of 0.40,
+# which is 80% of two-channel capacity and still a session that never loses audio. Past 12 the gains
+# sit inside 0.45, within 10% of break-even, where the queue is a near-zero-drift random walk that
+# NO window length fixes: 0.50 is immovable at 10 for every value from 4 to 24. So 12, and no
+# further, because beyond it we would be tuning inside the band where warning is defensible.
+#
+# Widening costs nothing in detection, which is why it is safe: the binding constraint on the slow
+# bleed is the depth threshold, not the window filling. Measured warning times are IDENTICAL at
+# every window from 4 to 24 (RTF 0.52 ~517 s, 0.55 ~238 s, 0.60 ~140 s, all before any drop), and
+# of the runs that genuinely lost ground at RTF 0.50, all 22 were caught at 4, 8 and 12 alike.
+STRUGGLE_COMPLETION_WINDOW = 12  # completions of evidence for the worker-side trend
+#
+# ACCEPTED, chosen not missed: a session ARMED at a near-ceiling depth (30 or more of 32) warns on
+# its first dropped chunk rather than before it, because only one or two samples can be taken before
+# the queue overflows and the window never fills. No special case is added for it. At 30 of 32 loss
+# is one chunk away whatever we do, the unconditional drop path still claims the warning, so the
+# user learns within a chunk instead of never; and an arm-time decision for an already-full queue is
+# exactly the kind of special case that cost two earlier revisions of this file.
+
+# The transcript line for that warning. Hedged deliberately: the engine measures inference time and
+# queue depth, which cannot tell another program apart from thermal throttling, memory pressure, a
+# driver problem or a genuinely slow configuration. Say what was observed, not what caused it.
+STRUGGLE_NOTICE = "[engine: struggling to keep up, the graphics card is unusually busy or slow]"
+
+
+def _queue_depth_growing(win, need):
+    """The queue-depth trend test shared by the GPU/MLX struggle signal: True iff `win` is FULL and
+    both deep (its newest sample >= `need`) AND still growing (newest strictly above oldest). A full
+    window that is draining (newest below oldest) reads False whatever depth it started from, which
+    is what makes an inherited backlog safe. Kept as one function so the MLX ladder trigger
+    (_maybe_downgrade_mlx) reads depth exactly the way the warning (_struggle_evaluate) does; the two
+    windows are separate deques, but the rule that turns a window into a verdict is the same one."""
+    return len(win) >= win.maxlen and win[-1] >= need and win[-1] > win[0]
 
 # Hold each MIC segment this long before showing it in the LIVE view, so a speaker echo lands
 # just after its cleaner SYS original instead of jumbled in front of it (the system channel
@@ -1663,9 +1791,17 @@ class Engine:
         # web layer can report the device honestly instead of reconstructing it. _is_cpu
         # stays the ladder gate: mlx is not CPU, so the RTF downgrade never fires on it.
         self._device = cfg["device"]
+        # The MLX (Apple Metal) ladder gate, the counterpart to _is_cpu. mlx is not CPU, so the
+        # RTF ladder never fires on it; instead an ENGLISH mlx session steps down MLX_LADDER on
+        # queue-depth evidence (see _maybe_downgrade_mlx), while an Afrikaans one only ever warns.
+        self._is_mlx = cfg["device"] == "mlx"
         self._compute_type = cfg["compute_type"]
         self._cpu_threads = cpu_threads
         self._rtf = deque(maxlen=DOWNGRADE_WINDOW)  # recent real-time factors (CPU downgrade)
+        # Backlog depth sampled at each completion for the MLX ladder trigger. Its OWN window, kept
+        # apart from the one-shot struggle warning's _pending_hist so a ladder step can re-arm the
+        # trend (cleared after a step, like _rtf) without spending the warning's ratchet.
+        self._mlx_depth = deque(maxlen=STRUGGLE_COMPLETION_WINDOW)
         # ── live ladder + shed valve state (CPU only) ──
         # Chunks the shed valve pulled back out of the queue so it could drop the OLDEST first.
         # Only the worker touches it, producers only ever put on the queue, and it is always
@@ -1683,6 +1819,33 @@ class Engine:
                                                # Decoupled like subscribe(): the web layer sets it to
                                                # surface the downgrade (banner + one-time toast); the
                                                # engine stays ignorant of app.py/notify/STATE.
+        self.on_struggle = None                # optional callback(), fired at most ONCE per session
+                                               # when a live GPU session falls behind (see
+                                               # _deliver_struggle). Same decoupling and best-effort
+                                               # contract as on_downgrade, but delivered on its own
+                                               # short-lived thread: it is raised from the worker AND
+                                               # from the real-time capture thread, neither of which
+                                               # may pay for what the listener does.
+        # Per-chunk ASR failures (stop-honesty iii). Before this they were caught and printed only,
+        # so a backend that threw on every chunk (a broken MLX install, an out-of-memory Metal call)
+        # looked exactly like a quiet room: no transcript, no warning, nothing to act on. The count
+        # is the honest signal; on_asr_error is the same optional worker-thread callback shape as
+        # on_downgrade, which the web layer turns into a single banner pointing at the log file.
+        self.asr_errors = 0
+        self.last_asr_error = ""
+        self.on_asr_error = None
+        # Struggle-warning state. EVERY read and write of the five fields below happens under
+        # _struggle_lock (see _struggle_evaluate, which is the only place they are touched after
+        # construction): the two windows are sampled from different threads, and the ratchet is
+        # raced by the worker and by both capture chunker threads.
+        self._struggle_lock = threading.Lock()
+        self.struggle_armed = False            # False until the OWNER calls arm_struggle(): until
+                                               # the session is genuinely live the queue is deep BY
+                                               # DESIGN (the catch-up replay), which is not a fault
+        self._struggle_warned = False          # the one-shot ratchet
+        self._struggle_notice_due = False      # the worker owes the transcript a STRUGGLE_NOTICE
+        self._pending_hist = deque(maxlen=STRUGGLE_COMPLETION_WINDOW)  # depth at COMPLETIONS
+        self._arrival_hist = deque(maxlen=STRUGGLE_ARRIVAL_WINDOW)   # depth at ARRIVALS
         self._pending_mic = []                # [(release_monotonic, Segment)] held by MIC_PUBLISH_DELAY
         self.sys_env = None                   # optional EnergyRing (far end) -> enables the MIC echo veto
         self.mic_env = None                   # optional EnergyRing (RAW near end) -> gain-invariant
@@ -1717,7 +1880,7 @@ class Engine:
         self._loop_guard_on = os.environ.get("SA_LIVE_LOOP_GUARD", "1") != "0"
         self._recent = RecentEmissions()   # cross-segment loop history, per source
         self._sys_text = SysTextRing()     # published SYS text: the echo reference for arm 2
-        self._queue = queue.Queue(maxsize=32)
+        self._queue = queue.Queue(maxsize=QUEUE_MAXSIZE)
         self._stop = threading.Event()    # shutting down: stop accepting new audio
         self._abort = threading.Event()   # hard abort: discard the backlog instead of draining
         self._busy = False                # True while a chunk is mid-transcription (for pending())
@@ -1978,16 +2141,27 @@ class Engine:
         item = (source, audio, t_start, time.monotonic(), self._is_burst(source, audio))
         try:
             self._queue.put(item, block=block, timeout=timeout)
-            return True
         except queue.Full:
             if not block:
                 # Live backpressure: drop, but make it VISIBLE - a real gap in the
                 # transcript beats a silent lie. The marker is emitted from the
                 # worker once it next runs (see _run).
                 self._dropped += 1
+                # Loss is happening NOW, so warn outright: no trend, no window. Under severe
+                # starvation the queue can fill before either window has the evidence to speak,
+                # and a warning that arrives after the audio is gone is the bug this feature
+                # exists to fix.
+                self._deliver_struggle(self._struggle_evaluate(forced=f"dropping {source} chunks"))
                 print(f"[engine] queue full, dropping {source} chunk @ t={t_start:.1f}s "
                       f"(total dropped: {self._dropped})", flush=True)
             return False
+        # Producer-side safety net, sampled here on the REAL-TIME capture thread (both chunker
+        # threads reach this line). Unlike the worker's window it needs no completed chunk, so it
+        # still speaks when transcription is so slow, or so stalled, that completions dry up.
+        # _struggle_evaluate holds the lock for a handful of comparisons on an 8-slot deque, and
+        # the delivery it hands back is done off this thread entirely.
+        self._deliver_struggle(self._struggle_evaluate(arrival=True))
+        return True
 
     def set_initial_prompt(self, prompt):
         """Replace the live prompt mid-session (growing glossary support).
@@ -2069,16 +2243,21 @@ class Engine:
             if ch.get("device"):
                 self._device = ch["device"]
                 self._is_cpu = ch["device"] == "cpu"
+                self._is_mlx = ch["device"] == "mlx"
             if ch.get("compute_type"):
                 self._compute_type = ch["compute_type"]
         self.initial_prompt = _compose_prompt(self.language, self._user_prompt)
         self._rebuild_prompt_leak(self._user_prompt, self.language)
         self._recent.clear()  # a model/language flip legitimately changes output style
         self._rtf.clear()   # judge the (possibly new) model fresh; never downgrade on the old RTF
+        self._mlx_depth.clear()  # ...and the MLX ladder's own trend window, for the same reason
         if ch["model"] is not None:
             self._cold_decode = True            # the new model pays its load cost on its first decode
             self._last_rung_change = time.monotonic()
             self._swap = None                   # a ladder build in flight is stale now: drop it
+        with self._struggle_lock:   # ...and the same for both queue-growth windows: a swap changes
+            self._pending_hist.clear()          # throughput, so pre-swap depths are stale evidence.
+            self._arrival_hist.clear()          # Lock-owned state, so touched only under the lock.
         lang_name = {"af": "Afrikaans", "en": "English"}.get(self.language, self.language or "auto-detect")
         self._emit_notice(t_start, f"[engine: now {self.family} {self.size}, language {lang_name}]")
 
@@ -2161,18 +2340,41 @@ class Engine:
         session is already running (never a stock model under an Afrikaans session), and it is
         already on this machine (never a mid-meeting download). A rung that fails either test is
         skipped and the search carries on down; when nothing is left the caller sheds instead.
-        Returns (size, model_id, family)."""
+        Returns (size, model_id, family).
+
+        The ladder itself is per backend: CPU walks CPU_LADDER and judges presence by the ct2
+        model.bin rule (model_present); an MLX (Apple Metal) session walks MLX_LADDER and judges
+        presence by the MLX file-set rule (_mlx_rung_present), and additionally requires the rung to
+        have a STOCK mlx-community form (is_stock_mlx_repo). That stock gate is the hard line: an
+        Afrikaans (Fluister) rung has no stock MLX form (mlx_model_for(digiphyte/*) is None), so it
+        is skipped and an Afrikaans MLX session is NEVER crossed onto stock Whisper. cuda has no
+        ladder and never reaches here."""
+        is_mlx = getattr(self, "_is_mlx", False)
+        ladder = MLX_LADDER if is_mlx else CPU_LADDER
+        if is_mlx:
+            from . import mlxbackend   # lazy, same as _build_model: Windows never pays for it
         try:
-            idx = CPU_LADDER.index(self.size)
+            idx = ladder.index(self.size)
         except ValueError:
             idx = -1  # start size above the ladder (turbo/large-v3) -> first rung is next
-        for size in CPU_LADDER[idx + 1:]:
+        for size in ladder[idx + 1:]:
             # Keep the family AND the user's engine choice: a forced-Fluister or forced-Whisper
             # session must NOT silently flip to language-based auto when the size drops a rung.
             model_id, fam = resolve_model(size, self.language, self.engine)
             if fam != self.family:
                 print(f"[engine] ladder: skipping {size} ({fam}, not {self.family})", flush=True)
                 continue
+            if is_mlx:
+                repo = mlxbackend.mlx_model_for(model_id)
+                if repo is None or not mlxbackend.is_stock_mlx_repo(repo):
+                    # No stock MLX form (an Afrikaans/Fluister rung, or a size with no MLX build):
+                    # the hard line, enforced here so no MLX ladder step can leave the family.
+                    print(f"[engine] ladder: skipping {size} (no stock MLX form for {model_id})", flush=True)
+                    continue
+                if not _mlx_rung_present(repo):
+                    print(f"[engine] ladder: skipping {size} ({repo} is not on this machine)", flush=True)
+                    continue
+                return size, model_id, fam
             if not model_present(model_id):
                 print(f"[engine] ladder: skipping {size} ({model_id} is not on this machine)", flush=True)
                 continue
@@ -2195,8 +2397,12 @@ class Engine:
     def _swap_run(self, swap):
         try:
             # local_only: the ladder never downloads. _next_rung already checked, this is the
-            # belt-and-braces half of the same rule.
-            swap["model"] = load_model(swap["model_id"], "cpu", self._compute_type,
+            # belt-and-braces half of the same rule. The build device follows the session's own
+            # backend: an MLX session builds the rung on Metal (load_model maps the ct2 size to the
+            # stock mlx-community repo via mlxbackend), a CPU session on the CPU. cpu_threads is
+            # ignored on MLX (the repo holds its own precision); the shared signature stays.
+            device = "mlx" if getattr(self, "_is_mlx", False) else "cpu"
+            swap["model"] = load_model(swap["model_id"], device, self._compute_type,
                                        cpu_threads=self._cpu_threads, local_only=True)
         except Exception as e:
             swap["error"] = e
@@ -2226,35 +2432,83 @@ class Engine:
         # done this for a language/model change; the ladder used to forget to).
         self._recent.clear()
         self._cold_decode = True                # the first decode pays this model's load cost
-        self._emit_notice(t_start, f"[engine: switched to '{self.size}' model to keep up with the audio]")
+        if getattr(self, "_is_mlx", False):
+            # An MLX step is only ever an English session dropping onto a stock Whisper rung (the
+            # ladder crosses no family), so name the model and say so plainly: the honest rung name
+            # in the live transcript, alongside the banner the on_downgrade callback raises.
+            self._emit_notice(t_start,
+                              f"[engine: switched to Whisper {self.size} (English only) to keep up with the audio]")
+        else:
+            self._emit_notice(t_start, f"[engine: switched to '{self.size}' model to keep up with the audio]")
         self._notify_downgrade(old_size, self.size)
         return True
 
     def _maybe_downgrade(self, t_start):
-        """Step down CPU_LADDER when sustained, honest evidence says we can't hold real-time.
+        """Step down the ladder when sustained, honest evidence says we can't hold real-time.
 
-        Only fires on CPU. Ratchets down only, never back up, to avoid oscillation. The new
-        (smaller) model also chews through the queued backlog faster, which is how the session
-        catches back up. See CPU_LADDER for the three rules the step itself obeys.
+        Ratchets down only, never back up, to avoid oscillation. The new (smaller) model also
+        chews through the queued backlog faster, which is how the session catches back up. CPU is
+        RTF-driven (see CPU_LADDER); MLX (Apple Metal) is queue-depth-driven and English-only, so it
+        is dispatched to _maybe_downgrade_mlx (RTF is not evidence about Metal contention). cuda has
+        no ladder and never reaches a step here.
         """
         # Swivuriso is a single fixed model (size-independent), so there is no smaller rung to drop
         # to; never downgrade it.
         if self.family == "swivuriso":
             return
-        if not self.adaptive or not self._is_cpu:
+        if not self.adaptive:
             return
+        if self._is_cpu:
+            if self._install_swap(t_start):
+                return                          # just changed rung; judge the new one fresh
+            if self._swap is not None:
+                return                          # a rung is already being built off-thread
+            if time.monotonic() - self._last_rung_change < DOWNGRADE_MIN_SECONDS:
+                return                          # a step has to hold for a while before the next
+            if len(self._rtf) < self._rtf.maxlen:
+                return
+            avg = sum(self._rtf) / len(self._rtf)
+            if avg <= DOWNGRADE_RTF:
+                return
+            self._start_step(f"CPU RTF ~{avg:.2f} (> {DOWNGRADE_RTF})")
+            return
+        if getattr(self, "_is_mlx", False):
+            self._maybe_downgrade_mlx(t_start)
+
+    def _maybe_downgrade_mlx(self, t_start):
+        """MLX (Apple Metal) auto-downgrade, ENGLISH sessions only. Returns True when the ladder is
+        the responder for this session right now, so the caller (_run) suppresses the generic
+        queue-depth warning; False when the ladder can do nothing and the warning should speak.
+
+        Same hysteresis as the CPU ladder, reused wholesale: one build in flight at a time, at least
+        DOWNGRADE_MIN_SECONDS between steps, the trend window cleared after a step. The DIFFERENCE is
+        the trigger. Metal contention (a screen share taking the GPU) shows as a backlog that grows,
+        not as a stable per-stream RTF, so the step is driven by the SAME queue-depth evidence wp1's
+        warning reads: a completion window that is deep AND still climbing (_queue_depth_growing),
+        gated on the same arm so the catch-up replay at Begin cannot trigger a spurious step.
+
+        An Afrikaans (Fluister) session finds no in-family stock rung (_next_rung returns None), so
+        this is a no-op and only wp1's warning fires: the hard line that Fluister is NEVER moved onto
+        stock Whisper lives in _next_rung, not here."""
+        if self.family == "swivuriso" or not self.adaptive:
+            return False
         if self._install_swap(t_start):
-            return                              # just changed rung; judge the new one fresh
+            return True                         # a finished rung just installed; the ladder owns it
         if self._swap is not None:
-            return                              # a rung is already being built off-thread
+            return True                         # a rung is building; the generic warning is premature
+        if self._next_rung() is None:
+            return False                        # Fluister, or English out of rungs: let the warning speak
         if time.monotonic() - self._last_rung_change < DOWNGRADE_MIN_SECONDS:
-            return                              # a step has to hold for a while before the next
-        if len(self._rtf) < self._rtf.maxlen:
-            return
-        avg = sum(self._rtf) / len(self._rtf)
-        if avg <= DOWNGRADE_RTF:
-            return
-        self._start_step(f"CPU RTF ~{avg:.2f} (> {DOWNGRADE_RTF})")
+            return True                         # cooling down after a step; the ladder still owns it
+        if not self.struggle_armed:
+            return True                         # not live yet (catch-up replay): no step, no warning
+        self._mlx_depth.append(self.pending())
+        if not _queue_depth_growing(self._mlx_depth, BACKPRESSURE_BEAM_THRESHOLD + 1):
+            return True                         # a rung is available and evidence is not yet sustained
+        # Deep and still growing, a stock English rung is cached and the spacing has elapsed: step.
+        self._start_step("MLX queue depth deep and growing")
+        self._mlx_depth.clear()                 # don't re-trigger while the build runs
+        return True
 
     def _start_step(self, reason):
         """Begin a step to the next usable rung, if the ladder is allowed to move and has one.
@@ -2263,8 +2517,9 @@ class Engine:
         RTF, and a shed event (the backlog blew past its bound on a live feed, which is the real
         time contract failing in the most direct way there is). Everything else - swivuriso, the
         minimum spacing, one build in flight, in-family, present-only - is checked here or in
-        _next_rung, so neither caller can bypass a rule."""
-        if self.family == "swivuriso" or not self.adaptive or not self._is_cpu:
+        _next_rung, so neither caller can bypass a rule. Shared by the CPU and MLX ladders (cuda has
+        no ladder); the callers differ only in the evidence that brings them here."""
+        if self.family == "swivuriso" or not self.adaptive or not (self._is_cpu or getattr(self, "_is_mlx", False)):
             return False
         if self._swap is not None:
             return False
@@ -2347,6 +2602,141 @@ class Engine:
         # present, and past the minimum spacing.
         self._start_step(f"shed {dropped:.0f}s of backlog")
 
+    def arm_struggle(self):
+        """Arm the "cannot hold real time" warning. The owner calls this ONCE, at the moment the
+        session becomes genuinely live: this engine is the published session engine and the audio
+        captured while the model loaded has been replayed into it.
+
+        A method rather than a flag because arming is a RESET that must never be seen half-done.
+        Both windows go with the flag: the catch-up replay leaves a climbing depth history behind
+        it, and if those samples survived into the post-arm window a queue that is actually
+        DRAINING would read as growth. That false warning would spend the one-shot ratchet and
+        silence the real starvation later in the meeting.
+
+        Under _struggle_lock, which is the SAME lock every evaluation takes, so the interleaving
+        "evaluate a pre-arm window, then arm, then claim" cannot exist: an evaluation either
+        completes before this call (and is refused, because the flag is still False) or starts
+        after it (and sees two empty windows). Idempotent in effect; call it once.
+        """
+        with self._struggle_lock:
+            self._pending_hist.clear()
+            self._arrival_hist.clear()
+            self.struggle_armed = True
+
+    def _struggle_evaluate(self, *, arrival=False, forced=None):
+        """The locked half of the warning, and the ONLY place struggle state is read or written.
+
+        TAKES the queue-depth sample itself, inside the lock, and decides whether it claims the
+        one-shot warning. Returns the reason string when THIS call won the ratchet, else None; the
+        caller passes that straight to _deliver_struggle, which runs with no lock held. Splitting it
+        this way is what makes the decision atomic: sampling, verdict and claim happen inside a
+        single acquisition, so no other thread can arm, clear or claim between them. The SAMPLE has
+        to be taken in here too, never handed in by the caller: a depth measured outside the lock is
+        a reading from before a concurrent arm_struggle or model-swap clear, and appending it after
+        that clear makes a stale value the first sample of a freshly emptied window (a pre-arm 24
+        ahead of a healthy 29, 28, 27 reads as growth). Nothing can index a deque that a concurrent
+        clear has just emptied, either.
+
+        `forced` claims outright, for an actual drop: audio is being lost right now, which needs no
+        trend to justify. Otherwise the rule is the same at both sampling points, deep AND still
+        growing, differing only in where the samples come from and how deep counts as deep:
+
+          arrival=True   on_chunk, capture threads, the queue depth, over STRUGGLE_QUEUE_HIGH
+          arrival=False  the worker, once per completed chunk, pending() so the chunk in flight
+                         counts, over BACKPRESSURE_BEAM_THRESHOLD
+
+        Cheap enough for the real-time audio path: a deque append and three comparisons. Every
+        input the decision reads is read inside the acquisition, including `adaptive` and `_device`,
+        which are the worker's to write but are cheaper to read here than to reason about twice.
+
+        Warn only, never auto-downgrade: a GPU tier has nothing faster below it, and an
+        engine-originated reconfigure would be a second writer racing the user's own (see
+        request_change's known limitation).
+        """
+        with self._struggle_lock:
+            if not self.adaptive or self._device == "cpu":
+                return None      # file import, or the CPU ladder's territory
+            if not self.struggle_armed or self._struggle_warned:
+                return None
+            why = forced
+            if why is None:
+                win = self._arrival_hist if arrival else self._pending_hist
+                win.append(self._queue.qsize() if arrival else self.pending())
+                need = STRUGGLE_QUEUE_HIGH if arrival else BACKPRESSURE_BEAM_THRESHOLD + 1
+                if len(win) < win.maxlen or win[-1] < need or win[-1] <= win[0]:
+                    return None
+                why = (f"queue {win[0]} -> {win[-1]} of {QUEUE_MAXSIZE} over {win.maxlen} "
+                       f"{'arrivals' if arrival else 'completions'}")
+            self._struggle_warned = True
+            self._struggle_notice_due = True
+            return why
+
+    def _deliver_struggle(self, why):
+        """The unlocked half: hand the claimed warning to the listener, off this thread.
+
+        `why` is whatever _struggle_evaluate returned, so None (nothing claimed) is the common case
+        and a no-op. NEVER call this holding _struggle_lock.
+
+        The listener runs on its own short-lived daemon thread because it is the web layer's: it
+        reads settings from disk and calls notify.show(), whose first backend initialisation can
+        block for seconds. The sole transcription worker must not stall there while the queue is
+        already endangered, and the capture thread must not stall there at all. It fires at most
+        once per session, so one thread is proportionate. The transcript notice is NOT sent from
+        here: _fanout is worker-thread-only (its subscribers write the transcript file and the SSE
+        stream), so the worker emits it on its next chunk from _struggle_notice_due.
+        """
+        if why is None:
+            return
+        cb = self.on_struggle
+        msg = f"[engine] cannot hold real time on {self._device} ({why}); warning the user"
+
+        def _fire():
+            # Delivery FIRST, diagnostic last, each guarded separately. stdout is not a given here
+            # (a windowed build redirects it to a log file, which can fill or fail, and a full pipe
+            # blocks), and no condition of the log may cost the user the warning itself.
+            err = None
+            try:
+                if cb is not None:
+                    cb()
+            except Exception as e:
+                err = e
+            try:
+                print(msg if err is None else f"{msg} [callback error: {err}]", flush=True)
+            except Exception:
+                pass
+
+        try:
+            threading.Thread(target=_fire, daemon=True, name="struggle-cb").start()
+        except Exception:
+            # Thread exhaustion, and nothing else, reaches here. It must not escape into the capture
+            # callback: the transcript notice is already owed, so the warning still reaches the user
+            # through the transcript even when no thread could be started.
+            pass
+
+    def _take_struggle_notice(self):
+        """Consume the "the transcript owes a STRUGGLE_NOTICE" flag, under the lock like every
+        other struggle field, and return whether this call took it. The caller emits AFTER this
+        returns and never with the lock held: _emit_notice fans out to subscribers, which write the
+        transcript file and the SSE stream."""
+        with self._struggle_lock:
+            due = self._struggle_notice_due
+            self._struggle_notice_due = False
+        return due
+
+    def _maybe_warn_gpu_struggle(self):
+        """Worker-side sampling point: the queue depth at each completed chunk.
+
+        The sensitive half of the pair. Deep alone is not evidence, a dense burst of speech fills
+        the queue and the queue clears it again, which is what it is for; deep AND growing means
+        arrivals are outrunning transcription, which ends in dropped audio. RTF is not part of the
+        verdict (see the constants), only of the log line.
+        """
+        why = self._struggle_evaluate()
+        if why is not None:
+            avg = (sum(self._rtf) / len(self._rtf)) if self._rtf else 0.0
+            why = f"{why}, RTF ~{avg:.2f}"
+        self._deliver_struggle(why)
+
     def _run(self):
         # Loop until the sentinel, or (during shutdown) until the queue empties.
         # We deliberately do NOT break the instant _stop is set, that would drop
@@ -2376,6 +2766,12 @@ class Engine:
             self._apply_pending_change(t_start)
             # A live device switch asked us to forget the loop history (worker-owned).
             self._apply_pending_recent_reset()
+
+            # A "cannot hold real time" warning tripped since the last chunk, possibly on the
+            # capture thread, which must never touch subscribers. Emit its notice here, on the
+            # worker, ahead of any gap marker: the explanation should precede the hole.
+            if self._take_struggle_notice():
+                self._emit_notice(t_start, STRUGGLE_NOTICE)
 
             # If chunks were dropped to backpressure before this one, record the
             # gap in the transcript so the reader knows audio is missing here.
@@ -2506,10 +2902,10 @@ class Engine:
                             continue
                     self._route(out)
 
-                # Adaptive model downgrade (CPU only): track real-time factor and
-                # step down to a faster model if we're sustained-slower than real-time.
+                audio_dur = len(audio) / 16000.0
                 if self._is_cpu:
-                    audio_dur = len(audio) / 16000.0
+                    # Adaptive model downgrade (CPU only): track real-time factor and step down
+                    # to a faster model if we are sustained-slower than real-time.
                     # Only LIVE, WARM samples are evidence about holding real time. A burst-fed
                     # chunk was never a real-time obligation (see _is_burst), and the first decode
                     # on a freshly built model is dominated by that model's one-off load cost -
@@ -2519,8 +2915,32 @@ class Engine:
                     self._cold_decode = False
                     self._maybe_downgrade(t_start)
                     self._maybe_shed(t_start)
+                else:
+                    # GPU/MLX: no RTF ladder. RTF used to be measured only on CPU, which left _rtf
+                    # permanently empty on cuda/mlx and so left a starved GPU with no signal at all
+                    # (the incident); it is recorded here too, feeding the diagnostic log line.
+                    if audio_dur > 0:
+                        self._rtf.append(elapsed / audio_dur)
+                    # An MLX ENGLISH session CAN step down (stock mlx rungs), driven by the same
+                    # queue-depth evidence as the warning; while it is handling the load, its own
+                    # honest downgrade notice is the signal, so the generic warning is held. cuda,
+                    # an MLX Afrikaans session, or an MLX English session with no lower rung left has
+                    # nothing to step to, so the queue-depth warning speaks instead.
+                    if not (getattr(self, "_is_mlx", False) and self._maybe_downgrade_mlx(t_start)):
+                        self._maybe_warn_gpu_struggle()
             except Exception as e:
+                # A per-chunk failure used to end here, as a line in the log nobody reads. Count
+                # it and hand it out, so "the model is throwing on every chunk" can be told apart
+                # from "nobody is talking" without opening a file (web/app.py:_on_asr_error).
+                self.asr_errors += 1
+                self.last_asr_error = str(e)
                 print(f"[engine] transcribe error on {source} chunk: {e}", flush=True)
+                cb = self.on_asr_error
+                if cb is not None:
+                    try:
+                        cb(self.asr_errors, str(e))
+                    except Exception as e2:
+                        print(f"[engine] on_asr_error callback error: {e2}", flush=True)
             finally:
                 self._busy = False
 
