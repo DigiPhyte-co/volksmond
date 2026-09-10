@@ -86,6 +86,11 @@ class FakeEngineOK:
     def stop(self):
         pass
 
+    def arm_struggle(self):
+        # The real Engine arms its 'cannot hold real time' warning here, at the
+        # publish point. Modelled so a missing wire-up fails loudly.
+        self.struggle_armed = True
+
     def pending(self):
         return 0
 
@@ -311,6 +316,11 @@ def test_retry_replays_the_buffer_from_t0():
 
         def stop(self, drain=False, timeout=None):
             pass
+
+        def arm_struggle(self):
+            # The real Engine arms its 'cannot hold real time' warning here, at the
+            # publish point. Modelled so a missing wire-up fails loudly.
+            self.struggle_armed = True
 
         def pending(self):
             return 0

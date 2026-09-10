@@ -1927,10 +1927,11 @@ function retryPrepare() {
   }).catch(function (e) { toast(e.message || "Could not retry.", true); });
 }
 function silenceSig(n) { return n ? (String(n.at || "") + "|" + String(n.count || 0)) : ""; }
-// The struggle nudge carries no timestamp; its identity is the model step plus whether
-// recording has since started, so any of those changing re-renders (a second downgrade, or
-// recording turning on so the banner switches to its "already recording" wording).
-function struggleSig(n) { return n ? (String(n.old_size || "") + "|" + String(n.new_size || "") + "|" + (n.recording ? "1" : "0")) : ""; }
+// The struggle nudge carries no timestamp; its identity is the reason plus the model step plus
+// whether recording has since started, so any of those changing re-renders (a second downgrade, a
+// switch of reason, or recording turning on so the banner switches to its "already recording"
+// wording). A gpu-busy nudge has no sizes; String(undefined || "") is "" and compares fine.
+function struggleSig(n) { return n ? (String(n.reason || "") + "|" + String(n.old_size || "") + "|" + String(n.new_size || "") + "|" + (n.recording ? "1" : "0")) : ""; }
 function refreshSilence() {
   if (!S.live.running || S.live.sourceKind === "file") return;
   api.get("/api/status").then(function (st) {
@@ -2005,11 +2006,13 @@ function silenceBanner() {
 }
 
 /* ── model struggling to keep up during a live session ─────────── */
-// Parallel to the silence nudge: the server steps a CPU session down to a lighter, faster model
-// when it cannot hold real time, and publishes struggle_nudge on /api/status
-// ({old_size, new_size, recording}). The page notices it on the SAME poll (refreshSilence) and
-// offers the honest answers: start recording so the audio can be re-transcribed at full accuracy
-// afterward, or keep going. Recording can also be started from the standalone live-footer button.
+// Parallel to the silence nudge, with two causes behind one banner. The server publishes
+// struggle_nudge on /api/status, always carrying {reason, recording}: "cpu-downgrade" (it stepped a
+// CPU session down to a lighter, faster model to stay live, plus old_size/new_size) or "gpu-busy"
+// (a GPU session cannot hold real time, usually another program on the card; no sizes, because
+// nothing changed). The page notices it on the SAME poll (refreshSilence) and offers the honest
+// answers: start recording so the audio can be re-transcribed at full accuracy afterward, or keep
+// going. Recording can also be started from the standalone live-footer button.
 async function recordFromHere() {
   // Optimistic + double-click guard: flipping recording now hides BOTH triggers (this action's
   // banner button and the live-footer button), so a fast second click short-circuits here and
@@ -2074,7 +2077,13 @@ function struggleBanner() {
   var hasRec = !!(S.live.recording || S.live.recordingStarted);
   var n = S.live.struggleNudge || {};
   var body;
-  if (n.old_size && n.old_size === n.new_size)
+  if (n.reason === "gpu-busy")
+    // wp1: a GPU/MLX session that fell behind. It cannot cut the beam or downgrade, so there is no
+    // model-change or shed variant. The copy stays hedged about the cause, because all the server
+    // measured was queue depth and inference time, which cannot tell another program apart from
+    // throttling. No recording variant either: the record offer below is the whole remedy anyway.
+    body = "Your graphics card is unusually busy or slow, so Volksmond is falling behind. Another program may be using it.";
+  else if (n.old_size && n.old_size === n.new_size)
     // A shed event, not a model change: the engine ran out of smaller models in this family and
     // is skipping audio to stay live rather than dropping to a model that would invent text.
     body = hasRec
@@ -4585,7 +4594,7 @@ function adoptRunning(status) {
   seedFromTranscript();
   seedNotes();
   S.live.silenceNudge = status.silence_nudge || null;   // a nudge that fired before this reload
-  S.live.struggleNudge = status.struggle_nudge || null; // same, for a downgrade that fired before this reload
+  S.live.struggleNudge = status.struggle_nudge || null; // same, for a struggle warning raised before this reload (reason included)
   S.live.recordingStarted = !!status.recording_started; // latched: recording is or was active this session
   adoptMicGate(status, true);                           // silent: a valve hint from before the reload is history
   S.live.downgraded = !!status.downgraded;              // latched: the engine dropped to a smaller model before this reload

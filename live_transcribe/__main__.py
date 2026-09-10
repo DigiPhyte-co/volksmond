@@ -526,6 +526,11 @@ def main():
     engine.subscribe(stdout_sink)
     engine.subscribe(md_sink)
     engine.start()
+    # Arm the "cannot hold real time" warning at once: unlike the web app there is no held backlog
+    # to replay here (capture starts after the model is loaded), so any deep queue from now on is a
+    # real fault. With no on_struggle listener the CLI surfaces it as the transcript notice alone,
+    # which is the only channel it has.
+    engine.arm_struggle()
 
     # Optional raw-audio recorder. Tapped BEFORE the engine queue so the
     # recording stays complete even if transcription drops chunks under load -

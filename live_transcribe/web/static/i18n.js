@@ -826,6 +826,8 @@ window.VM_I18N = {
       "Volksmond slaan van die klank oor om lewendig te bly. Jou opname het steeds alles en kan daarna teen volle akkuraatheid hertranskribeer word.",
     "Volksmond is skipping some audio to stay live. Record now so nothing is lost, and re-transcribe at full accuracy afterward.":
       "Volksmond slaan van die klank oor om lewendig te bly. Neem nou op sodat niks verlore gaan nie, en hertranskribeer daarna teen volle akkuraatheid.",
+    "Your graphics card is unusually busy or slow, so Volksmond is falling behind. Another program may be using it.":
+      "Jou grafikakaart is ongewoon besig of stadig, so Volksmond raak agter. 'n Ander program gebruik dit dalk.",
     "Record from here": "Neem van hier af op",
     "Keep going": "Gaan voort",
     "Don't warn again": "Moenie weer waarsku nie",

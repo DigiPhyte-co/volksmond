@@ -138,6 +138,11 @@ def test_start_returns_before_model_loads():
         def stop(self):
             pass
 
+        def arm_struggle(self):
+            # The real Engine arms its 'cannot hold real time' warning here, at the
+            # publish point. Modelled so a missing wire-up fails loudly.
+            self.struggle_armed = True
+
         def pending(self):
             return 0
 
@@ -198,6 +203,11 @@ def test_buffer_and_replay_in_order_no_drops():
 
         def stop(self):
             pass
+
+        def arm_struggle(self):
+            # The real Engine arms its 'cannot hold real time' warning here, at the
+            # publish point. Modelled so a missing wire-up fails loudly.
+            self.struggle_armed = True
 
         def pending(self):
             return 0
@@ -381,6 +391,11 @@ def test_backlog_stays_ahead_of_live_during_replay():
         def stop(self):
             pass
 
+        def arm_struggle(self):
+            # The real Engine arms its 'cannot hold real time' warning here, at the
+            # publish point. Modelled so a missing wire-up fails loudly.
+            self.struggle_armed = True
+
         def pending(self):
             return 0
 
@@ -466,6 +481,11 @@ def test_asr_slower_than_realtime_forever_stays_ready():
         def stop(self):
             pass
 
+        def arm_struggle(self):
+            # The real Engine arms its 'cannot hold real time' warning here, at the
+            # publish point. Modelled so a missing wire-up fails loudly.
+            self.struggle_armed = True
+
         def pending(self):
             return 999
 
@@ -548,6 +568,11 @@ def test_stop_during_catchup_drains_backlog():
         def stop(self, drain=False, timeout=None):
             self.stopped_drain = drain
 
+        def arm_struggle(self):
+            # The real Engine arms its 'cannot hold real time' warning here, at the
+            # publish point. Modelled so a missing wire-up fails loudly.
+            self.struggle_armed = True
+
         def pending(self):
             return 0
 
@@ -628,6 +653,11 @@ def test_partial_transcription_stop_makes_builder_bail():
         def stop(self, drain=False, timeout=None):
             pass
 
+        def arm_struggle(self):
+            # The real Engine arms its 'cannot hold real time' warning here, at the
+            # publish point. Modelled so a missing wire-up fails loudly.
+            self.struggle_armed = True
+
         def pending(self):
             return 0
 
@@ -699,6 +729,11 @@ def test_stop_during_catchup_no_two_feeders():
 
         def stop(self, drain=False, timeout=None):
             self.stopped_drain = drain
+
+        def arm_struggle(self):
+            # The real Engine arms its 'cannot hold real time' warning here, at the
+            # publish point. Modelled so a missing wire-up fails loudly.
+            self.struggle_armed = True
 
         def pending(self):
             return 0
@@ -804,6 +839,11 @@ def test_stop_during_large_accepted_backlog_hands_off_promptly():
         def stop(self, drain=False, timeout=None):
             self.stopped_drain = drain
 
+        def arm_struggle(self):
+            # The real Engine arms its 'cannot hold real time' warning here, at the
+            # publish point. Modelled so a missing wire-up fails loudly.
+            self.struggle_armed = True
+
         def pending(self):
             return 0
 
@@ -892,6 +932,11 @@ def test_dead_worker_during_replay_surfaces_error():
         def stop(self, drain=False, timeout=None):
             pass
 
+        def arm_struggle(self):
+            # The real Engine arms its 'cannot hold real time' warning here, at the
+            # publish point. Modelled so a missing wire-up fails loudly.
+            self.struggle_armed = True
+
         def pending(self):
             return 0
 
@@ -949,6 +994,11 @@ def test_dead_worker_at_start_surfaces_error():
         def stop(self, drain=False, timeout=None):
             pass
 
+        def arm_struggle(self):
+            # The real Engine arms its 'cannot hold real time' warning here, at the
+            # publish point. Modelled so a missing wire-up fails loudly.
+            self.struggle_armed = True
+
         def pending(self):
             return 0
 
@@ -972,6 +1022,70 @@ def test_dead_worker_at_start_surfaces_error():
     print("  OK  a worker dead immediately after start surfaces a retryable error, not a fake 'ready' (P1-6)")
 
 
+def test_struggle_warning_is_armed_only_after_the_catch_up_replay():
+    # The engine's "cannot hold real time" warning fires ONCE per session, and its callback is
+    # attached before this replay. During catch-up the queue is deep BY DESIGN, so if the warning
+    # were live here it would spend that one shot on a backlog that is not a fault (and on a
+    # callback the web layer rejects anyway, because STATE.engine is not yet this engine), leaving
+    # a genuinely starved GPU silent for the rest of the meeting. So: not armed for any replayed
+    # chunk, armed exactly at publication.
+    reset_state()
+    release = threading.Event()
+    armed_during_replay = []
+    rlock = threading.Lock()
+
+    class ArmWatchingEngine:
+        model_name = "fake-model"
+        family = "whisper"
+        engine = "auto"
+
+        def __init__(self, **kw):
+            self.struggle_armed = False          # as the real Engine starts out
+            if not release.wait(timeout=20.0):
+                raise RuntimeError("test never released the engine build")
+
+        def subscribe(self, fn):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def arm_struggle(self):
+            # The real Engine arms its 'cannot hold real time' warning here, at the
+            # publish point. Modelled so a missing wire-up fails loudly.
+            self.struggle_armed = True
+
+        def pending(self):
+            return 0
+
+        def on_chunk(self, source, audio, t_start, block=False, timeout=None):
+            with rlock:
+                armed_during_replay.append(self.struggle_armed)
+            return True
+
+    try:
+        with stubs(ArmWatchingEngine):
+            r = client.post("/api/start", json=START_BODY)
+            assert r.status_code == 200, r.text
+            for i in range(40):                  # more than the engine's 32-slot queue
+                webapp._feed("SYS", np.full(160, i, dtype=np.float32), float(i))
+            release.set()
+            assert wait_until(lambda: webapp.STATE.engine is not None, 20.0), "never published"
+            with rlock:
+                replayed = list(armed_during_replay)
+            assert len(replayed) >= 40, f"the backlog never replayed: {len(replayed)}"
+            assert not any(replayed), "the warning was armed while the catch-up backlog replayed"
+            assert webapp.STATE.engine.struggle_armed is True, \
+                "the warning was never armed once the engine was published"
+    finally:
+        release.set()
+        reset_state()
+    print("  OK  the struggle warning is armed at publication, never during the catch-up replay")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_start_returns_before_model_loads,
@@ -985,6 +1099,7 @@ if __name__ == "__main__":
                test_partial_transcription_stop_makes_builder_bail,
                test_dead_worker_during_replay_surfaces_error,
                test_dead_worker_at_start_surfaces_error,
+               test_struggle_warning_is_armed_only_after_the_catch_up_replay,
                test_pending_buffer_bounds_and_drop_take_finalise,
                test_putback_front_enforces_cap_by_dropping_newest,
                test_putback_front_protection_survives_later_appends):

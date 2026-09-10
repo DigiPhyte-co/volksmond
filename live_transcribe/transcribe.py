@@ -497,7 +497,9 @@ BACKPRESSURE_BEAM_THRESHOLD = 6
 # CPU adaptive model ladder (highest-quality -> fastest). When a CPU start model
 # can't hold real-time, the engine steps DOWN this ladder until it keeps up -
 # never back up (avoids oscillation). large-v3/turbo are deliberately NOT in the
-# ladder: too slow to be a sane CPU live floor. GPU tiers never downgrade (they keep up).
+# ladder: too slow to be a sane CPU live floor. GPU tiers never downgrade: there is nothing faster
+# to step down to, so a starved GPU (or MLX) session WARNS instead (see STRUGGLE_QUEUE_HIGH /
+# _maybe_warn_gpu_struggle) rather than dropping a rung.
 #
 # Three rules the ladder obeys, all of them learned the hard way on a CPU-only laptop that walked
 # medium -> small -> base -> tiny inside half an hour and produced Dutch-flavoured loops:
@@ -529,6 +531,62 @@ SHED_BACKLOG_SECONDS = 45.0
 # should be read as a rough guide and re-transcribed from the recording afterwards. Surfaced to the
 # UI as `indicative` on the downgrade payload.
 INDICATIVE_BELOW = "small"
+
+# A live GPU session that cannot hold real time. Measured incident: other programs were sharing
+# the card for a whole meeting (a local LLM and a second transcriber, leaving it both compute-
+# contended and ~500 MB short of full), so Volksmond fell behind and silently dropped 350+ chunks
+# with no warning at all. There is no GPU ladder to step down, so this only WARNS.
+#
+# The signal is QUEUE GROWTH, not a real-time-factor threshold, because RTF alone cannot answer
+# "are we keeping up". ONE worker serves every capture source, so break-even depends on how many
+# feed it: with MIC and SYS each producing a chunk per chunk-length, arrivals are 2 per
+# chunk-length while the worker manages 1/RTF of them, so break-even is RTF 0.5; mic-only it is
+# 1.0. Any fixed threshold is therefore wrong for one of them, and wrong in the dangerous
+# direction: a two-channel session at RTF 0.6 grows its queue without bound and drops audio while
+# sitting quietly under a 0.7 trip. A queue that is deep AND still growing IS the harm, needs no
+# per-backend or per-source tuning, and stays true on cuda, mlx and anything added later.
+#
+# ONE rule, applied at two sampling points and two depths (see _struggle_evaluate):
+#
+#   completions (the worker, window DOWNGRADE_WINDOW): the sensitive one. Over 7 chunks queued and
+#     the depth still climbing means transcription is RUNNING but losing ground, the slow bleed.
+#   arrivals (on_chunk, window STRUGGLE_ARRIVAL_WINDOW): the safety net. Over STRUGGLE_QUEUE_HIGH
+#     and still climbing means loss is close, and it needs no completed chunk at all, so it still
+#     speaks when transcription is so slow (or so stalled) that the completion window never fills.
+#
+# Growth is newest against oldest across the window, which is what makes an inherited backlog safe:
+# one that is DRAINING has newest below oldest and cannot warn, whatever depth it started from, so
+# no baseline, floor or healthy-first precondition is needed to tell catch-up from starvation. The
+# arrival window is 8 rather than 4 because it must not be fooled by arrival jitter: the per-source
+# chunker threads pick their own silence boundaries and carry the tail forward (capture_core), so
+# emissions run 6 to 12 s, the sources drift in and out of phase, and depths step up and down by a
+# chunk or two around the trend. MEASURED against that behaviour (see the jitter test in
+# tests/test_struggle_signal.py), 8 arrivals spans ~28 s of a two-channel session and ~20 s at its
+# tightest, and a card fast enough to be recovering (RTF <= 0.25) never trips it while draining a
+# backlog of up to 30, which is the case this must not get wrong.
+#
+# RTF stays measured on every backend (see _run): the CPU ladder needs it and it is the useful
+# number in the diagnostic log line. It just no longer decides this warning.
+#
+# No VRAM probe anywhere in the trip: the incident was compute contention with our model resident
+# and running, which a VRAM threshold would have missed entirely while firing on a card that is
+# legitimately full but fast. Queue growth catches contention, memory pressure, thermal throttling
+# and a slow disk alike, because it measures the consequence instead of guessing the cause.
+QUEUE_MAXSIZE = 32              # bounded chunk queue: live capture drops past this rather than stall
+STRUGGLE_QUEUE_HIGH = QUEUE_MAXSIZE * 3 // 4   # producer-side "loss is imminent" mark (24 of 32)
+STRUGGLE_ARRIVAL_WINDOW = 8     # arrivals of evidence for the producer-side trend
+#
+# ACCEPTED, chosen not missed: a session ARMED at a near-ceiling depth (30 or more of 32) warns on
+# its first dropped chunk rather than before it, because only one or two samples can be taken before
+# the queue overflows and the window never fills. No special case is added for it. At 30 of 32 loss
+# is one chunk away whatever we do, the unconditional drop path still claims the warning, so the
+# user learns within a chunk instead of never; and an arm-time decision for an already-full queue is
+# exactly the kind of special case that cost two earlier revisions of this file.
+
+# The transcript line for that warning. Hedged deliberately: the engine measures inference time and
+# queue depth, which cannot tell another program apart from thermal throttling, memory pressure, a
+# driver problem or a genuinely slow configuration. Say what was observed, not what caused it.
+STRUGGLE_NOTICE = "[engine: struggling to keep up, the graphics card is unusually busy or slow]"
 
 # Hold each MIC segment this long before showing it in the LIVE view, so a speaker echo lands
 # just after its cleaner SYS original instead of jumbled in front of it (the system channel
@@ -1683,6 +1741,25 @@ class Engine:
                                                # Decoupled like subscribe(): the web layer sets it to
                                                # surface the downgrade (banner + one-time toast); the
                                                # engine stays ignorant of app.py/notify/STATE.
+        self.on_struggle = None                # optional callback(), fired at most ONCE per session
+                                               # when a live GPU session falls behind (see
+                                               # _deliver_struggle). Same decoupling and best-effort
+                                               # contract as on_downgrade, but delivered on its own
+                                               # short-lived thread: it is raised from the worker AND
+                                               # from the real-time capture thread, neither of which
+                                               # may pay for what the listener does.
+        # Struggle-warning state. EVERY read and write of the five fields below happens under
+        # _struggle_lock (see _struggle_evaluate, which is the only place they are touched after
+        # construction): the two windows are sampled from different threads, and the ratchet is
+        # raced by the worker and by both capture chunker threads.
+        self._struggle_lock = threading.Lock()
+        self.struggle_armed = False            # False until the OWNER calls arm_struggle(): until
+                                               # the session is genuinely live the queue is deep BY
+                                               # DESIGN (the catch-up replay), which is not a fault
+        self._struggle_warned = False          # the one-shot ratchet
+        self._struggle_notice_due = False      # the worker owes the transcript a STRUGGLE_NOTICE
+        self._pending_hist = deque(maxlen=DOWNGRADE_WINDOW)          # depth at COMPLETIONS
+        self._arrival_hist = deque(maxlen=STRUGGLE_ARRIVAL_WINDOW)   # depth at ARRIVALS
         self._pending_mic = []                # [(release_monotonic, Segment)] held by MIC_PUBLISH_DELAY
         self.sys_env = None                   # optional EnergyRing (far end) -> enables the MIC echo veto
         self.mic_env = None                   # optional EnergyRing (RAW near end) -> gain-invariant
@@ -1717,7 +1794,7 @@ class Engine:
         self._loop_guard_on = os.environ.get("SA_LIVE_LOOP_GUARD", "1") != "0"
         self._recent = RecentEmissions()   # cross-segment loop history, per source
         self._sys_text = SysTextRing()     # published SYS text: the echo reference for arm 2
-        self._queue = queue.Queue(maxsize=32)
+        self._queue = queue.Queue(maxsize=QUEUE_MAXSIZE)
         self._stop = threading.Event()    # shutting down: stop accepting new audio
         self._abort = threading.Event()   # hard abort: discard the backlog instead of draining
         self._busy = False                # True while a chunk is mid-transcription (for pending())
@@ -1978,16 +2055,27 @@ class Engine:
         item = (source, audio, t_start, time.monotonic(), self._is_burst(source, audio))
         try:
             self._queue.put(item, block=block, timeout=timeout)
-            return True
         except queue.Full:
             if not block:
                 # Live backpressure: drop, but make it VISIBLE - a real gap in the
                 # transcript beats a silent lie. The marker is emitted from the
                 # worker once it next runs (see _run).
                 self._dropped += 1
+                # Loss is happening NOW, so warn outright: no trend, no window. Under severe
+                # starvation the queue can fill before either window has the evidence to speak,
+                # and a warning that arrives after the audio is gone is the bug this feature
+                # exists to fix.
+                self._deliver_struggle(self._struggle_evaluate(forced=f"dropping {source} chunks"))
                 print(f"[engine] queue full, dropping {source} chunk @ t={t_start:.1f}s "
                       f"(total dropped: {self._dropped})", flush=True)
             return False
+        # Producer-side safety net, sampled here on the REAL-TIME capture thread (both chunker
+        # threads reach this line). Unlike the worker's window it needs no completed chunk, so it
+        # still speaks when transcription is so slow, or so stalled, that completions dry up.
+        # _struggle_evaluate holds the lock for a handful of comparisons on an 8-slot deque, and
+        # the delivery it hands back is done off this thread entirely.
+        self._deliver_struggle(self._struggle_evaluate(arrival=True))
+        return True
 
     def set_initial_prompt(self, prompt):
         """Replace the live prompt mid-session (growing glossary support).
@@ -2079,6 +2167,9 @@ class Engine:
             self._cold_decode = True            # the new model pays its load cost on its first decode
             self._last_rung_change = time.monotonic()
             self._swap = None                   # a ladder build in flight is stale now: drop it
+        with self._struggle_lock:   # ...and the same for both queue-growth windows: a swap changes
+            self._pending_hist.clear()          # throughput, so pre-swap depths are stale evidence.
+            self._arrival_hist.clear()          # Lock-owned state, so touched only under the lock.
         lang_name = {"af": "Afrikaans", "en": "English"}.get(self.language, self.language or "auto-detect")
         self._emit_notice(t_start, f"[engine: now {self.family} {self.size}, language {lang_name}]")
 
@@ -2347,6 +2438,141 @@ class Engine:
         # present, and past the minimum spacing.
         self._start_step(f"shed {dropped:.0f}s of backlog")
 
+    def arm_struggle(self):
+        """Arm the "cannot hold real time" warning. The owner calls this ONCE, at the moment the
+        session becomes genuinely live: this engine is the published session engine and the audio
+        captured while the model loaded has been replayed into it.
+
+        A method rather than a flag because arming is a RESET that must never be seen half-done.
+        Both windows go with the flag: the catch-up replay leaves a climbing depth history behind
+        it, and if those samples survived into the post-arm window a queue that is actually
+        DRAINING would read as growth. That false warning would spend the one-shot ratchet and
+        silence the real starvation later in the meeting.
+
+        Under _struggle_lock, which is the SAME lock every evaluation takes, so the interleaving
+        "evaluate a pre-arm window, then arm, then claim" cannot exist: an evaluation either
+        completes before this call (and is refused, because the flag is still False) or starts
+        after it (and sees two empty windows). Idempotent in effect; call it once.
+        """
+        with self._struggle_lock:
+            self._pending_hist.clear()
+            self._arrival_hist.clear()
+            self.struggle_armed = True
+
+    def _struggle_evaluate(self, *, arrival=False, forced=None):
+        """The locked half of the warning, and the ONLY place struggle state is read or written.
+
+        TAKES the queue-depth sample itself, inside the lock, and decides whether it claims the
+        one-shot warning. Returns the reason string when THIS call won the ratchet, else None; the
+        caller passes that straight to _deliver_struggle, which runs with no lock held. Splitting it
+        this way is what makes the decision atomic: sampling, verdict and claim happen inside a
+        single acquisition, so no other thread can arm, clear or claim between them. The SAMPLE has
+        to be taken in here too, never handed in by the caller: a depth measured outside the lock is
+        a reading from before a concurrent arm_struggle or model-swap clear, and appending it after
+        that clear makes a stale value the first sample of a freshly emptied window (a pre-arm 24
+        ahead of a healthy 29, 28, 27 reads as growth). Nothing can index a deque that a concurrent
+        clear has just emptied, either.
+
+        `forced` claims outright, for an actual drop: audio is being lost right now, which needs no
+        trend to justify. Otherwise the rule is the same at both sampling points, deep AND still
+        growing, differing only in where the samples come from and how deep counts as deep:
+
+          arrival=True   on_chunk, capture threads, the queue depth, over STRUGGLE_QUEUE_HIGH
+          arrival=False  the worker, once per completed chunk, pending() so the chunk in flight
+                         counts, over BACKPRESSURE_BEAM_THRESHOLD
+
+        Cheap enough for the real-time audio path: a deque append and three comparisons. Every
+        input the decision reads is read inside the acquisition, including `adaptive` and `_device`,
+        which are the worker's to write but are cheaper to read here than to reason about twice.
+
+        Warn only, never auto-downgrade: a GPU tier has nothing faster below it, and an
+        engine-originated reconfigure would be a second writer racing the user's own (see
+        request_change's known limitation).
+        """
+        with self._struggle_lock:
+            if not self.adaptive or self._device == "cpu":
+                return None      # file import, or the CPU ladder's territory
+            if not self.struggle_armed or self._struggle_warned:
+                return None
+            why = forced
+            if why is None:
+                win = self._arrival_hist if arrival else self._pending_hist
+                win.append(self._queue.qsize() if arrival else self.pending())
+                need = STRUGGLE_QUEUE_HIGH if arrival else BACKPRESSURE_BEAM_THRESHOLD + 1
+                if len(win) < win.maxlen or win[-1] < need or win[-1] <= win[0]:
+                    return None
+                why = (f"queue {win[0]} -> {win[-1]} of {QUEUE_MAXSIZE} over {win.maxlen} "
+                       f"{'arrivals' if arrival else 'completions'}")
+            self._struggle_warned = True
+            self._struggle_notice_due = True
+            return why
+
+    def _deliver_struggle(self, why):
+        """The unlocked half: hand the claimed warning to the listener, off this thread.
+
+        `why` is whatever _struggle_evaluate returned, so None (nothing claimed) is the common case
+        and a no-op. NEVER call this holding _struggle_lock.
+
+        The listener runs on its own short-lived daemon thread because it is the web layer's: it
+        reads settings from disk and calls notify.show(), whose first backend initialisation can
+        block for seconds. The sole transcription worker must not stall there while the queue is
+        already endangered, and the capture thread must not stall there at all. It fires at most
+        once per session, so one thread is proportionate. The transcript notice is NOT sent from
+        here: _fanout is worker-thread-only (its subscribers write the transcript file and the SSE
+        stream), so the worker emits it on its next chunk from _struggle_notice_due.
+        """
+        if why is None:
+            return
+        cb = self.on_struggle
+        msg = f"[engine] cannot hold real time on {self._device} ({why}); warning the user"
+
+        def _fire():
+            # Delivery FIRST, diagnostic last, each guarded separately. stdout is not a given here
+            # (a windowed build redirects it to a log file, which can fill or fail, and a full pipe
+            # blocks), and no condition of the log may cost the user the warning itself.
+            err = None
+            try:
+                if cb is not None:
+                    cb()
+            except Exception as e:
+                err = e
+            try:
+                print(msg if err is None else f"{msg} [callback error: {err}]", flush=True)
+            except Exception:
+                pass
+
+        try:
+            threading.Thread(target=_fire, daemon=True, name="struggle-cb").start()
+        except Exception:
+            # Thread exhaustion, and nothing else, reaches here. It must not escape into the capture
+            # callback: the transcript notice is already owed, so the warning still reaches the user
+            # through the transcript even when no thread could be started.
+            pass
+
+    def _take_struggle_notice(self):
+        """Consume the "the transcript owes a STRUGGLE_NOTICE" flag, under the lock like every
+        other struggle field, and return whether this call took it. The caller emits AFTER this
+        returns and never with the lock held: _emit_notice fans out to subscribers, which write the
+        transcript file and the SSE stream."""
+        with self._struggle_lock:
+            due = self._struggle_notice_due
+            self._struggle_notice_due = False
+        return due
+
+    def _maybe_warn_gpu_struggle(self):
+        """Worker-side sampling point: the queue depth at each completed chunk.
+
+        The sensitive half of the pair. Deep alone is not evidence, a dense burst of speech fills
+        the queue and the queue clears it again, which is what it is for; deep AND growing means
+        arrivals are outrunning transcription, which ends in dropped audio. RTF is not part of the
+        verdict (see the constants), only of the log line.
+        """
+        why = self._struggle_evaluate()
+        if why is not None:
+            avg = (sum(self._rtf) / len(self._rtf)) if self._rtf else 0.0
+            why = f"{why}, RTF ~{avg:.2f}"
+        self._deliver_struggle(why)
+
     def _run(self):
         # Loop until the sentinel, or (during shutdown) until the queue empties.
         # We deliberately do NOT break the instant _stop is set, that would drop
@@ -2376,6 +2602,12 @@ class Engine:
             self._apply_pending_change(t_start)
             # A live device switch asked us to forget the loop history (worker-owned).
             self._apply_pending_recent_reset()
+
+            # A "cannot hold real time" warning tripped since the last chunk, possibly on the
+            # capture thread, which must never touch subscribers. Emit its notice here, on the
+            # worker, ahead of any gap marker: the explanation should precede the hole.
+            if self._take_struggle_notice():
+                self._emit_notice(t_start, STRUGGLE_NOTICE)
 
             # If chunks were dropped to backpressure before this one, record the
             # gap in the transcript so the reader knows audio is missing here.
@@ -2506,10 +2738,10 @@ class Engine:
                             continue
                     self._route(out)
 
-                # Adaptive model downgrade (CPU only): track real-time factor and
-                # step down to a faster model if we're sustained-slower than real-time.
+                audio_dur = len(audio) / 16000.0
                 if self._is_cpu:
-                    audio_dur = len(audio) / 16000.0
+                    # Adaptive model downgrade (CPU only): track real-time factor and step down
+                    # to a faster model if we are sustained-slower than real-time.
                     # Only LIVE, WARM samples are evidence about holding real time. A burst-fed
                     # chunk was never a real-time obligation (see _is_burst), and the first decode
                     # on a freshly built model is dominated by that model's one-off load cost -
@@ -2519,6 +2751,15 @@ class Engine:
                     self._cold_decode = False
                     self._maybe_downgrade(t_start)
                     self._maybe_shed(t_start)
+                else:
+                    # GPU/MLX cannot downgrade or shed (nothing faster to step to), so it WARNS.
+                    # RTF used to be measured only on CPU, which left _rtf permanently empty on
+                    # cuda/mlx and so left a starved GPU with no signal at all (the incident); it
+                    # is recorded here too, feeding the diagnostic log line. The warning itself
+                    # judges queue depth, which _maybe_warn_gpu_struggle samples under the lock.
+                    if audio_dur > 0:
+                        self._rtf.append(elapsed / audio_dur)
+                    self._maybe_warn_gpu_struggle()
             except Exception as e:
                 print(f"[engine] transcribe error on {source} chunk: {e}", flush=True)
             finally:
