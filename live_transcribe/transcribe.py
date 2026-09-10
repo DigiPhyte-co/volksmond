@@ -193,6 +193,14 @@ TIER_CONFIG = {
     # here (the MLX repo holds its own precision) but keeps the cache key disambiguated.
     "mlx":        {"model": "large-v3",       "device": "mlx",  "compute_type": "fp16"},
     "mlx-turbo":  {"model": "large-v3-turbo", "device": "mlx",  "compute_type": "fp16"},
+    # MLX lower gears (English sessions only): the Metal auto-downgrade ladder steps a struggling
+    # English session onto these when the Apple GPU cannot hold real time (see MLX_LADDER and
+    # _maybe_downgrade_mlx). The concrete repos are the 8-bit stock forms (mlxbackend.MLX_REPOS
+    # maps medium/small to whisper-*-mlx-8bit), so compute_type is "q8" to name that precision
+    # honestly and disambiguate the cache key; the repo holds the real precision either way. An
+    # Afrikaans (Fluister) session is NEVER moved onto these: the ladder crosses no family.
+    "mlx-medium": {"model": "medium",         "device": "mlx",  "compute_type": "q8"},
+    "mlx-small":  {"model": "small",          "device": "mlx",  "compute_type": "q8"},
 }
 
 
@@ -359,6 +367,22 @@ def _has_ct2_weights(path, min_bytes=1_000_000):
     try:
         binp = os.path.join(path, "model.bin")
         return os.path.isfile(binp) and os.path.getsize(binp) > min_bytes
+    except Exception:
+        return False
+
+
+def _mlx_rung_present(mlx_repo):
+    """True when an MLX repo is fully cached locally, no network: the MLX twin of model_present, and
+    the live MLX ladder's usability test. An MLX snapshot holds weights.* (not the ct2 model.bin),
+    so model_present's ct2 rule would read it as absent; voicedl._present dispatches an MLX repo id
+    onto the MLX file-set rule instead. Lazy import to dodge the voicedl <-> transcribe cycle, the
+    same way model_present does; any error means not-present (fail-safe: never claim on thin
+    evidence, never download mid-meeting)."""
+    if not mlx_repo:
+        return False
+    try:
+        from . import voicedl
+        return voicedl._present(mlx_repo)
     except Exception:
         return False
 
@@ -532,6 +556,14 @@ SHED_BACKLOG_SECONDS = 45.0
 # UI as `indicative` on the downgrade payload.
 INDICATIVE_BELOW = "small"
 
+# MLX (Apple Metal) adaptive ladder, ENGLISH sessions only. Locked at two rungs and no lower: the
+# Mac's stock lower gears are whisper-medium/small (mlxbackend.MLX_REPOS), and Metal never needs to
+# go as low as base/tiny the way a starved CPU does. The trigger is queue depth, not RTF (Metal
+# contention shows as a growing backlog, not a stable per-stream real-time factor), and the hard
+# line is enforced in _next_rung, not here: an Afrikaans (Fluister) rung has no stock MLX form, so
+# the ladder yields nothing for it and a Fluister session is NEVER crossed onto stock Whisper.
+MLX_LADDER = ["medium", "small"]
+
 # A live GPU session that cannot hold real time. Measured incident: other programs were sharing
 # the card for a whole meeting (a local LLM and a second transcriber, leaving it both compute-
 # contended and ~500 MB short of full), so Volksmond fell behind and silently dropped 350+ chunks
@@ -615,6 +647,16 @@ STRUGGLE_COMPLETION_WINDOW = 12  # completions of evidence for the worker-side t
 # queue depth, which cannot tell another program apart from thermal throttling, memory pressure, a
 # driver problem or a genuinely slow configuration. Say what was observed, not what caused it.
 STRUGGLE_NOTICE = "[engine: struggling to keep up, the graphics card is unusually busy or slow]"
+
+
+def _queue_depth_growing(win, need):
+    """The queue-depth trend test shared by the GPU/MLX struggle signal: True iff `win` is FULL and
+    both deep (its newest sample >= `need`) AND still growing (newest strictly above oldest). A full
+    window that is draining (newest below oldest) reads False whatever depth it started from, which
+    is what makes an inherited backlog safe. Kept as one function so the MLX ladder trigger
+    (_maybe_downgrade_mlx) reads depth exactly the way the warning (_struggle_evaluate) does; the two
+    windows are separate deques, but the rule that turns a window into a verdict is the same one."""
+    return len(win) >= win.maxlen and win[-1] >= need and win[-1] > win[0]
 
 # Hold each MIC segment this long before showing it in the LIVE view, so a speaker echo lands
 # just after its cleaner SYS original instead of jumbled in front of it (the system channel
@@ -1749,9 +1791,17 @@ class Engine:
         # web layer can report the device honestly instead of reconstructing it. _is_cpu
         # stays the ladder gate: mlx is not CPU, so the RTF downgrade never fires on it.
         self._device = cfg["device"]
+        # The MLX (Apple Metal) ladder gate, the counterpart to _is_cpu. mlx is not CPU, so the
+        # RTF ladder never fires on it; instead an ENGLISH mlx session steps down MLX_LADDER on
+        # queue-depth evidence (see _maybe_downgrade_mlx), while an Afrikaans one only ever warns.
+        self._is_mlx = cfg["device"] == "mlx"
         self._compute_type = cfg["compute_type"]
         self._cpu_threads = cpu_threads
         self._rtf = deque(maxlen=DOWNGRADE_WINDOW)  # recent real-time factors (CPU downgrade)
+        # Backlog depth sampled at each completion for the MLX ladder trigger. Its OWN window, kept
+        # apart from the one-shot struggle warning's _pending_hist so a ladder step can re-arm the
+        # trend (cleared after a step, like _rtf) without spending the warning's ratchet.
+        self._mlx_depth = deque(maxlen=STRUGGLE_COMPLETION_WINDOW)
         # ── live ladder + shed valve state (CPU only) ──
         # Chunks the shed valve pulled back out of the queue so it could drop the OLDEST first.
         # Only the worker touches it, producers only ever put on the queue, and it is always
@@ -2193,12 +2243,14 @@ class Engine:
             if ch.get("device"):
                 self._device = ch["device"]
                 self._is_cpu = ch["device"] == "cpu"
+                self._is_mlx = ch["device"] == "mlx"
             if ch.get("compute_type"):
                 self._compute_type = ch["compute_type"]
         self.initial_prompt = _compose_prompt(self.language, self._user_prompt)
         self._rebuild_prompt_leak(self._user_prompt, self.language)
         self._recent.clear()  # a model/language flip legitimately changes output style
         self._rtf.clear()   # judge the (possibly new) model fresh; never downgrade on the old RTF
+        self._mlx_depth.clear()  # ...and the MLX ladder's own trend window, for the same reason
         if ch["model"] is not None:
             self._cold_decode = True            # the new model pays its load cost on its first decode
             self._last_rung_change = time.monotonic()
@@ -2288,18 +2340,41 @@ class Engine:
         session is already running (never a stock model under an Afrikaans session), and it is
         already on this machine (never a mid-meeting download). A rung that fails either test is
         skipped and the search carries on down; when nothing is left the caller sheds instead.
-        Returns (size, model_id, family)."""
+        Returns (size, model_id, family).
+
+        The ladder itself is per backend: CPU walks CPU_LADDER and judges presence by the ct2
+        model.bin rule (model_present); an MLX (Apple Metal) session walks MLX_LADDER and judges
+        presence by the MLX file-set rule (_mlx_rung_present), and additionally requires the rung to
+        have a STOCK mlx-community form (is_stock_mlx_repo). That stock gate is the hard line: an
+        Afrikaans (Fluister) rung has no stock MLX form (mlx_model_for(digiphyte/*) is None), so it
+        is skipped and an Afrikaans MLX session is NEVER crossed onto stock Whisper. cuda has no
+        ladder and never reaches here."""
+        is_mlx = getattr(self, "_is_mlx", False)
+        ladder = MLX_LADDER if is_mlx else CPU_LADDER
+        if is_mlx:
+            from . import mlxbackend   # lazy, same as _build_model: Windows never pays for it
         try:
-            idx = CPU_LADDER.index(self.size)
+            idx = ladder.index(self.size)
         except ValueError:
             idx = -1  # start size above the ladder (turbo/large-v3) -> first rung is next
-        for size in CPU_LADDER[idx + 1:]:
+        for size in ladder[idx + 1:]:
             # Keep the family AND the user's engine choice: a forced-Fluister or forced-Whisper
             # session must NOT silently flip to language-based auto when the size drops a rung.
             model_id, fam = resolve_model(size, self.language, self.engine)
             if fam != self.family:
                 print(f"[engine] ladder: skipping {size} ({fam}, not {self.family})", flush=True)
                 continue
+            if is_mlx:
+                repo = mlxbackend.mlx_model_for(model_id)
+                if repo is None or not mlxbackend.is_stock_mlx_repo(repo):
+                    # No stock MLX form (an Afrikaans/Fluister rung, or a size with no MLX build):
+                    # the hard line, enforced here so no MLX ladder step can leave the family.
+                    print(f"[engine] ladder: skipping {size} (no stock MLX form for {model_id})", flush=True)
+                    continue
+                if not _mlx_rung_present(repo):
+                    print(f"[engine] ladder: skipping {size} ({repo} is not on this machine)", flush=True)
+                    continue
+                return size, model_id, fam
             if not model_present(model_id):
                 print(f"[engine] ladder: skipping {size} ({model_id} is not on this machine)", flush=True)
                 continue
@@ -2322,8 +2397,12 @@ class Engine:
     def _swap_run(self, swap):
         try:
             # local_only: the ladder never downloads. _next_rung already checked, this is the
-            # belt-and-braces half of the same rule.
-            swap["model"] = load_model(swap["model_id"], "cpu", self._compute_type,
+            # belt-and-braces half of the same rule. The build device follows the session's own
+            # backend: an MLX session builds the rung on Metal (load_model maps the ct2 size to the
+            # stock mlx-community repo via mlxbackend), a CPU session on the CPU. cpu_threads is
+            # ignored on MLX (the repo holds its own precision); the shared signature stays.
+            device = "mlx" if getattr(self, "_is_mlx", False) else "cpu"
+            swap["model"] = load_model(swap["model_id"], device, self._compute_type,
                                        cpu_threads=self._cpu_threads, local_only=True)
         except Exception as e:
             swap["error"] = e
@@ -2353,35 +2432,83 @@ class Engine:
         # done this for a language/model change; the ladder used to forget to).
         self._recent.clear()
         self._cold_decode = True                # the first decode pays this model's load cost
-        self._emit_notice(t_start, f"[engine: switched to '{self.size}' model to keep up with the audio]")
+        if getattr(self, "_is_mlx", False):
+            # An MLX step is only ever an English session dropping onto a stock Whisper rung (the
+            # ladder crosses no family), so name the model and say so plainly: the honest rung name
+            # in the live transcript, alongside the banner the on_downgrade callback raises.
+            self._emit_notice(t_start,
+                              f"[engine: switched to Whisper {self.size} (English only) to keep up with the audio]")
+        else:
+            self._emit_notice(t_start, f"[engine: switched to '{self.size}' model to keep up with the audio]")
         self._notify_downgrade(old_size, self.size)
         return True
 
     def _maybe_downgrade(self, t_start):
-        """Step down CPU_LADDER when sustained, honest evidence says we can't hold real-time.
+        """Step down the ladder when sustained, honest evidence says we can't hold real-time.
 
-        Only fires on CPU. Ratchets down only, never back up, to avoid oscillation. The new
-        (smaller) model also chews through the queued backlog faster, which is how the session
-        catches back up. See CPU_LADDER for the three rules the step itself obeys.
+        Ratchets down only, never back up, to avoid oscillation. The new (smaller) model also
+        chews through the queued backlog faster, which is how the session catches back up. CPU is
+        RTF-driven (see CPU_LADDER); MLX (Apple Metal) is queue-depth-driven and English-only, so it
+        is dispatched to _maybe_downgrade_mlx (RTF is not evidence about Metal contention). cuda has
+        no ladder and never reaches a step here.
         """
         # Swivuriso is a single fixed model (size-independent), so there is no smaller rung to drop
         # to; never downgrade it.
         if self.family == "swivuriso":
             return
-        if not self.adaptive or not self._is_cpu:
+        if not self.adaptive:
             return
+        if self._is_cpu:
+            if self._install_swap(t_start):
+                return                          # just changed rung; judge the new one fresh
+            if self._swap is not None:
+                return                          # a rung is already being built off-thread
+            if time.monotonic() - self._last_rung_change < DOWNGRADE_MIN_SECONDS:
+                return                          # a step has to hold for a while before the next
+            if len(self._rtf) < self._rtf.maxlen:
+                return
+            avg = sum(self._rtf) / len(self._rtf)
+            if avg <= DOWNGRADE_RTF:
+                return
+            self._start_step(f"CPU RTF ~{avg:.2f} (> {DOWNGRADE_RTF})")
+            return
+        if getattr(self, "_is_mlx", False):
+            self._maybe_downgrade_mlx(t_start)
+
+    def _maybe_downgrade_mlx(self, t_start):
+        """MLX (Apple Metal) auto-downgrade, ENGLISH sessions only. Returns True when the ladder is
+        the responder for this session right now, so the caller (_run) suppresses the generic
+        queue-depth warning; False when the ladder can do nothing and the warning should speak.
+
+        Same hysteresis as the CPU ladder, reused wholesale: one build in flight at a time, at least
+        DOWNGRADE_MIN_SECONDS between steps, the trend window cleared after a step. The DIFFERENCE is
+        the trigger. Metal contention (a screen share taking the GPU) shows as a backlog that grows,
+        not as a stable per-stream RTF, so the step is driven by the SAME queue-depth evidence wp1's
+        warning reads: a completion window that is deep AND still climbing (_queue_depth_growing),
+        gated on the same arm so the catch-up replay at Begin cannot trigger a spurious step.
+
+        An Afrikaans (Fluister) session finds no in-family stock rung (_next_rung returns None), so
+        this is a no-op and only wp1's warning fires: the hard line that Fluister is NEVER moved onto
+        stock Whisper lives in _next_rung, not here."""
+        if self.family == "swivuriso" or not self.adaptive:
+            return False
         if self._install_swap(t_start):
-            return                              # just changed rung; judge the new one fresh
+            return True                         # a finished rung just installed; the ladder owns it
         if self._swap is not None:
-            return                              # a rung is already being built off-thread
+            return True                         # a rung is building; the generic warning is premature
+        if self._next_rung() is None:
+            return False                        # Fluister, or English out of rungs: let the warning speak
         if time.monotonic() - self._last_rung_change < DOWNGRADE_MIN_SECONDS:
-            return                              # a step has to hold for a while before the next
-        if len(self._rtf) < self._rtf.maxlen:
-            return
-        avg = sum(self._rtf) / len(self._rtf)
-        if avg <= DOWNGRADE_RTF:
-            return
-        self._start_step(f"CPU RTF ~{avg:.2f} (> {DOWNGRADE_RTF})")
+            return True                         # cooling down after a step; the ladder still owns it
+        if not self.struggle_armed:
+            return True                         # not live yet (catch-up replay): no step, no warning
+        self._mlx_depth.append(self.pending())
+        if not _queue_depth_growing(self._mlx_depth, BACKPRESSURE_BEAM_THRESHOLD + 1):
+            return True                         # a rung is available and evidence is not yet sustained
+        # Deep and still growing, a stock English rung is cached and the spacing has elapsed: step.
+        self._start_step("MLX queue depth deep and growing")
+        self._mlx_depth.clear()                 # don't re-trigger while the build runs
+        return True
 
     def _start_step(self, reason):
         """Begin a step to the next usable rung, if the ladder is allowed to move and has one.
@@ -2390,8 +2517,9 @@ class Engine:
         RTF, and a shed event (the backlog blew past its bound on a live feed, which is the real
         time contract failing in the most direct way there is). Everything else - swivuriso, the
         minimum spacing, one build in flight, in-family, present-only - is checked here or in
-        _next_rung, so neither caller can bypass a rule."""
-        if self.family == "swivuriso" or not self.adaptive or not self._is_cpu:
+        _next_rung, so neither caller can bypass a rule. Shared by the CPU and MLX ladders (cuda has
+        no ladder); the callers differ only in the evidence that brings them here."""
+        if self.family == "swivuriso" or not self.adaptive or not (self._is_cpu or getattr(self, "_is_mlx", False)):
             return False
         if self._swap is not None:
             return False
@@ -2788,14 +2916,18 @@ class Engine:
                     self._maybe_downgrade(t_start)
                     self._maybe_shed(t_start)
                 else:
-                    # GPU/MLX cannot downgrade or shed (nothing faster to step to), so it WARNS.
-                    # RTF used to be measured only on CPU, which left _rtf permanently empty on
-                    # cuda/mlx and so left a starved GPU with no signal at all (the incident); it
-                    # is recorded here too, feeding the diagnostic log line. The warning itself
-                    # judges queue depth, which _maybe_warn_gpu_struggle samples under the lock.
+                    # GPU/MLX: no RTF ladder. RTF used to be measured only on CPU, which left _rtf
+                    # permanently empty on cuda/mlx and so left a starved GPU with no signal at all
+                    # (the incident); it is recorded here too, feeding the diagnostic log line.
                     if audio_dur > 0:
                         self._rtf.append(elapsed / audio_dur)
-                    self._maybe_warn_gpu_struggle()
+                    # An MLX ENGLISH session CAN step down (stock mlx rungs), driven by the same
+                    # queue-depth evidence as the warning; while it is handling the load, its own
+                    # honest downgrade notice is the signal, so the generic warning is held. cuda,
+                    # an MLX Afrikaans session, or an MLX English session with no lower rung left has
+                    # nothing to step to, so the queue-depth warning speaks instead.
+                    if not (getattr(self, "_is_mlx", False) and self._maybe_downgrade_mlx(t_start)):
+                        self._maybe_warn_gpu_struggle()
             except Exception as e:
                 # A per-chunk failure used to end here, as a line in the log nobody reads. Count
                 # it and hand it out, so "the model is throwing on every chunk" can be told apart
