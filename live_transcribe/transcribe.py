@@ -548,8 +548,9 @@ INDICATIVE_BELOW = "small"
 #
 # ONE rule, applied at two sampling points and two depths (see _struggle_evaluate):
 #
-#   completions (the worker, window DOWNGRADE_WINDOW): the sensitive one. Over 7 chunks queued and
-#     the depth still climbing means transcription is RUNNING but losing ground, the slow bleed.
+#   completions (the worker, window STRUGGLE_COMPLETION_WINDOW): the sensitive one. Over 7 chunks
+#     queued and the depth still climbing means transcription is RUNNING but losing ground, the
+#     slow bleed.
 #   arrivals (on_chunk, window STRUGGLE_ARRIVAL_WINDOW): the safety net. Over STRUGGLE_QUEUE_HIGH
 #     and still climbing means loss is close, and it needs no completed chunk at all, so it still
 #     speaks when transcription is so slow (or so stalled) that the completion window never fills.
@@ -575,6 +576,33 @@ INDICATIVE_BELOW = "small"
 QUEUE_MAXSIZE = 32              # bounded chunk queue: live capture drops past this rather than stall
 STRUGGLE_QUEUE_HIGH = QUEUE_MAXSIZE * 3 // 4   # producer-side "loss is imminent" mark (24 of 32)
 STRUGGLE_ARRIVAL_WINDOW = 8     # arrivals of evidence for the producer-side trend
+# The completion window is 12, and it is its OWN constant rather than DOWNGRADE_WINDOW (4), which
+# belongs to the CPU ladder and must not move. 4 was mis-sized for this second use: arrivals and
+# completions have different periods, so at 70 to 100% of capacity the depth wobbles UP inside any
+# 4 samples while the long-run trend is down, and a healthy session draining an inherited backlog
+# cried wolf. Measured on the event-driven chunker model (false positives over 160 runs: start
+# depths 10/20/26/30 x RTF 0.30 to 0.50 x 8 seeds; a run counts only if it warned, dropped nothing
+# and ended no deeper than it started):
+#
+#     window     4     6     8    10    12    16    20    24
+#     total     94    67    62    59    50    42    34    32
+#     RTF 0.30   4     0     0     0     0     0     0     0
+#     RTF 0.35  16     1     0     0     0     0     0     0
+#     RTF 0.40  32    24    21    18     9     4     1     1
+#     RTF 0.45  32    32    31    31    31    28    23    21
+#     RTF 0.50  10    10    10    10    10    10    10    10
+#
+# 8 clears the indefensible part (0.30 and 0.35 are comfortable drains) and 12 takes most of 0.40,
+# which is 80% of two-channel capacity and still a session that never loses audio. Past 12 the gains
+# sit inside 0.45, within 10% of break-even, where the queue is a near-zero-drift random walk that
+# NO window length fixes: 0.50 is immovable at 10 for every value from 4 to 24. So 12, and no
+# further, because beyond it we would be tuning inside the band where warning is defensible.
+#
+# Widening costs nothing in detection, which is why it is safe: the binding constraint on the slow
+# bleed is the depth threshold, not the window filling. Measured warning times are IDENTICAL at
+# every window from 4 to 24 (RTF 0.52 ~517 s, 0.55 ~238 s, 0.60 ~140 s, all before any drop), and
+# of the runs that genuinely lost ground at RTF 0.50, all 22 were caught at 4, 8 and 12 alike.
+STRUGGLE_COMPLETION_WINDOW = 12  # completions of evidence for the worker-side trend
 #
 # ACCEPTED, chosen not missed: a session ARMED at a near-ceiling depth (30 or more of 32) warns on
 # its first dropped chunk rather than before it, because only one or two samples can be taken before
@@ -1758,7 +1786,7 @@ class Engine:
                                                # DESIGN (the catch-up replay), which is not a fault
         self._struggle_warned = False          # the one-shot ratchet
         self._struggle_notice_due = False      # the worker owes the transcript a STRUGGLE_NOTICE
-        self._pending_hist = deque(maxlen=DOWNGRADE_WINDOW)          # depth at COMPLETIONS
+        self._pending_hist = deque(maxlen=STRUGGLE_COMPLETION_WINDOW)  # depth at COMPLETIONS
         self._arrival_hist = deque(maxlen=STRUGGLE_ARRIVAL_WINDOW)   # depth at ARRIVALS
         self._pending_mic = []                # [(release_monotonic, Segment)] held by MIC_PUBLISH_DELAY
         self.sys_env = None                   # optional EnergyRing (far end) -> enables the MIC echo veto

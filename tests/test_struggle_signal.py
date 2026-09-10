@@ -97,7 +97,7 @@ def _stub_engine(size="medium", family="whisper", adaptive=True, is_cpu=True, rt
     eng._struggle_warned = False
     eng._struggle_lock = threading.Lock()
     eng._struggle_notice_due = False
-    eng._pending_hist = deque(maxlen=transcribe.DOWNGRADE_WINDOW)
+    eng._pending_hist = deque(maxlen=transcribe.STRUGGLE_COMPLETION_WINDOW)
     eng._arrival_hist = deque(maxlen=transcribe.STRUGGLE_ARRIVAL_WINDOW)
     eng._dropped = 0
     eng._busy = False
@@ -190,7 +190,8 @@ def _simulate_chunkers(eng, rtf, backlog=0, seed=0, horizon=900.0, p_silence=0.8
     emissions run 6 to 12 s, the two sources drift in and out of phase, and service time is
     proportional to each chunk's own duration.
 
-    Returns a dict: warned, at (virtual seconds), dropped, end/start depth, and the mean span of an
+    Returns a dict: warned, at (virtual seconds), dropped_at_warn (what the warning had already
+    cost when it landed), total dropped, end/start depth, and the mean and worst span of an
     8-arrival window, which is what STRUGGLE_ARRIVAL_WINDOW is sized against.
     """
     rng = random.Random(seed)
@@ -202,7 +203,7 @@ def _simulate_chunkers(eng, rtf, backlog=0, seed=0, horizon=900.0, p_silence=0.8
     tails = {s: 0.0 for s in sources}
     events = [(rng.uniform(0.0, 6.0), s, "arrive") for s in sources]   # independent phases
     heapq.heapify(events)
-    busy, warned_at, arrivals = False, None, []
+    busy, warned_at, dropped_at_warn, arrivals = False, None, None, []
     while events:
         t, who, kind = heapq.heappop(events)
         if t > horizon:
@@ -235,10 +236,11 @@ def _simulate_chunkers(eng, rtf, backlog=0, seed=0, horizon=900.0, p_silence=0.8
                 eng._busy = True
                 heapq.heappush(events, (t + (len(audio) / 16000.0) * rtf, who, "done"))
         if fired and warned_at is None:
-            warned_at = t
+            warned_at, dropped_at_warn = t, eng._dropped
     spans = [arrivals[i + 7] - arrivals[i] for i in range(max(0, len(arrivals) - 7))]
-    return dict(warned=bool(fired), at=warned_at, dropped=eng._dropped, start=backlog,
-                end=eng._queue.qsize(), span=(sum(spans) / len(spans)) if spans else 0.0,
+    return dict(warned=bool(fired), at=warned_at, dropped_at_warn=dropped_at_warn,
+                dropped=eng._dropped, start=backlog, end=eng._queue.qsize(),
+                span=(sum(spans) / len(spans)) if spans else 0.0,
                 worst_span=min(spans) if spans else 0.0)
 
 
@@ -255,12 +257,13 @@ class _SlowModel:
         return ([], None)
 
 
-def _worker_engine(device="cuda", chunks=12, chunk_secs=0.005, work_secs=0.02):
+def _worker_engine(device="cuda", chunks=transcribe.STRUGGLE_COMPLETION_WINDOW + 4,
+                   chunk_secs=0.005, work_secs=0.02):
     """A stub Engine wired well enough to run Engine._run() ON THE CALLING THREAD: _stop is already
     set, so the loop drains the pre-queued chunks and exits. Everything the loop touches is hand-set
     (no capture, no rings, no real model); _rtf starts EMPTY so the worker itself has to fill it."""
     eng = _stub_engine(is_cpu=(device == "cpu"), device=device)
-    eng._rtf = deque(maxlen=transcribe.DOWNGRADE_WINDOW)
+    eng._rtf = deque(maxlen=transcribe.DOWNGRADE_WINDOW)   # RTF window is the CPU ladder's, still 4
     eng.model = _SlowModel(work_secs)
     eng.initial_prompt = None
     eng.beam_size = 5
@@ -552,10 +555,10 @@ def test_pre_arm_evidence_can_never_spend_the_warning():
     now happen in ONE acquisition, so the interleaving does not exist."""
     # (a) the semantics: a full pre-arm window is discarded, so the next sample cannot claim on it.
     eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
-    for d in (20, 22, 24, 26):
-        eng._pending_hist.append(d)
-    for d in range(24, 32):
-        eng._arrival_hist.append(d)
+    for i in range(transcribe.STRUGGLE_COMPLETION_WINDOW):      # a FULL, climbing pre-arm window
+        eng._pending_hist.append(20 + i)
+    for i in range(transcribe.STRUGGLE_ARRIVAL_WINDOW):
+        eng._arrival_hist.append(24 + i)
     eng.arm_struggle()
     assert list(eng._pending_hist) == [] and list(eng._arrival_hist) == [], "arming kept stale evidence"
     eng._maybe_warn_gpu_struggle()
@@ -565,8 +568,8 @@ def test_pre_arm_evidence_can_never_spend_the_warning():
     errors = []
     for _ in range(200):
         e = _stub_engine(is_cpu=False, device="cuda", armed=False)
-        for d in (20, 22, 24, 26):
-            e._pending_hist.append(d)
+        for i in range(transcribe.STRUGGLE_COMPLETION_WINDOW):   # full and climbing: would claim
+            e._pending_hist.append(20 + i)
         ready = threading.Barrier(2)
 
         def arm():
@@ -594,51 +597,65 @@ def test_pre_arm_evidence_can_never_spend_the_warning():
 
 
 def test_under_real_chunker_jitter_a_recovering_session_is_never_warned():
-    """M2: the smooth simulation above justifies the window lengths with an argument it does not
-    test. This one drives the engine from independently phased per-source chunkers across the real
-    6 to 12 s boundary behaviour (see _simulate_chunkers) and pins the two properties that matter.
+    """The window lengths are sized by MEASUREMENT against the real chunker behaviour, not by
+    argument, and this pins the result so the claim cannot rot the way the span claim did.
 
-    MEASURED, and recorded here so the next reader does not have to re-derive it:
+    Driven from independently phased per-source chunkers across the real 6 to 12 s boundary
+    behaviour (see _simulate_chunkers). False positives (warned, yet dropped nothing and ended no
+    deeper) over 160 runs per window, start depths 10/20/26/30 x RTF 0.30 to 0.50 x 8 seeds:
 
-      * an 8-arrival window spans ~28 s on average and ~20 s at its tightest (all-6 s cuts on two
-        sources), not the ~32 s the earlier comment claimed. Corrected there.
-      * the recovery case is CLEAN: a card fast enough to be recovering (RTF <= 0.25) never warns
-        while draining an inherited backlog, at any starting depth up to 30. That is the case this
-        design must not get wrong, because a slow first-run model load routinely hands the engine
-        20+ chunks.
-      * there IS a marginal band, RTF ~0.30 to ~0.50 with a backlog already past the completion
-        threshold, where a session that ends up draining can still warn. The claim comes from the
-        COMPLETION window (4 samples, shared with the CPU ladder as DOWNGRADE_WINDOW), not the
-        arrival window: at 80 to 100% of capacity the depth wobbles up within any 4 samples even
-        while the long-run trend is down. Deliberately NOT chased. Two channels break even at
-        RTF 0.5, so those sessions are inside 20% of losing audio with a minute or more already
-        queued, the banner they get offers exactly the right remedy, and the alternative is a
-        condition that would re-open a blind spot. A spurious banner is dismissible; a missed
-        warning is lost audio.
+        window     4     6     8    10    12    16    20    24
+        total     94    67    62    59    50    42    34    32
+        RTF 0.30   4     0     0     0     0     0     0     0
+        RTF 0.35  16     1     0     0     0     0     0     0
+        RTF 0.40  32    24    21    18     9     4     1     1
+        RTF 0.45  32    32    31    31    31    28    23    21
+        RTF 0.50  10    10    10    10    10    10    10    10
+
+    Hence STRUGGLE_COMPLETION_WINDOW = 12. Asserted below: everything up to and including RTF 0.35
+    is silent while draining (those are comfortable sessions and warning them was the cry-wolf
+    defect), and real loss is still always caught.
+
+    KNOWN RESIDUAL, deliberately not chased and deliberately not asserted, because it is a property
+    of the queue and not of this code: from RTF ~0.40 to ~0.50, two channels are at 80 to 100% of
+    capacity and the depth is a near-zero-drift random walk, so a session that ends up draining can
+    still warn. No window length fixes it (0.50 is immovable at 10 across every value from 4 to 24)
+    and the only other lever would be a magnitude threshold, i.e. a new condition. Those sessions
+    are within 20% of losing audio with a minute or more already queued, and the banner they get
+    offers exactly the right remedy.
     """
-    # The protection that must hold: recovering, at every depth a slow model load could hand us.
+    # 1. Recovering, and comfortably-loaded, sessions must be silent: this is what round 6 bought.
     for backlog in (10, 20, 26, 30):
-        for rtf in (0.05, 0.15, 0.25):
+        for rtf in (0.05, 0.15, 0.25, 0.30, 0.35):
             for seed in range(4):
                 eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
                 r = _simulate_chunkers(eng, rtf=rtf, backlog=backlog, seed=seed)
                 assert not r["warned"], (
-                    f"backlog {backlog} at RTF {rtf} (seed {seed}) warned while recovering: {r}")
+                    f"backlog {backlog} at RTF {rtf} (seed {seed}) warned while draining: {r}")
                 assert r["end"] == 0 and r["dropped"] == 0, r
-    # And the harm that must be caught, from an empty queue, with the jitter running.
+    # 2. And the harm must still be caught, from empty, with the jitter running. The wider window
+    #    costs nothing here: the binding constraint is the depth threshold, not the window filling.
     for rtf in (0.55, 0.7, 1.0):
         for seed in range(4):
             eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
             r = _simulate_chunkers(eng, rtf=rtf, backlog=0, seed=seed)
             assert r["warned"], f"a session losing ground at RTF {rtf} (seed {seed}) never warned: {r}"
             assert r["at"] is not None and r["at"] < 400.0, r
-    # The window length claim, measured rather than asserted from theory.
+            assert r["dropped"] == 0 or r["at"] < 400.0, r
+    # 3. Severe starvation from a moderate inherited backlog: the arrival net, before any loss.
+    for backlog in (7, 16, 23):
+        for seed in range(4):
+            eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
+            r = _simulate_chunkers(eng, rtf=4.0, backlog=backlog, seed=seed)
+            assert r["warned"] and r["at"] is not None, r
+            assert r["dropped_at_warn"] == 0, f"backlog {backlog}: warned only after loss: {r}"
+    # 4. The window-span claim, measured rather than asserted from theory.
     eng = _stub_engine(is_cpu=False, device="cuda", armed=False)
     r = _simulate_chunkers(eng, rtf=0.1, backlog=0, seed=7)
     assert 18.0 <= r["worst_span"] <= 32.0, f"8 arrivals spanned {r['worst_span']:.1f}s at worst"
     assert 22.0 <= r["span"] <= 34.0, f"8 arrivals spanned {r['span']:.1f}s on average"
-    print(f"  OK  real chunker jitter: recovery never warns, real loss always does "
-          f"(8 arrivals span ~{r['span']:.0f}s, ~{r['worst_span']:.0f}s at worst)")
+    print(f"  OK  real chunker jitter: draining sessions (RTF <= 0.35) silent, real loss always "
+          f"caught (8 arrivals span ~{r['span']:.0f}s, ~{r['worst_span']:.0f}s at worst)")
 
 
 def test_the_depth_sample_is_taken_inside_the_lock():
