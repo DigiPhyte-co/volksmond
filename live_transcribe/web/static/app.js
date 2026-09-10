@@ -441,15 +441,18 @@ function pollStatus(predicateDone, onDone, onTick) {
 // once the engine had been published and this page turned a missing value into 0. The server now
 // always answers with either a real count or an explicit null plus a phase saying why, and this is
 // the single place that turns those into words. A missing count is never dressed up as zero.
+// Returns the display string already translated (trFmt for the count branch so the {n} af keys in
+// i18n.js are live, tr for the fixed phrases), so every caller, including adoptStopProgress which
+// writes textContent directly, shows Afrikaans without translating again.
 function stopLabel(pending, phase) {
-  if (phase === "discarding") return "Finishing up";
+  if (phase === "discarding") return tr("Finishing up");
   if (typeof pending === "number" && pending > 0) {
-    return "Finishing, " + pending + " chunk" + (pending === 1 ? "" : "s") + " left";
+    return trFmt(pending === 1 ? "Finishing, {n} chunk left" : "Finishing, {n} chunks left", { n: pending });
   }
-  if (phase === "starting") return "Finishing, still starting up";
-  if (typeof pending === "number") return "Finishing, almost done";
-  if (phase === "closing" || !phase) return "Finishing";
-  return "Finishing, working out what is left";
+  if (phase === "starting") return tr("Finishing, still starting up");
+  if (typeof pending === "number") return tr("Finishing, almost done");
+  if (phase === "closing" || !phase) return tr("Finishing");
+  return tr("Finishing, working out what is left");
 }
 // Adopt a status poll's stop progress. Paints the chip and the button in place (cheap, like the
 // level meters), and returns true only when something changed that needs a real re-render: the
@@ -1141,15 +1144,16 @@ function warnBanner(spec) {
 // The choice the user never had when Stop hung with a countless spinner and force-quitting the
 // window was the only way out.
 function stopSlowBanner() {
+  // Built from translated fixed phrases plus the verbatim count (like trNotice), so the whole body
+  // renders in Afrikaans; an exact tr() of the finished concatenation never would.
   var n = S.live.stopPending;
   var left = (typeof n === "number" && n > 0)
-    ? ("There " + (n === 1 ? "is " : "are ") + n + " piece" + (n === 1 ? "" : "s") + " of audio still to transcribe. ")
+    ? (trFmt(n === 1 ? "There is {n} piece of audio still to transcribe." : "There are {n} pieces of audio still to transcribe.", { n: n }) + " ")
     : "";
-  var body = "Volksmond is still finishing this meeting and this computer is slow at it. " + left
-    + "You can wait for it, or stop now and keep everything transcribed so far. Audio that has not "
-    + "been transcribed yet would be left out.";
+  var body = tr("Volksmond is still finishing this meeting and this computer is slow at it.") + " " + left
+    + tr("You can wait for it, or stop now and keep everything transcribed so far. Audio that has not been transcribed yet would be left out.");
   if (S.live.recording || S.live.recordingStarted) {
-    body += " Your recording is saved either way, so the meeting can be transcribed again in full afterwards.";
+    body += " " + tr("Your recording is saved either way, so the meeting can be transcribed again in full afterwards.");
   }
   return warnBanner({
     title: "This is taking a while",
@@ -2339,12 +2343,14 @@ function asrErrorBanner() {
   var n = S.live.asrErrorNudge || {};
   var count = n.count || 0;
   var hasRec = !!(S.live.recording || S.live.recordingStarted);
-  var body = "Volksmond could not transcribe " + count + " piece" + (count === 1 ? "" : "s")
-    + " of audio on this computer, so " + (count === 1 ? "a part" : "parts")
-    + " of this meeting will be missing from the transcript.";
-  body += hasRec
-    ? " The audio is still being recorded, so the meeting can be transcribed again afterwards."
-    : " Record now so the meeting can be transcribed again afterwards.";
+  // Translated fixed phrases plus the verbatim count, so the whole body renders in Afrikaans.
+  var body = trFmt(count === 1
+    ? "Volksmond could not transcribe {n} piece of audio on this computer, so a part of this meeting will be missing from the transcript."
+    : "Volksmond could not transcribe {n} pieces of audio on this computer, so parts of this meeting will be missing from the transcript.",
+    { n: count });
+  body += " " + (hasRec
+    ? tr("The audio is still being recorded, so the meeting can be transcribed again afterwards.")
+    : tr("Record now so the meeting can be transcribed again afterwards."));
   var actions = [];
   if (!hasRec) actions.push(el("button", { class: "btn sm record", onclick: function () { recordFromHere(); } }, [icon("dot", 12), "Record from here"]));
   actions.push(el("button", { class: "btn sm ghost", onclick: function () { dismissAsrError(); } }, "Got it"));

@@ -224,6 +224,12 @@ window.VM_I18N = {
     "Stopping": "Stop tans",
     "Finishing, {n} chunk left": "Maak klaar, {n} stuk oor",
     "Finishing, {n} chunks left": "Maak klaar, {n} stukke oor",
+    // The other honest-wording outcomes stopLabel can render: a count it genuinely does not know,
+    // a drain that has only just begun, the last piece, or the "stop now" discard of the tail.
+    "Finishing, still starting up": "Maak klaar, begin nog",
+    "Finishing, almost done": "Maak klaar, amper klaar",
+    "Finishing, working out what is left": "Maak klaar, werk uit wat oor is",
+    "Finishing up": "Rond af",
 
     // WP-2a: what the screen says once the microphone is shut but the backlog is still being
     // transcribed. The point of these lines is that they are plain and unambiguous, so keep the
@@ -848,6 +854,33 @@ window.VM_I18N = {
       "Volksmond slaan van die klank oor om lewendig te bly. Neem nou op sodat niks verlore gaan nie, en hertranskribeer daarna teen volle akkuraatheid.",
     "Your graphics card is unusually busy or slow, so Volksmond is falling behind. Another program may be using it.":
       "Jou grafikakaart is ongewoon besig of stadig, so Volksmond raak agter. 'n Ander program gebruik dit dalk.",
+    // Stop taking longer than the grace period: the keep-waiting / stop-now choice. Body built
+    // from these fixed phrases plus the verbatim count (see stopSlowBanner), so split to match.
+    "This is taking a while": "Dit neem 'n rukkie",
+    "There is {n} piece of audio still to transcribe.": "Daar is nog {n} stuk klank om te transkribeer.",
+    "There are {n} pieces of audio still to transcribe.": "Daar is nog {n} stukke klank om te transkribeer.",
+    "Volksmond is still finishing this meeting and this computer is slow at it.":
+      "Volksmond maak hierdie vergadering nog klaar en hierdie rekenaar is stadig daarmee.",
+    "You can wait for it, or stop now and keep everything transcribed so far. Audio that has not been transcribed yet would be left out.":
+      "Jy kan daarvoor wag, of nou stop en alles hou wat tot dusver getranskribeer is. Klank wat nog nie getranskribeer is nie, sal uitgelaat word.",
+    "Your recording is saved either way, so the meeting can be transcribed again in full afterwards.":
+      "Jou opname word in elk geval gestoor, so die vergadering kan naderhand weer ten volle getranskribeer word.",
+    "Keep waiting": "Hou aan wag",
+    "Stop now": "Stop nou",
+    "Could not finish this session yet.": "Kon nie hierdie sessie nog klaarmaak nie.",
+    // Transcription failing on this machine (asrErrorBanner): a fault, not a trade-off, so the
+    // only answer is to acknowledge it. Body built from these phrases plus the verbatim count.
+    "Transcription is failing": "Transkripsie misluk",
+    "Volksmond could not transcribe {n} piece of audio on this computer, so a part of this meeting will be missing from the transcript.":
+      "Volksmond kon nie {n} stuk klank op hierdie rekenaar transkribeer nie, so 'n deel van hierdie vergadering sal in die transkripsie ontbreek.",
+    "Volksmond could not transcribe {n} pieces of audio on this computer, so parts of this meeting will be missing from the transcript.":
+      "Volksmond kon nie {n} stukke klank op hierdie rekenaar transkribeer nie, so dele van hierdie vergadering sal in die transkripsie ontbreek.",
+    "The audio is still being recorded, so the meeting can be transcribed again afterwards.":
+      "Die klank word steeds opgeneem, so die vergadering kan naderhand weer getranskribeer word.",
+    "Record now so the meeting can be transcribed again afterwards.":
+      "Neem nou op sodat die vergadering naderhand weer getranskribeer kan word.",
+    "The details are in the log file:": "Die besonderhede is in die loglêer:",
+    "Got it": "Reg so",
     "Record from here": "Neem van hier af op",
     "Keep going": "Gaan voort",
     "Don't warn again": "Moenie weer waarsku nie",
