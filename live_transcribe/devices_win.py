@@ -7,6 +7,29 @@ WASAPI loopback at all on Windows, pyaudiowpatch is the right tool.
 import pyaudiowpatch as pa
 
 
+def _fix_name(s):
+    # PyAudio returns device names as latin-1-encoded bytes wrapped in a Python str, so a real
+    # "Intel(R)" comes back as the mojibake we'd see if you decoded UTF-8 as latin-1. Reverse it:
+    # encode the str's code points as latin-1 bytes, decode those bytes as UTF-8. Falls open if the
+    # name was actually plain ASCII (no Unicode chars to misencode). Module-level (was nested in
+    # list_ui_devices) so the name-based resolvers clean BOTH sides of a comparison the same way:
+    # the UI sends the cleaned name, and the raw PyAudio name has to be cleaned before it can match.
+    try:
+        return s.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s
+
+
+def _as_index(spec):
+    """Return spec as an int when it is one (a bare index, from the CLI --loopback-device N), or
+    None when it is a name. A device NAME is never int-parseable, so this is what decides whether a
+    spec takes the positional branch (kept for the CLI) or the name branch (what the UI sends)."""
+    try:
+        return int(spec)
+    except (TypeError, ValueError):
+        return None
+
+
 def print_devices():
     """Print available loopback (system audio) and mic devices."""
     p = pa.PyAudio()
@@ -42,49 +65,112 @@ def print_devices():
         p.terminate()
 
 
-def resolve_loopback(p, spec):
-    """Return a PortAudio device info dict for a loopback (system audio) device."""
+def _wasapi_host_index(p):
+    """The WASAPI host-API index, or None when it cannot be read."""
+    try:
+        return p.get_host_api_info_by_type(pa.paWASAPI)["index"]
+    except Exception:
+        return None
+
+
+def _mic_pool(p):
+    """The candidate input devices, WASAPI-first (codex F3). resolve_mic must resolve against the
+    SAME preferred pool list_ui_devices enumerates, or an identically named MME/DirectSound duplicate
+    at a lower index could win over the WASAPI endpoint the UI actually listed and offered. So: the
+    WASAPI mics when WASAPI exposes any, otherwise every real input device (the same fallback the UI
+    listing uses when WASAPI has none)."""
+    allmics = []
+    for i in range(p.get_device_count()):
+        info = p.get_device_info_by_index(i)
+        if info["maxInputChannels"] > 0 and not info.get("isLoopbackDevice", False):
+            allmics.append(info)
+    wasapi_idx = _wasapi_host_index(p)
+    wasapi_mics = [m for m in allmics if wasapi_idx is not None and m["hostApi"] == wasapi_idx]
+    return wasapi_mics if wasapi_mics else allmics
+
+
+def resolve_loopback(p, spec, positional=True):
+    """Return a PortAudio device info dict for a loopback (system audio) device.
+
+    `positional` (codex G2): the CLI passes True so a bare integer selects by position; the web layer
+    passes False, because a UI value is ALWAYS a name (a device named "2", or a stale numeric value
+    whose device has vanished, must resolve by name only and raise when missing, never fall through to
+    positional index 2).
+
+    Resolution order (codex F4): None -> the system default; then an EXACT cleaned-name match (the
+    UI's value, which can itself be numeric like "123"); then a bare integer as a positional index
+    (the CLI --loopback-device N, which still raises when it lands on a non-loopback device); then the
+    historical case-insensitive substring. Exact-name-before-index is what lets a device whose
+    friendly name happens to be a number resolve as a name, while a CLI numeric spec (no device is
+    named "26") still selects by position. Resolving by name is what makes a selection survive the
+    endpoint renumbering that plugging headphones triggers."""
     if spec is None:
         return p.get_default_wasapi_loopback()
-    try:
-        idx = int(spec)
-        info = p.get_device_info_by_index(idx)
-        if not info.get("isLoopbackDevice"):
-            raise ValueError(f"Device #{idx} '{info['name']}' is not a loopback device.")
-        return info
-    except (TypeError, ValueError) as e:
-        if "is not a loopback" in str(e):
-            raise
-    sub = str(spec).lower()
-    for info in p.get_loopback_device_info_generator():
-        if sub in info["name"].lower():
+    want = str(spec).strip()
+    loopbacks = list(p.get_loopback_device_info_generator())
+    for info in loopbacks:
+        if _fix_name(info["name"]).strip() == want:
+            return info
+    if positional:
+        idx = _as_index(spec)
+        if idx is not None:
+            info = p.get_device_info_by_index(idx)
+            if not info.get("isLoopbackDevice"):
+                raise ValueError(f"Device #{idx} '{_fix_name(info['name'])}' is not a loopback device.")
+            return info
+    sub = want.lower()
+    for info in loopbacks:
+        if sub in _fix_name(info["name"]).strip().lower():
             return info
     raise ValueError(f"No loopback device matching {spec!r}. Run --list-devices.")
 
 
-def resolve_mic(p, spec):
-    """Return a PortAudio device info dict for a microphone (non-loopback input)."""
+def resolve_mic(p, spec, positional=True):
+    """Return a PortAudio device info dict for a microphone (non-loopback input).
+
+    Same order as resolve_loopback: None -> the system default; EXACT cleaned-name match over the
+    WASAPI-first pool (codex F3); then (only when `positional`) a bare integer as a positional index
+    (CLI; raises on no input channels); then substring over the pool. `positional` is False from the
+    web layer so a numeric UI value is name-only and never opens a positional index (codex G2).
+    Resolving against the same preferred pool the UI lists means an identically named MME duplicate
+    can never win over the WASAPI endpoint that was offered, and loopbacks are excluded throughout."""
     if spec is None:
         return p.get_default_input_device_info()
-    try:
-        idx = int(spec)
-        info = p.get_device_info_by_index(idx)
-        if info["maxInputChannels"] == 0:
-            raise ValueError(f"Device #{idx} '{info['name']}' has no input channels.")
-        return info
-    except (TypeError, ValueError) as e:
-        if "no input channels" in str(e):
-            raise
-    sub = str(spec).lower()
-    for i in range(p.get_device_count()):
-        info = p.get_device_info_by_index(i)
-        if (
-            info["maxInputChannels"] > 0
-            and not info.get("isLoopbackDevice", False)
-            and sub in info["name"].lower()
-        ):
+    want = str(spec).strip()
+    pool = _mic_pool(p)
+    for info in pool:
+        if _fix_name(info["name"]).strip() == want:
+            return info
+    if positional:
+        idx = _as_index(spec)
+        if idx is not None:
+            info = p.get_device_info_by_index(idx)
+            if info["maxInputChannels"] == 0:
+                raise ValueError(f"Device #{idx} '{_fix_name(info['name'])}' has no input channels.")
+            return info
+    sub = want.lower()
+    for info in pool:
+        if sub in _fix_name(info["name"]).strip().lower():
             return info
     raise ValueError(f"No mic matching {spec!r}. Run --list-devices.")
+
+
+def default_loopback_name(p=None):
+    """Cleaned name of the current default WASAPI loopback, or None when there is none.
+
+    Opens and terminates its OWN PyAudio when not given one, so the follow-the-default watcher can
+    read the default each tick without holding a PyAudio handle open between ticks (holding one is
+    what the task brief forbids: a stale handle would not see the endpoint the OS just switched to)."""
+    own = p is None
+    if own:
+        p = pa.PyAudio()
+    try:
+        return _fix_name(p.get_default_wasapi_loopback()["name"]).strip()
+    except Exception:
+        return None
+    finally:
+        if own:
+            p.terminate()
 
 
 def list_ui_devices():
@@ -103,16 +189,6 @@ def list_ui_devices():
     on a particular machine, the CLI `--list-devices` still shows every
     host API for diagnostic purposes; this function is for the UI.
     """
-    def _fix_name(s):
-        # PyAudio returns device names as latin-1-encoded bytes wrapped in a
-        # Python str, so a real "Intel(R)" comes back as the mojibake we'd see
-        # if you decoded UTF-8 as latin-1. Reverse it: encode the str's code
-        # points as latin-1 bytes, decode those bytes as UTF-8. Falls open if
-        # the name was actually plain ASCII (no Unicode chars to misencode).
-        try:
-            return s.encode("latin-1").decode("utf-8")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            return s
     p = pa.PyAudio()
     try:
         loopbacks = [

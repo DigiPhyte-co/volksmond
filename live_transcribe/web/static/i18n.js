@@ -893,6 +893,22 @@ window.VM_I18N = {
       "Stelselklank word nie vasgevang nie, net jou mikrofoon. Die ander kant van die oproep sal nie in die transkripsie wees nie.",
     "System audio isn't being captured, so only your microphone is being recorded. The other side of the call won't be in the transcript. You can allow it in System Settings > Privacy & Security, then restart the meeting.":
       "Stelselklank word nie vasgevang nie, net jou mikrofoon. Die ander kant van die oproep sal nie in die transkripsie wees nie. Jy kan dit toelaat in Stelselinstellings > Privaatheid en sekuriteit, en dan die vergadering herbegin.",
+    // Device identity + follow-the-default (1.14.1, Windows)
+    "microphone": "mikrofoon",
+    "system audio": "stelselklank",
+    "Now using {d} for {c} ({p} is no longer available)": "Gebruik nou {d} vir {c} ({p} is nie meer beskikbaar nie)",
+    "No system audio is coming through": "Geen stelselklank kom deur nie",
+    "Nothing is reaching {c}. Windows is playing through {d}.": "Niks bereik {c} nie. Windows speel deur {d}.",
+    "Use it": "Gebruik dit",
+    "System audio moved to {d} (Windows default output changed)": "Stelselklank het na {d} geskuif (Windows se verstek-uitset het verander)",
+    "System audio device {d} would not open, usually because nothing is playing to it. Pick the output you are actually using in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.":
+      "Stelselklankstoestel {d} wou nie oopmaak nie, gewoonlik omdat niks daardeur speel nie. Kies die uitset wat jy werklik gebruik in die Stelselklank-keuselys. Net jou mikrofoon word opgeneem, so die ander kant van die oproep sal nie in die transkripsie wees nie.",
+    "System audio device {d} could not be found (it may have been unplugged or renumbered). Pick another entry in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.":
+      "Stelselklankstoestel {d} kon nie gevind word nie (dit is dalk uitgeprop of hernommer). Kies 'n ander inskrywing in die Stelselklank-keuselys. Net jou mikrofoon word opgeneem, so die ander kant van die oproep sal nie in die transkripsie wees nie.",
+    "The system audio would not open, usually because nothing is playing to it. Pick the output you are actually using in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.":
+      "Die stelselklank wou nie oopmaak nie, gewoonlik omdat niks daardeur speel nie. Kies die uitset wat jy werklik gebruik in die Stelselklank-keuselys. Net jou mikrofoon word opgeneem, so die ander kant van die oproep sal nie in die transkripsie wees nie.",
+    "The system audio device could not be found (it may have been unplugged or renumbered). Pick another entry in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.":
+      "Die stelselklankstoestel kon nie gevind word nie (dit is dalk uitgeprop of hernommer). Kies 'n ander inskrywing in die Stelselklank-keuselys. Net jou mikrofoon word opgeneem, so die ander kant van die oproep sal nie in die transkripsie wees nie.",
     "Warn me when the model can't keep up": "Waarsku my wanneer die model nie kan byhou nie",
     "On a slower computer, Volksmond drops to a lighter, faster model to stay live. When it does, it tells you so you can record and re-transcribe at full accuracy afterward.":
       "Op 'n stadiger rekenaar val Volksmond terug na 'n ligter, vinniger model om lewendig te bly. Wanneer dit gebeur, sê dit vir jou sodat jy kan opneem en daarna teen volle akkuraatheid kan hertranskribeer.",

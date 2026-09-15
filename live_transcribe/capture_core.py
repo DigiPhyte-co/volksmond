@@ -153,7 +153,7 @@ class CaptureBase:
     `_release_backend()` hook runs late in `stop()` for host-API teardown
     (PortAudio terminate on Windows)."""
 
-    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False):
+    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False, positional=True):
         """on_chunk(source: str, audio_16k_mono: np.ndarray, t_start: float).
 
         t0: optional monotonic start time. When a live session switches its mic or
@@ -173,7 +173,12 @@ class CaptureBase:
 
         record_raw_mic: when True AND the APM worker engages, ALSO chunk the RAW (pre-APM) mic
         on a side "MIC_RAW" source, so a recording made with live AEC/AGC on stays raw (the
-        engine still transcribes the processed mic). No effect when the worker does not engage."""
+        engine still transcribes the processed mic). No effect when the worker does not engage.
+
+        positional: passed to the backend's device resolvers (codex G2). True (the CLI default) lets a
+        bare integer spec select by position; the web layer passes False so a UI value, which is always
+        a device NAME, is never reinterpreted as a positional index (a device named "2", or a stale
+        numeric value whose device vanished, resolves by name only and raises when missing)."""
         self.mic_device_spec = mic_device
         self.loopback_device_spec = loopback_device
         self.chunk_seconds = chunk_seconds
@@ -181,6 +186,7 @@ class CaptureBase:
         self.aec = aec
         self.agc = agc
         self.record_raw_mic = record_raw_mic
+        self.positional = positional
         self._live_aec = None     # set in start() when AEC engages; read by the audio callbacks
 
         self._stop_event = threading.Event()

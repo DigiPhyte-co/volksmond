@@ -173,6 +173,17 @@ class _State:
         self.silence_nudge: Optional[dict] = None
         self.silence_watch = None
         self.silence_stop: Optional[threading.Event] = None
+        # System-audio device-follow watcher (WP-4, Windows). sys_idle_hint is the non-blocking
+        # "your chosen system audio is idle, Windows is playing elsewhere" banner payload
+        # ({"chosen", "default"}) or None; sys_switch_notice is the one-shot toast the watcher raises
+        # after it auto-follows a default-output change ({"message", "seq"}), with sys_switch_seq the
+        # server-side counter that makes each notice fire in the UI exactly once. device_follow_stop
+        # is the watcher thread's exit signal. All session-scoped, so reset() clears them (and sets
+        # the event, so the watcher can never outlive its session).
+        self.sys_idle_hint: Optional[dict] = None
+        self.sys_switch_notice: Optional[dict] = None
+        self.sys_switch_seq: int = 0
+        self.device_follow_stop: Optional[threading.Event] = None
         # "Model struggling to keep up" nudge. struggle_nudge is the outstanding warning the UI
         # renders as a banner, or None. It carries a "reason" discriminator plus "recording" (the
         # session's recording state when it was raised):
@@ -273,6 +284,15 @@ class _State:
         self.silence_stop = None
         self.silence_watch = None
         self.silence_nudge = None
+        # Device-follow watcher (WP-4): same discipline as the silence watcher above. Signal it to
+        # exit before dropping the reference so it can never outlive its session, and clear the
+        # session-scoped hint/notice so a fresh session starts clean.
+        if self.device_follow_stop is not None:
+            self.device_follow_stop.set()
+        self.device_follow_stop = None
+        self.sys_idle_hint = None
+        self.sys_switch_notice = None
+        self.sys_switch_seq = 0
         self.struggle_nudge = None
         self.struggle_notified = False
         self.asr_errors = 0
@@ -1253,6 +1273,136 @@ def _silence_signal():
         ev.set()
 
 
+# --- device-follow watcher (WP-4, Windows) -------------------------------------
+# Plugging headphones into a Windows machine renumbers the PortAudio endpoints AND moves the
+# default output. A session that opened the speakers loopback then quietly captures nothing (a
+# WASAPI loopback on an endpoint nothing is rendering to produces no frames). This watcher makes
+# the app follow the default output when the session was on it, and warn (with a one-click fix)
+# when an explicitly chosen loopback goes idle while Windows plays elsewhere. Windows-only: the
+# Mac backend has a single whole-system tap with no per-endpoint choice to follow.
+DEVICE_FOLLOW_ENV = "SA_LIVE_DEVICE_FOLLOW"
+DEVICE_FOLLOW_TICK_S = 5.0    # watcher cadence
+SYS_IDLE_HINT_S = 30.0        # a chosen loopback delivering no frames for this long, while the
+                              # default output differs, raises the idle hint
+# Frame-liveness state for the idle hint, loop-local in effect (one session at a time) but module
+# level so _device_follow_tick is driveable from a test with a hand-wound clock.
+_FOLLOW = {"last_frames": None, "changed_at": 0.0}
+
+
+def _device_follow_env_on() -> bool:
+    """False when SA_LIVE_DEVICE_FOLLOW is set to 0/false/no/off: a hard kill switch, so a support
+    session can turn the whole follow-the-default behaviour off without a code change."""
+    return (os.environ.get(DEVICE_FOLLOW_ENV, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _current_default_loopback_name():
+    """Cleaned name of the current Windows default loopback, or None. One seam the watcher and its
+    test read/patch. Uses the MMDevice probe, NOT PyAudio: while a live capture holds PortAudio open
+    the PortAudio device table is frozen (codex F1), so a PyAudio probe would return the default from
+    when capture started and never see the endpoint the OS just switched to. The MMDevice default
+    render name plus ' [Loopback]' is exactly the PortAudio WASAPI loopback name the resolver matches
+    on the next rebuild (verified: the names are identical)."""
+    try:
+        from .. import mmdevice_win
+        name = mmdevice_win.default_render_friendly_name()
+        return (name + " [Loopback]") if name else None
+    except Exception:
+        return None
+
+
+def _raise_sys_switch_notice(device_name):
+    """Publish a one-shot auto-follow toast for the UI. Structured (device name + seq), NOT a
+    pre-built English string, so the UI can render it through a translated trFmt template (codex F7).
+    seq increments so the UI fires it exactly once. Caller holds STATE.lock."""
+    STATE.sys_switch_seq += 1
+    STATE.sys_switch_notice = {"device": str(device_name), "seq": STATE.sys_switch_seq}
+
+
+def _device_follow_tick(now):
+    """One device-follow decision. Split out of the loop and given the clock explicitly so the whole
+    path is driveable from a test with a patched _current_default_loopback_name and no threads.
+    Returns a short tag for what it did, for the test to assert on.
+
+    Concurrency (codex F2): the capture object AND the session token (STATE.started_at) are sampled
+    under STATE.lock; the switch is done via _switch_device with those expectations, which re-checks
+    them under the lock before touching anything, and every hint/notice write happens under the lock
+    after re-confirming the same session is still current. So a user switch that lands during the
+    probe, or a reset+Start into a new session, can never be clobbered by a stale tick."""
+    with STATE.lock:
+        live = (STATE.running and not STATE.stopping
+                and STATE.source_kind == "live" and STATE.capture is not None)
+        cap = STATE.capture if live else None
+        session = STATE.started_at
+        following = bool(getattr(cap, "sys_following_default", False)) if cap else False
+        chosen = getattr(cap, "sys_loopback_name", None) if cap else None
+        frames = getattr(cap, "sys_frames", None) if cap else None
+    if cap is None:
+        return "idle"
+    default_name = _current_default_loopback_name()   # MMDevice, live (outside the lock: it is slow)
+    if not default_name:
+        return "no-default"
+    if frames != _FOLLOW["last_frames"]:
+        _FOLLOW["last_frames"] = frames
+        _FOLLOW["changed_at"] = now
+    if following:
+        # On the Windows default: follow it when it moves. The switch rebuilds the capture on the new
+        # default's NAME through the same locked path the UI uses, guarded by (cap, session) so a
+        # concurrent user switch or a new session is never overwritten.
+        if default_name != chosen:
+            try:
+                # announce_follow publishes the toast INSIDE the switch's lock scope (codex G5), so it
+                # names the device actually committed and cannot be desynced by a user switch racing
+                # the notice.
+                _switch_device("loopback", default_name, expect_capture=cap, expect_session=session,
+                               announce_follow=True)
+            except HTTPException:
+                return "follow-failed"      # session changed, or the new default would not open
+            except Exception as e:
+                print(f"[device-follow] could not follow the default output: {e}", flush=True)
+                return "follow-failed"
+            return "followed"
+        with STATE.lock:
+            if STATE.capture is cap and STATE.started_at is session:
+                STATE.sys_idle_hint = None
+        return "following"
+    # Explicit non-default pick: warn only when it is delivering NO frames for the idle window while
+    # Windows is playing through a different endpoint. Clear the hint the instant frames arrive or the
+    # names line up again.
+    idle = frames is not None and (now - _FOLLOW["changed_at"]) >= SYS_IDLE_HINT_S
+    hint_on = bool(default_name != chosen and chosen and idle)
+    with STATE.lock:
+        if STATE.capture is cap and STATE.started_at is session:
+            STATE.sys_idle_hint = {"chosen": chosen, "default": default_name} if hint_on else None
+    return "idle-hint" if hint_on else "ok"
+
+
+def _device_follow_loop(stop_event):
+    """The ~5 s watcher thread. Exits within one tick of the session ending. Every tick is fully
+    guarded: a watchdog must never take the session down with it."""
+    _FOLLOW["last_frames"] = None
+    _FOLLOW["changed_at"] = time.monotonic()
+    while not stop_event.wait(DEVICE_FOLLOW_TICK_S):
+        try:
+            _device_follow_tick(time.monotonic())
+        except Exception:
+            pass
+
+
+def _device_follow_start(cap):
+    """Arm the device-follow watcher for a live Windows session. Returns the thread, or None when it
+    is off (non-Windows, kill switch, or no session clock). Caller holds STATE.lock."""
+    if sys.platform != "win32" or not _device_follow_env_on():
+        return None
+    if getattr(cap, "_t0", None) is None:
+        return None
+    stop = threading.Event()
+    STATE.device_follow_stop = stop
+    STATE.sys_idle_hint = None
+    th = threading.Thread(target=_device_follow_loop, args=(stop,), daemon=True, name="device-follow")
+    th.start()
+    return th
+
+
 # --- "model struggling to keep up" nudge --------------------------------------
 # One surface, two causes, both meaning "the transcript you are watching is getting worse":
 #   CPU: the session auto-downgrades (transcribe.Engine._maybe_downgrade, ladder
@@ -1692,6 +1842,20 @@ def status():
             # expose this yet (or a mock in tests) reports as 'active' so the UI never raises a
             # false warning. The live screen banners only on the last two values.
             resp["sys_state"] = getattr(STATE.capture, "sys_state", "active")
+            # sys_error stays a plain English string for the log / diagnostics. sys_fault is the
+            # STRUCTURED form the UI renders from ({reason, device}), so the banner text is built by a
+            # translated trFmt template rather than passing a server string through exact-key tr()
+            # (codex F7). reason is a code: "not_found" | "open_failed" | "not_loopback"; None when the
+            # backend does not expose it (Mac keeps its own permission-denied wording).
+            resp["sys_error"] = getattr(STATE.capture, "sys_error", None)
+            _reason = getattr(STATE.capture, "sys_error_reason", None)
+            resp["sys_fault"] = ({"reason": _reason, "device": getattr(STATE.capture, "sys_error_device", None)}
+                                 if _reason else None)
+            # WP-4: the idle-loopback hint (Windows plays elsewhere) and the one-shot auto-follow
+            # toast, both raised by the device-follow watcher, both structured for translation.
+            # Absent (null) unless it set them.
+            resp["sys_idle_hint"] = STATE.sys_idle_hint
+            resp["sys_switch_notice"] = STATE.sys_switch_notice
         # Live mic-gate truth for the in-meeting toggle and its counter, on the same terms as AEC:
         # the ENGINE'S own state, pulled fresh, never the stored setting. Shape:
         # {on, mode: normal|gentle|off, skipped, decoded, hint, hint_seq}. Absent (null) until the
@@ -1713,18 +1877,76 @@ def status():
         return resp
 
 
+# Last PortAudio device enumeration's name -> sample rate, cached so the MMDevice-based live listing
+# (which has no rates of its own) can carry a display rate over by name. Rate is display-only; the
+# capture opens each device at the native rate it discovers when it resolves, so a stale/missing rate
+# here never affects what is opened.
+_DEVICE_RATE_CACHE = {}
+
+
+def _cache_device_rates(d):
+    for entry in (d.get("mics") or []) + (d.get("loopbacks") or []):
+        if entry.get("name"):
+            _DEVICE_RATE_CACHE[entry["name"]] = entry.get("rate")
+
+
+def _live_devices_win():
+    """The /api/devices dict built from the live MMDevice endpoint set, or None on any failure.
+
+    Why not PyAudio here: while a capture is running it holds PortAudio initialised, and PortAudio
+    builds its device table once (codex F1), so a fresh PyAudio() during a session cannot see a
+    just-plugged endpoint. MMDevice always reflects the live set. Its friendly names are exactly the
+    PortAudio WASAPI names (loopback = render name + ' [Loopback]'; verified), so the names the UI
+    sends back resolve against PortAudio on the next capture rebuild. Indices here are positional and
+    only feed the default highlight (the UI keys everything off the NAME); rates come from the cached
+    PortAudio enumeration by name (display only)."""
+    try:
+        from .. import mmdevice_win
+        eps = mmdevice_win.list_endpoints()
+        renders, captures = eps.get("render"), eps.get("capture")
+        # None means a class could not be enumerated (partial COM failure): fall the WHOLE listing
+        # back to PortAudio rather than advertise a half list that drops a dropdown (codex G4). [] is
+        # a real "nothing active" answer and is kept.
+        if renders is None or captures is None:
+            return None
+        if not renders and not captures:
+            return None
+        loop_names = [n + " [Loopback]" for n in renders]
+        mics = [{"index": i, "name": n, "rate": _DEVICE_RATE_CACHE.get(n)} for i, n in enumerate(captures)]
+        loopbacks = [{"index": i, "name": n, "rate": _DEVICE_RATE_CACHE.get(n)} for i, n in enumerate(loop_names)]
+        dr = mmdevice_win.default_render_friendly_name()
+        default_loop_name = (dr + " [Loopback]") if dr else None
+        default_loop_idx = next((l["index"] for l in loopbacks if l["name"] == default_loop_name), None)
+        dc = mmdevice_win.default_capture_friendly_name()
+        default_mic_idx = next((m["index"] for m in mics if m["name"] == dc), None)
+        return {"loopbacks": loopbacks, "mics": mics,
+                "default_loopback_index": default_loop_idx, "default_mic_index": default_mic_idx}
+    except Exception:
+        return None
+
+
 @app.get("/api/devices")
 def devices_list():
-    """List the mics and loopbacks the user can pick.
-
-    Enumeration is platform-specific (WASAPI-only filtering, per-host-API
-    dedupe and the device-name mojibake fix on Windows), so the body lives
-    behind the devices seam (devices.list_ui_devices); this endpoint just
-    serves its dict: {loopbacks, mics, default_loopback_index,
+    """List the mics and loopbacks the user can pick: {loopbacks, mics, default_loopback_index,
     default_mic_index}.
-    """
+
+    Enumeration is platform-specific (WASAPI-only filtering, per-host-API dedupe and the device-name
+    mojibake fix on Windows), behind the devices seam. DURING a live Windows session the PortAudio
+    table is frozen (codex F1), so the list is built from the live MMDevice endpoint set instead;
+    when nothing is capturing, the PortAudio path is fresh and is used (and its rates are cached for
+    the live path to reuse by name)."""
     from .. import devices
-    return devices.list_ui_devices()
+    with STATE.lock:
+        live = STATE.running and STATE.capture is not None
+    if live and sys.platform == "win32":
+        d = _live_devices_win()
+        if d is not None:
+            return d
+        # MMDevice unavailable (COM failure): fall through to PortAudio, stale during a session but
+        # better than an empty list.
+    d = devices.list_ui_devices()
+    _cache_device_rates(d)
+    return d
 
 
 @app.get("/api/levels")
@@ -1751,13 +1973,26 @@ def switch_device(req: SwitchDeviceRequest):
     file keep running; the original timeline (t0) is preserved so timestamps stay continuous.
     There is a brief (~1s) capture gap during the switch. On failure we revert to the
     previously working devices, so a bad pick never leaves the session with no audio."""
+    return _switch_device(req.which, req.device)
+
+
+def _switch_device(which, device, expect_capture=None, expect_session=None, announce_follow=False):
+    """Core of the device switch, callable by the API handler and by the device-follow watcher.
+
+    expect_capture / expect_session (codex F2): when given, the switch runs ONLY if STATE.capture is
+    still that exact object AND STATE.started_at is still that session, checked under STATE.lock that
+    is held across the whole rebuild. This is how a background watcher can switch without clobbering a
+    user switch that landed since it sampled, or acting on a session that has since been reset+started.
+    The API handler passes neither (any live session is a valid target)."""
     with STATE.lock:
         if not STATE.running or STATE.stopping or STATE.source_kind != "live" or STATE.capture is None:
             raise HTTPException(status_code=409, detail="Switching devices is only available during a live session.")
+        if expect_capture is not None and (STATE.capture is not expect_capture or STATE.started_at is not expect_session):
+            raise HTTPException(status_code=409, detail="The device changed since the follow check.")
         old_cap = STATE.capture
         prev_mic, prev_loop = STATE.mic_device, STATE.loopback_device
-        mic = req.device if req.which == "mic" else prev_mic
-        loop = req.device if req.which == "loopback" else prev_loop
+        mic = device if which == "mic" else prev_mic
+        loop = device if which == "loopback" else prev_loop
         chunk = STATE.chunk_seconds or 15
 
         def _build(m, l):
@@ -1766,7 +2001,8 @@ def switch_device(req: SwitchDeviceRequest):
             # recording side channel) off.
             c = capture.AudioCapture(mic_device=m, loopback_device=l, chunk_seconds=chunk,
                                      on_chunk=_feed, t0=old_cap._t0, aec=old_cap.aec,
-                                     agc=old_cap.agc, record_raw_mic=old_cap.record_raw_mic)
+                                     agc=old_cap.agc, record_raw_mic=old_cap.record_raw_mic,
+                                     positional=False)   # switch values are device NAMES (codex G2)
             eng = STATE.engine
             # Re-attach BOTH energy rings, or the guards' level reference dies at the first
             # mid-meeting device change (the rings survive on the engine; the new capture has to
@@ -1798,6 +2034,16 @@ def switch_device(req: SwitchDeviceRequest):
         try:
             new_cap = _build(mic, loop)
             new_cap.start()
+            # A loopback that cannot resolve or open no longer raises on Windows (the mic-only session
+            # is valid, sys_state just goes "failed"), so start() returning is NOT proof the new system
+            # audio is live. A loopback switch that landed on a dead device must not report success and
+            # toast "System audio switched." Treat it as a failed switch: fall into the revert path
+            # below, which brings the previous device back and returns the reason for the UI to toast.
+            if which == "loopback" and getattr(new_cap, "sys_state", "active") == "failed":
+                raise RuntimeError(
+                    getattr(new_cap, "sys_error", None)
+                    or "the system-audio device delivered no audio (nothing may be playing to it)."
+                )
         except Exception as e:
             # The new device would not open. Stop the half-opened attempt first so it cannot
             # leak the audio device and a thread, then bring the previous (working) one back
@@ -1821,13 +2067,20 @@ def switch_device(req: SwitchDeviceRequest):
                     except Exception:
                         pass
                 STATE.capture = None  # both failed: session stays running with no capture; the user can Stop
-            raise HTTPException(status_code=500, detail=f"Could not switch the {req.which}: {e}")
+            raise HTTPException(status_code=500, detail=f"Could not switch the {which}: {e}")
         STATE.capture = new_cap
         STATE.record_raw_mic = new_cap.has_raw_mic()   # AEC may re-engage (or not) on the new device
         STATE.mic_device, STATE.loopback_device = mic, loop
         _reset_loop_history()
         _silence_after_switch()
-        return {"which": req.which, "device": req.device, "mic_device": mic, "loopback_device": loop}
+        # Publish the auto-follow toast INSIDE this lock scope (codex G5), naming the device we just
+        # committed to (`loop`), so a user switch that lands between here and the watcher's next line
+        # can never make the notice name the wrong output. The watcher passes announce_follow only on
+        # the follow path; the API handler never does.
+        if announce_follow:
+            _raise_sys_switch_notice(loop)
+            STATE.sys_idle_hint = None
+        return {"which": which, "device": device, "mic_device": mic, "loopback_device": loop}
 
 
 class SilenceNudgeRequest(BaseModel):
@@ -3228,6 +3481,7 @@ def start(req: StartRequest):
             aec=aec_live,
             agc=agc_live,
             record_raw_mic=False,   # record the AEC-cleaned mic into the single stereo file, not a raw stem
+            positional=False,       # UI values are device NAMES, never positional indices (codex G2)
         )
         # The engine's energy rings (SYS echo-veto reference, gain-invariant raw MIC) live on the
         # engine and are attached by _build_engine_async once it exists, not here, because there is no
@@ -3245,6 +3499,11 @@ def start(req: StartRequest):
         # True only if live AEC actually engaged (the raw side channel exists). If AEC could not
         # start, this stays False and the recorder takes the normal MIC, which is already raw.
         STATE.record_raw_mic = cap.has_raw_mic()
+        # Follow-the-default watcher (WP-4, Windows): arm it for every live session (transcription or
+        # record-only) the moment capture is live, independent of the engine. It follows a default-
+        # output change and warns on an idle chosen loopback; a no-op off Windows or with the kill
+        # switch set.
+        _device_follow_start(cap)
         # Long-silence watcher: a record-only session has no engine (its rings live on the engine), so
         # it arms here exactly as before. A transcription session arms its watcher from
         # _build_engine_async, once the engine + rings exist.

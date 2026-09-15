@@ -42,7 +42,7 @@ START_BODY = {"transcribe": True, "record": False, "tier": "small", "device": "c
 
 class FakeCapture:
     def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15,
-                 on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False):
+                 on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False, positional=True):
         self.on_chunk = on_chunk
         self.record_raw_mic = record_raw_mic
         self._t0 = t0 if t0 is not None else 0.0

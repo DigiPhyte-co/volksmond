@@ -102,7 +102,7 @@ def print_devices():
     print("System audio is the whole-system tap; --loopback-device selects it on/off only.")
 
 
-def resolve_loopback(p, spec):
+def resolve_loopback(p, spec, positional=True):
     """Resolve the system-audio request to the synthetic tap descriptor, or raise.
 
     On macOS there is exactly one tap, so this collapses to "helper on/off":
@@ -111,16 +111,23 @@ def resolve_loopback(p, spec):
     the capture backend treats the same way Windows treats a failed loopback
     resolve: log it and continue mic-only.
 
-    `p` is accepted for signature parity with the Windows backend (which passes
-    its PyAudio handle) and is ignored here.
+    `positional` (codex G2) mirrors the Windows signature: the CLI passes True so the sentinel index
+    still works; the web layer passes False so a UI value is name-only. `p` is accepted for signature
+    parity with the Windows backend and is ignored here.
     """
     if spec is None:
         return _sys_loopback_entry()
-    # Numeric spec: only the sentinel index selects the tap.
-    try:
-        idx = int(spec)
-    except (TypeError, ValueError):
-        idx = None
+    # Exact name match first (codex F5), so the UI's exact synthetic name resolves before any looser
+    # rule; there is only one tap, so this is simply the precise form of the substring accept below.
+    if str(spec).strip() == SYS_LOOPBACK_NAME:
+        return _sys_loopback_entry()
+    # Numeric spec: only the sentinel index selects the tap (CLI only).
+    idx = None
+    if positional:
+        try:
+            idx = int(spec)
+        except (TypeError, ValueError):
+            idx = None
     if idx is not None:
         if idx == SYS_LOOPBACK_INDEX:
             return _sys_loopback_entry()
@@ -138,14 +145,17 @@ def resolve_loopback(p, spec):
     )
 
 
-def resolve_mic(p, spec):
+def resolve_mic(p, spec, positional=True):
     """Return a normalised mic descriptor ({index, name, rate, channels}) that
     capture_mac can hand straight to a sounddevice InputStream.
 
-    Resolution order mirrors the Windows backend: None -> the Core Audio default
-    input; an integer -> that device index (must have input channels); otherwise
-    a case-insensitive name-substring match. `p` is ignored (parity with the
-    Windows signature).
+    Resolution order mirrors the Windows backend (codex F5): None -> the Core Audio
+    default input; an EXACT cleaned-name match (the value the shared UI sends now);
+    then (only when `positional`) an integer -> that device index; then a
+    case-insensitive name-substring match. Exact-before-substring stops picking
+    "Microphone" from opening "External Microphone". `positional` is False from the
+    web layer so a numeric UI value is name-only (codex G2). `p` is ignored (parity
+    with the Windows signature).
     """
     sd = _sd()
     devices = sd.query_devices()
@@ -168,11 +178,21 @@ def resolve_mic(p, spec):
             return _descriptor(i)
         raise ValueError("No microphone (input device) found. Run --list-devices.")
 
-    # Integer index.
-    try:
-        idx = int(spec)
-    except (TypeError, ValueError):
-        idx = None
+    # Exact name match first: the UI sends the device NAME, and a substring search would open
+    # "External Microphone" when the user picked "Microphone". A numeric friendly name resolves here
+    # as a name before the positional index branch below.
+    want = str(spec).strip()
+    for i, info in _input_devices(sd):
+        if str(info["name"]).strip() == want:
+            return _descriptor(i)
+
+    # Integer index (positional, for the CLI only).
+    idx = None
+    if positional:
+        try:
+            idx = int(spec)
+        except (TypeError, ValueError):
+            idx = None
     if idx is not None:
         if idx < 0 or idx >= len(devices):
             raise ValueError(f"No device #{idx}. Run --list-devices.")
@@ -181,7 +201,7 @@ def resolve_mic(p, spec):
         return _descriptor(idx)
 
     # Name substring.
-    sub = str(spec).lower()
+    sub = want.lower()
     for i, info in _input_devices(sd):
         if sub in str(info["name"]).lower():
             return _descriptor(i)
