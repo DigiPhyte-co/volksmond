@@ -486,9 +486,10 @@ html, body { margin: 0; padding: 0; height: 100%; }
 .model-setup-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-top: 1px solid var(--line); }
 .model-setup-row:first-child { border-top: 0; }
 .model-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); }
-.model-table { width: 100%; min-width: 790px; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
+.model-table { width: 100%; min-width: 560px; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
 .model-table th { padding: 8px 10px; color: var(--ink-3); font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em; text-align: left; text-transform: uppercase; }
 .model-table td { padding: 8px 10px; border-top: 1px solid var(--line); color: var(--ink-2); vertical-align: middle; white-space: nowrap; }
+.model-table td:nth-child(2) { white-space: normal; line-height: 1.35; }
 .model-table th:nth-child(1) { width: 29%; }
 .model-table th:nth-child(2) { width: 19%; }
 .model-table th:nth-child(3) { width: 10%; }
