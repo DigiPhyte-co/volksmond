@@ -27,6 +27,12 @@ class AudioCapture(CaptureBase):
         # human-readable reason (device name + what went wrong, no stack trace) the banner shows.
         self.sys_state = "active"
         self.sys_error = None
+        # Structured form of the same failure for the UI (codex F7): sys_error_reason is a code
+        # ("not_found" | "open_failed") and sys_error_device the device name, so the banner text is
+        # built by a translated trFmt template rather than passing this English string through
+        # exact-key tr(). sys_error stays a plain English string for the log and diagnostics.
+        self.sys_error_reason = None
+        self.sys_error_device = None
         # Follow-the-default bookkeeping for the device-follow watcher (WP-4). sys_loopback_name is
         # the CLEANED name of the loopback we actually opened; sys_following_default is True when that
         # equals the Windows default output's loopback name at open time, which is the signal the
@@ -41,6 +47,8 @@ class AudioCapture(CaptureBase):
         self._pa = pa.PyAudio()
         self.sys_state = "active"   # optimistic; flipped to "failed" below if the loopback cannot open
         self.sys_error = None
+        self.sys_error_reason = None
+        self.sys_error_device = None
 
         loopback_info = None
         try:
@@ -51,7 +59,7 @@ class AudioCapture(CaptureBase):
             # session. Record it so /api/status can raise the banner (H1) and the user knows the far
             # side of the call is missing from the transcript.
             self.sys_state = "failed"
-            self.sys_error = self._sys_error_text(self.loopback_device_spec, opened=False)
+            self._set_sys_error(self.loopback_device_spec, reason="not_found")
             print(f"[SYS] cannot resolve loopback: {e}", flush=True)
 
         mic_info = None
@@ -76,7 +84,7 @@ class AudioCapture(CaptureBase):
                 self._open_stream("SYS", loopback_info)
             except Exception as e:
                 self.sys_state = "failed"
-                self.sys_error = self._sys_error_text(loopback_info.get("name"), opened=True)
+                self._set_sys_error(loopback_info.get("name"), reason="open_failed")
                 print(f"[SYS] could not open system audio device #{loopback_info['index']} "
                       f"'{loopback_info['name']}': {e}", flush=True)
         if mic_info is not None:
@@ -107,17 +115,20 @@ class AudioCapture(CaptureBase):
                 default_name is not None and self.sys_loopback_name == default_name
             )
 
-    @staticmethod
-    def _sys_error_text(name, opened):
-        """Short, human-readable reason the system audio is not being captured, for the banner.
-        `name` is the chosen device (a spec or a raw PyAudio name); `opened` distinguishes a device
-        that resolved but would not open from one that could not be found at all. No stack traces."""
+    def _set_sys_error(self, name, reason):
+        """Record a system-audio failure in both forms: the structured (reason code + device name)
+        the UI renders through a translated template (codex F7), and the plain English sys_error
+        string for the log and diagnostics. reason is "not_found" (could not resolve) or "open_failed"
+        (resolved but the endpoint would not open, usually nothing rendering to it). No stack traces."""
         who = _fix_name(str(name)).strip() if name else "the chosen system-audio device"
-        if opened:
-            return (f"System audio device '{who}' would not open, usually because nothing is playing "
-                    "to it. Pick the output you are actually using in the System audio dropdown.")
-        return (f"System audio device '{who}' could not be found (it may have been unplugged or "
-                "renumbered). Pick another entry in the System audio dropdown.")
+        self.sys_error_reason = reason
+        self.sys_error_device = who
+        if reason == "open_failed":
+            self.sys_error = (f"System audio device '{who}' would not open, usually because nothing is "
+                              "playing to it. Pick the output you are actually using in the System audio dropdown.")
+        else:
+            self.sys_error = (f"System audio device '{who}' could not be found (it may have been unplugged "
+                              "or renumbered). Pick another entry in the System audio dropdown.")
 
     def _close_sources(self):
         """Stop and close every stream; True only if they all closed. The per-stream exception is

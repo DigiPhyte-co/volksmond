@@ -65,29 +65,53 @@ def print_devices():
         p.terminate()
 
 
+def _wasapi_host_index(p):
+    """The WASAPI host-API index, or None when it cannot be read."""
+    try:
+        return p.get_host_api_info_by_type(pa.paWASAPI)["index"]
+    except Exception:
+        return None
+
+
+def _mic_pool(p):
+    """The candidate input devices, WASAPI-first (codex F3). resolve_mic must resolve against the
+    SAME preferred pool list_ui_devices enumerates, or an identically named MME/DirectSound duplicate
+    at a lower index could win over the WASAPI endpoint the UI actually listed and offered. So: the
+    WASAPI mics when WASAPI exposes any, otherwise every real input device (the same fallback the UI
+    listing uses when WASAPI has none)."""
+    allmics = []
+    for i in range(p.get_device_count()):
+        info = p.get_device_info_by_index(i)
+        if info["maxInputChannels"] > 0 and not info.get("isLoopbackDevice", False):
+            allmics.append(info)
+    wasapi_idx = _wasapi_host_index(p)
+    wasapi_mics = [m for m in allmics if wasapi_idx is not None and m["hostApi"] == wasapi_idx]
+    return wasapi_mics if wasapi_mics else allmics
+
+
 def resolve_loopback(p, spec):
     """Return a PortAudio device info dict for a loopback (system audio) device.
 
-    A bare integer takes the positional branch (the CLI --loopback-device N still works, and a
-    stale index that lands on a render/mic device still raises, so a numeric spec is never silently
-    reinterpreted). Everything else is a NAME, which is what the UI sends now: match it against the
-    CLEANED loopback names, exact match first (unambiguous when names are unique) then the historical
-    case-insensitive substring. Resolving by name is what makes a selection survive the endpoint
-    renumbering that plugging headphones triggers, where the old positional index pointed at a
-    different device."""
+    Resolution order (codex F4): None -> the system default; then an EXACT cleaned-name match (the
+    UI's value, which can itself be numeric like "123"); then a bare integer as a positional index
+    (the CLI --loopback-device N, which still raises when it lands on a non-loopback device); then the
+    historical case-insensitive substring. Exact-name-before-index is what lets a device whose
+    friendly name happens to be a number resolve as a name, while a CLI numeric spec (no device is
+    named "26") still selects by position. Resolving by name is what makes a selection survive the
+    endpoint renumbering that plugging headphones triggers."""
     if spec is None:
         return p.get_default_wasapi_loopback()
+    want = str(spec).strip()
+    loopbacks = list(p.get_loopback_device_info_generator())
+    for info in loopbacks:
+        if _fix_name(info["name"]).strip() == want:
+            return info
     idx = _as_index(spec)
     if idx is not None:
         info = p.get_device_info_by_index(idx)
         if not info.get("isLoopbackDevice"):
             raise ValueError(f"Device #{idx} '{_fix_name(info['name'])}' is not a loopback device.")
         return info
-    want = str(spec).strip()
-    loopbacks = list(p.get_loopback_device_info_generator())
-    for info in loopbacks:
-        if _fix_name(info["name"]).strip() == want:
-            return info
     sub = want.lower()
     for info in loopbacks:
         if sub in _fix_name(info["name"]).strip().lower():
@@ -98,27 +122,26 @@ def resolve_loopback(p, spec):
 def resolve_mic(p, spec):
     """Return a PortAudio device info dict for a microphone (non-loopback input).
 
-    Same resolution order as resolve_loopback: None -> the system default; a bare integer -> that
-    index (positional, for the CLI; raises when it has no input channels); otherwise a NAME (the
-    UI's value) matched against the CLEANED names of the real input devices, exact first then
-    substring. Loopback devices are skipped throughout, so a name that also exists as a loopback
-    can never resolve to the wrong class."""
+    Same order as resolve_loopback: None -> the system default; EXACT cleaned-name match over the
+    WASAPI-first pool (codex F3/F4); then a bare integer as a positional index (CLI; raises on no
+    input channels); then substring over the pool. Resolving against the same preferred pool the UI
+    lists means an identically named MME duplicate can never win over the WASAPI endpoint that was
+    offered, and loopbacks are excluded throughout so a name can never cross classes."""
     if spec is None:
         return p.get_default_input_device_info()
+    want = str(spec).strip()
+    pool = _mic_pool(p)
+    for info in pool:
+        if _fix_name(info["name"]).strip() == want:
+            return info
     idx = _as_index(spec)
     if idx is not None:
         info = p.get_device_info_by_index(idx)
         if info["maxInputChannels"] == 0:
             raise ValueError(f"Device #{idx} '{_fix_name(info['name'])}' has no input channels.")
         return info
-    want = str(spec).strip()
-    mics = [p.get_device_info_by_index(i) for i in range(p.get_device_count())]
-    mics = [m for m in mics if m["maxInputChannels"] > 0 and not m.get("isLoopbackDevice", False)]
-    for info in mics:
-        if _fix_name(info["name"]).strip() == want:
-            return info
     sub = want.lower()
-    for info in mics:
+    for info in pool:
         if sub in _fix_name(info["name"]).strip().lower():
             return info
     raise ValueError(f"No mic matching {spec!r}. Run --list-devices.")

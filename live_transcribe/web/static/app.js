@@ -207,7 +207,7 @@ function freshLive() {
     // banner. sysIdleHint ({chosen, default}) drives the non-blocking "your system audio is idle,
     // Windows is playing elsewhere" banner with a one-click switch. sysSwitchSeq is the last
     // auto-follow toast this client has shown, so a reload never re-fires an old one.
-    sysError: null, sysIdleHint: null, sysSwitchSeq: 0,
+    sysError: null, sysFault: null, sysIdleHint: null, sysIdleHintDismissedFor: null, sysSwitchSeq: 0,
     // Server-owned latched flag: true once recording is, or has ever been, active this session.
     // Latched (never clears on stop) so the record affordances stay hidden after a stop, which
     // prevents a stop-then-restart that would clobber the session WAV.
@@ -1598,8 +1598,10 @@ function render() {
     APP.appendChild(sysAudioBanner());
   }
   // The idle-loopback hint (Windows is playing through a different output than the one you chose):
-  // a non-blocking banner with a one-click "use it" switch. Same live/record-only screens.
-  if (S.live.sysIdleHint && (S.route === "live" || S.route === "recordonly")) {
+  // a non-blocking banner with a one-click "use it" switch. Same live/record-only screens. Honours a
+  // local dismiss by signature so a dismissed hint stays gone until the condition changes (F8).
+  if (S.live.sysIdleHint && sysIdleHintSig(S.live.sysIdleHint) !== S.live.sysIdleHintDismissedFor
+      && (S.route === "live" || S.route === "recordonly")) {
     APP.appendChild(sysIdleHintBanner());
   }
   if (S.toast) {
@@ -2159,6 +2161,8 @@ function asrErrorSig(n) { return n ? String(n.count || 0) : ""; }
 // The idle-loopback hint's identity is the two device names it names, so it re-renders when either
 // the chosen or the default output changes.
 function sysIdleHintSig(h) { return h ? (String(h.chosen || "") + "|" + String(h.default || "")) : ""; }
+// The system-audio fault's identity is the reason plus the device it names.
+function sysFaultSig(f) { return f ? (String(f.reason || "") + "|" + String(f.device || "")) : ""; }
 function refreshSilence() {
   if (!S.live.running || S.live.sourceKind === "file") return;
   api.get("/api/status").then(function (st) {
@@ -2192,10 +2196,12 @@ function refreshSilence() {
     // is treated the same as "active" so it never renders a stale warning.
     var ss = st.sys_state || null;
     if (ss !== S.live.sysState) { S.live.sysState = ss; changed = true; }
-    // The loopback failure detail that goes in the banner (Windows), plus the idle-loopback hint,
-    // both continuous readings adopted every poll.
+    // The loopback failure detail for the banner: sysError (English, for the log) plus sysFault, the
+    // STRUCTURED {reason, device} the banner renders through a translated template (codex F7).
     var se = st.sys_error || null;
     if (se !== S.live.sysError) { S.live.sysError = se; changed = true; }
+    var sf = st.sys_fault || null;
+    if (sysFaultSig(sf) !== sysFaultSig(S.live.sysFault)) { S.live.sysFault = sf; changed = true; }
     var sih = st.sys_idle_hint || null;
     if (sysIdleHintSig(sih) !== sysIdleHintSig(S.live.sysIdleHint)) { S.live.sysIdleHint = sih; changed = true; }
     // The device the capture is actually running on can change WITHOUT a user action (the server's
@@ -2203,11 +2209,12 @@ function refreshSilence() {
     // dropdowns honest.
     if (st.mic_device != null && st.mic_device !== S.live.micDevice) { S.live.micDevice = st.mic_device; changed = true; }
     if (st.loopback_device != null && st.loopback_device !== S.live.loopbackDevice) { S.live.loopbackDevice = st.loopback_device; changed = true; }
-    // One-shot toast when the server auto-followed a default-output change. seq gates it to once.
+    // One-shot toast when the server auto-followed a default-output change. seq gates it to once; the
+    // notice is structured ({device, seq}), so the text is built here from a translated template (F7).
     var notice = st.sys_switch_notice || null;
     if (notice && (notice.seq || 0) > (S.live.sysSwitchSeq || 0)) {
       S.live.sysSwitchSeq = notice.seq || 0;
-      toast(notice.message || "");
+      toast(trFmt("System audio moved to {d} (Windows default output changed)", { d: notice.device || "" }));
     }
     // The mic-gate counter and mode, plus any hint the quiet-mic safety valve has just latched.
     // Not silent: this is the poll that is meant to surface it.
@@ -2421,14 +2428,20 @@ function dismissSysAudioWarning() {
 // body varies: permission_denied gets the extra "how to fix it" sentence, failed does not (nothing
 // the user can do about it mid-meeting beyond knowing the other side is missing).
 function sysAudioBanner() {
-  // Windows supplies a specific reason (device name + what went wrong + which dropdown to use); the
-  // Mac permission-denied case keeps its own how-to-fix wording. Fall back to the generic line when
-  // neither is present.
-  var body = S.live.sysError
-    ? S.live.sysError + " Only your microphone is being recorded, so the other side of the call won't be in the transcript."
-    : (S.live.sysState === "permission_denied"
-        ? "System audio isn't being captured, so only your microphone is being recorded. The other side of the call won't be in the transcript. You can allow it in System Settings > Privacy & Security, then restart the meeting."
-        : "System audio isn't being captured, so only your microphone is being recorded. The other side of the call won't be in the transcript.");
+  // Windows supplies a STRUCTURED fault ({reason, device}); the banner builds its text from a
+  // translated trFmt template so the Afrikaans UI is not bypassed (codex F7). The Mac permission-
+  // denied case keeps its own how-to-fix wording; a generic line is the final fallback.
+  var f = S.live.sysFault;
+  var body;
+  if (f && f.reason === "open_failed") {
+    body = trFmt("System audio device {d} would not open, usually because nothing is playing to it. Pick the output you are actually using in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.", { d: f.device || "" });
+  } else if (f && f.reason === "not_found") {
+    body = trFmt("System audio device {d} could not be found (it may have been unplugged or renumbered). Pick another entry in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.", { d: f.device || "" });
+  } else if (S.live.sysState === "permission_denied") {
+    body = tr("System audio isn't being captured, so only your microphone is being recorded. The other side of the call won't be in the transcript. You can allow it in System Settings > Privacy & Security, then restart the meeting.");
+  } else {
+    body = tr("System audio isn't being captured, so only your microphone is being recorded. The other side of the call won't be in the transcript.");
+  }
   return el("div", { style: { position: "fixed", top: "16px", left: "50%", transform: "translateX(-50%)", zIndex: "60", maxWidth: "460px", width: "calc(100% - 32px)" } },
     el("div", { class: "card", style: { padding: "14px 16px", display: "flex", gap: "12px", alignItems: "flex-start", borderColor: "var(--warn)", boxShadow: "0 10px 34px rgba(0,0,0,0.20)" } }, [
       el("div", { class: "tone-tile warn", style: { width: "34px", height: "34px", flex: "0 0 auto" } }, icon("alert", 17)),
@@ -2444,6 +2457,13 @@ function sysAudioBanner() {
 // sysAudioBanner this is not a hard failure, so its main affordance is a one-click switch to the
 // output Windows is actually using, by NAME (index-independent). A live switch, so it goes through
 // the same switchDevice() the dropdown uses, including its revert-on-failure.
+// Dismiss the idle hint by remembering its SIGNATURE, not by clearing the local copy: the hint is a
+// continuous server reading, so clearing S.live.sysIdleHint alone lets the next poll restore it
+// (codex F8). Suppressed until the server hint changes (a different chosen/default) or clears.
+function dismissSysIdleHint() {
+  S.live.sysIdleHintDismissedFor = sysIdleHintSig(S.live.sysIdleHint);
+  render();
+}
 function sysIdleHintBanner() {
   var h = S.live.sysIdleHint || {};
   return el("div", { style: { position: "fixed", top: "16px", left: "50%", transform: "translateX(-50%)", zIndex: "60", maxWidth: "460px", width: "calc(100% - 32px)" } },
@@ -2456,7 +2476,7 @@ function sysIdleHintBanner() {
         el("div", { class: "row gap-8", style: { marginTop: "10px" } }, [
           el("button", { class: "btn primary sm", disabled: S.live.switching,
             onclick: function () { switchDevice("loopback", h.default); } }, tr("Use it")),
-          el("button", { class: "btn ghost sm", onclick: function () { S.live.sysIdleHint = null; render(); } }, tr("Dismiss")),
+          el("button", { class: "btn ghost sm", onclick: dismissSysIdleHint }, tr("Dismiss")),
         ]),
       ]),
     ]));
@@ -4868,23 +4888,43 @@ function deviceField(label, list, value, defaultIdx, onChange) {
 // user's current pick by NAME; if that pick vanished (e.g. headphones unplugged) it falls back to
 // the current default for that class and toasts which device is now selected. `doToast` is off for
 // the live-strip refresh, where a silent list update is less jarring mid-meeting.
-var _devFetchInFlight = false;
-async function refreshDevices(doToast) {
-  if (_devFetchInFlight) return;
-  _devFetchInFlight = true;
-  var dev;
-  try { dev = await api.get("/api/devices"); }
-  catch (e) { _devFetchInFlight = false; return; }
-  _devFetchInFlight = false;
-  if (!dev) return;
-  var before = JSON.stringify({ m: S.devices && S.devices.mics, l: S.devices && S.devices.loopbacks });
-  S.devices = dev;
-  var reconciled = reconcileFormDevices(dev, doToast);
-  var after = JSON.stringify({ m: dev.mics, l: dev.loopbacks });
-  // Only re-render when something actually changed. Re-rendering rebuilds the <select> the user just
-  // clicked, which would close a dropdown that is mid-open; skipping the no-op case keeps the common
-  // "list unchanged" open smooth.
-  if (reconciled || before !== after) render();
+// Resolve a promise with a hard time bound: on timeout it rejects, so a slow /api/devices can never
+// leave Begin hanging (codex F6). The underlying fetch is left to settle on its own.
+function withTimeout(promise, ms) {
+  return new Promise(function (resolve, reject) {
+    var t = setTimeout(function () { reject(new Error("timeout")); }, ms);
+    promise.then(function (v) { clearTimeout(t); resolve(v); },
+                 function (e) { clearTimeout(t); reject(e); });
+  });
+}
+// A single in-flight refresh shared by every caller (codex F6): if a dropdown-focus refresh is
+// already running when Begin is pressed, Begin AWAITS that same promise and starts from the
+// reconciled selection, instead of returning immediately and submitting the pre-reconcile pick. The
+// fetch is bounded (4 s) so Begin never hangs; on timeout or failure we proceed with the current
+// selection and log to the console.
+var _devRefreshPromise = null;
+function refreshDevices(doToast) {
+  if (_devRefreshPromise) return _devRefreshPromise;
+  var p = (async function () {
+    var dev = null;
+    try { dev = await withTimeout(api.get("/api/devices"), 4000); }
+    catch (e) { console.log("device refresh skipped (" + (e && e.message) + "); using current selection"); }
+    if (dev) {
+      var before = JSON.stringify({ m: S.devices && S.devices.mics, l: S.devices && S.devices.loopbacks });
+      S.devices = dev;
+      var reconciled = reconcileFormDevices(dev, doToast);
+      var after = JSON.stringify({ m: dev.mics, l: dev.loopbacks });
+      // Only re-render when something actually changed. Re-rendering rebuilds the <select> the user
+      // just clicked, which would close a dropdown that is mid-open; skipping the no-op case keeps the
+      // common "list unchanged" open smooth.
+      if (reconciled || before !== after) render();
+    }
+    return dev;
+  })();
+  _devRefreshPromise = p;
+  var clear = function () { if (_devRefreshPromise === p) _devRefreshPromise = null; };
+  p.then(clear, clear);
+  return p;
 }
 // Bring the idle-form picks (S.form.mic / S.form.loopback) back onto the fresh list. Returns true
 // when a pick changed, so the caller can decide to re-render. Live-strip picks are intentionally
@@ -5005,6 +5045,7 @@ function adoptRunning(status) {
   S.live.aecActive = !!status.aec_live_active;
   S.live.sysState = status.sys_state || null;   // system-audio capture health at reload time
   S.live.sysError = status.sys_error || null;
+  S.live.sysFault = status.sys_fault || null;
   S.live.sysIdleHint = status.sys_idle_hint || null;
   // A follow-the-default toast that fired before this reload is history: adopt its seq WITHOUT
   // toasting, so a reload never re-shows it (the mic-gate hint uses the same silent-on-reload rule).

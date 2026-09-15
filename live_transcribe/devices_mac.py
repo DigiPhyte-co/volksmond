@@ -116,6 +116,10 @@ def resolve_loopback(p, spec):
     """
     if spec is None:
         return _sys_loopback_entry()
+    # Exact name match first (codex F5), so the UI's exact synthetic name resolves before any looser
+    # rule; there is only one tap, so this is simply the precise form of the substring accept below.
+    if str(spec).strip() == SYS_LOOPBACK_NAME:
+        return _sys_loopback_entry()
     # Numeric spec: only the sentinel index selects the tap.
     try:
         idx = int(spec)
@@ -142,10 +146,12 @@ def resolve_mic(p, spec):
     """Return a normalised mic descriptor ({index, name, rate, channels}) that
     capture_mac can hand straight to a sounddevice InputStream.
 
-    Resolution order mirrors the Windows backend: None -> the Core Audio default
-    input; an integer -> that device index (must have input channels); otherwise
-    a case-insensitive name-substring match. `p` is ignored (parity with the
-    Windows signature).
+    Resolution order mirrors the Windows backend (codex F5): None -> the Core Audio
+    default input; an EXACT cleaned-name match (the value the shared UI sends now);
+    then an integer -> that device index (positional, for the CLI); then a
+    case-insensitive name-substring match. Exact-before-substring stops picking
+    "Microphone" from opening "External Microphone". `p` is ignored (parity with
+    the Windows signature).
     """
     sd = _sd()
     devices = sd.query_devices()
@@ -168,7 +174,15 @@ def resolve_mic(p, spec):
             return _descriptor(i)
         raise ValueError("No microphone (input device) found. Run --list-devices.")
 
-    # Integer index.
+    # Exact name match first: the UI sends the device NAME, and a substring search would open
+    # "External Microphone" when the user picked "Microphone". A numeric friendly name resolves here
+    # as a name before the positional index branch below.
+    want = str(spec).strip()
+    for i, info in _input_devices(sd):
+        if str(info["name"]).strip() == want:
+            return _descriptor(i)
+
+    # Integer index (positional, for the CLI).
     try:
         idx = int(spec)
     except (TypeError, ValueError):
@@ -181,7 +195,7 @@ def resolve_mic(p, spec):
         return _descriptor(idx)
 
     # Name substring.
-    sub = str(spec).lower()
+    sub = want.lower()
     for i, info in _input_devices(sd):
         if sub in str(info["name"]).lower():
             return _descriptor(i)

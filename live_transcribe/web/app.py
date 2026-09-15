@@ -1296,65 +1296,84 @@ def _device_follow_env_on() -> bool:
 
 
 def _current_default_loopback_name():
-    """Cleaned name of the current Windows default WASAPI loopback, or None. One seam the watcher
-    and its test read/patch; imports devices_win lazily so this file stays importable off Windows."""
+    """Cleaned name of the current Windows default loopback, or None. One seam the watcher and its
+    test read/patch. Uses the MMDevice probe, NOT PyAudio: while a live capture holds PortAudio open
+    the PortAudio device table is frozen (codex F1), so a PyAudio probe would return the default from
+    when capture started and never see the endpoint the OS just switched to. The MMDevice default
+    render name plus ' [Loopback]' is exactly the PortAudio WASAPI loopback name the resolver matches
+    on the next rebuild (verified: the names are identical)."""
     try:
-        from ..devices_win import default_loopback_name
-        return default_loopback_name()
+        from .. import mmdevice_win
+        name = mmdevice_win.default_render_friendly_name()
+        return (name + " [Loopback]") if name else None
     except Exception:
         return None
 
 
-def _raise_sys_switch_notice(message):
-    """Publish a one-shot auto-follow toast for the UI. seq increments so the UI fires it exactly
-    once (the same hint_seq discipline the mic-gate hint uses)."""
+def _raise_sys_switch_notice(device_name):
+    """Publish a one-shot auto-follow toast for the UI. Structured (device name + seq), NOT a
+    pre-built English string, so the UI can render it through a translated trFmt template (codex F7).
+    seq increments so the UI fires it exactly once. Caller holds STATE.lock."""
     STATE.sys_switch_seq += 1
-    STATE.sys_switch_notice = {"message": str(message), "seq": STATE.sys_switch_seq}
+    STATE.sys_switch_notice = {"device": str(device_name), "seq": STATE.sys_switch_seq}
 
 
 def _device_follow_tick(now):
     """One device-follow decision. Split out of the loop and given the clock explicitly so the whole
     path is driveable from a test with a patched _current_default_loopback_name and no threads.
-    Returns a short tag for what it did, for the test to assert on. Reads capture state under
-    STATE.lock, then acts (switch_device / hint) OUTSIDE it, because switch_device takes the lock."""
+    Returns a short tag for what it did, for the test to assert on.
+
+    Concurrency (codex F2): the capture object AND the session token (STATE.started_at) are sampled
+    under STATE.lock; the switch is done via _switch_device with those expectations, which re-checks
+    them under the lock before touching anything, and every hint/notice write happens under the lock
+    after re-confirming the same session is still current. So a user switch that lands during the
+    probe, or a reset+Start into a new session, can never be clobbered by a stale tick."""
     with STATE.lock:
         live = (STATE.running and not STATE.stopping
                 and STATE.source_kind == "live" and STATE.capture is not None)
         cap = STATE.capture if live else None
+        session = STATE.started_at
         following = bool(getattr(cap, "sys_following_default", False)) if cap else False
         chosen = getattr(cap, "sys_loopback_name", None) if cap else None
         frames = getattr(cap, "sys_frames", None) if cap else None
     if cap is None:
         return "idle"
-    default_name = _current_default_loopback_name()
+    default_name = _current_default_loopback_name()   # MMDevice, live (outside the lock: it is slow)
     if not default_name:
         return "no-default"
     if frames != _FOLLOW["last_frames"]:
         _FOLLOW["last_frames"] = frames
         _FOLLOW["changed_at"] = now
     if following:
-        # On the Windows default: follow it when it moves. The auto-switch rebuilds the capture on the
-        # new default's NAME through the same handler the UI uses, so the new capture re-evaluates
-        # following_default (still true) and this will not re-fire on the next tick.
-        STATE.sys_idle_hint = None
+        # On the Windows default: follow it when it moves. The switch rebuilds the capture on the new
+        # default's NAME through the same locked path the UI uses, guarded by (cap, session) so a
+        # concurrent user switch or a new session is never overwritten.
         if default_name != chosen:
             try:
-                switch_device(SwitchDeviceRequest(which="loopback", device=default_name))
-                _raise_sys_switch_notice(f"System audio moved to {default_name} (Windows default output changed)")
-                return "followed"
+                _switch_device("loopback", default_name, expect_capture=cap, expect_session=session)
+            except HTTPException:
+                return "follow-failed"      # session changed, or the new default would not open
             except Exception as e:
                 print(f"[device-follow] could not follow the default output: {e}", flush=True)
                 return "follow-failed"
+            with STATE.lock:
+                if STATE.started_at is session and STATE.capture is not None:
+                    _raise_sys_switch_notice(default_name)
+                    STATE.sys_idle_hint = None
+            return "followed"
+        with STATE.lock:
+            if STATE.capture is cap and STATE.started_at is session:
+                STATE.sys_idle_hint = None
         return "following"
     # Explicit non-default pick: warn only when it is delivering NO frames for the idle window while
     # Windows is playing through a different endpoint. Clear the hint the instant frames arrive or the
     # names line up again.
     idle = frames is not None and (now - _FOLLOW["changed_at"]) >= SYS_IDLE_HINT_S
-    if default_name != chosen and chosen and idle:
-        STATE.sys_idle_hint = {"chosen": chosen, "default": default_name}
-        return "idle-hint"
-    STATE.sys_idle_hint = None
-    return "ok"
+    hint_on = bool(default_name != chosen and chosen and idle)
+    with STATE.lock:
+        if STATE.capture is cap and STATE.started_at is session:
+            STATE.sys_idle_hint = {"chosen": chosen, "default": default_name} if hint_on else None
+    return "idle-hint" if hint_on else "ok"
 
 
 def _device_follow_loop(stop_event):
@@ -1823,12 +1842,18 @@ def status():
             # expose this yet (or a mock in tests) reports as 'active' so the UI never raises a
             # false warning. The live screen banners only on the last two values.
             resp["sys_state"] = getattr(STATE.capture, "sys_state", "active")
-            # Short human-readable reason the loopback failed (device name + what went wrong, no
-            # stack trace), for the banner. The Mac backend has no such field, so it reports None and
-            # its banner keeps its own permission-denied wording.
+            # sys_error stays a plain English string for the log / diagnostics. sys_fault is the
+            # STRUCTURED form the UI renders from ({reason, device}), so the banner text is built by a
+            # translated trFmt template rather than passing a server string through exact-key tr()
+            # (codex F7). reason is a code: "not_found" | "open_failed" | "not_loopback"; None when the
+            # backend does not expose it (Mac keeps its own permission-denied wording).
             resp["sys_error"] = getattr(STATE.capture, "sys_error", None)
+            _reason = getattr(STATE.capture, "sys_error_reason", None)
+            resp["sys_fault"] = ({"reason": _reason, "device": getattr(STATE.capture, "sys_error_device", None)}
+                                 if _reason else None)
             # WP-4: the idle-loopback hint (Windows plays elsewhere) and the one-shot auto-follow
-            # toast, both raised by the device-follow watcher. Absent (null) unless it set them.
+            # toast, both raised by the device-follow watcher, both structured for translation.
+            # Absent (null) unless it set them.
             resp["sys_idle_hint"] = STATE.sys_idle_hint
             resp["sys_switch_notice"] = STATE.sys_switch_notice
         # Live mic-gate truth for the in-meeting toggle and its counter, on the same terms as AEC:
@@ -1852,18 +1877,71 @@ def status():
         return resp
 
 
+# Last PortAudio device enumeration's name -> sample rate, cached so the MMDevice-based live listing
+# (which has no rates of its own) can carry a display rate over by name. Rate is display-only; the
+# capture opens each device at the native rate it discovers when it resolves, so a stale/missing rate
+# here never affects what is opened.
+_DEVICE_RATE_CACHE = {}
+
+
+def _cache_device_rates(d):
+    for entry in (d.get("mics") or []) + (d.get("loopbacks") or []):
+        if entry.get("name"):
+            _DEVICE_RATE_CACHE[entry["name"]] = entry.get("rate")
+
+
+def _live_devices_win():
+    """The /api/devices dict built from the live MMDevice endpoint set, or None on any failure.
+
+    Why not PyAudio here: while a capture is running it holds PortAudio initialised, and PortAudio
+    builds its device table once (codex F1), so a fresh PyAudio() during a session cannot see a
+    just-plugged endpoint. MMDevice always reflects the live set. Its friendly names are exactly the
+    PortAudio WASAPI names (loopback = render name + ' [Loopback]'; verified), so the names the UI
+    sends back resolve against PortAudio on the next capture rebuild. Indices here are positional and
+    only feed the default highlight (the UI keys everything off the NAME); rates come from the cached
+    PortAudio enumeration by name (display only)."""
+    try:
+        from .. import mmdevice_win
+        eps = mmdevice_win.list_endpoints()
+        renders, captures = eps.get("render") or [], eps.get("capture") or []
+        if not renders and not captures:
+            return None
+        loop_names = [n + " [Loopback]" for n in renders]
+        mics = [{"index": i, "name": n, "rate": _DEVICE_RATE_CACHE.get(n)} for i, n in enumerate(captures)]
+        loopbacks = [{"index": i, "name": n, "rate": _DEVICE_RATE_CACHE.get(n)} for i, n in enumerate(loop_names)]
+        dr = mmdevice_win.default_render_friendly_name()
+        default_loop_name = (dr + " [Loopback]") if dr else None
+        default_loop_idx = next((l["index"] for l in loopbacks if l["name"] == default_loop_name), None)
+        dc = mmdevice_win.default_capture_friendly_name()
+        default_mic_idx = next((m["index"] for m in mics if m["name"] == dc), None)
+        return {"loopbacks": loopbacks, "mics": mics,
+                "default_loopback_index": default_loop_idx, "default_mic_index": default_mic_idx}
+    except Exception:
+        return None
+
+
 @app.get("/api/devices")
 def devices_list():
-    """List the mics and loopbacks the user can pick.
-
-    Enumeration is platform-specific (WASAPI-only filtering, per-host-API
-    dedupe and the device-name mojibake fix on Windows), so the body lives
-    behind the devices seam (devices.list_ui_devices); this endpoint just
-    serves its dict: {loopbacks, mics, default_loopback_index,
+    """List the mics and loopbacks the user can pick: {loopbacks, mics, default_loopback_index,
     default_mic_index}.
-    """
+
+    Enumeration is platform-specific (WASAPI-only filtering, per-host-API dedupe and the device-name
+    mojibake fix on Windows), behind the devices seam. DURING a live Windows session the PortAudio
+    table is frozen (codex F1), so the list is built from the live MMDevice endpoint set instead;
+    when nothing is capturing, the PortAudio path is fresh and is used (and its rates are cached for
+    the live path to reuse by name)."""
     from .. import devices
-    return devices.list_ui_devices()
+    with STATE.lock:
+        live = STATE.running and STATE.capture is not None
+    if live and sys.platform == "win32":
+        d = _live_devices_win()
+        if d is not None:
+            return d
+        # MMDevice unavailable (COM failure): fall through to PortAudio, stale during a session but
+        # better than an empty list.
+    d = devices.list_ui_devices()
+    _cache_device_rates(d)
+    return d
 
 
 @app.get("/api/levels")
@@ -1890,13 +1968,26 @@ def switch_device(req: SwitchDeviceRequest):
     file keep running; the original timeline (t0) is preserved so timestamps stay continuous.
     There is a brief (~1s) capture gap during the switch. On failure we revert to the
     previously working devices, so a bad pick never leaves the session with no audio."""
+    return _switch_device(req.which, req.device)
+
+
+def _switch_device(which, device, expect_capture=None, expect_session=None):
+    """Core of the device switch, callable by the API handler and by the device-follow watcher.
+
+    expect_capture / expect_session (codex F2): when given, the switch runs ONLY if STATE.capture is
+    still that exact object AND STATE.started_at is still that session, checked under STATE.lock that
+    is held across the whole rebuild. This is how a background watcher can switch without clobbering a
+    user switch that landed since it sampled, or acting on a session that has since been reset+started.
+    The API handler passes neither (any live session is a valid target)."""
     with STATE.lock:
         if not STATE.running or STATE.stopping or STATE.source_kind != "live" or STATE.capture is None:
             raise HTTPException(status_code=409, detail="Switching devices is only available during a live session.")
+        if expect_capture is not None and (STATE.capture is not expect_capture or STATE.started_at is not expect_session):
+            raise HTTPException(status_code=409, detail="The device changed since the follow check.")
         old_cap = STATE.capture
         prev_mic, prev_loop = STATE.mic_device, STATE.loopback_device
-        mic = req.device if req.which == "mic" else prev_mic
-        loop = req.device if req.which == "loopback" else prev_loop
+        mic = device if which == "mic" else prev_mic
+        loop = device if which == "loopback" else prev_loop
         chunk = STATE.chunk_seconds or 15
 
         def _build(m, l):
@@ -1942,7 +2033,7 @@ def switch_device(req: SwitchDeviceRequest):
             # audio is live. A loopback switch that landed on a dead device must not report success and
             # toast "System audio switched." Treat it as a failed switch: fall into the revert path
             # below, which brings the previous device back and returns the reason for the UI to toast.
-            if req.which == "loopback" and getattr(new_cap, "sys_state", "active") == "failed":
+            if which == "loopback" and getattr(new_cap, "sys_state", "active") == "failed":
                 raise RuntimeError(
                     getattr(new_cap, "sys_error", None)
                     or "the system-audio device delivered no audio (nothing may be playing to it)."
@@ -1970,13 +2061,13 @@ def switch_device(req: SwitchDeviceRequest):
                     except Exception:
                         pass
                 STATE.capture = None  # both failed: session stays running with no capture; the user can Stop
-            raise HTTPException(status_code=500, detail=f"Could not switch the {req.which}: {e}")
+            raise HTTPException(status_code=500, detail=f"Could not switch the {which}: {e}")
         STATE.capture = new_cap
         STATE.record_raw_mic = new_cap.has_raw_mic()   # AEC may re-engage (or not) on the new device
         STATE.mic_device, STATE.loopback_device = mic, loop
         _reset_loop_history()
         _silence_after_switch()
-        return {"which": req.which, "device": req.device, "mic_device": mic, "loopback_device": loop}
+        return {"which": which, "device": device, "mic_device": mic, "loopback_device": loop}
 
 
 class SilenceNudgeRequest(BaseModel):
