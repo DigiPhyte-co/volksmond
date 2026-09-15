@@ -4157,7 +4157,7 @@ function voiceTableRows(d) {
   if (d.swivuriso) {
     var sv = d.swivuriso;
     rows.push({ family: "swivuriso", key: "turbo", repo: sv.repo, present: sv.present, bytes: (sv.present && sv.size_on_disk) ? sv.size_on_disk : sv.approx_bytes,
-      label: "Swivuriso turbo (beta)", languages: "isiZulu, isiXhosa, Sesotho + 4",
+      label: "Swivuriso turbo (beta)", languages: "isiZulu, isiXhosa, Sesotho, Setswana, Xitsonga, isiNdebele, Tshivenda",
       onDownload: startSwivurisoDownload,
       onRemove: function () { confirmRemoveVoiceItem("Swivuriso", sv.repo, sv.size_on_disk || sv.approx_bytes); } });
   }

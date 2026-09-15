@@ -591,7 +591,7 @@ window.VM_I18N = {
     "Action": "Aksie",
     "Multilingual": "Veeltalig",
     "Afrikaans + English": "Afrikaans + Engels",
-    "isiZulu, isiXhosa, Sesotho + 4": "isiZulu, isiXhosa, Sesotho + 4",
+    "isiZulu, isiXhosa, Sesotho, Setswana, Xitsonga, isiNdebele, Tshivenda": "isiZulu, isiXhosa, Sesotho, Setswana, Xitsonga, isiNdebele, Tshivenda",
     "Not downloaded": "Nie afgelaai nie",
     "Needs a graphics card (GPU)": "Benodig 'n grafikakaart (GPU)",
     "Downloading {pct}%": "Besig om af te laai {pct}%",
