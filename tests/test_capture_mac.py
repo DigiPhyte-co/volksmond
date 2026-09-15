@@ -898,6 +898,49 @@ def test_resolve_mic_default_index_name():
     print("  OK  resolve_mic: default / index / name substring, rejects non-inputs")
 
 
+def test_resolve_mic_exact_name_beats_substring():
+    # codex F5: the shared UI now sends the device NAME. A substring search would open the wrong
+    # device when one name is a substring of another ("Microphone" inside "External Microphone").
+    # Exact match must win. "External Microphone" is placed FIRST so a substring search would return
+    # it for the query "Microphone"; exact-first must return the standalone "Microphone" instead.
+    devs = [
+        {"name": "External Microphone", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 48000.0},
+        {"name": "Microphone", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 48000.0},
+    ]
+    restore = _with_fake_sd(devs, default_in=0)
+    try:
+        got = devices_mac.resolve_mic(None, "Microphone")
+        assert got["index"] == 1 and got["name"] == "Microphone", got
+        # A substring that is no exact name still resolves the first substring match (CLI convenience).
+        assert devices_mac.resolve_mic(None, "External")["index"] == 0
+    finally:
+        restore()
+    print("  OK  resolve_mic: an exact name beats an earlier substring match (codex F5)")
+
+
+def test_resolve_mic_positional_flag_gates_index():
+    # codex G2 (Mac mirror): positional=False (the web layer) makes a UI value name-only. A device
+    # literally named "1" resolves by name; a numeric value with no name match opens the positional
+    # index only for the CLI (positional=True) and raises under positional=False.
+    devs = [
+        {"name": "Built-in", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 48000.0},
+        {"name": "1", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 48000.0},
+    ]
+    restore = _with_fake_sd(devs, default_in=0)
+    try:
+        assert devices_mac.resolve_mic(None, "1", positional=False)["index"] == 1   # by name
+        assert devices_mac.resolve_mic(None, "0", positional=True)["index"] == 0    # CLI positional
+        try:
+            devices_mac.resolve_mic(None, "0", positional=False)                    # no device named "0"
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("positional=False must not open a positional index on Mac")
+    finally:
+        restore()
+    print("  OK  resolve_mic: positional=False is name-only; positional=True still indexes (Mac G2)")
+
+
 def test_resolve_mic_default_falls_back_when_no_system_default():
     restore = _with_fake_sd(_MICS, default_in=-1)  # no default reported
     try:
@@ -987,6 +1030,8 @@ TESTS = [
     test_merge_default_absent_single_mic,
     test_resolve_loopback_on_off,
     test_resolve_mic_default_index_name,
+    test_resolve_mic_exact_name_beats_substring,
+    test_resolve_mic_positional_flag_gates_index,
     test_resolve_mic_default_falls_back_when_no_system_default,
     test_selectors_route_darwin,
     test_selectors_route_native,

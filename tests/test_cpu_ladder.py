@@ -552,6 +552,54 @@ def test_beam_defaults_per_device_and_the_decode_kwargs():
     print("  OK  CPU decodes at beam 1 with chunk_length 20; GPU keeps beam 5")
 
 
+def test_live_processor_switch_re_derives_beam_and_window_stays_per_model():
+    # GAP 1 (the live GPU<->CPU processor switch): beam_size is fixed at __init__ from the STARTING
+    # tier's device and does NOT ride on the model, so a device swap must re-derive it. The CPU
+    # encoder window DOES ride on the model (per model, set in _build_model), so a swap to a CUDA
+    # model must leave no 20 s window behind. Both directions, plus the explicit-beam exemption.
+    with _fake_whisper():
+        eng = _real_engine("cpu")                       # starts on CPU: beam 1, 20 s window
+        assert eng.beam_size == T.CPU_BEAM_SIZE == 1, eng.beam_size
+        assert eng._is_cpu and eng._device == "cpu"
+        assert eng.model.feature_extractor.chunk_length == 20
+        assert getattr(eng.model, "_vm_encoder_frames", None) == 2000
+
+        cuda_model = T._build_model("large-v3-turbo", "cuda", "int8_float16", 4)
+        eng.request_change(language="af", engine="auto", model=cuda_model,
+                           model_name="digiphyte/fluister-turbo", size="large-v3-turbo",
+                           family="fluister", device="cuda", compute_type="int8_float16")
+        eng._apply_pending_change(0.0)
+        # Beam re-derived up to the GPU default; device identity moved with the model.
+        assert eng.beam_size == T.DEFAULT_BEAM_SIZE == 5, eng.beam_size
+        assert not eng._is_cpu and eng._device == "cuda" and eng._compute_type == "int8_float16"
+        assert eng.model is cuda_model
+        # The window is per model: the CUDA model never had a 20 s window, so the swap leaves none.
+        assert eng.model.feature_extractor.chunk_length == 30
+        assert not hasattr(eng.model, "_vm_encoder_frames")
+
+        cpu_model = T._build_model("large-v3-turbo", "cpu", "int8", 4)
+        eng.request_change(language="af", engine="auto", model=cpu_model,
+                           model_name="digiphyte/fluister-turbo", size="large-v3-turbo",
+                           family="fluister", device="cpu", compute_type="int8")
+        eng._apply_pending_change(0.0)
+        # Beam re-derived back down to the CPU default; the CPU model carries the 20 s window.
+        assert eng.beam_size == T.CPU_BEAM_SIZE == 1, eng.beam_size
+        assert eng._is_cpu and eng._device == "cpu"
+        assert eng.model.feature_extractor.chunk_length == 20
+        assert getattr(eng.model, "_vm_encoder_frames", None) == 2000
+
+        # An explicit beam is honoured on either device, and a device swap must not clobber it.
+        pinned = _real_engine("cpu", beam_size=3)
+        assert pinned.beam_size == 3
+        cuda2 = T._build_model("large-v3-turbo", "cuda", "int8_float16", 4)
+        pinned.request_change(language="af", engine="auto", model=cuda2,
+                              model_name="digiphyte/fluister-turbo", size="large-v3-turbo",
+                              family="fluister", device="cuda", compute_type="int8_float16")
+        pinned._apply_pending_change(0.0)
+        assert pinned.beam_size == 3, "an explicit beam must survive a device switch"
+    print("  OK  a live processor switch re-derives beam per device (5<->1); the window stays per-model; an explicit beam is kept")
+
+
 def test_chunk_audio_stays_at_15_seconds_on_cpu():
     # The encoder window changed; the AUDIO chunk did not. 15 s chunks with a 20 s window is the
     # measured pairing; matching the window to the chunk (15 s) is catastrophic.
@@ -604,6 +652,7 @@ TESTS = (test_every_ladder_rung_has_a_fluister_build,
          test_cpu_models_get_the_measured_window_and_gpu_models_do_not,
          test_the_pad_override_is_scoped_to_the_model_and_the_thread,
          test_beam_defaults_per_device_and_the_decode_kwargs,
+         test_live_processor_switch_re_derives_beam_and_window_stays_per_model,
          test_chunk_audio_stays_at_15_seconds_on_cpu,
          test_cpu_auto_is_small_whatever_the_core_count)
 

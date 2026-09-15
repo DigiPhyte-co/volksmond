@@ -47,7 +47,7 @@ class FakeCapture:
     """Device-free stand-in for capture.AudioCapture (same shape as test_start_capture_first)."""
 
     def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15,
-                 on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False):
+                 on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False, positional=True):
         self.on_chunk = on_chunk
         self.started = False
 

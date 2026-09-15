@@ -10,49 +10,83 @@ import numpy as np
 import pyaudiowpatch as pa
 
 from .capture_core import BLOCK_SECONDS, CaptureBase
-from .devices_win import resolve_loopback, resolve_mic
+from .devices_win import _fix_name, default_loopback_name, resolve_loopback, resolve_mic
 
 
 class AudioCapture(CaptureBase):
-    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False):
+    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False, positional=True):
         super().__init__(mic_device=mic_device, loopback_device=loopback_device,
                          chunk_seconds=chunk_seconds, on_chunk=on_chunk, t0=t0,
-                         aec=aec, agc=agc, record_raw_mic=record_raw_mic)
+                         aec=aec, agc=agc, record_raw_mic=record_raw_mic, positional=positional)
         self._pa = None
         self._streams = []
+        # System-audio (loopback) health, mirrored to /api/status the same way the Mac backend
+        # exposes sys_state (H1). Windows uses only two of the shared values: "active" once the
+        # loopback stream opened, "failed" when the loopback could not resolve or open while the mic
+        # DID open (a mic-only session, which is better than no session). sys_error is a short,
+        # human-readable reason (device name + what went wrong, no stack trace) the banner shows.
+        self.sys_state = "active"
+        self.sys_error = None
+        # Structured form of the same failure for the UI (codex F7): sys_error_reason is a code
+        # ("not_found" | "open_failed") and sys_error_device the device name, so the banner text is
+        # built by a translated trFmt template rather than passing this English string through
+        # exact-key tr(). sys_error stays a plain English string for the log and diagnostics.
+        self.sys_error_reason = None
+        self.sys_error_device = None
+        # Follow-the-default bookkeeping for the device-follow watcher (WP-4). sys_loopback_name is
+        # the CLEANED name of the loopback we actually opened; sys_following_default is True when that
+        # equals the Windows default output's loopback name at open time, which is the signal the
+        # watcher uses to decide between auto-following a default change and warning about an idle
+        # explicit pick. sys_frames counts SYS blocks delivered, so the watcher can tell a loopback
+        # that is producing nothing (an endpoint nothing is rendering to) from one that is live.
+        self.sys_loopback_name = None
+        self.sys_following_default = False
+        self.sys_frames = 0
 
     def _open_sources(self):
         self._pa = pa.PyAudio()
+        self.sys_state = "active"   # optimistic; flipped to "failed" below if the loopback cannot open
+        self.sys_error = None
+        self.sys_error_reason = None
+        self.sys_error_device = None
 
         loopback_info = None
         try:
-            loopback_info = resolve_loopback(self._pa, self.loopback_device_spec)
+            loopback_info = resolve_loopback(self._pa, self.loopback_device_spec, positional=self.positional)
         except Exception as e:
+            # Resolution failed (a stale index, or a chosen device that was unplugged/renumbered). Do
+            # NOT abort: the mic below may still open, and a mic-only session is better than no
+            # session. Record it so /api/status can raise the banner (H1) and the user knows the far
+            # side of the call is missing from the transcript.
+            self.sys_state = "failed"
+            self._set_sys_error(self.loopback_device_spec, reason="not_found")
             print(f"[SYS] cannot resolve loopback: {e}", flush=True)
 
         mic_info = None
         try:
-            mic_info = resolve_mic(self._pa, self.mic_device_spec)
+            mic_info = resolve_mic(self._pa, self.mic_device_spec, positional=self.positional)
         except Exception as e:
             print(f"[MIC] cannot resolve mic: {e}", flush=True)
 
-        # Wrap each open so the failing source identifies itself in the error
-        # the FastAPI layer surfaces. The raw PyAudio message (e.g. `[Errno -9996]
-        # Invalid device`) by itself does not tell the user whether their mic or
-        # their loopback choice failed, so they cannot guess which dropdown to
-        # change. WASAPI loopback in particular can enumerate a device whose
-        # actual endpoint is inactive (laptop "Headphones" reported as default
-        # when no headphones are plugged in is the common case): swapping to
-        # the Speakers loopback usually fixes it.
+        # Wrap each open so the failing source identifies itself in the error the FastAPI layer
+        # surfaces. The raw PyAudio message (e.g. `[Errno -9996] Invalid device`) by itself does not
+        # tell the user whether their mic or their loopback choice failed, so they cannot guess which
+        # dropdown to change. WASAPI loopback in particular can enumerate a device whose actual
+        # endpoint is inactive (a loopback on the speakers while Windows is playing through the
+        # headphones is the common case): swapping to the endpoint that is actually playing fixes it.
+        #
+        # A loopback open failure is now RECORDED and swallowed rather than raised: the mic still
+        # opens below, so the session runs mic-only with sys_state="failed" and the banner shows
+        # immediately (locked: mic-only is better than nothing). Only a mic that will not open, or
+        # both sources failing, aborts the start.
         if loopback_info is not None:
             try:
                 self._open_stream("SYS", loopback_info)
             except Exception as e:
-                raise RuntimeError(
-                    f"could not open system audio device #{loopback_info['index']} "
-                    f"'{loopback_info['name']}': {e}. Try a different option in "
-                    "the System audio dropdown (e.g. Speakers if Headphones fails)."
-                ) from e
+                self.sys_state = "failed"
+                self._set_sys_error(loopback_info.get("name"), reason="open_failed")
+                print(f"[SYS] could not open system audio device #{loopback_info['index']} "
+                      f"'{loopback_info['name']}': {e}", flush=True)
         if mic_info is not None:
             try:
                 self._open_stream("MIC", mic_info)
@@ -68,6 +102,39 @@ class AudioCapture(CaptureBase):
                 "no audio sources opened (both loopback and mic resolution failed). "
                 "Run --list-devices from the CLI to enumerate what is available."
             )
+
+        # Follow-the-default bookkeeping: record the cleaned name of the loopback we actually opened
+        # and whether it matches the Windows default output at open time. The watcher (WP-4) reads
+        # both to decide between auto-following a later default change and warning that an explicitly
+        # chosen loopback is idle. Only meaningful when a loopback stream opened; on a failed loopback
+        # the name stays None and following stays False so the watcher leaves it to the banner.
+        if "SYS" in self._buffers and loopback_info is not None:
+            self.sys_loopback_name = _fix_name(loopback_info["name"]).strip()
+            default_name = default_loopback_name(self._pa)
+            self.sys_following_default = (
+                default_name is not None and self.sys_loopback_name == default_name
+            )
+
+    def _set_sys_error(self, name, reason):
+        """Record a system-audio failure in both forms: the structured (reason code + device name)
+        the UI renders through a translated template (codex F7), and the plain English sys_error
+        string for the log and diagnostics. reason is "not_found" (could not resolve) or "open_failed"
+        (resolved but the endpoint would not open, usually nothing rendering to it). No stack traces.
+
+        When there is no real device name (a None spec that still failed), sys_error_device is None
+        (codex G7): the UI then picks a translated UNNAMED-device template rather than inserting an
+        English placeholder verbatim into the Afrikaans string. The log string keeps a readable
+        placeholder for diagnostics."""
+        who = _fix_name(str(name)).strip() if name else None
+        self.sys_error_reason = reason
+        self.sys_error_device = who
+        log_who = who or "the chosen system-audio device"
+        if reason == "open_failed":
+            self.sys_error = (f"System audio device '{log_who}' would not open, usually because nothing is "
+                              "playing to it. Pick the output you are actually using in the System audio dropdown.")
+        else:
+            self.sys_error = (f"System audio device '{log_who}' could not be found (it may have been unplugged "
+                              "or renumbered). Pick another entry in the System audio dropdown.")
 
     def _close_sources(self):
         """Stop and close every stream; True only if they all closed. The per-stream exception is
@@ -128,6 +195,12 @@ class AudioCapture(CaptureBase):
                         arr = arr.reshape(-1, _ch)
                     else:
                         arr = arr.reshape(-1, 1)
+                    # Count SYS blocks delivered so the device-follow watcher can tell a loopback that
+                    # is producing nothing (an endpoint nothing is rendering to) from a live one. A
+                    # plain int increment from the audio thread is a GIL-atomic write the watcher reads
+                    # without a lock; it only ever needs to see whether it moved between ticks.
+                    if _src == "SYS":
+                        _self.sys_frames += arr.shape[0]
                     # Level calc, SYS-ring feed, AEC routing and the under-lock
                     # re-check all live in the shared core.
                     _self._ingest_block(_src, arr)

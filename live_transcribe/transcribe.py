@@ -29,6 +29,10 @@ import faster_whisper.transcribe as _fw_transcribe
 # (fuzzy_echo_veto below) reuses it so both places call the same two words "the same word".
 from . import dedup
 
+# One-shot NVIDIA GPU usage snapshot, fired off-thread when a CUDA session delivers its struggle
+# notice so the log names what else was on the card. Stdlib only, no-op on macOS (MLX/Metal).
+from . import gpu_snapshot
+
 
 # Fluister: our Afrikaans-optimised Whisper models (LoRA fine-tunes merged to ctranslate2 int8).
 # Much better on Afrikaans, equal-or-better on English, no Afrikaans leakage on pure-English
@@ -1760,6 +1764,10 @@ class Engine:
         # the caller is always honoured, on either device.
         self.beam_size = beam_size if beam_size is not None else (
             CPU_BEAM_SIZE if TIER_CONFIG[tier]["device"] == "cpu" else DEFAULT_BEAM_SIZE)
+        # Whether the caller pinned an explicit beam. A live device swap (request_change) re-derives
+        # the per-device default beam, but an explicit beam stays fixed on either device, the same
+        # rule the line above applies at construction. See _apply_pending_change (GAP 1).
+        self._beam_explicit = beam_size is not None
         # adaptive=True (live): cut beam + downgrade the model under backlog to keep
         # up with real time. adaptive=False (file import): not real time, so never
         # trade quality for speed - keep the chosen model and full beam size.
@@ -1844,6 +1852,7 @@ class Engine:
                                                # DESIGN (the catch-up replay), which is not a fault
         self._struggle_warned = False          # the one-shot ratchet
         self._struggle_notice_due = False      # the worker owes the transcript a STRUGGLE_NOTICE
+        self._gpu_snapshot_fired = False       # one-shot: at most one GPU snapshot attempt per session
         self._pending_hist = deque(maxlen=STRUGGLE_COMPLETION_WINDOW)  # depth at COMPLETIONS
         self._arrival_hist = deque(maxlen=STRUGGLE_ARRIVAL_WINDOW)   # depth at ARRIVALS
         self._pending_mic = []                # [(release_monotonic, Segment)] held by MIC_PUBLISH_DELAY
@@ -1887,6 +1896,11 @@ class Engine:
         self._dropped = 0                 # chunks dropped to backpressure since last reported
         self._change_lock = threading.Lock()  # guards _pending_change (API thread queues, worker applies)
         self._pending_change = None           # a live language/model change to apply between chunks
+        # The change_id of the LAST pending change the worker has actually applied, or None. A caller
+        # that must know its specific change reached the worker (the live processor switch, which may
+        # only report "on the CPU" once the worker is genuinely decoding on the CPU) passes a
+        # change_id to request_change and waits for this to equal it. Written by the worker only.
+        self._last_applied_change_id = None
         self._pending_recent_reset = False    # a live device switch: forget the loop history
         self._worker = threading.Thread(target=self._run, daemon=True, name="transcribe")
 
@@ -2173,7 +2187,7 @@ class Engine:
         self._rebuild_prompt_leak(prompt, self.language)
 
     def request_change(self, *, language, engine, model=None, model_name=None, size=None, family=None,
-                       device=None, compute_type=None):
+                       device=None, compute_type=None, change_id=None):
         """Queue a live language and/or model change, applied by the worker between chunks.
 
         Pass `model` (a WhisperModel the CALLER already built via load_model, off the worker, so
@@ -2187,15 +2201,22 @@ class Engine:
         swap, which is all Windows ever does). A second request before the worker applies the first
         simply replaces it.
 
-        Known limitation (pre-existing, all platforms including Windows): rapid overlapping
-        reconfigure requests can transiently desync STATE.* from the engine, because each API
-        thread publishes its own view while the worker applies only the LAST queued change
-        between chunks. Accepted as-is; no request/worker generation tags here."""
+        `change_id` (optional) is echoed into self._last_applied_change_id once the worker applies
+        THIS change, so a caller can wait for its specific change to land (the processor switch waits
+        for the worker to be genuinely on the new device before it reports success). A newer request
+        that replaces this one before the worker applies it carries the newer id, so the older
+        caller's wait simply times out, which is the correct answer (its change was superseded).
+
+        Known limitation (pre-existing): rapid overlapping LANGUAGE/QUALITY requests can transiently
+        desync STATE.* from the engine, because each API thread publishes its own view while the
+        worker applies only the LAST queued change. The web layer now serialises the processor switch
+        against the language/quality path (a reconfigure generation + a preparing gate), so that
+        specific race is closed; plain overlapping language/quality changes stay best-effort."""
         with self._change_lock:
             self._pending_change = {
                 "language": language, "engine": engine,
                 "model": model, "model_name": model_name, "size": size, "family": family,
-                "device": device, "compute_type": compute_type,
+                "device": device, "compute_type": compute_type, "change_id": change_id,
             }
 
     def request_loop_history_reset(self):
@@ -2244,6 +2265,15 @@ class Engine:
                 self._device = ch["device"]
                 self._is_cpu = ch["device"] == "cpu"
                 self._is_mlx = ch["device"] == "mlx"
+                # GAP 1: beam_size is the one per-device decode constant the model does NOT carry
+                # with it. The CPU encoder window rides on the model (set in _build_model for a CPU
+                # build, absent on a CUDA/MLX build, so a swap back to CUDA sheds it for free), but
+                # beam is the engine's own field, fixed at __init__ from the STARTING tier's device.
+                # A live GPU<->CPU switch left it stale (beam 5 on a CPU that should cut to 1, or
+                # beam 1 on a GPU that can afford 5), so re-derive it on the new device, unless the
+                # caller pinned an explicit beam (honoured on either device, as __init__ does).
+                if not getattr(self, "_beam_explicit", False):
+                    self.beam_size = CPU_BEAM_SIZE if ch["device"] == "cpu" else DEFAULT_BEAM_SIZE
             if ch.get("compute_type"):
                 self._compute_type = ch["compute_type"]
         self.initial_prompt = _compose_prompt(self.language, self._user_prompt)
@@ -2260,6 +2290,9 @@ class Engine:
             self._arrival_hist.clear()          # Lock-owned state, so touched only under the lock.
         lang_name = {"af": "Afrikaans", "en": "English"}.get(self.language, self.language or "auto-detect")
         self._emit_notice(t_start, f"[engine: now {self.family} {self.size}, language {lang_name}]")
+        # Acknowledge THIS change last, once every field above is in place, so a caller waiting on its
+        # change_id (the processor switch) only sees success after the worker is genuinely applied.
+        self._last_applied_change_id = ch.get("change_id")
 
     def _fanout(self, seg):
         """Deliver a finished segment to every subscriber. Single point of delivery."""
@@ -2687,6 +2720,13 @@ class Engine:
         """
         if why is None:
             return
+        # A CUDA session that is struggling: name what else is on the card, ONCE, off-thread. This is
+        # the single delivery point for the one-shot notice (forced drop, arrival and completion all
+        # funnel here and the ratchet lets exactly one call through), so the snapshot fires once per
+        # session and never on the audio or worker thread. CPU/MLX skip it: nvidia-smi is a CUDA
+        # thing and must never run on a Mac.
+        if self._device == "cuda":
+            self._fire_gpu_snapshot()
         cb = self.on_struggle
         msg = f"[engine] cannot hold real time on {self._device} ({why}); warning the user"
 
@@ -2711,6 +2751,33 @@ class Engine:
             # Thread exhaustion, and nothing else, reaches here. It must not escape into the capture
             # callback: the transcript notice is already owed, so the warning still reaches the user
             # through the transcript even when no thread could be started.
+            pass
+
+    def _fire_gpu_snapshot(self):
+        """Print one `[gpu] ...` line naming what else is on the NVIDIA card, off-thread.
+
+        The snapshot shells out to nvidia-smi (with a hard timeout) which must never touch the audio
+        or worker thread, so it runs on its own short-lived daemon thread exactly like the struggle
+        callback. At most one attempt per session (_gpu_snapshot_fired): the delivery point already
+        fires once, and this makes the "no snapshot available" fallback un-spammable even if that
+        ever changed. Guarded end to end; no condition of the log may reach the caller. getattr so a
+        minimal stub engine (the struggle tests build one via __new__) needs no attribute seeded."""
+        if getattr(self, "_gpu_snapshot_fired", False):
+            return
+        self._gpu_snapshot_fired = True
+
+        def _fire():
+            try:
+                line = gpu_snapshot.snapshot()
+                # nvidia-smi absent (a CPU laptop, an AMD/Intel card) or a failed probe: say so once,
+                # so a later "it fell behind" report shows the snapshot was tried, not forgotten.
+                print(f"[gpu] {line}" if line else "[gpu] no snapshot available", flush=True)
+            except Exception:
+                pass
+
+        try:
+            threading.Thread(target=_fire, daemon=True, name="gpu-snapshot").start()
+        except Exception:
             pass
 
     def _take_struggle_notice(self):

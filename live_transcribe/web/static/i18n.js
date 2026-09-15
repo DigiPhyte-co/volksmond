@@ -884,6 +884,39 @@ window.VM_I18N = {
     "Record from here": "Neem van hier af op",
     "Keep going": "Gaan voort",
     "Don't warn again": "Moenie weer waarsku nie",
+    // Live processor switch (GPU<->CPU): the tune-strip Processor picker, its preparing labels, and
+    // the ready/failed/already toasts, plus the "Switch to CPU" action on the gpu-busy banner.
+    "Processor": "Verwerker",
+    "GPU (graphics card)": "GPU (grafikakaart)",
+    "Preparing CPU...": "Berei CPU voor...",
+    "Preparing GPU...": "Berei GPU voor...",
+    "Switch to CPU": "Skakel oor na CPU",
+    "Now transcribing on the CPU. If the CPU cannot keep up, Volksmond may step down to a smaller model on its own.":
+      "Transkribeer nou op die CPU. As die CPU nie kan byhou nie, kan Volksmond op sy eie na 'n kleiner model afskaal.",
+    "Now transcribing on the GPU.": "Transkribeer nou op die GPU.",
+    "Now transcribing on the GPU. The model it was using earlier is no longer available, so a different size is loaded.":
+      "Transkribeer nou op die GPU. Die model wat dit vroeër gebruik het, is nie meer beskikbaar nie, so 'n ander grootte is gelaai.",
+    "Already on the CPU.": "Reeds op die CPU.",
+    "Already on the GPU.": "Reeds op die GPU.",
+    "Could not switch the processor.": "Kon nie die verwerker oorskakel nie.",
+    // Backend error details for the processor switch (shown via the toast, translated at render). Kept
+    // verbatim as i18n keys so a CUDA-readiness or duplicate-switch error is not left in English (K6).
+    "Processor must be 'cpu', 'cuda' or 'auto'.": "Verwerker moet 'cpu', 'cuda' of 'auto' wees.",
+    "Switching the processor is only available during a live transcription.":
+      "Om die verwerker oor te skakel is net beskikbaar tydens 'n lewendige transkripsie.",
+    "A processor switch is already in progress.": "'n Verwerker-oorskakeling is reeds aan die gang.",
+    "Switching between the GPU and the CPU is only available on Windows with an NVIDIA GPU.":
+      "Om tussen die GPU en die CPU oor te skakel is net op Windows met 'n NVIDIA-GPU beskikbaar.",
+    "No NVIDIA GPU on this computer, so there is nothing to switch to.":
+      "Geen NVIDIA-GPU op hierdie rekenaar nie, so daar is niks om na oor te skakel nie.",
+    "The GPU is not ready: the CUDA runtime pack is not installed or failed to load.":
+      "Die GPU is nie gereed nie: die CUDA-looptydpakket is nie geïnstalleer nie of kon nie laai nie.",
+    "The session changed before the processor could switch.":
+      "Die sessie het verander voordat die verwerker kon oorskakel.",
+    "A processor switch is in progress; try again once it is ready.":
+      "'n Verwerker-oorskakeling is aan die gang; probeer weer sodra dit gereed is.",
+    "The settings changed again before this update could apply.":
+      "Die instellings het weer verander voordat hierdie opdatering kon toepas.",
     "Recording from here. Earlier audio is not saved.": "Neem van hier af op. Vroeëre klank word nie gestoor nie.",
     "Could not start recording.": "Kon nie opname begin nie.",
     "Won't warn again": "Sal nie weer waarsku nie",
@@ -893,6 +926,22 @@ window.VM_I18N = {
       "Stelselklank word nie vasgevang nie, net jou mikrofoon. Die ander kant van die oproep sal nie in die transkripsie wees nie.",
     "System audio isn't being captured, so only your microphone is being recorded. The other side of the call won't be in the transcript. You can allow it in System Settings > Privacy & Security, then restart the meeting.":
       "Stelselklank word nie vasgevang nie, net jou mikrofoon. Die ander kant van die oproep sal nie in die transkripsie wees nie. Jy kan dit toelaat in Stelselinstellings > Privaatheid en sekuriteit, en dan die vergadering herbegin.",
+    // Device identity + follow-the-default (1.14.1, Windows)
+    "microphone": "mikrofoon",
+    "system audio": "stelselklank",
+    "Now using {d} for {c} ({p} is no longer available)": "Gebruik nou {d} vir {c} ({p} is nie meer beskikbaar nie)",
+    "No system audio is coming through": "Geen stelselklank kom deur nie",
+    "Nothing is reaching {c}. Windows is playing through {d}.": "Niks bereik {c} nie. Windows speel deur {d}.",
+    "Use it": "Gebruik dit",
+    "System audio moved to {d} (Windows default output changed)": "Stelselklank het na {d} geskuif (Windows se verstek-uitset het verander)",
+    "System audio device {d} would not open, usually because nothing is playing to it. Pick the output you are actually using in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.":
+      "Stelselklankstoestel {d} wou nie oopmaak nie, gewoonlik omdat niks daardeur speel nie. Kies die uitset wat jy werklik gebruik in die Stelselklank-keuselys. Net jou mikrofoon word opgeneem, so die ander kant van die oproep sal nie in die transkripsie wees nie.",
+    "System audio device {d} could not be found (it may have been unplugged or renumbered). Pick another entry in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.":
+      "Stelselklankstoestel {d} kon nie gevind word nie (dit is dalk uitgeprop of hernommer). Kies 'n ander inskrywing in die Stelselklank-keuselys. Net jou mikrofoon word opgeneem, so die ander kant van die oproep sal nie in die transkripsie wees nie.",
+    "The system audio would not open, usually because nothing is playing to it. Pick the output you are actually using in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.":
+      "Die stelselklank wou nie oopmaak nie, gewoonlik omdat niks daardeur speel nie. Kies die uitset wat jy werklik gebruik in die Stelselklank-keuselys. Net jou mikrofoon word opgeneem, so die ander kant van die oproep sal nie in die transkripsie wees nie.",
+    "The system audio device could not be found (it may have been unplugged or renumbered). Pick another entry in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.":
+      "Die stelselklankstoestel kon nie gevind word nie (dit is dalk uitgeprop of hernommer). Kies 'n ander inskrywing in die Stelselklank-keuselys. Net jou mikrofoon word opgeneem, so die ander kant van die oproep sal nie in die transkripsie wees nie.",
     "Warn me when the model can't keep up": "Waarsku my wanneer die model nie kan byhou nie",
     "On a slower computer, Volksmond drops to a lighter, faster model to stay live. When it does, it tells you so you can record and re-transcribe at full accuracy afterward.":
       "Op 'n stadiger rekenaar val Volksmond terug na 'n ligter, vinniger model om lewendig te bly. Wanneer dit gebeur, sê dit vir jou sodat jy kan opneem en daarna teen volle akkuraatheid kan hertranskribeer.",
