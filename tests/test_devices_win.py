@@ -53,23 +53,25 @@ DEVICES = [
 
 
 class FakePyAudio:
-    """The slice of the pyaudiowpatch.PyAudio surface the resolvers touch, over DEVICES. Index equals
-    position (as it does for real PyAudio), so get_device_info_by_index(i) returns DEVICES[i]."""
+    """The slice of the pyaudiowpatch.PyAudio surface the resolvers touch, over a device table (the
+    module DEVICES by default). Index equals position (as it does for real PyAudio), so
+    get_device_info_by_index(i) returns table[i]."""
 
-    def __init__(self):
+    def __init__(self, table=None):
         self.terminated = False
+        self._table = table if table is not None else DEVICES
 
     def get_device_count(self):
-        return len(DEVICES)
+        return len(self._table)
 
     def get_device_info_by_index(self, i):
-        for d in DEVICES:
+        for d in self._table:
             if d["index"] == i:
                 return dict(d)
         raise ValueError(f"[Errno -9996] Invalid device #{i}")   # what real PyAudio raises
 
     def get_loopback_device_info_generator(self):
-        for d in DEVICES:
+        for d in self._table:
             if d.get("isLoopbackDevice"):
                 yield dict(d)
 
@@ -163,6 +165,39 @@ def test_resolve_mic_ignores_loopbacks_and_trailing_spaces():
     print("  OK  resolve_mic resolves by exact name (with trailing spaces) and never returns a loopback/output")
 
 
+def test_resolve_mic_prefers_wasapi_over_an_earlier_mme_duplicate():
+    # codex F3: an identically named MME entry placed BEFORE the WASAPI endpoint must not win. The UI
+    # lists the WASAPI endpoint, so resolution has to resolve against the same WASAPI-first pool, or a
+    # switch could open a device with different channel/rate capabilities from the one advertised.
+    MME = 0
+    table = [
+        {"index": 0, "name": "Studio Mic", "maxInputChannels": 2, "isLoopbackDevice": False, "hostApi": MME, "defaultSampleRate": 44100.0},
+        {"index": 1, "name": "Studio Mic", "maxInputChannels": 2, "isLoopbackDevice": False, "hostApi": WASAPI_IDX, "defaultSampleRate": 48000.0},
+    ]
+    p = FakePyAudio(table)
+    got = devices_win.resolve_mic(p, "Studio Mic")
+    assert got["index"] == 1 and got["hostApi"] == WASAPI_IDX, \
+        f"resolve_mic must return the WASAPI endpoint, not the earlier MME duplicate: {got}"
+    print("  OK  resolve_mic returns the WASAPI endpoint over an earlier identically named MME entry (F3)")
+
+
+def test_a_numeric_device_name_resolves_as_a_name_not_an_index():
+    # codex F4: a device whose friendly name is "123" is sent from the UI as "123". Exact-name-first
+    # means it resolves to that device, not to positional index 123. A CLI numeric spec (no device is
+    # named "26") still selects positionally.
+    table = [
+        {"index": 0, "name": "Speakers X", "maxInputChannels": 0, "isLoopbackDevice": False, "hostApi": WASAPI_IDX, "defaultSampleRate": 48000.0},
+        {"index": 1, "name": "123", "maxInputChannels": 1, "isLoopbackDevice": False, "hostApi": WASAPI_IDX, "defaultSampleRate": 48000.0},
+        {"index": 2, "name": "Normal Mic", "maxInputChannels": 1, "isLoopbackDevice": False, "hostApi": WASAPI_IDX, "defaultSampleRate": 48000.0},
+    ]
+    p = FakePyAudio(table)
+    got = devices_win.resolve_mic(p, "123")
+    assert got["index"] == 1 and got["name"] == "123", f"a numeric NAME must resolve as a name: {got}"
+    # A CLI positional index still works when no device carries that name.
+    assert devices_win.resolve_mic(p, "2")["index"] == 2
+    print("  OK  a numeric device NAME resolves as a name; a positional CLI index still works (F4)")
+
+
 def test_default_loopback_name_is_cleaned():
     saved = devices_win.pa
     try:
@@ -200,6 +235,8 @@ if __name__ == "__main__":
              test_name_resolution_is_exact_first_then_substring,
              test_mojibake_names_compare_equal,
              test_resolve_mic_ignores_loopbacks_and_trailing_spaces,
+             test_resolve_mic_prefers_wasapi_over_an_earlier_mme_duplicate,
+             test_a_numeric_device_name_resolves_as_a_name_not_an_index,
              test_default_loopback_name_is_cleaned,
              test_list_ui_devices_includes_the_cleaned_name_and_dedupes)
     failures = 0

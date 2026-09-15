@@ -2085,6 +2085,9 @@ def test_start_with_a_failed_loopback_still_starts_mic_only():
         cap._open_sources()   # must NOT raise: the mic opens, the loopback fails -> mic-only
         assert cap.sys_state == "failed", cap.sys_state
         assert "Speakers" in (cap.sys_error or ""), cap.sys_error
+        # Structured fault for the UI (F7): open failure -> reason "open_failed" + the device name.
+        assert cap.sys_error_reason == "open_failed", cap.sys_error_reason
+        assert "Speakers" in (cap.sys_error_device or ""), cap.sys_error_device
         assert "MIC" in cap._buffers and "SYS" not in cap._buffers, list(cap._buffers)
         cap._close_sources()
     finally:
@@ -2131,13 +2134,15 @@ def test_device_follow_auto_switches_on_a_default_output_change():
     saved_probe = webapp._current_default_loopback_name
     saved = (st.running, st.stopping, st.source_kind, st.capture, st.engine,
              st.mic_device, st.loopback_device, st.chunk_seconds, st.record_raw_mic,
-             st.sys_switch_notice, st.sys_switch_seq)
+             st.started_at, st.sys_switch_notice, st.sys_switch_seq)
+    session = object()   # the session token the tick captures under the lock and re-validates (F2)
     try:
         webapp.capture.AudioCapture = _FakeCapture
         webapp._FOLLOW["last_frames"] = None
         webapp._FOLLOW["changed_at"] = _time.monotonic()
         st.running, st.stopping, st.source_kind = True, False, "live"
         st.engine = None
+        st.started_at = session
         st.mic_device, st.loopback_device, st.chunk_seconds = "Mic", "Speakers [Loopback]", 15
         st.sys_switch_notice, st.sys_switch_seq = None, 0
         # The session opened the speakers loopback and was following the default at the time.
@@ -2150,23 +2155,68 @@ def test_device_follow_auto_switches_on_a_default_output_change():
         webapp._current_default_loopback_name = lambda: "Headphones [Loopback]"
         tag = webapp._device_follow_tick(_time.monotonic())
         assert tag == "followed", tag
-        # The loopback was switched to the new default by name, and the toast is queued once.
+        # The loopback was switched to the new default by name, and the toast is queued once. The
+        # notice is STRUCTURED (device + seq), so the UI can translate it (F7).
         assert st.loopback_device == "Headphones [Loopback]", st.loopback_device
         assert getattr(st.capture, "sys_loopback_name", None) == "Headphones [Loopback]", st.capture
         assert st.sys_switch_notice and st.sys_switch_notice["seq"] == 1, st.sys_switch_notice
-        assert "Headphones [Loopback]" in st.sys_switch_notice["message"], st.sys_switch_notice
+        assert st.sys_switch_notice["device"] == "Headphones [Loopback]", st.sys_switch_notice
 
         # Second tick, default unchanged: nothing to follow, no new notice.
         tag2 = webapp._device_follow_tick(_time.monotonic())
         assert tag2 == "following", tag2
         assert st.sys_switch_notice["seq"] == 1, "a stable default must not re-fire the toast"
+
+        # F2: a stale tick whose sampled session no longer matches must NOT switch. Simulate a
+        # reset+Start by moving the session token on while the tick still holds the old capture.
+        st.started_at = object()          # a new session
+        st.capture = old
+        old.sys_loopback_name = "Speakers [Loopback]"   # pretend a fresh session back on speakers
+        old.sys_following_default = True
+        st.loopback_device = "Speakers [Loopback]"
+        webapp._current_default_loopback_name = lambda: "Headphones [Loopback]"
+        # Drive a tick that sampled the PREVIOUS session token: it must be rejected by _switch_device.
+        tag3 = webapp._switch_device("loopback", "Headphones [Loopback]", expect_capture=old, expect_session=session)  # noqa
+    except HTTPException as he:
+        assert he.status_code == 409, he.status_code   # the token check rejected the stale switch
+        assert st.loopback_device == "Speakers [Loopback]", "a stale tick must not switch the new session"
+    else:
+        raise AssertionError("a stale-session switch should have been rejected with 409")
     finally:
         webapp.capture.AudioCapture = saved_factory
         webapp._current_default_loopback_name = saved_probe
         (st.running, st.stopping, st.source_kind, st.capture, st.engine,
          st.mic_device, st.loopback_device, st.chunk_seconds, st.record_raw_mic,
-         st.sys_switch_notice, st.sys_switch_seq) = saved
-    print("  OK  device-follow auto-switches the loopback by name when the Windows default output changes")
+         st.started_at, st.sys_switch_notice, st.sys_switch_seq) = saved
+    print("  OK  device-follow auto-switches by name on a default change; a stale-session tick is rejected (F2)")
+
+
+def test_live_devices_win_builds_from_mmdevice():
+    # codex F1: during a live session PortAudio's device table is frozen, so /api/devices builds the
+    # list from the live MMDevice endpoint set instead. Fake the mmdevice functions (no COM in tests):
+    # mics = capture names, loopbacks = render names + " [Loopback]", defaults matched by name.
+    from live_transcribe import mmdevice_win
+    saved = (mmdevice_win.list_endpoints, mmdevice_win.default_render_friendly_name,
+             mmdevice_win.default_capture_friendly_name)
+    try:
+        mmdevice_win.list_endpoints = lambda: {"render": ["Speakers (Realtek)", "Headphones"],
+                                               "capture": ["Samson", "FHD Cam"]}
+        mmdevice_win.default_render_friendly_name = lambda: "Headphones"
+        mmdevice_win.default_capture_friendly_name = lambda: "Samson"
+        d = webapp._live_devices_win()
+        assert d is not None, "mmdevice-backed listing should be built"
+        assert [l["name"] for l in d["loopbacks"]] == ["Speakers (Realtek) [Loopback]", "Headphones [Loopback]"], d
+        assert [m["name"] for m in d["mics"]] == ["Samson", "FHD Cam"], d
+        # The default indices point at the entries with the matching names (the UI's default highlight).
+        assert d["loopbacks"][d["default_loopback_index"]]["name"] == "Headphones [Loopback]", d
+        assert d["mics"][d["default_mic_index"]]["name"] == "Samson", d
+        # An empty endpoint set falls through (None), so the endpoint can use the PortAudio path.
+        mmdevice_win.list_endpoints = lambda: {"render": [], "capture": []}
+        assert webapp._live_devices_win() is None, "an empty MMDevice set must fall through to PortAudio"
+    finally:
+        (mmdevice_win.list_endpoints, mmdevice_win.default_render_friendly_name,
+         mmdevice_win.default_capture_friendly_name) = saved
+    print("  OK  /api/devices live path builds names from MMDevice (loopback = render + ' [Loopback]'); empty falls through")
 
 
 if __name__ == "__main__":
@@ -2232,7 +2282,8 @@ if __name__ == "__main__":
                test_status_carries_sys_state_and_error_from_capture,
                test_switch_device_loopback_failure_reverts_and_reports,
                test_start_with_a_failed_loopback_still_starts_mic_only,
-               test_device_follow_auto_switches_on_a_default_output_change):
+               test_device_follow_auto_switches_on_a_default_output_change,
+               test_live_devices_win_builds_from_mmdevice):
         try:
             fn()
         except AssertionError as e:

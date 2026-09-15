@@ -898,6 +898,26 @@ def test_resolve_mic_default_index_name():
     print("  OK  resolve_mic: default / index / name substring, rejects non-inputs")
 
 
+def test_resolve_mic_exact_name_beats_substring():
+    # codex F5: the shared UI now sends the device NAME. A substring search would open the wrong
+    # device when one name is a substring of another ("Microphone" inside "External Microphone").
+    # Exact match must win. "External Microphone" is placed FIRST so a substring search would return
+    # it for the query "Microphone"; exact-first must return the standalone "Microphone" instead.
+    devs = [
+        {"name": "External Microphone", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 48000.0},
+        {"name": "Microphone", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 48000.0},
+    ]
+    restore = _with_fake_sd(devs, default_in=0)
+    try:
+        got = devices_mac.resolve_mic(None, "Microphone")
+        assert got["index"] == 1 and got["name"] == "Microphone", got
+        # A substring that is no exact name still resolves the first substring match (CLI convenience).
+        assert devices_mac.resolve_mic(None, "External")["index"] == 0
+    finally:
+        restore()
+    print("  OK  resolve_mic: an exact name beats an earlier substring match (codex F5)")
+
+
 def test_resolve_mic_default_falls_back_when_no_system_default():
     restore = _with_fake_sd(_MICS, default_in=-1)  # no default reported
     try:
@@ -987,6 +1007,7 @@ TESTS = [
     test_merge_default_absent_single_mic,
     test_resolve_loopback_on_off,
     test_resolve_mic_default_index_name,
+    test_resolve_mic_exact_name_beats_substring,
     test_resolve_mic_default_falls_back_when_no_system_default,
     test_selectors_route_darwin,
     test_selectors_route_native,
