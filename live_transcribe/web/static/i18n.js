@@ -884,6 +884,40 @@ window.VM_I18N = {
     "Record from here": "Neem van hier af op",
     "Keep going": "Gaan voort",
     "Don't warn again": "Moenie weer waarsku nie",
+    // Live processor switch (GPU<->CPU): the tune-strip Processor picker, its preparing labels, and
+    // the ready/failed/already toasts, plus the "Switch to CPU" action on the gpu-busy banner.
+    "Processor": "Verwerker",
+    "GPU (graphics card)": "GPU (grafikakaart)",
+    "CPU": "CPU",
+    "Preparing CPU...": "Berei CPU voor...",
+    "Preparing GPU...": "Berei GPU voor...",
+    "Switch to CPU": "Skakel oor na CPU",
+    "Now transcribing on the CPU. If the CPU cannot keep up, Volksmond may step down to a smaller model on its own.":
+      "Transkribeer nou op die CPU. As die CPU nie kan byhou nie, kan Volksmond op sy eie na 'n kleiner model afskaal.",
+    "Now transcribing on the GPU.": "Transkribeer nou op die GPU.",
+    "Now transcribing on the GPU. The model it was using earlier is no longer available, so a different size is loaded.":
+      "Transkribeer nou op die GPU. Die model wat dit vroeër gebruik het, is nie meer beskikbaar nie, so 'n ander grootte is gelaai.",
+    "Already on the CPU.": "Reeds op die CPU.",
+    "Already on the GPU.": "Reeds op die GPU.",
+    "Could not switch the processor.": "Kon nie die verwerker oorskakel nie.",
+    // Backend error details for the processor switch (shown via the toast, translated at render). Kept
+    // verbatim as i18n keys so a CUDA-readiness or duplicate-switch error is not left in English (K6).
+    "Processor must be 'cpu', 'cuda' or 'auto'.": "Verwerker moet 'cpu', 'cuda' of 'auto' wees.",
+    "Switching the processor is only available during a live transcription.":
+      "Om die verwerker oor te skakel is net beskikbaar tydens 'n lewendige transkripsie.",
+    "A processor switch is already in progress.": "'n Verwerker-oorskakeling is reeds aan die gang.",
+    "Switching between the GPU and the CPU is only available on Windows with an NVIDIA GPU.":
+      "Om tussen die GPU en die CPU oor te skakel is net op Windows met 'n NVIDIA-GPU beskikbaar.",
+    "No NVIDIA GPU on this computer, so there is nothing to switch to.":
+      "Geen NVIDIA-GPU op hierdie rekenaar nie, so daar is niks om na oor te skakel nie.",
+    "The GPU is not ready: the CUDA runtime pack is not installed or failed to load.":
+      "Die GPU is nie gereed nie: die CUDA-looptydpakket is nie geïnstalleer nie of kon nie laai nie.",
+    "The session changed before the processor could switch.":
+      "Die sessie het verander voordat die verwerker kon oorskakel.",
+    "A processor switch is in progress; try again once it is ready.":
+      "'n Verwerker-oorskakeling is aan die gang; probeer weer sodra dit gereed is.",
+    "The settings changed again before this update could apply.":
+      "Die instellings het weer verander voordat hierdie opdatering kon toepas.",
     "Recording from here. Earlier audio is not saved.": "Neem van hier af op. Vroeëre klank word nie gestoor nie.",
     "Could not start recording.": "Kon nie opname begin nie.",
     "Won't warn again": "Sal nie weer waarsku nie",

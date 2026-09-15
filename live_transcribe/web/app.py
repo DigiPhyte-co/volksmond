@@ -197,6 +197,29 @@ class _State:
         # session-scoped, so reset() clears them.
         self.struggle_nudge: Optional[dict] = None
         self.struggle_notified: bool = False
+        # Live processor switch (GPU<->CPU mid-meeting, Windows + a CUDA-capable GPU only). The
+        # outstanding switch state the UI polls, or None:
+        #   {"target": "cpu"|"gpu", "state": "preparing"|"ready"|"failed", "error": str|None}
+        # The target-device model builds on a HELPER thread (a cold CPU large-v3-turbo build is tens
+        # of seconds and must never block the HTTP call while the backlog grows), so the endpoint
+        # returns "preparing" at once and the swap lands via engine.request_change once ready. Only
+        # one switch runs at a time (the endpoint refuses a second while "preparing"). It also carries
+        # a "token" (the reconfigure generation that admitted it): the helper only mutates state it
+        # still owns (so an old session's helper cannot clobber a new session's switch), and the UI
+        # keys its optimistic state + terminal toast off it. Session-scoped, so reset() clears it.
+        self.processor_switch: Optional[dict] = None
+        # Reconfigure generation: a monotonic counter bumped under STATE.lock every time a reconfigure
+        # (language/quality OR a processor switch) is admitted. Each path records its generation and
+        # re-checks it before it applies, so the processor switch and a language/quality change can
+        # never overwrite each other (the later-admitted one wins; the earlier discards). Deliberately
+        # NOT reset between sessions, so a generation (and the switch token derived from it) is unique
+        # for the life of the process.
+        self.reconfigure_gen: int = 0
+        # The Whisper size the session was running on the GPU at the moment it switched to the CPU, so
+        # a switch back to the GPU restores exactly that size rather than re-resolving a size the CPU
+        # auto-downgrade ladder may have stepped down to (which would silently change the weights, or
+        # trigger a download). None when the session is on the GPU. Session-scoped.
+        self.gpu_size_before_cpu: Optional[str] = None
         # ASR worker failures. asr_errors is the running count of per-chunk transcription failures
         # this session (transcribe.Engine.asr_errors, mirrored here so /api/status can report it
         # after the engine has gone); asr_error_nudge is the ONE banner the UI renders once the
@@ -295,6 +318,8 @@ class _State:
         self.sys_switch_seq = 0
         self.struggle_nudge = None
         self.struggle_notified = False
+        self.processor_switch = None
+        self.gpu_size_before_cpu = None
         self.asr_errors = 0
         self.asr_error_nudge = None
         self.asr_error_dismissed = False
@@ -1798,6 +1823,13 @@ def status():
             # poll, one banner whose copy branches on the reason. `recording` is the session's
             # recording state when it was raised.
             "struggle_nudge": STATE.struggle_nudge,
+            # The outstanding live processor switch (GPU<->CPU) or None: {"token":int,"target":"cpu"
+            # |"gpu","state":"preparing"|"ready"|"failed","error":str|None,"note":str|None}. The UI
+            # keys its optimistic state and terminal toast off the token (so an older poll cannot
+            # erase a newer local switch), and disables the tune-strip controls while preparing.
+            # "note"="size_fallback" when a GPU restore could not reload the pre-switch size. Windows
+            # + a CUDA-capable GPU only; always None on a Mac (mlx) or a machine with no GPU.
+            "processor_switch": STATE.processor_switch,
             # Per-chunk ASR failures this session, plus the single banner raised once they pass
             # ASR_ERROR_THRESHOLD ({"count","message","log_path"}) or None. The raw count is
             # published either way, so a support session can read it with the banner dismissed.
@@ -2389,6 +2421,8 @@ class ReconfigureRequest(BaseModel):
     language: Optional[str] = None    # "af" | "en" | "sa" | a code like "zu"/"de" | ""
     tier: Optional[str] = None        # quality/model key (a model size like "medium", or "auto")
     engine: Optional[str] = None      # "auto" | "fluister" | "whisper"
+    device: Optional[str] = None      # "auto" | "cuda" | "cpu" - live GPU<->CPU processor switch
+                                      # (Windows + a CUDA-capable GPU only; handled off-thread)
 
 
 @app.post("/api/reconfigure")
@@ -2401,8 +2435,19 @@ def reconfigure(req: ReconfigureRequest):
     forcing the Fluister/Whisper family) reloads it, cached after the first time. The model loads
     OUTSIDE the state lock so /api/status and /api/levels keep responding, and the engine applies the
     swap between chunks so no live audio is dropped. The device (CPU/GPU) and chunk size are kept; only
-    a live session can be reconfigured (a file import is re-run with new settings instead)."""
+    a live session can be reconfigured (a file import is re-run with new settings instead).
+
+    A `device` field is the ONE exception to "the device is kept": it un-pins the processor and moves
+    the running session between the GPU (CUDA) and the CPU mid-meeting (Windows + a CUDA-capable GPU
+    only). That path is handled separately (_reconfigure_device), off the request thread, because a
+    cold model build on the new device is tens of seconds and must not hold the HTTP call open while
+    the backlog grows."""
     data = req.model_dump(exclude_unset=True)
+    # A processor switch (GPU<->CPU) is its own off-thread path: it keeps the current quality/engine/
+    # language and only re-resolves the tier onto the requested device. Handled first, before the
+    # synchronous language/model logic below, which keeps the device pinned as it always has.
+    if data.get("device"):
+        return _reconfigure_device(data["device"])
     change_lang = "language" in data
     change_model = bool(data.get("tier")) or bool(data.get("engine"))
     if not change_lang and not change_model:
@@ -2412,6 +2457,17 @@ def reconfigure(req: ReconfigureRequest):
         if not (STATE.running and STATE.transcribing and not STATE.stopping
                 and STATE.source_kind == "live" and STATE.engine is not None):
             raise HTTPException(status_code=409, detail="Changing the language or model is only available during a live transcription.")
+        # A processor switch owns the engine's single pending-change slot while it prepares, so a
+        # language/quality change must wait for it (else the two would race for that slot and one
+        # would silently lose). Refuse with a clear 409; the UI also disables these controls while a
+        # switch is preparing (K2).
+        if STATE.processor_switch and STATE.processor_switch.get("state") == "preparing":
+            raise HTTPException(status_code=409, detail="A processor switch is in progress; try again once it is ready.")
+        # Admit this reconfigure: bump the shared generation and remember ours. The re-check before we
+        # apply (below, after the model loads outside the lock) fails if a newer reconfigure, of
+        # either kind, was admitted in the meantime, so the later one always wins cleanly (K2).
+        STATE.reconfigure_gen += 1
+        my_gen = STATE.reconfigure_gen
         engine = STATE.engine
         cur_is_cpu = engine._is_cpu
         # D8: the engine carries its concrete device ("cpu"/"cuda"/"mlx"). Legacy engine
@@ -2480,6 +2536,10 @@ def reconfigure(req: ReconfigureRequest):
         if not (STATE.running and STATE.transcribing and not STATE.stopping
                 and STATE.source_kind == "live" and STATE.engine is engine):
             raise HTTPException(status_code=409, detail="The session changed before the new settings could apply.")
+        # A newer reconfigure (a language/quality change OR a processor switch) was admitted while
+        # this model loaded: it wins, so discard this one rather than overwrite it (K2).
+        if STATE.reconfigure_gen != my_gen:
+            raise HTTPException(status_code=409, detail="The settings changed again before this update could apply.")
         # Swivuriso (and any South African code on any family) decodes on auto-detect; every
         # other explicit code is forced as-is (see transcribe.decode_language).
         eff_family = family if family is not None else cur_family
@@ -2504,6 +2564,197 @@ def reconfigure(req: ReconfigureRequest):
             STATE.family = family
         return {"language": STATE.language, "tier": STATE.tier, "model": STATE.model,
                 "family": STATE.family, "engine": new_engine_pref}
+
+
+PROCESSOR_SWITCH_APPLY_TIMEOUT_S = 60   # how long the helper waits for the worker to APPLY the swap
+
+
+def _processor_switch_owned(token):
+    """True iff STATE.processor_switch is still the preparing switch that `token` started. Call under
+    STATE.lock. This is the single ownership gate that stops an old session's helper thread from
+    clobbering a newer switch's state, and stops a helper acting after its own switch was replaced."""
+    ps = STATE.processor_switch
+    return bool(ps and ps.get("token") == token and ps.get("state") == "preparing")
+
+
+def _reconfigure_device(device_req):
+    """Live processor switch (GPU<->CPU) without ending the meeting. Windows + a CUDA-capable GPU
+    only. Unlike the synchronous language/model reconfigure above, the target-device model is built
+    on a HELPER thread (a cold CPU large-v3-turbo int8 build is tens of seconds; blocking the HTTP
+    call there is exactly the stall this feature exists to avoid), so this returns "preparing" at
+    once and the swap lands via engine.request_change once the model is ready AND the worker has
+    actually applied it (the helper waits for the apply before reporting success).
+
+    The reason this exists: on 2026-09-11 an RTX 3090 session fell four minutes behind because the
+    card was starved by another program, and the engine could only warn. This is the escape hatch to
+    the CPU (and back)."""
+    want = (device_req or "").strip().lower()
+    if want not in ("auto", "cuda", "cpu"):
+        raise HTTPException(status_code=400, detail="Processor must be 'cpu', 'cuda' or 'auto'.")
+    target = "cpu" if want == "cpu" else "cuda"     # "auto"/"cuda" both mean the GPU here
+    ui_reserve = "cpu" if target == "cpu" else "gpu"
+
+    with STATE.lock:
+        if not (STATE.running and STATE.transcribing and not STATE.stopping
+                and STATE.source_kind == "live" and STATE.engine is not None):
+            raise HTTPException(status_code=409, detail="Switching the processor is only available during a live transcription.")
+        engine = STATE.engine
+        # Only one switch at a time.
+        if STATE.processor_switch and STATE.processor_switch.get("state") == "preparing":
+            raise HTTPException(status_code=409, detail="A processor switch is already in progress.")
+        cur_device = getattr(engine, "_device", None) or ("cpu" if engine._is_cpu else "cuda")
+        cur_size = engine.size
+        threads = engine._cpu_threads
+        # The engine stores the DECODE token (None for auto-detect AND every South African code), so
+        # STATE.language is the canonical user choice, exactly as the synchronous path reads it.
+        cur_language = None if STATE.language in (None, "auto") else STATE.language
+        cur_engine_pref = engine.engine
+        remembered = STATE.gpu_size_before_cpu
+        # RESERVE the switch here, in the first critical section, so a language/quality reconfigure is
+        # refused from this instant on (its preparing-gate), not only once the helper starts. token is
+        # the reconfigure generation, unique for the life of the process, so no old-session helper can
+        # ever own this entry (K1/K2).
+        STATE.reconfigure_gen += 1
+        my_gen = STATE.reconfigure_gen
+        STATE.processor_switch = {"token": my_gen, "target": ui_reserve, "state": "preparing", "error": None, "note": None}
+
+    def _drop_and_raise(status, detail):
+        with STATE.lock:
+            if _processor_switch_owned(my_gen):
+                STATE.processor_switch = None
+        raise HTTPException(status_code=status, detail=detail)
+
+    # Platform + hardware gates, reusing the same facts the [tier] line logs. A Mac (mlx) session,
+    # a machine with no NVIDIA GPU, or a GPU whose CUDA runtime pack is missing cannot cross
+    # backends: refuse with a clear 400 rather than a silent no-op or a mid-meeting load failure.
+    from .. import cudadl
+    if cur_device == "mlx" or not cudadl.SUPPORTED:
+        _drop_and_raise(400, "Switching between the GPU and the CPU is only available on Windows with an NVIDIA GPU.")
+    if not cudadl.gpu_present():
+        _drop_and_raise(400, "No NVIDIA GPU on this computer, so there is nothing to switch to.")
+    if target == "cuda" and not cudadl.cuda_ready():
+        _drop_and_raise(400, "The GPU is not ready: the CUDA runtime pack is not installed or failed to load.")
+
+    if target == cur_device:
+        # Already on the requested processor: release the reservation and report no-op.
+        with STATE.lock:
+            if _processor_switch_owned(my_gen):
+                STATE.processor_switch = None
+        return {"processor": ui_reserve, "state": "ready", "tier": STATE.tier, "token": my_gen}
+
+    # Pick the size to build. Leaving the GPU: remember the size we are on now, so the way back can
+    # restore it. Returning to the GPU: restore that exact size rather than re-resolving whatever the
+    # CPU auto-downgrade ladder stepped down to (base/tiny -> gpu-small or gpu large-v3 would silently
+    # change weights or trigger a download, K5). If the remembered model is somehow gone, fall back to
+    # the current size and say so in the toast.
+    build_size = cur_size
+    restore_note = None
+    if target == "cuda" and remembered:
+        cand_model, _cand_family = transcribe.resolve_model(remembered, cur_language, cur_engine_pref)
+        if transcribe.model_present(cand_model):
+            build_size = remembered
+        else:
+            restore_note = "size_fallback"
+
+    # Un-pin the device: re-resolve the chosen size onto the requested processor. Same family; the
+    # model id is unchanged for a same-size restore, so the weights are already on disk and load_model
+    # only rebuilds for the new backend.
+    new_tier = resolve_tier(build_size, "cpu" if target == "cpu" else "cuda", cur_language, cur_engine_pref)
+    new_size = transcribe.TIER_CONFIG[new_tier]["model"]
+    device_str = transcribe.TIER_CONFIG[new_tier]["device"]
+    compute = transcribe.TIER_CONFIG[new_tier]["compute_type"]
+    model_name, family = transcribe.resolve_model(new_size, cur_language, cur_engine_pref)
+    ui_target = "cpu" if device_str == "cpu" else "gpu"
+
+    try:
+        print(f"[tier] quality={build_size!r} device={target!r} gpu_present={cudadl.gpu_present()} "
+              f"installed={cudadl.installed()} cuda_ready={cudadl.cuda_ready()} "
+              f"-> {new_tier} (live processor switch)", flush=True)
+    except Exception:
+        pass
+
+    with STATE.lock:
+        # Re-check: the session could have ended, and we must still own the reservation (nothing
+        # should have replaced it, since we hold it across the gates above, but be safe).
+        if not (STATE.running and STATE.transcribing and not STATE.stopping
+                and STATE.source_kind == "live" and STATE.engine is engine and _processor_switch_owned(my_gen)):
+            if _processor_switch_owned(my_gen):
+                STATE.processor_switch = None
+            raise HTTPException(status_code=409, detail="The session changed before the processor could switch.")
+        # Leaving the GPU: remember the size for the return trip. (Set here, under the lock, once the
+        # switch is committed.)
+        if target == "cpu":
+            STATE.gpu_size_before_cpu = cur_size
+        STATE.processor_switch = {"token": my_gen, "target": ui_target, "state": "preparing", "error": None, "note": restore_note}
+        args = (engine, new_tier, new_size, device_str, compute, model_name, family,
+                threads, ui_target, my_gen, restore_note, target)
+        threading.Thread(target=_run_processor_switch, args=args, daemon=True, name="processor-switch").start()
+
+    return {"processor": ui_target, "state": "preparing", "tier": new_tier, "token": my_gen}
+
+
+def _run_processor_switch(engine, new_tier, new_size, device_str, compute, model_name, family,
+                          threads, ui_target, my_gen, restore_note, target):
+    """Helper-thread half of the processor switch (mirrors the CPU ladder's rung-swap thread). Builds
+    the target-device model (serialised on transcribe._BUILD_LOCK inside load_model so it can never
+    race a ladder build), hands it to the worker, then WAITS for the worker to actually apply it
+    before publishing success with the confirmed tier/model/family. Every state mutation is guarded
+    by _processor_switch_owned(my_gen): a helper whose switch was superseded, or whose session ended
+    and was replaced, does nothing at all (K1/K2/K3)."""
+    t0 = time.monotonic()
+    try:
+        model = transcribe.load_model(model_name, device_str, compute, cpu_threads=threads)
+    except Exception as e:
+        with STATE.lock:
+            if _processor_switch_owned(my_gen):
+                STATE.processor_switch = {"token": my_gen, "target": ui_target, "state": "failed", "error": str(e), "note": None}
+        print(f"[engine] processor switch to {ui_target} failed: {e}", flush=True)
+        return
+    print(f"[engine] processor switch: {device_str} model ready in {time.monotonic() - t0:.1f} s", flush=True)
+
+    # Submit the swap, only if we still own it. Read the decode language from STATE at THIS point (not
+    # a pre-build snapshot); a language change is impossible while we hold the reservation, so this is
+    # simply the honest current value (K2). change_id = my_gen lets us wait for the worker to apply it.
+    with STATE.lock:
+        if not (STATE.running and STATE.transcribing and not STATE.stopping
+                and STATE.source_kind == "live" and STATE.engine is engine and _processor_switch_owned(my_gen)):
+            if _processor_switch_owned(my_gen):
+                STATE.processor_switch = None
+            return
+        cur_language = None if STATE.language in (None, "auto") else STATE.language
+        decode_lang = transcribe.decode_language(family, cur_language)
+        engine.request_change(language=decode_lang, engine=engine.engine,
+                              model=model, model_name=model_name, size=new_size, family=family,
+                              device=device_str, compute_type=compute, change_id=my_gen)
+
+    # Wait, bounded, for the worker to apply THIS change (K3): only then is the session genuinely on
+    # the new processor, so only then may status/toast claim it and a swap-back read the new device.
+    deadline = time.monotonic() + PROCESSOR_SWITCH_APPLY_TIMEOUT_S
+    applied = False
+    while time.monotonic() < deadline:
+        if getattr(engine, "_last_applied_change_id", None) == my_gen:
+            applied = True
+            break
+        if not (STATE.running and not STATE.stopping and STATE.engine is engine):
+            break                                   # session ended out from under the swap
+        time.sleep(0.05)
+
+    with STATE.lock:
+        if not _processor_switch_owned(my_gen):
+            return                                  # superseded or the session ended and was replaced
+        if applied:
+            # Publish the CONFIRMED identity the worker now holds, together with the terminal state.
+            STATE.tier = new_tier
+            STATE.model = getattr(engine, "model_name", model_name)
+            STATE.family = getattr(engine, "family", family)
+            if target == "cuda":
+                STATE.gpu_size_before_cpu = None    # back on the GPU: forget the remembered size
+            STATE.processor_switch = {"token": my_gen, "target": ui_target, "state": "ready", "error": None, "note": restore_note}
+        else:
+            STATE.processor_switch = {"token": my_gen, "target": ui_target, "state": "failed",
+                                      "error": "the engine did not switch in time", "note": None}
+            print(f"[engine] processor switch to {ui_target}: worker did not apply within "
+                  f"{PROCESSOR_SWITCH_APPLY_TIMEOUT_S} s", flush=True)
 
 
 class WarmUpRequest(BaseModel):
