@@ -884,6 +884,20 @@ window.VM_I18N = {
     "Record from here": "Neem van hier af op",
     "Keep going": "Gaan voort",
     "Don't warn again": "Moenie weer waarsku nie",
+    // Live processor switch (GPU<->CPU): the tune-strip Processor picker, its preparing labels, and
+    // the ready/failed/already toasts, plus the "Switch to CPU" action on the gpu-busy banner.
+    "Processor": "Verwerker",
+    "GPU (graphics card)": "GPU (grafikakaart)",
+    "CPU": "CPU",
+    "Preparing CPU...": "Berei CPU voor...",
+    "Preparing GPU...": "Berei GPU voor...",
+    "Switch to CPU": "Skakel oor na CPU",
+    "Now transcribing on the CPU. If the CPU cannot keep up, Volksmond may step down to a smaller model on its own.":
+      "Transkribeer nou op die CPU. As die CPU nie kan byhou nie, kan Volksmond op sy eie na 'n kleiner model afskaal.",
+    "Now transcribing on the GPU.": "Transkribeer nou op die GPU.",
+    "Already on the CPU.": "Reeds op die CPU.",
+    "Already on the GPU.": "Reeds op die GPU.",
+    "Could not switch the processor.": "Kon nie die verwerker oorskakel nie.",
     "Recording from here. Earlier audio is not saved.": "Neem van hier af op. Vroeëre klank word nie gestoor nie.",
     "Could not start recording.": "Kon nie opname begin nie.",
     "Won't warn again": "Sal nie weer waarsku nie",

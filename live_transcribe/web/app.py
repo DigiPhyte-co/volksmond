@@ -186,6 +186,15 @@ class _State:
         # session-scoped, so reset() clears them.
         self.struggle_nudge: Optional[dict] = None
         self.struggle_notified: bool = False
+        # Live processor switch (GPU<->CPU mid-meeting, Windows + a CUDA-capable GPU only). The
+        # outstanding switch state the UI polls, or None:
+        #   {"target": "cpu"|"gpu", "state": "preparing"|"ready"|"failed", "error": str|None}
+        # The target-device model builds on a HELPER thread (a cold CPU large-v3-turbo build is tens
+        # of seconds and must never block the HTTP call while the backlog grows), so the endpoint
+        # returns "preparing" at once and the swap lands via engine.request_change once ready. Only
+        # one switch runs at a time (the endpoint refuses a second while "preparing"). Session-scoped,
+        # so reset() clears it.
+        self.processor_switch: Optional[dict] = None
         # ASR worker failures. asr_errors is the running count of per-chunk transcription failures
         # this session (transcribe.Engine.asr_errors, mirrored here so /api/status can report it
         # after the engine has gone); asr_error_nudge is the ONE banner the UI renders once the
@@ -275,6 +284,7 @@ class _State:
         self.silence_nudge = None
         self.struggle_nudge = None
         self.struggle_notified = False
+        self.processor_switch = None
         self.asr_errors = 0
         self.asr_error_nudge = None
         self.asr_error_dismissed = False
@@ -1648,6 +1658,12 @@ def status():
             # poll, one banner whose copy branches on the reason. `recording` is the session's
             # recording state when it was raised.
             "struggle_nudge": STATE.struggle_nudge,
+            # The outstanding live processor switch (GPU<->CPU) or None:
+            # {"target":"cpu"|"gpu","state":"preparing"|"ready"|"failed","error":str|None}. The UI
+            # polls this to disable the Processor picker while the target-device model builds off the
+            # request thread and to toast on ready/failed. Windows + a CUDA-capable GPU only; always
+            # None on a Mac (mlx) or a machine with no GPU.
+            "processor_switch": STATE.processor_switch,
             # Per-chunk ASR failures this session, plus the single banner raised once they pass
             # ASR_ERROR_THRESHOLD ({"count","message","log_path"}) or None. The raw count is
             # published either way, so a support session can read it with the banner dismissed.
@@ -2136,6 +2152,8 @@ class ReconfigureRequest(BaseModel):
     language: Optional[str] = None    # "af" | "en" | "sa" | a code like "zu"/"de" | ""
     tier: Optional[str] = None        # quality/model key (a model size like "medium", or "auto")
     engine: Optional[str] = None      # "auto" | "fluister" | "whisper"
+    device: Optional[str] = None      # "auto" | "cuda" | "cpu" - live GPU<->CPU processor switch
+                                      # (Windows + a CUDA-capable GPU only; handled off-thread)
 
 
 @app.post("/api/reconfigure")
@@ -2148,8 +2166,19 @@ def reconfigure(req: ReconfigureRequest):
     forcing the Fluister/Whisper family) reloads it, cached after the first time. The model loads
     OUTSIDE the state lock so /api/status and /api/levels keep responding, and the engine applies the
     swap between chunks so no live audio is dropped. The device (CPU/GPU) and chunk size are kept; only
-    a live session can be reconfigured (a file import is re-run with new settings instead)."""
+    a live session can be reconfigured (a file import is re-run with new settings instead).
+
+    A `device` field is the ONE exception to "the device is kept": it un-pins the processor and moves
+    the running session between the GPU (CUDA) and the CPU mid-meeting (Windows + a CUDA-capable GPU
+    only). That path is handled separately (_reconfigure_device), off the request thread, because a
+    cold model build on the new device is tens of seconds and must not hold the HTTP call open while
+    the backlog grows."""
     data = req.model_dump(exclude_unset=True)
+    # A processor switch (GPU<->CPU) is its own off-thread path: it keeps the current quality/engine/
+    # language and only re-resolves the tier onto the requested device. Handled first, before the
+    # synchronous language/model logic below, which keeps the device pinned as it always has.
+    if data.get("device"):
+        return _reconfigure_device(data["device"])
     change_lang = "language" in data
     change_model = bool(data.get("tier")) or bool(data.get("engine"))
     if not change_lang and not change_model:
@@ -2251,6 +2280,130 @@ def reconfigure(req: ReconfigureRequest):
             STATE.family = family
         return {"language": STATE.language, "tier": STATE.tier, "model": STATE.model,
                 "family": STATE.family, "engine": new_engine_pref}
+
+
+def _reconfigure_device(device_req):
+    """Live processor switch (GPU<->CPU) without ending the meeting. Windows + a CUDA-capable GPU
+    only. Unlike the synchronous language/model reconfigure above, the target-device model is built
+    on a HELPER thread (a cold CPU large-v3-turbo int8 build is tens of seconds; blocking the HTTP
+    call there is exactly the stall this feature exists to avoid), so this returns "preparing" at
+    once and the swap lands via engine.request_change once the model is ready.
+
+    The reason this exists: on 2026-09-11 an RTX 3090 session fell four minutes behind because the
+    card was starved by another program, and the engine could only warn. This is the escape hatch to
+    the CPU (and back)."""
+    want = (device_req or "").strip().lower()
+    if want not in ("auto", "cuda", "cpu"):
+        raise HTTPException(status_code=400, detail="Processor must be 'cpu', 'cuda' or 'auto'.")
+    target = "cpu" if want == "cpu" else "cuda"     # "auto"/"cuda" both mean the GPU here
+
+    with STATE.lock:
+        if not (STATE.running and STATE.transcribing and not STATE.stopping
+                and STATE.source_kind == "live" and STATE.engine is not None):
+            raise HTTPException(status_code=409, detail="Switching the processor is only available during a live transcription.")
+        engine = STATE.engine
+        # Only one switch at a time: a second request while a build is in flight is refused, never
+        # queued (two builds racing to swap the single live model is exactly what we must not do).
+        if STATE.processor_switch and STATE.processor_switch.get("state") == "preparing":
+            raise HTTPException(status_code=409, detail="A processor switch is already in progress.")
+        cur_device = getattr(engine, "_device", None) or ("cpu" if engine._is_cpu else "cuda")
+        cur_size = engine.size
+        threads = engine._cpu_threads
+        # The engine stores the DECODE token (None for auto-detect AND every South African code), so
+        # STATE.language is the canonical user choice, exactly as the synchronous path reads it.
+        cur_language = None if STATE.language in (None, "auto") else STATE.language
+        cur_engine_pref = engine.engine
+
+    # Platform + hardware gates, reusing the same facts the [tier] line logs. A Mac (mlx) session,
+    # a machine with no NVIDIA GPU, or a GPU whose CUDA runtime pack is missing cannot cross
+    # backends: refuse with a clear 400 rather than a silent no-op or a mid-meeting load failure.
+    from .. import cudadl
+    if cur_device == "mlx" or not cudadl.SUPPORTED:
+        raise HTTPException(status_code=400, detail="Switching between the GPU and the CPU is only available on Windows with an NVIDIA GPU.")
+    if not cudadl.gpu_present():
+        raise HTTPException(status_code=400, detail="No NVIDIA GPU on this computer, so there is nothing to switch to.")
+    if target == "cuda" and not cudadl.cuda_ready():
+        raise HTTPException(status_code=400, detail="The GPU is not ready: the CUDA runtime pack is not installed or failed to load.")
+
+    if target == cur_device:
+        # Already on the requested processor: nothing to build, nothing to switch.
+        return {"processor": ("cpu" if target == "cpu" else "gpu"), "state": "ready", "tier": STATE.tier}
+
+    # Un-pin the device: re-resolve the CURRENT quality (size) onto the requested processor. Same
+    # size and family, new device + compute type; the model id is unchanged (a Fluister session stays
+    # Fluister), so the weights are already on disk and load_model only rebuilds for the new backend.
+    new_tier = resolve_tier(cur_size, "cpu" if target == "cpu" else "cuda", cur_language, cur_engine_pref)
+    new_size = transcribe.TIER_CONFIG[new_tier]["model"]
+    device_str = transcribe.TIER_CONFIG[new_tier]["device"]
+    compute = transcribe.TIER_CONFIG[new_tier]["compute_type"]
+    model_name, family = transcribe.resolve_model(new_size, cur_language, cur_engine_pref)
+    ui_target = "cpu" if device_str == "cpu" else "gpu"
+
+    # Log the re-resolution in the existing [tier] format plus the switch marker, so a field report
+    # can see the processor moved and why.
+    try:
+        print(f"[tier] quality={cur_size!r} device={target!r} gpu_present={cudadl.gpu_present()} "
+              f"installed={cudadl.installed()} cuda_ready={cudadl.cuda_ready()} "
+              f"-> {new_tier} (live processor switch)", flush=True)
+    except Exception:
+        pass
+
+    with STATE.lock:
+        # Re-check under the lock: the session could have ended, or another switch could have started,
+        # between the gate above and here.
+        if not (STATE.running and STATE.transcribing and not STATE.stopping
+                and STATE.source_kind == "live" and STATE.engine is engine):
+            raise HTTPException(status_code=409, detail="The session changed before the processor could switch.")
+        if STATE.processor_switch and STATE.processor_switch.get("state") == "preparing":
+            raise HTTPException(status_code=409, detail="A processor switch is already in progress.")
+        STATE.processor_switch = {"target": ui_target, "state": "preparing", "error": None}
+        args = (engine, new_tier, new_size, device_str, compute, model_name, family,
+                cur_language, cur_engine_pref, threads, ui_target)
+        threading.Thread(target=_run_processor_switch, args=args, daemon=True, name="processor-switch").start()
+
+    return {"processor": ui_target, "state": "preparing", "tier": new_tier}
+
+
+def _run_processor_switch(engine, new_tier, new_size, device_str, compute, model_name, family,
+                          new_lang, new_engine_pref, threads, ui_target):
+    """Helper-thread half of the processor switch (mirrors the CPU ladder's rung-swap thread). Builds
+    the target-device model, serialised on transcribe._BUILD_LOCK inside load_model so it can never
+    race a ladder build, then hands it to the engine between chunks. Honours the same 409 re-check
+    the synchronous handler does: if the session ended or a newer switch replaced this one while the
+    model built, the built model is discarded and never installed."""
+    t0 = time.monotonic()
+    try:
+        model = transcribe.load_model(model_name, device_str, compute, cpu_threads=threads)
+    except Exception as e:
+        with STATE.lock:
+            # Only mark OUR switch failed: a superseding one would already have replaced it.
+            if STATE.processor_switch and STATE.processor_switch.get("state") == "preparing":
+                STATE.processor_switch = {"target": ui_target, "state": "failed", "error": str(e)}
+        print(f"[engine] processor switch to {ui_target} failed: {e}", flush=True)
+        return
+    elapsed = time.monotonic() - t0
+    # Field-report timing: how long the hatch took to open on this machine (task 6).
+    print(f"[engine] processor switch: {device_str} model ready in {elapsed:.1f} s", flush=True)
+    with STATE.lock:
+        # Superseded (a newer switch) or the session ended while the model built: discard it. Clear
+        # only a preparing state that is still ours; never stomp a newer switch's state.
+        superseded = not (STATE.running and STATE.transcribing and not STATE.stopping
+                          and STATE.source_kind == "live" and STATE.engine is engine)
+        if superseded or not (STATE.processor_switch and STATE.processor_switch.get("state") == "preparing"):
+            if STATE.processor_switch and STATE.processor_switch.get("state") == "preparing":
+                STATE.processor_switch = None
+            return
+        decode_lang = transcribe.decode_language(family, new_lang)
+        # Hand over the backend the model was built on so the engine's device identity
+        # (_device/_is_cpu/_compute_type AND beam_size, GAP 1) moves with the model, applied by the
+        # worker between chunks (no audio dropped, capture/recorder untouched).
+        engine.request_change(language=decode_lang, engine=new_engine_pref,
+                              model=model, model_name=model_name, size=new_size, family=family,
+                              device=device_str, compute_type=compute)
+        STATE.tier = new_tier
+        STATE.model = model_name
+        STATE.family = family
+        STATE.processor_switch = {"target": ui_target, "state": "ready", "error": None}
 
 
 class WarmUpRequest(BaseModel):

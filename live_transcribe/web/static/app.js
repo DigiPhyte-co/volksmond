@@ -513,6 +513,10 @@ async function switchDevice(which, value) {
 // loaded model (instant; the fix for a room that switches Afrikaans <-> English on a both-capable
 // model); a tier/engine patch reloads it. The server resolves and confirms the running model.
 async function reconfigureLive(patch, okMsg) {
+  // A processor switch (GPU<->CPU) is its own async lifecycle (the server builds the target-device
+  // model off the request thread and returns "preparing"), so it cannot use the synchronous
+  // language/model path below that toasts success at once. Delegate it.
+  if (patch.device != null) return switchProcessor(patch.device === "cpu" ? "cpu" : "gpu");
   var prev = { language: S.live.language, model: S.live.model, family: S.live.family, tier: S.live.tier, engine: S.live.engine };
   if (patch.language != null) S.live.language = patch.language === "" ? "auto" : patch.language;
   if (patch.engine != null) S.live.engine = patch.engine;
@@ -529,6 +533,31 @@ async function reconfigureLive(patch, okMsg) {
     S.live.language = prev.language; S.live.model = prev.model; S.live.family = prev.family;
     S.live.tier = prev.tier; S.live.engine = prev.engine;
     toast(e.message || "Could not change the settings.", true);
+  } finally {
+    S.live.reconfiguring = false; render();
+  }
+}
+// Move the running transcription between the GPU (graphics card) and the CPU mid-meeting, without
+// stopping. The server builds the new processor's model on a helper thread and returns "preparing";
+// the /api/status poll then adopts "ready"/"failed" and toasts. Optimistic like reconfigureLive: the
+// preparing state shows at once, and a request error reverts it. target is "cpu" | "gpu".
+async function switchProcessor(target) {
+  var wantCpu = target === "cpu";
+  var prevTier = S.live.tier;
+  S.live.procSwitch = { target: wantCpu ? "cpu" : "gpu", state: "preparing", error: null };
+  S.live.reconfiguring = true; render();
+  try {
+    var resp = await api.post("/api/reconfigure", { device: wantCpu ? "cpu" : "cuda" });
+    if (resp && resp.state === "ready") {
+      // Already on that processor: no build, no preparing state to wait on.
+      S.live.procSwitch = null;
+      toast(wantCpu ? "Already on the CPU." : "Already on the GPU.");
+    }
+    // Otherwise "preparing": refreshSilence() adopts the server's ready/failed and toasts + adopts
+    // the new tier, so nothing more to do here.
+  } catch (e) {
+    S.live.procSwitch = null; S.live.tier = prevTier;
+    toast(e.message || "Could not switch the processor.", true);
   } finally {
     S.live.reconfiguring = false; render();
   }
@@ -721,6 +750,28 @@ function liveTuneStrip() {
     return [o[0], tr(o[1]) + " · " + tr("downloads first")];
   });
   items.push(field("Quality", tuneSelect(qOpts, normalizeQuality(S.live.tier), function (v) { reconfigureLive({ tier: v }, "Model switched."); })));
+  // Processor picker: move the running session between the GPU (graphics card) and the CPU
+  // mid-meeting. Only when a CUDA-capable NVIDIA GPU is present on this Windows machine (else there
+  // is nothing to switch between); the whole card is hidden on a Mac (mlx) and on CPU-only machines,
+  // the same predicate the Settings CUDA card uses. Current value is read off the running tier
+  // (gpu-* -> GPU, cpu* -> CPU); while a switch is preparing it shows the target and disables.
+  if (S.cuda && S.cuda.supported !== false && S.cuda.gpu_present) {
+    var proc = S.live.procSwitch;
+    var preparing = !!(proc && proc.state === "preparing");
+    var curProc = String(S.live.tier || "").indexOf("cpu") === 0 ? "cpu" : "gpu";
+    var procVal = preparing ? proc.target : curProc;
+    var procSel = tuneSelect([["gpu", "GPU (graphics card)"], ["cpu", "CPU"]], procVal,
+      function (v) { reconfigureLive({ device: v }); });
+    if (preparing) {
+      procSel.disabled = true;
+      items.push(field("Processor", el("div", { class: "row gap-6", style: { alignItems: "center" } }, [
+        procSel,
+        el("span", { class: "ink-3", style: { fontSize: "11px" }, text: proc.target === "cpu" ? "Preparing CPU..." : "Preparing GPU..." }),
+      ])));
+    } else {
+      items.push(field("Processor", procSel));
+    }
+  }
   return el("div", { class: "row gap-16", style: { flexWrap: "wrap", padding: "8px 16px", borderBottom: "1px solid var(--line)", background: "var(--surface-2)", alignItems: "center" } }, items);
 }
 
@@ -2139,6 +2190,9 @@ function silenceSig(n) { return n ? (String(n.at || "") + "|" + String(n.count |
 function struggleSig(n) { return n ? (String(n.reason || "") + "|" + String(n.old_size || "") + "|" + String(n.new_size || "") + "|" + (n.recording ? "1" : "0")) : ""; }
 // The ASR-error nudge is one banner whose count grows, so its identity is just that count.
 function asrErrorSig(n) { return n ? String(n.count || 0) : ""; }
+// The live processor switch: its identity is the target plus the state, so a preparing->ready or
+// preparing->failed transition re-renders (and toasts) exactly once.
+function procSwitchSig(p) { return p ? (String(p.target || "") + "|" + String(p.state || "")) : ""; }
 function refreshSilence() {
   if (!S.live.running || S.live.sourceKind === "file") return;
   api.get("/api/status").then(function (st) {
@@ -2153,6 +2207,27 @@ function refreshSilence() {
     if (silenceSig(n) !== silenceSig(S.live.silenceNudge)) { S.live.silenceNudge = n; changed = true; }
     var g = st.struggle_nudge || null;
     if (struggleSig(g) !== struggleSig(S.live.struggleNudge)) { S.live.struggleNudge = g; changed = true; }
+    // Live processor switch (GPU<->CPU): adopt the server state, and toast once on ready/failed. The
+    // build runs off the request thread, so this poll is the ONLY channel that carries the outcome.
+    var ps = st.processor_switch || null;
+    if (procSwitchSig(ps) !== procSwitchSig(S.live.procSwitch)) {
+      var wasPreparing = S.live.procSwitch && S.live.procSwitch.state === "preparing";
+      S.live.procSwitch = ps; changed = true;
+      if (ps && ps.state === "ready" && wasPreparing) {
+        toast(ps.target === "cpu"
+          ? "Now transcribing on the CPU. If the CPU cannot keep up, Volksmond may step down to a smaller model on its own."
+          : "Now transcribing on the GPU.");
+      } else if (ps && ps.state === "failed" && wasPreparing) {
+        toast("Could not switch the processor.", true);
+      }
+    }
+    // After an off-thread processor switch the running tier/model/family change server-side, and the
+    // synchronous reconfigure response never carried them; adopt them here so the tune strip's
+    // Processor and Quality reflect reality. A no-op for a normal reconfigure (its response already
+    // set these, so the values match).
+    if (st.tier && st.tier !== S.live.tier) { S.live.tier = st.tier; changed = true; }
+    if (st.model && st.model !== S.live.model) { S.live.model = st.model; changed = true; }
+    if (st.family && st.family !== S.live.family) { S.live.family = st.family; changed = true; }
     var ae = st.asr_error_nudge || null;
     if (asrErrorSig(ae) !== asrErrorSig(S.live.asrErrorNudge)) { S.live.asrErrorNudge = ae; changed = true; }
     // Capture liveness BEFORE the recording reconcile below: adoptCapture clears S.live.recording
@@ -2308,6 +2383,12 @@ function struggleBanner() {
     ? "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Your recording can be re-transcribed at full accuracy afterward."
     : "Volksmond switched to a lighter, faster model to stay live, so this part may be less accurate. Record now and re-transcribe at full accuracy afterward.";
   var actions = [];
+  // gpu-busy: the escape hatch to the CPU is the first, primary action. Only when a CUDA GPU is
+  // present on this Windows machine (always true for a gpu-busy nudge, but guard so it never shows
+  // where the switch is unavailable). Triggers the same reconfigureLive({device}) as the tune strip
+  // and dismisses the banner (the switch itself is now the remedy).
+  if (n.reason === "gpu-busy" && S.cuda && S.cuda.supported !== false && S.cuda.gpu_present)
+    actions.push(el("button", { class: "btn sm", onclick: function () { reconfigureLive({ device: "cpu" }); dismissStruggle("dismiss"); } }, "Switch to CPU"));
   // Record button only when nothing has recorded yet; once it has, the audio is already kept for a
   // re-transcribe, so the primary action falls away (matches the body copy).
   if (!hasRec) actions.push(el("button", { class: "btn sm record", onclick: function () { recordFromHere(); } }, [icon("dot", 12), "Record from here"]));

@@ -1760,6 +1760,10 @@ class Engine:
         # the caller is always honoured, on either device.
         self.beam_size = beam_size if beam_size is not None else (
             CPU_BEAM_SIZE if TIER_CONFIG[tier]["device"] == "cpu" else DEFAULT_BEAM_SIZE)
+        # Whether the caller pinned an explicit beam. A live device swap (request_change) re-derives
+        # the per-device default beam, but an explicit beam stays fixed on either device, the same
+        # rule the line above applies at construction. See _apply_pending_change (GAP 1).
+        self._beam_explicit = beam_size is not None
         # adaptive=True (live): cut beam + downgrade the model under backlog to keep
         # up with real time. adaptive=False (file import): not real time, so never
         # trade quality for speed - keep the chosen model and full beam size.
@@ -2244,6 +2248,15 @@ class Engine:
                 self._device = ch["device"]
                 self._is_cpu = ch["device"] == "cpu"
                 self._is_mlx = ch["device"] == "mlx"
+                # GAP 1: beam_size is the one per-device decode constant the model does NOT carry
+                # with it. The CPU encoder window rides on the model (set in _build_model for a CPU
+                # build, absent on a CUDA/MLX build, so a swap back to CUDA sheds it for free), but
+                # beam is the engine's own field, fixed at __init__ from the STARTING tier's device.
+                # A live GPU<->CPU switch left it stale (beam 5 on a CPU that should cut to 1, or
+                # beam 1 on a GPU that can afford 5), so re-derive it on the new device, unless the
+                # caller pinned an explicit beam (honoured on either device, as __init__ does).
+                if not getattr(self, "_beam_explicit", False):
+                    self.beam_size = CPU_BEAM_SIZE if ch["device"] == "cpu" else DEFAULT_BEAM_SIZE
             if ch.get("compute_type"):
                 self._compute_type = ch["compute_type"]
         self.initial_prompt = _compose_prompt(self.language, self._user_prompt)
