@@ -1941,6 +1941,234 @@ def test_status_prepare_block_schema():
     print("  OK  /api/status: model_ready authoritative + prepare block present only while preparing or on error")
 
 
+def test_status_carries_sys_state_and_error_from_capture():
+    # /api/status surfaces the capture's system-audio health (H1) and, for Windows, the short
+    # human-readable reason. A capture that does not expose the field reports 'active' (never a
+    # false warning).
+    from live_transcribe.web import app as A
+
+    class _Cap:
+        sys_state = "failed"
+        sys_error = "System audio device 'Speakers (Realtek(R) Audio)' would not open. Pick the output you are actually using in the System audio dropdown."
+
+        def aec_state(self):
+            return (False, False)
+
+    with A.STATE.lock:
+        saved = (A.STATE.running, A.STATE.stopping, A.STATE.source_kind, A.STATE.capture, A.STATE.engine)
+    try:
+        with A.STATE.lock:
+            A.STATE.running = True
+            A.STATE.stopping = False
+            A.STATE.source_kind = "live"
+            A.STATE.capture = _Cap()
+            A.STATE.engine = None
+        j = client.get("/api/status").json()
+        assert j["sys_state"] == "failed", j
+        assert "Speakers" in (j.get("sys_error") or ""), j
+        # A capture with no sys_error attribute still answers (getattr default None), never crashes.
+        class _Bare:
+            def aec_state(self):
+                return (False, False)
+        with A.STATE.lock:
+            A.STATE.capture = _Bare()
+        j2 = client.get("/api/status").json()
+        assert j2["sys_state"] == "active" and j2["sys_error"] is None, j2
+    finally:
+        with A.STATE.lock:
+            (A.STATE.running, A.STATE.stopping, A.STATE.source_kind, A.STATE.capture, A.STATE.engine) = saved
+    print("  OK  /api/status carries sys_state + sys_error from the capture (defaults safe)")
+
+
+def test_switch_device_loopback_failure_reverts_and_reports():
+    # A loopback that cannot open no longer raises in the capture (mic-only is valid), so a bad
+    # loopback SWITCH must be caught by the sys_state check: it reverts to the previous device and
+    # returns non-200 so the UI toasts it, instead of a misleading "System audio switched."
+    import time as _time
+
+    class _FakeCapture:
+        def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15,
+                     on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False):
+            self.loopback_device = loopback_device
+            self._t0 = t0 if t0 is not None else _time.monotonic()
+            self.aec, self.agc, self.record_raw_mic = aec, agc, record_raw_mic
+            # The dead endpoint: opening it "succeeds" but delivers no audio, exactly as capture_win
+            # now reports it (sys_state='failed' while the mic still opened).
+            self.sys_state = "failed" if loopback_device == "Dead [Loopback]" else "active"
+            self.sys_error = "System audio device 'Dead' would not open." if self.sys_state == "failed" else None
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def attach_sys_ring(self, ring):
+            pass
+
+        def attach_mic_ring(self, ring):
+            pass
+
+        def has_raw_mic(self):
+            return self.record_raw_mic
+
+    st = webapp.STATE
+    saved_factory = webapp.capture.AudioCapture
+    saved = (st.running, st.stopping, st.source_kind, st.capture, st.engine,
+             st.mic_device, st.loopback_device, st.chunk_seconds, st.record_raw_mic)
+    try:
+        webapp.capture.AudioCapture = _FakeCapture
+        st.running, st.stopping, st.source_kind = True, False, "live"
+        st.engine = None
+        st.mic_device, st.loopback_device, st.chunk_seconds = "Mic", "Good [Loopback]", 15
+        st.capture = _FakeCapture(mic_device="Mic", loopback_device="Good [Loopback]")
+
+        # A good loopback switch succeeds and commits.
+        r_ok = client.post("/api/switch-device", json={"which": "loopback", "device": "Good [Loopback]"})
+        assert r_ok.status_code == 200, (r_ok.status_code, r_ok.text)
+        assert st.loopback_device == "Good [Loopback]", st.loopback_device
+
+        # A dead loopback switch does NOT report success: it reverts and returns non-200 with the reason.
+        r_bad = client.post("/api/switch-device", json={"which": "loopback", "device": "Dead [Loopback]"})
+        assert r_bad.status_code == 500, (r_bad.status_code, r_bad.text)
+        assert "Dead" in r_bad.json().get("detail", ""), r_bad.text
+        # Reverted: the committed device is still the good one, and the live capture is on it.
+        assert st.loopback_device == "Good [Loopback]", st.loopback_device
+        assert getattr(st.capture, "loopback_device", None) == "Good [Loopback]", st.capture
+        assert getattr(st.capture, "sys_state", None) == "active", st.capture
+    finally:
+        webapp.capture.AudioCapture = saved_factory
+        (st.running, st.stopping, st.source_kind, st.capture, st.engine,
+         st.mic_device, st.loopback_device, st.chunk_seconds, st.record_raw_mic) = saved
+    print("  OK  /api/switch-device: a dead loopback reverts and returns non-200 (no false 'switched')")
+
+
+def test_start_with_a_failed_loopback_still_starts_mic_only():
+    # Locked: a mic that opened with a loopback that failed still starts (mic-only > nothing), with
+    # sys_state='failed' so the banner shows immediately. Drives capture_win._open_sources with a
+    # fake PyAudio whose loopback stream will not open and whose mic does. Windows-only (capture_win
+    # needs pyaudiowpatch); skipped elsewhere.
+    if sys.platform != "win32":
+        print("  SKIP  start-with-failed-loopback (capture_win is Windows-only)")
+        return
+    import types as _types
+    from live_transcribe import capture_win
+
+    class _FakeStream:
+        def start_stream(self):
+            pass
+
+        def stop_stream(self):
+            pass
+
+        def close(self):
+            pass
+
+    class _FakePA:
+        def open(self, **kw):
+            if kw.get("input_device_index") == 5:      # the loopback endpoint refuses to open
+                raise OSError("[Errno -9996] Invalid device")
+            return _FakeStream()
+
+        def terminate(self):
+            pass
+
+    loop_info = {"index": 5, "name": "Speakers (Realtek(R) Audio) [Loopback]", "maxInputChannels": 2, "defaultSampleRate": 48000.0}
+    mic_info = {"index": 2, "name": "Microphone (2- Samson C01U              )", "maxInputChannels": 1, "defaultSampleRate": 44100.0}
+    saved = (capture_win.pa, capture_win.resolve_loopback, capture_win.resolve_mic, capture_win.default_loopback_name)
+    try:
+        capture_win.pa = _types.SimpleNamespace(PyAudio=_FakePA, paFloat32=1, paContinue=0)
+        capture_win.resolve_loopback = lambda p, spec: dict(loop_info)
+        capture_win.resolve_mic = lambda p, spec: dict(mic_info)
+        capture_win.default_loopback_name = lambda p=None: "Realtek HD Audio 2nd output (Realtek(R) Audio) [Loopback]"
+        cap = capture_win.AudioCapture(mic_device=mic_info["name"], loopback_device=loop_info["name"])
+        cap._open_sources()   # must NOT raise: the mic opens, the loopback fails -> mic-only
+        assert cap.sys_state == "failed", cap.sys_state
+        assert "Speakers" in (cap.sys_error or ""), cap.sys_error
+        assert "MIC" in cap._buffers and "SYS" not in cap._buffers, list(cap._buffers)
+        cap._close_sources()
+    finally:
+        (capture_win.pa, capture_win.resolve_loopback, capture_win.resolve_mic, capture_win.default_loopback_name) = saved
+    print("  OK  a start with a mic that opened and a loopback that failed runs mic-only, sys_state='failed'")
+
+
+def test_device_follow_auto_switches_on_a_default_output_change():
+    # WP-4: when the session is following the Windows default output and that default moves, the
+    # watcher switches the loopback to the new default BY NAME and raises a one-shot toast. Drives
+    # _device_follow_tick with a patched default probe and a fake AudioCapture, no threads.
+    import time as _time
+
+    class _FakeCapture:
+        def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15,
+                     on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False):
+            self.loopback_device = loopback_device
+            self._t0 = t0 if t0 is not None else _time.monotonic()
+            self.aec, self.agc, self.record_raw_mic = aec, agc, record_raw_mic
+            self.sys_state = "active"
+            self.sys_error = None
+            # The rebuilt capture is on the new default, so it is following it again (no re-fire).
+            self.sys_loopback_name = loopback_device
+            self.sys_following_default = True
+            self.sys_frames = 0
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def attach_sys_ring(self, ring):
+            pass
+
+        def attach_mic_ring(self, ring):
+            pass
+
+        def has_raw_mic(self):
+            return self.record_raw_mic
+
+    st = webapp.STATE
+    saved_factory = webapp.capture.AudioCapture
+    saved_probe = webapp._current_default_loopback_name
+    saved = (st.running, st.stopping, st.source_kind, st.capture, st.engine,
+             st.mic_device, st.loopback_device, st.chunk_seconds, st.record_raw_mic,
+             st.sys_switch_notice, st.sys_switch_seq)
+    try:
+        webapp.capture.AudioCapture = _FakeCapture
+        webapp._FOLLOW["last_frames"] = None
+        webapp._FOLLOW["changed_at"] = _time.monotonic()
+        st.running, st.stopping, st.source_kind = True, False, "live"
+        st.engine = None
+        st.mic_device, st.loopback_device, st.chunk_seconds = "Mic", "Speakers [Loopback]", 15
+        st.sys_switch_notice, st.sys_switch_seq = None, 0
+        # The session opened the speakers loopback and was following the default at the time.
+        old = _FakeCapture(mic_device="Mic", loopback_device="Speakers [Loopback]")
+        old.sys_loopback_name = "Speakers [Loopback]"
+        old.sys_following_default = True
+        st.capture = old
+
+        # Windows now reports a DIFFERENT default output (headphones were plugged in).
+        webapp._current_default_loopback_name = lambda: "Headphones [Loopback]"
+        tag = webapp._device_follow_tick(_time.monotonic())
+        assert tag == "followed", tag
+        # The loopback was switched to the new default by name, and the toast is queued once.
+        assert st.loopback_device == "Headphones [Loopback]", st.loopback_device
+        assert getattr(st.capture, "sys_loopback_name", None) == "Headphones [Loopback]", st.capture
+        assert st.sys_switch_notice and st.sys_switch_notice["seq"] == 1, st.sys_switch_notice
+        assert "Headphones [Loopback]" in st.sys_switch_notice["message"], st.sys_switch_notice
+
+        # Second tick, default unchanged: nothing to follow, no new notice.
+        tag2 = webapp._device_follow_tick(_time.monotonic())
+        assert tag2 == "following", tag2
+        assert st.sys_switch_notice["seq"] == 1, "a stable default must not re-fire the toast"
+    finally:
+        webapp.capture.AudioCapture = saved_factory
+        webapp._current_default_loopback_name = saved_probe
+        (st.running, st.stopping, st.source_kind, st.capture, st.engine,
+         st.mic_device, st.loopback_device, st.chunk_seconds, st.record_raw_mic,
+         st.sys_switch_notice, st.sys_switch_seq) = saved
+    print("  OK  device-follow auto-switches the loopback by name when the Windows default output changes")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_app_info,
@@ -2000,7 +2228,11 @@ if __name__ == "__main__":
                test_store_build_registers_no_app_update_check,
                test_preflight_model_api,
                test_downloaded_alternatives_swivuriso_only_when_present,
-               test_status_prepare_block_schema):
+               test_status_prepare_block_schema,
+               test_status_carries_sys_state_and_error_from_capture,
+               test_switch_device_loopback_failure_reverts_and_reports,
+               test_start_with_a_failed_loopback_still_starts_mic_only,
+               test_device_follow_auto_switches_on_a_default_output_change):
         try:
             fn()
         except AssertionError as e:
