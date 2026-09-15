@@ -1,5 +1,13 @@
 # Changelog, SA-Live-Transcribe
 
+## Unreleased, v1.14.1 (2026-09-15)
+
+`licensing.APP_VERSION` 1.14.0 -> 1.14.1. Windows audio device fixes: a device selection now survives Windows renumbering its audio endpoints, and system-audio failures are shown instead of hidden.
+
+- **Your device choice survives plugging in headphones.** Plugging headphones into a Windows machine adds several hidden audio entries and shifts every device number, so a session that had opened your microphone could quietly reopen a different input, and the "everyone else" audio could land on a device playing nothing and record silence for the whole meeting. Volksmond now remembers each device by name rather than by position, re-checks what is plugged in right at the moment you press Begin (and whenever you open a device dropdown), and keeps your choice if it is still there. If the device you picked has been unplugged, it falls back to the current default and tells you which device it switched to. (`live_transcribe/devices_win.py`, `live_transcribe/capture_win.py`, `live_transcribe/web/static/app.js`.)
+- **System audio problems are now visible.** If the "System audio (everyone else)" side cannot be captured while your microphone still works, the meeting used to run microphone-only with no warning at all on Windows. Now a banner says so straight away, names the device and the reason, and points you to the System audio dropdown to pick another. Switching the system-audio device mid-meeting to one that cannot be captured no longer reports "switched" and then silently records nothing: it keeps the previous device and tells you it failed. (`live_transcribe/capture_win.py`, `live_transcribe/web/app.py`, `live_transcribe/web/static/app.js`.)
+- **Volksmond follows your default speakers, or warns when it should.** When your meeting was on the Windows default output and Windows moves it (you plug in headphones, say), Volksmond moves the system-audio capture to follow it and tells you. When you deliberately chose a specific output and it goes silent while Windows is playing somewhere else, a one-click banner offers to switch to the output that is actually playing. (`live_transcribe/web/app.py`, `live_transcribe/web/static/app.js`.)
+
 ## Unreleased, v1.14.0 (test build 2026-09-04)
 
 `licensing.APP_VERSION` 1.13.3 -> 1.14.0.
