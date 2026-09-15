@@ -123,26 +123,66 @@ def _format_gpu(gpu_out):
 def _format_apps(apps_out):
     """Format the compute-apps query into the `apps: ...` tail. `apps_out` is one CSV row per app:
     `pid, process_name, used_memory`. process_name is reduced to its basename (no path, no args).
-    An empty result is a valid state (nothing else on the card), rendered as `apps: none`."""
+    An empty result is a valid state (nothing else on the card), rendered as `apps: none`.
+
+    Privacy: a Windows user profile path can contain a comma (e.g. "C:\\Users\\Example, Person\\..."),
+    so a naive comma split would shift a directory fragment into the memory field and leak that
+    directory name into the log. Each row is parsed with the csv module (nvidia-smi quotes a field
+    that contains a comma) AND reconstructed positionally as a fallback: the FIRST field is the pid,
+    the LAST is the memory, and everything between is the process name rejoined. pid must be an
+    integer and memory an integer or an N/A marker, or the row is dropped; the name is basenamed on
+    BOTH separators BEFORE it can reach the log, so only the executable name ever appears."""
     entries = []
-    for row in apps_out.splitlines():
-        row = row.strip()
-        if not row:
+    for raw in apps_out.splitlines():
+        raw = raw.strip()
+        if not raw:
             continue
-        fields = [f.strip() for f in row.split(",")]
+        try:
+            # skipinitialspace: nvidia-smi writes ", " between fields, so the quote that guards a
+            # comma-bearing path does not sit flush against the delimiter; without this the csv
+            # dialect treats that quote as a literal and a stray quote clings to the basename.
+            fields = next(csv.reader([raw], skipinitialspace=True))
+        except Exception:
+            fields = raw.split(",")
+        fields = [f.strip() for f in fields]
         if len(fields) < 3:
             continue
-        pid, name, mem = fields[0], fields[1], fields[2]
-        base = os.path.basename(name.replace("\\", "/")) or name
-        # Under WDDM nvidia-smi cannot see per-process VRAM and reports "[N/A]"; omit it then rather
-        # than print a useless "[N/A] MB". The adapter dedicated/shared totals cover memory instead.
-        if mem.upper() in ("[N/A]", "N/A", ""):
-            entries.append(f"{base}(pid {pid})")
-        else:
+        pid, mem = fields[0], fields[-1]
+        name = ",".join(fields[1:-1])   # rejoin the middle: a comma in the path cannot reach `mem`
+        if not pid.isdigit():
+            continue                    # a malformed row never reaches the log
+        # basename on both separators, then strip any residual quote (invalid in a Windows filename
+        # anyway), so only the bare executable name can ever reach the log.
+        base = (os.path.basename(name.replace("\\", "/")) or name).strip('"')
+        # Under WDDM nvidia-smi cannot see per-process VRAM and reports "[N/A]"; omit it then (and on
+        # any non-integer memory) rather than print a useless value. The adapter dedicated/shared
+        # totals cover memory instead.
+        if mem.isdigit():
             entries.append(f"{base}(pid {pid}, {mem} MB)")
+        else:
+            entries.append(f"{base}(pid {pid})")
     if not entries:
         return "apps: none"
     return "apps: " + ", ".join(entries)
+
+
+def _normalise_number(value):
+    """typeperf formats its decimals with the machine's locale separator, so on an af-ZA or de-DE
+    box a byte count reads "24956108800,000000" (comma decimal) and a plain float() would raise,
+    silently losing the VRAM diagnostic exactly on SA machines. Normalise to a dot-decimal string
+    without touching process-global locale: a value with BOTH separators treats the LAST one as the
+    decimal point and drops the other (thousands); a value with only a comma treats it as the
+    decimal point. A dot-only or separator-free value is returned unchanged."""
+    value = value.strip().strip('"')
+    has_dot, has_comma = "." in value, "," in value
+    if has_dot and has_comma:
+        if value.rfind(",") > value.rfind("."):
+            value = value.replace(".", "").replace(",", ".")   # comma is the decimal
+        else:
+            value = value.replace(",", "")                     # dot is the decimal
+    elif has_comma:
+        value = value.replace(",", ".")
+    return value
 
 
 def _parse_typeperf(out):
@@ -164,7 +204,7 @@ def _parse_typeperf(out):
     for name, value in zip(header, data):
         low = name.lower()
         try:
-            num = float(value)
+            num = float(_normalise_number(value))
         except ValueError:
             continue
         if "dedicated usage" in low:
@@ -232,16 +272,17 @@ def snapshot():
         # macOS (MLX/Metal) and anything else: never touch nvidia-smi.
         return None
 
-    now = time.monotonic()
+    # Lookup, probe and publish under ONE acquisition, so two diagnostic threads arriving together
+    # cannot both probe: the second blocks until the first has published, then reads the cache. Only
+    # short-lived diagnostic threads call this, so holding the lock across the (2 s bounded) probe is
+    # fine, and it is what keeps a 45-chunk drop burst to a single nvidia-smi call.
     with _lock:
+        now = time.monotonic()
         if _cache["ts"] and (now - _cache["ts"]) < _CACHE_SECONDS:
             cached = _cache["line"]
             return f"{cached} (cached)" if cached is not None else None
-
-    exe = _find_nvidia_smi()
-    line = _build_line(exe) if exe else None
-
-    with _lock:
+        exe = _find_nvidia_smi()
+        line = _build_line(exe) if exe else None
         _cache["line"] = line
         _cache["ts"] = time.monotonic()
     return line
