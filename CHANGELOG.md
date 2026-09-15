@@ -10,6 +10,7 @@
 
 - **Switch between the graphics card and the CPU mid-meeting.** On a Windows machine with an NVIDIA card, the live strip gets a Processor picker (GPU or CPU) and the "struggling to keep up" banner gets a Switch to CPU button. The CPU model is prepared in the background while transcription carries on, then the engine swaps between two chunks without losing audio; switching back restores exactly the size you had on the GPU. On CPU the app may step down to a smaller model on its own if it cannot keep up, and it says so. (`live_transcribe/web/app.py`, `live_transcribe/transcribe.py`, `live_transcribe/web/static/app.js`.)
 - **The log now says what was on the graphics card when the engine struggled.** The first time a session falls behind or drops audio on a CUDA session, one `[gpu]` line records utilisation, memory in use, dedicated and shared GPU memory, and the names of the other programs using the card (names only, no paths), so a slow meeting can be root-caused afterwards. (`live_transcribe/gpu_snapshot.py`, `live_transcribe/transcribe.py`.)
+- **The models table fits its card again.** The Settings table of transcription models was wider than the card, so the Remove button sat behind a horizontal scrollbar; it now fits at normal window widths, the Languages column wraps instead of clipping, and the Swivuriso row lists all seven languages it covers. (`live_transcribe/web/static/styles.css`, `live_transcribe/web/static/app.js`, `live_transcribe/web/static/i18n.js`.)
 
 ## Unreleased, v1.14.0 (test build 2026-09-04)
 
