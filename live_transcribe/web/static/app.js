@@ -2204,6 +2204,12 @@ function refreshSilence() {
     if (sysFaultSig(sf) !== sysFaultSig(S.live.sysFault)) { S.live.sysFault = sf; changed = true; }
     var sih = st.sys_idle_hint || null;
     if (sysIdleHintSig(sih) !== sysIdleHintSig(S.live.sysIdleHint)) { S.live.sysIdleHint = sih; changed = true; }
+    // Reset the dismissal once the server hint clears or changes, so a dismissed hint is not
+    // suppressed forever after the condition goes away and later comes back (codex G6). Kept while the
+    // exact same hint persists (the dismissal still holds through steady-state polls).
+    if (sysIdleHintSig(sih) !== S.live.sysIdleHintDismissedFor && S.live.sysIdleHintDismissedFor != null) {
+      S.live.sysIdleHintDismissedFor = null; changed = true;
+    }
     // The device the capture is actually running on can change WITHOUT a user action (the server's
     // follow-the-default auto-switch), so adopt the current specs every poll to keep the live-strip
     // dropdowns honest.
@@ -2433,10 +2439,15 @@ function sysAudioBanner() {
   // denied case keeps its own how-to-fix wording; a generic line is the final fallback.
   var f = S.live.sysFault;
   var body;
-  if (f && f.reason === "open_failed") {
-    body = trFmt("System audio device {d} would not open, usually because nothing is playing to it. Pick the output you are actually using in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.", { d: f.device || "" });
+  if (f && f.reason === "open_failed" && f.device) {
+    body = trFmt("System audio device {d} would not open, usually because nothing is playing to it. Pick the output you are actually using in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.", { d: f.device });
+  } else if (f && f.reason === "open_failed") {
+    // No device name (codex G7): a fully translated unnamed template, no English placeholder inserted.
+    body = tr("The system audio would not open, usually because nothing is playing to it. Pick the output you are actually using in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.");
+  } else if (f && f.reason === "not_found" && f.device) {
+    body = trFmt("System audio device {d} could not be found (it may have been unplugged or renumbered). Pick another entry in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.", { d: f.device });
   } else if (f && f.reason === "not_found") {
-    body = trFmt("System audio device {d} could not be found (it may have been unplugged or renumbered). Pick another entry in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.", { d: f.device || "" });
+    body = tr("The system audio device could not be found (it may have been unplugged or renumbered). Pick another entry in the System audio dropdown. Only your microphone is being recorded, so the other side of the call won't be in the transcript.");
   } else if (S.live.sysState === "permission_denied") {
     body = tr("System audio isn't being captured, so only your microphone is being recorded. The other side of the call won't be in the transcript. You can allow it in System Settings > Privacy & Security, then restart the meeting.");
   } else {

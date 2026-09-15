@@ -602,10 +602,10 @@ class _AudioTapHelper:
 # ---- the capture backend ---------------------------------------------------
 
 class AudioCapture(CaptureBase):
-    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False):
+    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False, positional=True):
         super().__init__(mic_device=mic_device, loopback_device=loopback_device,
                          chunk_seconds=chunk_seconds, on_chunk=on_chunk, t0=t0,
-                         aec=aec, agc=agc, record_raw_mic=record_raw_mic)
+                         aec=aec, agc=agc, record_raw_mic=record_raw_mic, positional=positional)
         self._mic_stream = None
         self._helper = None
         self._sys_await_thread = None   # deferred permission-wait completion thread
@@ -636,7 +636,7 @@ class AudioCapture(CaptureBase):
         # not resolve OR open is surfaced as an error (matching capture_win exactly).
         loop_desc = None
         try:
-            loop_desc = resolve_loopback(None, self.loopback_device_spec)
+            loop_desc = resolve_loopback(None, self.loopback_device_spec, positional=self.positional)
         except Exception as e:
             print(f"[SYS] system audio disabled: {e}", flush=True)
 
@@ -655,7 +655,7 @@ class AudioCapture(CaptureBase):
 
         mic_desc = None
         try:
-            mic_desc = resolve_mic(None, self.mic_device_spec)
+            mic_desc = resolve_mic(None, self.mic_device_spec, positional=self.positional)
         except Exception as e:
             if self.mic_device_spec is not None:
                 # An EXPLICITLY chosen mic that will not resolve is fatal, exactly as

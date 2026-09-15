@@ -89,8 +89,13 @@ def _mic_pool(p):
     return wasapi_mics if wasapi_mics else allmics
 
 
-def resolve_loopback(p, spec):
+def resolve_loopback(p, spec, positional=True):
     """Return a PortAudio device info dict for a loopback (system audio) device.
+
+    `positional` (codex G2): the CLI passes True so a bare integer selects by position; the web layer
+    passes False, because a UI value is ALWAYS a name (a device named "2", or a stale numeric value
+    whose device has vanished, must resolve by name only and raise when missing, never fall through to
+    positional index 2).
 
     Resolution order (codex F4): None -> the system default; then an EXACT cleaned-name match (the
     UI's value, which can itself be numeric like "123"); then a bare integer as a positional index
@@ -106,12 +111,13 @@ def resolve_loopback(p, spec):
     for info in loopbacks:
         if _fix_name(info["name"]).strip() == want:
             return info
-    idx = _as_index(spec)
-    if idx is not None:
-        info = p.get_device_info_by_index(idx)
-        if not info.get("isLoopbackDevice"):
-            raise ValueError(f"Device #{idx} '{_fix_name(info['name'])}' is not a loopback device.")
-        return info
+    if positional:
+        idx = _as_index(spec)
+        if idx is not None:
+            info = p.get_device_info_by_index(idx)
+            if not info.get("isLoopbackDevice"):
+                raise ValueError(f"Device #{idx} '{_fix_name(info['name'])}' is not a loopback device.")
+            return info
     sub = want.lower()
     for info in loopbacks:
         if sub in _fix_name(info["name"]).strip().lower():
@@ -119,14 +125,15 @@ def resolve_loopback(p, spec):
     raise ValueError(f"No loopback device matching {spec!r}. Run --list-devices.")
 
 
-def resolve_mic(p, spec):
+def resolve_mic(p, spec, positional=True):
     """Return a PortAudio device info dict for a microphone (non-loopback input).
 
     Same order as resolve_loopback: None -> the system default; EXACT cleaned-name match over the
-    WASAPI-first pool (codex F3/F4); then a bare integer as a positional index (CLI; raises on no
-    input channels); then substring over the pool. Resolving against the same preferred pool the UI
-    lists means an identically named MME duplicate can never win over the WASAPI endpoint that was
-    offered, and loopbacks are excluded throughout so a name can never cross classes."""
+    WASAPI-first pool (codex F3); then (only when `positional`) a bare integer as a positional index
+    (CLI; raises on no input channels); then substring over the pool. `positional` is False from the
+    web layer so a numeric UI value is name-only and never opens a positional index (codex G2).
+    Resolving against the same preferred pool the UI lists means an identically named MME duplicate
+    can never win over the WASAPI endpoint that was offered, and loopbacks are excluded throughout."""
     if spec is None:
         return p.get_default_input_device_info()
     want = str(spec).strip()
@@ -134,12 +141,13 @@ def resolve_mic(p, spec):
     for info in pool:
         if _fix_name(info["name"]).strip() == want:
             return info
-    idx = _as_index(spec)
-    if idx is not None:
-        info = p.get_device_info_by_index(idx)
-        if info["maxInputChannels"] == 0:
-            raise ValueError(f"Device #{idx} '{_fix_name(info['name'])}' has no input channels.")
-        return info
+    if positional:
+        idx = _as_index(spec)
+        if idx is not None:
+            info = p.get_device_info_by_index(idx)
+            if info["maxInputChannels"] == 0:
+                raise ValueError(f"Device #{idx} '{_fix_name(info['name'])}' has no input channels.")
+            return info
     sub = want.lower()
     for info in pool:
         if sub in _fix_name(info["name"]).strip().lower():

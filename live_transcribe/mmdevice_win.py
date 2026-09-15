@@ -28,7 +28,14 @@ _STGM_READ = 0
 _DEVICE_STATE_ACTIVE = 0x00000001
 _eRender = 0
 _eCapture = 1
-_eConsole = 0
+# ERole: use eMultimedia (1), NOT eConsole (0). PyAudioWPatch's WASAPI host resolves its own default
+# device with eMultimedia (pa_win_wasapi.c), so the PortAudio default loopback the capture opens and
+# the follow-the-default bookkeeping compare against is the eMultimedia endpoint. Probing eConsole
+# here would, when the two roles point at different endpoints, make the watcher chase the console
+# default, move capture off the multimedia default, and then mark sys_following_default False,
+# silently killing auto-follow. Matching the role keeps all three (probe, listing default,
+# bookkeeping) on the same endpoint (codex G1).
+_eMultimedia = 1
 _VT_LPWSTR = 31
 
 _logged_fail = False
@@ -141,7 +148,7 @@ def _default_endpoint_name(flow):
     def _fn(ole32, pEnum):
         pDev = ctypes.c_void_p()
         hr = _method(pEnum, 4, [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)])(  # GetDefaultAudioEndpoint
-            pEnum, flow, _eConsole, ctypes.byref(pDev))
+            pEnum, flow, _eMultimedia, ctypes.byref(pDev))
         if hr == _E_NOTFOUND or hr < 0 or not pDev:
             return None
         try:
@@ -167,27 +174,35 @@ def default_capture_friendly_name():
 
 
 def _endpoint_names(ole32, pEnum, flow):
-    out = []
+    """The friendly names of this data flow's ACTIVE endpoints, or None when enumeration itself
+    failed (codex G4). None is distinct from []: [] means "successfully enumerated, nothing active",
+    which is a real answer the UI can show; None means "could not enumerate this class", which must
+    fall the whole listing back to PortAudio rather than silently drop a dropdown. A single device
+    whose property read fails is skipped (logged once), never failing the whole class."""
     pColl = ctypes.c_void_p()
     hr = _method(pEnum, 3, [ctypes.c_int, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p)])(  # EnumAudioEndpoints
         pEnum, flow, _DEVICE_STATE_ACTIVE, ctypes.byref(pColl))
     if hr < 0 or not pColl:
-        return out
+        return None
     try:
         count = ctypes.c_uint()
         hr = _method(pColl, 3, [ctypes.POINTER(ctypes.c_uint)])(pColl, ctypes.byref(count))  # GetCount
         if hr < 0:
-            return out
+            return None
+        out = []
         for i in range(count.value):
             pDev = ctypes.c_void_p()
             hr = _method(pColl, 4, [ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)])(  # Item
                 pColl, i, ctypes.byref(pDev))
             if hr < 0 or not pDev:
+                _log_once("an endpoint could not be opened; skipping it")
                 continue
             try:
                 nm = _friendly_name(ole32, pDev)
                 if nm:
                     out.append(nm)
+                else:
+                    _log_once("an endpoint's friendly name could not be read; skipping it")
             finally:
                 _release(pDev)
         return out
@@ -196,14 +211,16 @@ def _endpoint_names(ole32, pEnum, flow):
 
 
 def list_endpoints():
-    """{'render': [friendly names], 'capture': [friendly names]} for every ACTIVE endpoint, live.
-    Empty lists on any COM failure (logged once). Loopback names are render names + ' [Loopback]'."""
+    """{'render': names_or_None, 'capture': names_or_None} for the ACTIVE endpoints, live. A class is
+    None when it could not be enumerated (COM failure), [] when it enumerated to nothing; the caller
+    falls the whole listing back to PortAudio when EITHER class is None (codex G4). Loopback names are
+    render names + ' [Loopback]'."""
     def _fn(ole32, pEnum):
         return {"render": _endpoint_names(ole32, pEnum, _eRender),
                 "capture": _endpoint_names(ole32, pEnum, _eCapture)}
     try:
         r = _with_enumerator(_fn)
-        return r if r is not None else {"render": [], "capture": []}
+        return r if r is not None else {"render": None, "capture": None}
     except Exception as e:
         _log_once(f"endpoint enumeration failed: {e}")
-        return {"render": [], "capture": []}
+        return {"render": None, "capture": None}

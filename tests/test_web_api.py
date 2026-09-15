@@ -733,7 +733,7 @@ def test_switch_device_preserves_recording_clock():
 
     class _FakeCapture:
         def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15,
-                     on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False):
+                     on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False, positional=True):
             self._t0_init = t0
             self._t0 = t0 if t0 is not None else _time.monotonic()
             self.aec = aec
@@ -1591,7 +1591,7 @@ def test_switch_device_resets_the_loop_history():
         fail_on = None      # mic_device value whose start() blows up
 
         def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15,
-                     on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False):
+                     on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False, positional=True):
             self.mic_device = mic_device
             self._t0 = t0 if t0 is not None else _time.monotonic()
             self.aec, self.agc, self.record_raw_mic = aec, agc, record_raw_mic
@@ -1988,7 +1988,7 @@ def test_switch_device_loopback_failure_reverts_and_reports():
 
     class _FakeCapture:
         def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15,
-                     on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False):
+                     on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False, positional=True):
             self.loopback_device = loopback_device
             self._t0 = t0 if t0 is not None else _time.monotonic()
             self.aec, self.agc, self.record_raw_mic = aec, agc, record_raw_mic
@@ -2078,10 +2078,10 @@ def test_start_with_a_failed_loopback_still_starts_mic_only():
     saved = (capture_win.pa, capture_win.resolve_loopback, capture_win.resolve_mic, capture_win.default_loopback_name)
     try:
         capture_win.pa = _types.SimpleNamespace(PyAudio=_FakePA, paFloat32=1, paContinue=0)
-        capture_win.resolve_loopback = lambda p, spec: dict(loop_info)
-        capture_win.resolve_mic = lambda p, spec: dict(mic_info)
+        capture_win.resolve_loopback = lambda p, spec, positional=True: dict(loop_info)
+        capture_win.resolve_mic = lambda p, spec, positional=True: dict(mic_info)
         capture_win.default_loopback_name = lambda p=None: "Realtek HD Audio 2nd output (Realtek(R) Audio) [Loopback]"
-        cap = capture_win.AudioCapture(mic_device=mic_info["name"], loopback_device=loop_info["name"])
+        cap = capture_win.AudioCapture(mic_device=mic_info["name"], loopback_device=loop_info["name"], positional=False)
         cap._open_sources()   # must NOT raise: the mic opens, the loopback fails -> mic-only
         assert cap.sys_state == "failed", cap.sys_state
         assert "Speakers" in (cap.sys_error or ""), cap.sys_error
@@ -2103,7 +2103,7 @@ def test_device_follow_auto_switches_on_a_default_output_change():
 
     class _FakeCapture:
         def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15,
-                     on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False):
+                     on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False, positional=True):
             self.loopback_device = loopback_device
             self._t0 = t0 if t0 is not None else _time.monotonic()
             self.aec, self.agc, self.record_raw_mic = aec, agc, record_raw_mic
@@ -2219,6 +2219,51 @@ def test_live_devices_win_builds_from_mmdevice():
     print("  OK  /api/devices live path builds names from MMDevice (loopback = render + ' [Loopback]'); empty falls through")
 
 
+def test_live_devices_win_falls_back_on_partial_com_failure():
+    # codex G4: a partial COM failure (one class enumerates None) must fall the WHOLE listing back to
+    # PortAudio rather than advertise a half list that silently drops a dropdown. list_endpoints
+    # returns None for a class it could not enumerate; _live_devices_win returns None then.
+    from live_transcribe import mmdevice_win
+    saved = (mmdevice_win.list_endpoints, mmdevice_win.default_render_friendly_name,
+             mmdevice_win.default_capture_friendly_name)
+    try:
+        mmdevice_win.default_render_friendly_name = lambda: "Headphones"
+        mmdevice_win.default_capture_friendly_name = lambda: "Samson"
+        # render enumeration failed (None) but capture succeeded: must NOT build a half list.
+        mmdevice_win.list_endpoints = lambda: {"render": None, "capture": ["Samson"]}
+        assert webapp._live_devices_win() is None, "a None class must fall back to PortAudio"
+        # capture failed, render succeeded: same.
+        mmdevice_win.list_endpoints = lambda: {"render": ["Speakers"], "capture": None}
+        assert webapp._live_devices_win() is None, "a None class must fall back to PortAudio"
+        # both classes genuinely enumerated (one empty): still a valid listing, not a fallback.
+        mmdevice_win.list_endpoints = lambda: {"render": ["Speakers"], "capture": []}
+        d = webapp._live_devices_win()
+        assert d is not None and [l["name"] for l in d["loopbacks"]] == ["Speakers [Loopback]"] and d["mics"] == [], d
+    finally:
+        (mmdevice_win.list_endpoints, mmdevice_win.default_render_friendly_name,
+         mmdevice_win.default_capture_friendly_name) = saved
+    print("  OK  /api/devices live path falls back to PortAudio on a partial COM failure (G4)")
+
+
+def test_sys_error_unnamed_device_is_null():
+    # codex G7: when there is no real device name, the structured fault carries device=None so the UI
+    # picks a translated unnamed template, instead of the English placeholder being inserted verbatim
+    # into the Afrikaans string. sys_error (the log string) keeps a readable placeholder.
+    if sys.platform != "win32":
+        print("  SKIP  sys_error unnamed (capture_win is Windows-only)")
+        return
+    from live_transcribe import capture_win
+    cap = capture_win.AudioCapture(positional=False)
+    cap._set_sys_error(None, reason="not_found")
+    assert cap.sys_error_device is None, cap.sys_error_device
+    assert cap.sys_error_reason == "not_found", cap.sys_error_reason
+    assert cap.sys_error and "system-audio device" in cap.sys_error, cap.sys_error   # log placeholder kept
+    # A real name is still carried structured, cleaned.
+    cap._set_sys_error("Speakers (Realtek(R) Audio)", reason="open_failed")
+    assert cap.sys_error_device == "Speakers (Realtek(R) Audio)", cap.sys_error_device
+    print("  OK  an unnamed system-audio failure reports device=None (translated unnamed template) (G7)")
+
+
 if __name__ == "__main__":
     failures = 0
     for fn in (test_app_info,
@@ -2283,7 +2328,9 @@ if __name__ == "__main__":
                test_switch_device_loopback_failure_reverts_and_reports,
                test_start_with_a_failed_loopback_still_starts_mic_only,
                test_device_follow_auto_switches_on_a_default_output_change,
-               test_live_devices_win_builds_from_mmdevice):
+               test_live_devices_win_builds_from_mmdevice,
+               test_live_devices_win_falls_back_on_partial_com_failure,
+               test_sys_error_unnamed_device_is_null):
         try:
             fn()
         except AssertionError as e:

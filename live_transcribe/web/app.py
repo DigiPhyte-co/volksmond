@@ -1350,16 +1350,16 @@ def _device_follow_tick(now):
         # concurrent user switch or a new session is never overwritten.
         if default_name != chosen:
             try:
-                _switch_device("loopback", default_name, expect_capture=cap, expect_session=session)
+                # announce_follow publishes the toast INSIDE the switch's lock scope (codex G5), so it
+                # names the device actually committed and cannot be desynced by a user switch racing
+                # the notice.
+                _switch_device("loopback", default_name, expect_capture=cap, expect_session=session,
+                               announce_follow=True)
             except HTTPException:
                 return "follow-failed"      # session changed, or the new default would not open
             except Exception as e:
                 print(f"[device-follow] could not follow the default output: {e}", flush=True)
                 return "follow-failed"
-            with STATE.lock:
-                if STATE.started_at is session and STATE.capture is not None:
-                    _raise_sys_switch_notice(default_name)
-                    STATE.sys_idle_hint = None
             return "followed"
         with STATE.lock:
             if STATE.capture is cap and STATE.started_at is session:
@@ -1903,7 +1903,12 @@ def _live_devices_win():
     try:
         from .. import mmdevice_win
         eps = mmdevice_win.list_endpoints()
-        renders, captures = eps.get("render") or [], eps.get("capture") or []
+        renders, captures = eps.get("render"), eps.get("capture")
+        # None means a class could not be enumerated (partial COM failure): fall the WHOLE listing
+        # back to PortAudio rather than advertise a half list that drops a dropdown (codex G4). [] is
+        # a real "nothing active" answer and is kept.
+        if renders is None or captures is None:
+            return None
         if not renders and not captures:
             return None
         loop_names = [n + " [Loopback]" for n in renders]
@@ -1971,7 +1976,7 @@ def switch_device(req: SwitchDeviceRequest):
     return _switch_device(req.which, req.device)
 
 
-def _switch_device(which, device, expect_capture=None, expect_session=None):
+def _switch_device(which, device, expect_capture=None, expect_session=None, announce_follow=False):
     """Core of the device switch, callable by the API handler and by the device-follow watcher.
 
     expect_capture / expect_session (codex F2): when given, the switch runs ONLY if STATE.capture is
@@ -1996,7 +2001,8 @@ def _switch_device(which, device, expect_capture=None, expect_session=None):
             # recording side channel) off.
             c = capture.AudioCapture(mic_device=m, loopback_device=l, chunk_seconds=chunk,
                                      on_chunk=_feed, t0=old_cap._t0, aec=old_cap.aec,
-                                     agc=old_cap.agc, record_raw_mic=old_cap.record_raw_mic)
+                                     agc=old_cap.agc, record_raw_mic=old_cap.record_raw_mic,
+                                     positional=False)   # switch values are device NAMES (codex G2)
             eng = STATE.engine
             # Re-attach BOTH energy rings, or the guards' level reference dies at the first
             # mid-meeting device change (the rings survive on the engine; the new capture has to
@@ -2067,6 +2073,13 @@ def _switch_device(which, device, expect_capture=None, expect_session=None):
         STATE.mic_device, STATE.loopback_device = mic, loop
         _reset_loop_history()
         _silence_after_switch()
+        # Publish the auto-follow toast INSIDE this lock scope (codex G5), naming the device we just
+        # committed to (`loop`), so a user switch that lands between here and the watcher's next line
+        # can never make the notice name the wrong output. The watcher passes announce_follow only on
+        # the follow path; the API handler never does.
+        if announce_follow:
+            _raise_sys_switch_notice(loop)
+            STATE.sys_idle_hint = None
         return {"which": which, "device": device, "mic_device": mic, "loopback_device": loop}
 
 
@@ -3468,6 +3481,7 @@ def start(req: StartRequest):
             aec=aec_live,
             agc=agc_live,
             record_raw_mic=False,   # record the AEC-cleaned mic into the single stereo file, not a raw stem
+            positional=False,       # UI values are device NAMES, never positional indices (codex G2)
         )
         # The engine's energy rings (SYS echo-veto reference, gain-invariant raw MIC) live on the
         # engine and are attached by _build_engine_async once it exists, not here, because there is no

@@ -102,7 +102,7 @@ def print_devices():
     print("System audio is the whole-system tap; --loopback-device selects it on/off only.")
 
 
-def resolve_loopback(p, spec):
+def resolve_loopback(p, spec, positional=True):
     """Resolve the system-audio request to the synthetic tap descriptor, or raise.
 
     On macOS there is exactly one tap, so this collapses to "helper on/off":
@@ -111,8 +111,9 @@ def resolve_loopback(p, spec):
     the capture backend treats the same way Windows treats a failed loopback
     resolve: log it and continue mic-only.
 
-    `p` is accepted for signature parity with the Windows backend (which passes
-    its PyAudio handle) and is ignored here.
+    `positional` (codex G2) mirrors the Windows signature: the CLI passes True so the sentinel index
+    still works; the web layer passes False so a UI value is name-only. `p` is accepted for signature
+    parity with the Windows backend and is ignored here.
     """
     if spec is None:
         return _sys_loopback_entry()
@@ -120,11 +121,13 @@ def resolve_loopback(p, spec):
     # rule; there is only one tap, so this is simply the precise form of the substring accept below.
     if str(spec).strip() == SYS_LOOPBACK_NAME:
         return _sys_loopback_entry()
-    # Numeric spec: only the sentinel index selects the tap.
-    try:
-        idx = int(spec)
-    except (TypeError, ValueError):
-        idx = None
+    # Numeric spec: only the sentinel index selects the tap (CLI only).
+    idx = None
+    if positional:
+        try:
+            idx = int(spec)
+        except (TypeError, ValueError):
+            idx = None
     if idx is not None:
         if idx == SYS_LOOPBACK_INDEX:
             return _sys_loopback_entry()
@@ -142,16 +145,17 @@ def resolve_loopback(p, spec):
     )
 
 
-def resolve_mic(p, spec):
+def resolve_mic(p, spec, positional=True):
     """Return a normalised mic descriptor ({index, name, rate, channels}) that
     capture_mac can hand straight to a sounddevice InputStream.
 
     Resolution order mirrors the Windows backend (codex F5): None -> the Core Audio
     default input; an EXACT cleaned-name match (the value the shared UI sends now);
-    then an integer -> that device index (positional, for the CLI); then a
+    then (only when `positional`) an integer -> that device index; then a
     case-insensitive name-substring match. Exact-before-substring stops picking
-    "Microphone" from opening "External Microphone". `p` is ignored (parity with
-    the Windows signature).
+    "Microphone" from opening "External Microphone". `positional` is False from the
+    web layer so a numeric UI value is name-only (codex G2). `p` is ignored (parity
+    with the Windows signature).
     """
     sd = _sd()
     devices = sd.query_devices()
@@ -182,11 +186,13 @@ def resolve_mic(p, spec):
         if str(info["name"]).strip() == want:
             return _descriptor(i)
 
-    # Integer index (positional, for the CLI).
-    try:
-        idx = int(spec)
-    except (TypeError, ValueError):
-        idx = None
+    # Integer index (positional, for the CLI only).
+    idx = None
+    if positional:
+        try:
+            idx = int(spec)
+        except (TypeError, ValueError):
+            idx = None
     if idx is not None:
         if idx < 0 or idx >= len(devices):
             raise ValueError(f"No device #{idx}. Run --list-devices.")

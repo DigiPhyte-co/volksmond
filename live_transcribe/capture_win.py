@@ -14,10 +14,10 @@ from .devices_win import _fix_name, default_loopback_name, resolve_loopback, res
 
 
 class AudioCapture(CaptureBase):
-    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False):
+    def __init__(self, mic_device=None, loopback_device=None, chunk_seconds=15, on_chunk=None, t0=None, aec=False, agc=True, record_raw_mic=False, positional=True):
         super().__init__(mic_device=mic_device, loopback_device=loopback_device,
                          chunk_seconds=chunk_seconds, on_chunk=on_chunk, t0=t0,
-                         aec=aec, agc=agc, record_raw_mic=record_raw_mic)
+                         aec=aec, agc=agc, record_raw_mic=record_raw_mic, positional=positional)
         self._pa = None
         self._streams = []
         # System-audio (loopback) health, mirrored to /api/status the same way the Mac backend
@@ -52,7 +52,7 @@ class AudioCapture(CaptureBase):
 
         loopback_info = None
         try:
-            loopback_info = resolve_loopback(self._pa, self.loopback_device_spec)
+            loopback_info = resolve_loopback(self._pa, self.loopback_device_spec, positional=self.positional)
         except Exception as e:
             # Resolution failed (a stale index, or a chosen device that was unplugged/renumbered). Do
             # NOT abort: the mic below may still open, and a mic-only session is better than no
@@ -64,7 +64,7 @@ class AudioCapture(CaptureBase):
 
         mic_info = None
         try:
-            mic_info = resolve_mic(self._pa, self.mic_device_spec)
+            mic_info = resolve_mic(self._pa, self.mic_device_spec, positional=self.positional)
         except Exception as e:
             print(f"[MIC] cannot resolve mic: {e}", flush=True)
 
@@ -119,15 +119,21 @@ class AudioCapture(CaptureBase):
         """Record a system-audio failure in both forms: the structured (reason code + device name)
         the UI renders through a translated template (codex F7), and the plain English sys_error
         string for the log and diagnostics. reason is "not_found" (could not resolve) or "open_failed"
-        (resolved but the endpoint would not open, usually nothing rendering to it). No stack traces."""
-        who = _fix_name(str(name)).strip() if name else "the chosen system-audio device"
+        (resolved but the endpoint would not open, usually nothing rendering to it). No stack traces.
+
+        When there is no real device name (a None spec that still failed), sys_error_device is None
+        (codex G7): the UI then picks a translated UNNAMED-device template rather than inserting an
+        English placeholder verbatim into the Afrikaans string. The log string keeps a readable
+        placeholder for diagnostics."""
+        who = _fix_name(str(name)).strip() if name else None
         self.sys_error_reason = reason
         self.sys_error_device = who
+        log_who = who or "the chosen system-audio device"
         if reason == "open_failed":
-            self.sys_error = (f"System audio device '{who}' would not open, usually because nothing is "
+            self.sys_error = (f"System audio device '{log_who}' would not open, usually because nothing is "
                               "playing to it. Pick the output you are actually using in the System audio dropdown.")
         else:
-            self.sys_error = (f"System audio device '{who}' could not be found (it may have been unplugged "
+            self.sys_error = (f"System audio device '{log_who}' could not be found (it may have been unplugged "
                               "or renumbered). Pick another entry in the System audio dropdown.")
 
     def _close_sources(self):

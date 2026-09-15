@@ -198,6 +198,43 @@ def test_a_numeric_device_name_resolves_as_a_name_not_an_index():
     print("  OK  a numeric device NAME resolves as a name; a positional CLI index still works (F4)")
 
 
+def test_positional_flag_gates_index_resolution():
+    # codex G2: the web layer passes positional=False so a UI value is name-only. A device named "2",
+    # or a stale numeric value whose device has vanished, must resolve by name (or raise), never fall
+    # through to positional index 2. The CLI keeps positional=True.
+    named2 = [
+        {"index": 0, "name": "Out A", "maxInputChannels": 0, "isLoopbackDevice": False, "hostApi": WASAPI_IDX, "defaultSampleRate": 48000.0},
+        {"index": 1, "name": "2", "maxInputChannels": 1, "isLoopbackDevice": False, "hostApi": WASAPI_IDX, "defaultSampleRate": 48000.0},
+        {"index": 2, "name": "Real Mic", "maxInputChannels": 1, "isLoopbackDevice": False, "hostApi": WASAPI_IDX, "defaultSampleRate": 48000.0},
+    ]
+    p = FakePyAudio(named2)
+    # A device literally named "2": both modes resolve it by exact name (index 1), never index 2.
+    assert devices_win.resolve_mic(p, "2", positional=True)["index"] == 1
+    assert devices_win.resolve_mic(p, "2", positional=False)["index"] == 1
+    # A numeric value with NO matching name: the CLI opens positional index 2; the web layer refuses.
+    two_mics = [
+        {"index": 0, "name": "Out A", "maxInputChannels": 0, "isLoopbackDevice": False, "hostApi": WASAPI_IDX, "defaultSampleRate": 48000.0},
+        {"index": 1, "name": "Mic One", "maxInputChannels": 1, "isLoopbackDevice": False, "hostApi": WASAPI_IDX, "defaultSampleRate": 48000.0},
+        {"index": 2, "name": "Mic Two", "maxInputChannels": 1, "isLoopbackDevice": False, "hostApi": WASAPI_IDX, "defaultSampleRate": 48000.0},
+    ]
+    p2 = FakePyAudio(two_mics)
+    assert devices_win.resolve_mic(p2, "2", positional=True)["index"] == 2   # CLI positional index
+    try:
+        devices_win.resolve_mic(p2, "2", positional=False)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("positional=False must not open a positional index for a numeric UI value")
+    # Same for the loopback resolver: a numeric value with no name match refuses under positional=False.
+    try:
+        devices_win.resolve_loopback(FakePyAudio(), "4", positional=False)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("positional=False loopback must not open a positional index")
+    print("  OK  positional=False makes numeric values name-only; CLI positional=True still indexes (G2)")
+
+
 def test_default_loopback_name_is_cleaned():
     saved = devices_win.pa
     try:
@@ -237,6 +274,7 @@ if __name__ == "__main__":
              test_resolve_mic_ignores_loopbacks_and_trailing_spaces,
              test_resolve_mic_prefers_wasapi_over_an_earlier_mme_duplicate,
              test_a_numeric_device_name_resolves_as_a_name_not_an_index,
+             test_positional_flag_gates_index_resolution,
              test_default_loopback_name_is_cleaned,
              test_list_ui_devices_includes_the_cleaned_name_and_dedupes)
     failures = 0
