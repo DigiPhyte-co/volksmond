@@ -29,6 +29,10 @@ import faster_whisper.transcribe as _fw_transcribe
 # (fuzzy_echo_veto below) reuses it so both places call the same two words "the same word".
 from . import dedup
 
+# One-shot NVIDIA GPU usage snapshot, fired off-thread when a CUDA session delivers its struggle
+# notice so the log names what else was on the card. Stdlib only, no-op on macOS (MLX/Metal).
+from . import gpu_snapshot
+
 
 # Fluister: our Afrikaans-optimised Whisper models (LoRA fine-tunes merged to ctranslate2 int8).
 # Much better on Afrikaans, equal-or-better on English, no Afrikaans leakage on pure-English
@@ -1844,6 +1848,7 @@ class Engine:
                                                # DESIGN (the catch-up replay), which is not a fault
         self._struggle_warned = False          # the one-shot ratchet
         self._struggle_notice_due = False      # the worker owes the transcript a STRUGGLE_NOTICE
+        self._gpu_snapshot_fired = False       # one-shot: at most one GPU snapshot attempt per session
         self._pending_hist = deque(maxlen=STRUGGLE_COMPLETION_WINDOW)  # depth at COMPLETIONS
         self._arrival_hist = deque(maxlen=STRUGGLE_ARRIVAL_WINDOW)   # depth at ARRIVALS
         self._pending_mic = []                # [(release_monotonic, Segment)] held by MIC_PUBLISH_DELAY
@@ -2687,6 +2692,13 @@ class Engine:
         """
         if why is None:
             return
+        # A CUDA session that is struggling: name what else is on the card, ONCE, off-thread. This is
+        # the single delivery point for the one-shot notice (forced drop, arrival and completion all
+        # funnel here and the ratchet lets exactly one call through), so the snapshot fires once per
+        # session and never on the audio or worker thread. CPU/MLX skip it: nvidia-smi is a CUDA
+        # thing and must never run on a Mac.
+        if self._device == "cuda":
+            self._fire_gpu_snapshot()
         cb = self.on_struggle
         msg = f"[engine] cannot hold real time on {self._device} ({why}); warning the user"
 
@@ -2711,6 +2723,33 @@ class Engine:
             # Thread exhaustion, and nothing else, reaches here. It must not escape into the capture
             # callback: the transcript notice is already owed, so the warning still reaches the user
             # through the transcript even when no thread could be started.
+            pass
+
+    def _fire_gpu_snapshot(self):
+        """Print one `[gpu] ...` line naming what else is on the NVIDIA card, off-thread.
+
+        The snapshot shells out to nvidia-smi (with a hard timeout) which must never touch the audio
+        or worker thread, so it runs on its own short-lived daemon thread exactly like the struggle
+        callback. At most one attempt per session (_gpu_snapshot_fired): the delivery point already
+        fires once, and this makes the "no snapshot available" fallback un-spammable even if that
+        ever changed. Guarded end to end; no condition of the log may reach the caller. getattr so a
+        minimal stub engine (the struggle tests build one via __new__) needs no attribute seeded."""
+        if getattr(self, "_gpu_snapshot_fired", False):
+            return
+        self._gpu_snapshot_fired = True
+
+        def _fire():
+            try:
+                line = gpu_snapshot.snapshot()
+                # nvidia-smi absent (a CPU laptop, an AMD/Intel card) or a failed probe: say so once,
+                # so a later "it fell behind" report shows the snapshot was tried, not forgotten.
+                print(f"[gpu] {line}" if line else "[gpu] no snapshot available", flush=True)
+            except Exception:
+                pass
+
+        try:
+            threading.Thread(target=_fire, daemon=True, name="gpu-snapshot").start()
+        except Exception:
             pass
 
     def _take_struggle_notice(self):
