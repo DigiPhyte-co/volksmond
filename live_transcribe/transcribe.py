@@ -1891,6 +1891,11 @@ class Engine:
         self._dropped = 0                 # chunks dropped to backpressure since last reported
         self._change_lock = threading.Lock()  # guards _pending_change (API thread queues, worker applies)
         self._pending_change = None           # a live language/model change to apply between chunks
+        # The change_id of the LAST pending change the worker has actually applied, or None. A caller
+        # that must know its specific change reached the worker (the live processor switch, which may
+        # only report "on the CPU" once the worker is genuinely decoding on the CPU) passes a
+        # change_id to request_change and waits for this to equal it. Written by the worker only.
+        self._last_applied_change_id = None
         self._pending_recent_reset = False    # a live device switch: forget the loop history
         self._worker = threading.Thread(target=self._run, daemon=True, name="transcribe")
 
@@ -2177,7 +2182,7 @@ class Engine:
         self._rebuild_prompt_leak(prompt, self.language)
 
     def request_change(self, *, language, engine, model=None, model_name=None, size=None, family=None,
-                       device=None, compute_type=None):
+                       device=None, compute_type=None, change_id=None):
         """Queue a live language and/or model change, applied by the worker between chunks.
 
         Pass `model` (a WhisperModel the CALLER already built via load_model, off the worker, so
@@ -2191,15 +2196,22 @@ class Engine:
         swap, which is all Windows ever does). A second request before the worker applies the first
         simply replaces it.
 
-        Known limitation (pre-existing, all platforms including Windows): rapid overlapping
-        reconfigure requests can transiently desync STATE.* from the engine, because each API
-        thread publishes its own view while the worker applies only the LAST queued change
-        between chunks. Accepted as-is; no request/worker generation tags here."""
+        `change_id` (optional) is echoed into self._last_applied_change_id once the worker applies
+        THIS change, so a caller can wait for its specific change to land (the processor switch waits
+        for the worker to be genuinely on the new device before it reports success). A newer request
+        that replaces this one before the worker applies it carries the newer id, so the older
+        caller's wait simply times out, which is the correct answer (its change was superseded).
+
+        Known limitation (pre-existing): rapid overlapping LANGUAGE/QUALITY requests can transiently
+        desync STATE.* from the engine, because each API thread publishes its own view while the
+        worker applies only the LAST queued change. The web layer now serialises the processor switch
+        against the language/quality path (a reconfigure generation + a preparing gate), so that
+        specific race is closed; plain overlapping language/quality changes stay best-effort."""
         with self._change_lock:
             self._pending_change = {
                 "language": language, "engine": engine,
                 "model": model, "model_name": model_name, "size": size, "family": family,
-                "device": device, "compute_type": compute_type,
+                "device": device, "compute_type": compute_type, "change_id": change_id,
             }
 
     def request_loop_history_reset(self):
@@ -2273,6 +2285,9 @@ class Engine:
             self._arrival_hist.clear()          # Lock-owned state, so touched only under the lock.
         lang_name = {"af": "Afrikaans", "en": "English"}.get(self.language, self.language or "auto-detect")
         self._emit_notice(t_start, f"[engine: now {self.family} {self.size}, language {lang_name}]")
+        # Acknowledge THIS change last, once every field above is in place, so a caller waiting on its
+        # change_id (the processor switch) only sees success after the worker is genuinely applied.
+        self._last_applied_change_id = ch.get("change_id")
 
     def _fanout(self, seg):
         """Deliver a finished segment to every subscriber. Single point of delivery."""

@@ -543,20 +543,28 @@ async function reconfigureLive(patch, okMsg) {
 // preparing state shows at once, and a request error reverts it. target is "cpu" | "gpu".
 async function switchProcessor(target) {
   var wantCpu = target === "cpu";
-  var prevTier = S.live.tier;
-  S.live.procSwitch = { target: wantCpu ? "cpu" : "gpu", state: "preparing", error: null };
+  // Optimistic preparing state. `pendingAt` timestamps this local switch so the poll can ignore
+  // stale/null status payloads that predate it (K4); the token is filled in from the POST response.
+  S.live.procSwitch = { token: null, target: wantCpu ? "cpu" : "gpu", state: "preparing", error: null, note: null };
+  S.live.procSwitchAt = Date.now();
   S.live.reconfiguring = true; render();
   try {
     var resp = await api.post("/api/reconfigure", { device: wantCpu ? "cpu" : "cuda" });
     if (resp && resp.state === "ready") {
       // Already on that processor: no build, no preparing state to wait on.
-      S.live.procSwitch = null;
+      S.live.procSwitch = null; S.live.procSwitchAt = null;
       toast(wantCpu ? "Already on the CPU." : "Already on the GPU.");
+    } else if (resp && resp.token != null) {
+      // Adopt the server's token so the poll can match its terminal result to THIS request.
+      S.live.procSwitch = { token: resp.token, target: resp.processor || (wantCpu ? "cpu" : "gpu"), state: "preparing", error: null, note: null };
     }
-    // Otherwise "preparing": refreshSilence() adopts the server's ready/failed and toasts + adopts
-    // the new tier, so nothing more to do here.
+    // Otherwise "preparing": refreshSilence() adopts the server's ready/failed (matched by token),
+    // toasts once, and adopts the new tier.
   } catch (e) {
-    S.live.procSwitch = null; S.live.tier = prevTier;
+    // Revert the optimistic state; the picker re-enables. The backend error strings are stable
+    // English that double as i18n keys, and toast copy is translated at render time via el/tr (K6),
+    // so pass the message straight through; a non-key message falls back to English.
+    S.live.procSwitch = null; S.live.procSwitchAt = null;
     toast(e.message || "Could not switch the processor.", true);
   } finally {
     S.live.reconfiguring = false; render();
@@ -724,10 +732,13 @@ function finishingStrip() {
 function liveTuneStrip() {
   if (!S.live.transcribing || S.live.stopping) return null;
   var langVal = (S.live.language === "auto" || !S.live.language) ? "" : S.live.language;
+  // While a processor switch is preparing it owns the engine's single pending-change slot, so the
+  // backend refuses a language/quality change (409). Disable those controls to match (K2).
+  var procPreparing = !!(S.live.procSwitch && S.live.procSwitch.state === "preparing");
   function tuneSelect(opts, value, fn) {
     var s = el("select", {
       class: "field", style: { width: "auto", maxWidth: "150px", fontSize: "12px", padding: "5px 8px" },
-      disabled: S.live.reconfiguring, onchange: function (e) { fn(e.target.value); },
+      disabled: S.live.reconfiguring || procPreparing, onchange: function (e) { fn(e.target.value); },
     }, opts.map(function (o) { return el("option", { value: o[0], text: o[1] }); }));
     s.value = value;
     return s;
@@ -2190,9 +2201,21 @@ function silenceSig(n) { return n ? (String(n.at || "") + "|" + String(n.count |
 function struggleSig(n) { return n ? (String(n.reason || "") + "|" + String(n.old_size || "") + "|" + String(n.new_size || "") + "|" + (n.recording ? "1" : "0")) : ""; }
 // The ASR-error nudge is one banner whose count grows, so its identity is just that count.
 function asrErrorSig(n) { return n ? String(n.count || 0) : ""; }
-// The live processor switch: its identity is the target plus the state, so a preparing->ready or
-// preparing->failed transition re-renders (and toasts) exactly once.
-function procSwitchSig(p) { return p ? (String(p.target || "") + "|" + String(p.state || "")) : ""; }
+// The live processor switch: its identity is the token plus target plus state, so a preparing->ready
+// or preparing->failed transition (for a specific switch) re-renders exactly once.
+function procSwitchSig(p) { return p ? (String(p.token == null ? "" : p.token) + "|" + String(p.target || "") + "|" + String(p.state || "")) : ""; }
+// One terminal toast per switch, deduped by token: a switch's ready/failed must announce itself only
+// once even though several polls carry the same terminal payload.
+function procTerminalToast(ps) {
+  if (!ps || !(ps.state === "ready" || ps.state === "failed")) return;
+  var key = String(ps.token == null ? "" : ps.token);
+  if (S.live.procToastedToken === key) return;
+  S.live.procToastedToken = key;
+  if (ps.state === "failed") { toast("Could not switch the processor.", true); return; }
+  if (ps.target === "cpu") toast("Now transcribing on the CPU. If the CPU cannot keep up, Volksmond may step down to a smaller model on its own.");
+  else if (ps.note === "size_fallback") toast("Now transcribing on the GPU. The model it was using earlier is no longer available, so a different size is loaded.");
+  else toast("Now transcribing on the GPU.");
+}
 function refreshSilence() {
   if (!S.live.running || S.live.sourceKind === "file") return;
   api.get("/api/status").then(function (st) {
@@ -2207,27 +2230,37 @@ function refreshSilence() {
     if (silenceSig(n) !== silenceSig(S.live.silenceNudge)) { S.live.silenceNudge = n; changed = true; }
     var g = st.struggle_nudge || null;
     if (struggleSig(g) !== struggleSig(S.live.struggleNudge)) { S.live.struggleNudge = g; changed = true; }
-    // Live processor switch (GPU<->CPU): adopt the server state, and toast once on ready/failed. The
-    // build runs off the request thread, so this poll is the ONLY channel that carries the outcome.
+    // Live processor switch (GPU<->CPU). The build runs off the request thread, so this poll is the
+    // channel that carries the outcome. While a LOCAL switch is in flight (optimistic preparing,
+    // within a 90 s guard), ignore any status payload that is not OUR switch's terminal result: a
+    // null or different-token payload can predate our POST and must not erase the preparing state or
+    // suppress the toast (K4). A terminal (ready/failed) matched by token wins and toasts once.
     var ps = st.processor_switch || null;
-    if (procSwitchSig(ps) !== procSwitchSig(S.live.procSwitch)) {
-      var wasPreparing = S.live.procSwitch && S.live.procSwitch.state === "preparing";
-      S.live.procSwitch = ps; changed = true;
-      if (ps && ps.state === "ready" && wasPreparing) {
-        toast(ps.target === "cpu"
-          ? "Now transcribing on the CPU. If the CPU cannot keep up, Volksmond may step down to a smaller model on its own."
-          : "Now transcribing on the GPU.");
-      } else if (ps && ps.state === "failed" && wasPreparing) {
-        toast("Could not switch the processor.", true);
+    var localPending = S.live.procSwitch && S.live.procSwitch.state === "preparing";
+    var localFresh = S.live.procSwitchAt && (Date.now() - S.live.procSwitchAt) < 90000;
+    if (localPending && localFresh) {
+      if (ps && ps.token != null && S.live.procSwitch.token != null && ps.token === S.live.procSwitch.token
+          && (ps.state === "ready" || ps.state === "failed")) {
+        S.live.procSwitch = ps; S.live.procSwitchAt = null; changed = true;
+        procTerminalToast(ps);
       }
+    } else if (procSwitchSig(ps) !== procSwitchSig(S.live.procSwitch)) {
+      // No local switch pending (a reload mid-switch, or another viewer's switch): adopt what the
+      // server says, deduping the terminal toast by token.
+      S.live.procSwitch = ps; changed = true;
+      procTerminalToast(ps);
     }
-    // After an off-thread processor switch the running tier/model/family change server-side, and the
-    // synchronous reconfigure response never carried them; adopt them here so the tune strip's
-    // Processor and Quality reflect reality. A no-op for a normal reconfigure (its response already
-    // set these, so the values match).
-    if (st.tier && st.tier !== S.live.tier) { S.live.tier = st.tier; changed = true; }
-    if (st.model && st.model !== S.live.model) { S.live.model = st.model; changed = true; }
-    if (st.family && st.family !== S.live.family) { S.live.family = st.family; changed = true; }
+    // After an off-thread processor switch the running tier/model/family change server-side (and only
+    // once the swap is CONFIRMED, so never mid-preparing), and the reconfigure response never carried
+    // them; adopt them here so the tune strip's Processor and Quality reflect reality. Skipped while a
+    // switch is still preparing, so the old tier is not briefly re-shown. A no-op for a normal
+    // reconfigure (its response already set these).
+    var stillPreparing = S.live.procSwitch && S.live.procSwitch.state === "preparing";
+    if (!stillPreparing) {
+      if (st.tier && st.tier !== S.live.tier) { S.live.tier = st.tier; changed = true; }
+      if (st.model && st.model !== S.live.model) { S.live.model = st.model; changed = true; }
+      if (st.family && st.family !== S.live.family) { S.live.family = st.family; changed = true; }
+    }
     var ae = st.asr_error_nudge || null;
     if (asrErrorSig(ae) !== asrErrorSig(S.live.asrErrorNudge)) { S.live.asrErrorNudge = ae; changed = true; }
     // Capture liveness BEFORE the recording reconcile below: adoptCapture clears S.live.recording
