@@ -262,6 +262,7 @@ var S = {
 var liveDocEl = null, liveBodyEl = null, elapsedEl = null, recTimerEl = null, returnPillTimeEl = null;
 var pollTimer = null, elapsedTimer = null, toastTimer = null, levelTimer = null, warmTimer = null, histTimer = null, reminderTimer = null;
 var silenceTimer = null;
+var toastQueue = [];
 var readinessTimer = null;   // t0-capture: polls /api/status for model_ready while a session prepares
 var startingTimer = null, startingElapsedEl = null;
 
@@ -320,11 +321,22 @@ function topicFromName(name) {
   if (m) return (m[1] || "").replace(/-/g, " ") || "session";
   return stem;
 }
+// A tiny FIFO queue rather than a single slot: when two toasts are raised in one tick (e.g. a
+// processor-switch failure AND the auto-follow "system audio moved" notice arriving on the same
+// status poll), the second must not overwrite the first before it has ever been seen. Each message
+// is shown in turn and only leaves the queue when it is actually displayed, so no event is silently
+// dropped. Callers keep their own dedupe (token/seq) upstream, so nothing here re-shows a duplicate.
 function toast(msg, isErr) {
-  S.toast = { msg: msg, err: !!isErr };
+  toastQueue.push({ msg: msg, err: !!isErr });
+  if (!S.toast) drainToast();
+}
+function drainToast() {
+  var t = toastQueue.shift();
+  if (!t) { S.toast = null; render(); return; }
+  S.toast = { msg: t.msg, err: t.err };
   render();
   if (toastTimer) clearTimeout(toastTimer);
-  toastTimer = setTimeout(function () { S.toast = null; render(); }, isErr ? 4200 : 2600);
+  toastTimer = setTimeout(drainToast, t.err ? 4200 : 2600);
 }
 async function copyText(t) {
   try { await navigator.clipboard.writeText(t); toast("Copied to clipboard."); }
@@ -1206,7 +1218,7 @@ function warnBanner(spec) {
   if (spec.actions && spec.actions.length) {
     body.push(el("div", { class: "row gap-8", style: { marginTop: "10px", flexWrap: "wrap" } }, spec.actions));
   }
-  return el("div", { style: { position: "fixed", top: "16px", left: "50%", transform: "translateX(-50%)", zIndex: "60", maxWidth: "460px", width: "calc(100% - 32px)" } },
+  return el("div", { class: "banner-item" },
     el("div", { class: "card", style: { padding: "14px 16px", display: "flex", gap: "12px", alignItems: "flex-start", borderColor: "var(--warn)", boxShadow: "0 10px 34px rgba(0,0,0,0.20)" } }, [
       el("div", { class: "tone-tile warn", style: { width: "34px", height: "34px", flex: "0 0 auto" } }, icon("alert", 17)),
       el("div", { class: "grow" }, body),
@@ -1634,37 +1646,32 @@ function render() {
   // The long-silence warning belongs on the live screen: it is about THIS session's audio,
   // and its answers (stop and save / keep recording) only make sense there. Elsewhere the
   // Windows notification is what reaches the user, and the return pill leads back here.
-  if (S.live.silenceNudge && S.route === "live") {
-    APP.appendChild(silenceBanner());
-  }
-  // The "model struggling to keep up" nudge lives on the same live screen for the same reason:
-  // its answers (record from here / keep going) only make sense there. Mirrors the silence inject.
-  if (S.live.struggleNudge && S.route === "live") {
-    APP.appendChild(struggleBanner());
-  }
-  // Transcription is failing on this machine. Same inject point; unlike the nudges above it is
-  // about a fault rather than a trade-off, so its only answer is to acknowledge it.
-  if (S.live.asrErrorNudge && S.route === "live") {
-    APP.appendChild(asrErrorBanner());
-  }
-  // Stop has been running longer than the grace period. This one belongs on the record-only
-  // screen too: a session that stopped transcription first finishes its drain from there, and it
-  // is the same wait with the same two answers.
-  if (S.live.stopping && S.live.stopSlow && (S.route === "live" || S.route === "recordonly")) {
-    APP.appendChild(stopSlowBanner());
-  }
-  // System audio not being captured (denied or failed): same live-screen-only reasoning, and
-  // dismissible locally since there is nothing server-side to acknowledge (see sysState comment
-  // in freshLive). codex H1.
-  if (sysAudioWarn(S.live.sysState) && S.live.sysAudioDismissedFor !== S.live.sysState && (S.route === "live" || S.route === "recordonly")) {
-    APP.appendChild(sysAudioBanner());
-  }
+  // All the floating live-screen banners share ONE fixed-position stack so that when several are up
+  // at once they sit one under another (a small gap between), instead of each owning the same fixed
+  // slot and covering the ones below it (which used to hide, e.g., the struggle banner's "Switch to
+  // CPU" behind a later system-audio banner). codex I1. Each banner keeps its own card, classes and
+  // dismiss handlers; the stack owns the fixed position, centring and width.
+  var liveBanners = [];
+  // The long-silence warning: about THIS session's audio, so live only.
+  if (S.live.silenceNudge && S.route === "live") liveBanners.push(silenceBanner());
+  // The "model struggling to keep up" nudge: its answers (record from here / keep going) only make
+  // sense on the live screen.
+  if (S.live.struggleNudge && S.route === "live") liveBanners.push(struggleBanner());
+  // Transcription is failing on this machine: a fault to acknowledge, live only.
+  if (S.live.asrErrorNudge && S.route === "live") liveBanners.push(asrErrorBanner());
+  // Stop has been running longer than the grace period. Belongs on the record-only screen too: a
+  // session that stopped transcription first finishes its drain from there, same wait, same answers.
+  if (S.live.stopping && S.live.stopSlow && (S.route === "live" || S.route === "recordonly")) liveBanners.push(stopSlowBanner());
+  // System audio not being captured (denied or failed): live/record-only, dismissible locally since
+  // there is nothing server-side to acknowledge (see sysState comment in freshLive). codex H1.
+  if (sysAudioWarn(S.live.sysState) && S.live.sysAudioDismissedFor !== S.live.sysState && (S.route === "live" || S.route === "recordonly")) liveBanners.push(sysAudioBanner());
   // The idle-loopback hint (Windows is playing through a different output than the one you chose):
   // a non-blocking banner with a one-click "use it" switch. Same live/record-only screens. Honours a
   // local dismiss by signature so a dismissed hint stays gone until the condition changes (F8).
   if (S.live.sysIdleHint && sysIdleHintSig(S.live.sysIdleHint) !== S.live.sysIdleHintDismissedFor
-      && (S.route === "live" || S.route === "recordonly")) {
-    APP.appendChild(sysIdleHintBanner());
+      && (S.route === "live" || S.route === "recordonly")) liveBanners.push(sysIdleHintBanner());
+  if (liveBanners.length) {
+    APP.appendChild(el("div", { class: "banner-stack", style: { position: "fixed", top: "16px", left: "50%", transform: "translateX(-50%)", zIndex: "60", maxWidth: "460px", width: "calc(100% - 32px)", display: "flex", flexDirection: "column", gap: "10px" } }, liveBanners));
   }
   if (S.toast) {
     APP.appendChild(el("div", { class: "toast-wrap" }, el("div", { class: "toast" + (S.toast.err ? " err" : ""), text: S.toast.msg })));
@@ -2357,7 +2364,7 @@ async function answerSilence(action) {
 function silenceBanner() {
   var n = S.live.silenceNudge || {};
   var mins = n.minutes || 5;
-  return el("div", { style: { position: "fixed", top: "16px", left: "50%", transform: "translateX(-50%)", zIndex: "60", maxWidth: "460px", width: "calc(100% - 32px)" } },
+  return el("div", { class: "banner-item" },
     el("div", { class: "card", style: { padding: "14px 16px", display: "flex", gap: "12px", alignItems: "flex-start", borderColor: "var(--warn)", boxShadow: "0 10px 34px rgba(0,0,0,0.20)" } }, [
       el("div", { class: "tone-tile warn", style: { width: "34px", height: "34px", flex: "0 0 auto" } }, icon("alert", 17)),
       el("div", { class: "grow" }, [
@@ -2477,7 +2484,7 @@ function struggleBanner() {
   if (!hasRec) actions.push(el("button", { class: "btn sm record", onclick: function () { recordFromHere(); } }, [icon("dot", 12), "Record from here"]));
   actions.push(el("button", { class: "btn sm ghost", onclick: function () { dismissStruggle("dismiss"); } }, "Keep going"));
   actions.push(el("button", { class: "btn ghost sm ink-3", onclick: function () { dismissStruggle("mute"); } }, "Don't warn again"));
-  return el("div", { style: { position: "fixed", top: "16px", left: "50%", transform: "translateX(-50%)", zIndex: "60", maxWidth: "460px", width: "calc(100% - 32px)" } },
+  return el("div", { class: "banner-item" },
     el("div", { class: "card", style: { padding: "14px 16px", display: "flex", gap: "12px", alignItems: "flex-start", borderColor: "var(--warn)", boxShadow: "0 10px 34px rgba(0,0,0,0.20)" } }, [
       el("div", { class: "tone-tile warn", style: { width: "34px", height: "34px", flex: "0 0 auto" } }, icon("alert", 17)),
       el("div", { class: "grow" }, [
@@ -2567,7 +2574,7 @@ function sysAudioBanner() {
   } else {
     body = tr("System audio isn't being captured, so only your microphone is being recorded. The other side of the call won't be in the transcript.");
   }
-  return el("div", { style: { position: "fixed", top: "16px", left: "50%", transform: "translateX(-50%)", zIndex: "60", maxWidth: "460px", width: "calc(100% - 32px)" } },
+  return el("div", { class: "banner-item" },
     el("div", { class: "card", style: { padding: "14px 16px", display: "flex", gap: "12px", alignItems: "flex-start", borderColor: "var(--warn)", boxShadow: "0 10px 34px rgba(0,0,0,0.20)" } }, [
       el("div", { class: "tone-tile warn", style: { width: "34px", height: "34px", flex: "0 0 auto" } }, icon("alert", 17)),
       el("div", { class: "grow" }, [
@@ -2591,7 +2598,7 @@ function dismissSysIdleHint() {
 }
 function sysIdleHintBanner() {
   var h = S.live.sysIdleHint || {};
-  return el("div", { style: { position: "fixed", top: "16px", left: "50%", transform: "translateX(-50%)", zIndex: "60", maxWidth: "460px", width: "calc(100% - 32px)" } },
+  return el("div", { class: "banner-item" },
     el("div", { class: "card", style: { padding: "14px 16px", display: "flex", gap: "12px", alignItems: "flex-start", borderColor: "var(--warn)", boxShadow: "0 10px 34px rgba(0,0,0,0.20)" } }, [
       el("div", { class: "tone-tile warn", style: { width: "34px", height: "34px", flex: "0 0 auto" } }, icon("alert", 17)),
       el("div", { class: "grow" }, [

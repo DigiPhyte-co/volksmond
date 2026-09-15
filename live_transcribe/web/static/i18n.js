@@ -888,7 +888,6 @@ window.VM_I18N = {
     // the ready/failed/already toasts, plus the "Switch to CPU" action on the gpu-busy banner.
     "Processor": "Verwerker",
     "GPU (graphics card)": "GPU (grafikakaart)",
-    "CPU": "CPU",
     "Preparing CPU...": "Berei CPU voor...",
     "Preparing GPU...": "Berei GPU voor...",
     "Switch to CPU": "Skakel oor na CPU",
