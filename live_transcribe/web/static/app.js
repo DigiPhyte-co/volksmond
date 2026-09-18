@@ -1614,8 +1614,8 @@ function reportBug() {
  * ═══════════════════════════════════════════════════════════ */
 var _renderedRoute = null;
 // Keyboard focus + caret survive a re-render. render() rebuilds the entire DOM (clear(APP)
-// below), so any re-render that lands while the user is typing — a background poll, a toast, a
-// calendar reminder — would otherwise recreate the focused <input>/<textarea> as a new, unfocused
+// below), so any re-render that lands while the user is typing, a background poll, a toast, a
+// calendar reminder, would otherwise recreate the focused <input>/<textarea> as a new, unfocused
 // element and drop the user mid-word. Record which field held focus (by its index path in the
 // tree) and its caret range, then restore both onto the freshly built field of the same shape.
 // A structural mismatch (different tag or placeholder at that path) just skips restoration, so we
@@ -2695,15 +2695,21 @@ function bigAudioAlert(a) {
   if (a.kind === "wrong-sys-device") {
     title = "Volksmond may be on the wrong output";
     body = trFmt("We can't hear the other side. Sound is playing on {other}, but Volksmond is listening to {chosen}.", { other: other, chosen: chosen });
-    if (other) actions.push(el("button", { class: "btn sm aa-primary", disabled: S.live.switching, onclick: function () { switchDevice("loopback", a.other + LOOPBACK_SUFFIX); } }, raw(trFmt("Switch to {d}", { d: other }))));
+    // In Automatic mode, hand the session back to Automatic rather than pinning a named pick: the
+    // policy re-resolves to the output that is actually playing (which is `other`), the live mode
+    // stays "auto", and the saved "auto" is not silently converted to a named device. In a named
+    // session the user chose the output, so switching is a deliberate new named pick.
+    if (other) actions.push(el("button", { class: "btn sm aa-primary", disabled: S.live.switching, onclick: function () { if (S.live.loopbackMode === "auto") { switchDevice("loopback", "auto"); } else { switchDevice("loopback", a.other + LOOPBACK_SUFFIX); } } }, raw(trFmt("Switch to {d}", { d: other }))));
     actions.push(el("button", { class: "btn sm aa-ghost", onclick: function () { keepAudioAlert(a); } }, raw(trFmt("Keep {d}", { d: chosen }))));
   } else if (a.kind === "sys-capture-fault") {
     title = "System audio stopped";
     body = trFmt("System audio stopped arriving from {chosen}. We restarted it; if this stays, pick another output.", { chosen: chosen });
   } else if (a.kind === "mic-muted") {
     title = "Your microphone is muted";
-    // No "Open sound settings" button: the backend exposes no route to open Windows sound settings.
     body = "Your microphone is muted in Windows. Nothing you say is being captured.";
+    // One click to the Windows Sound settings page so the user can unmute (the backend owns the
+    // fixed system URI; a 404 off Windows is swallowed and the banner stays put).
+    actions.push(el("button", { class: "btn sm aa-primary", onclick: function () { api.post("/api/open-sound-settings").catch(function () {}); } }, raw(tr("Open sound settings"))));
   } else if (a.kind === "mic-flat") {
     title = "No sound from your microphone";
     body = "Your microphone is sending no sound at all. Check it is plugged in, or pick another one.";
@@ -3714,7 +3720,7 @@ async function openReader(name, initialTab) {
   // Always try the sibling summary file (ignore 404). Don't gate on cached has_summary: a
   // summary made this session may not be in S.sessions yet, which would hide the Summary tab.
   // Header-verify it (matches the backend rule): a real transcript whose topic ends in
-  // "summary" (e.g. budget-summary.md) is NOT a sibling summary — accepting it would show that
+  // "summary" (e.g. budget-summary.md) is NOT a sibling summary, accepting it would show that
   // transcript as the current one's summary. Only treat it as a summary if it starts with
   // "# Summary:".
   var sumName = name.replace(/\.md$/, "") + "-summary.md";

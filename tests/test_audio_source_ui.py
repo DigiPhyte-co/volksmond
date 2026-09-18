@@ -44,6 +44,7 @@ NEW_STRINGS = [
     "Your microphone is sending no sound at all. Check it is plugged in, or pick another one.",
     "Your microphone is very quiet",
     "Your microphone is very quiet. Move closer or raise its level in Windows.",
+    "Open sound settings",
 ]
 
 
@@ -100,16 +101,23 @@ def test_big_red_alert_and_amber_hint_render_from_audio_alert():
         ('function audioQuietBanner(a)', "the amber mic-quiet hint has its own hint-sized banner"),
         ('api.post("/api/audio-alert/dismiss")', "the amber hint is dismissed through the backend"),
         ('switchDevice("loopback", a.other + LOOPBACK_SUFFIX)',
-         "the wrong-sys-device switch must re-add the loopback suffix the devices list uses"),
+         "a named wrong-sys-device switch must re-add the loopback suffix the devices list uses"),
+        ('S.live.loopbackMode === "auto"',
+         "an Automatic wrong-sys-device switch must hand back to Automatic, not pin a named pick"),
+        ('switchDevice("loopback", "auto")',
+         "the Automatic branch re-resolves through the policy so the live mode stays Automatic"),
+        ('api.post("/api/open-sound-settings")',
+         "the muted-mic banner opens the Windows sound settings through the backend route"),
         ('function keepAudioAlert(a)', "the wrong-sys-device 'Keep' answer suppresses this seq locally"),
         ('function audioAlertSig(a)', "re-renders are gated on the alert signature (kind + seq + chosen + other)"),
         ('audio-alert-wrap', "the big alert uses its own full-width top bar"),
     ]
     for needle, why in checks:
         assert needle in APP_JS, f"app.js: {why} (missing {needle!r})"
-    # The mic-muted banner must NOT invent a backend route to open Windows sound settings.
+    # The ms-settings:sound URI is a backend concern only: the browser bundle names the API route,
+    # never the raw Windows URI, so an untrusted page can never be handed a launchable target.
     assert "ms-settings" not in APP_JS, \
-        "app.js must not launch ms-settings:sound (the backend exposes no such route)"
+        "app.js must call /api/open-sound-settings, never the raw ms-settings:sound URI"
 
 
 def test_moved_toast_and_remembered_absent_notice_are_consumed():
@@ -139,7 +147,9 @@ def test_new_strings_have_afrikaans_and_no_dashes():
         assert s in APP_JS, f"app.js no longer uses the string {s!r}"
         assert ('"' + s + '"') in I18N_JS, f"i18n.js is missing an Afrikaans translation for {s!r}"
     # i18n.js is copy the user reads in both languages; it must be free of em and en dashes.
-    assert "–" not in I18N_JS and "—" not in I18N_JS, \
+    # The dash characters are built with chr() so this guard file itself stays dash-free.
+    en_dash, em_dash = chr(0x2013), chr(0x2014)
+    assert en_dash not in I18N_JS and em_dash not in I18N_JS, \
         "i18n.js must not contain an em or en dash"
 
 
