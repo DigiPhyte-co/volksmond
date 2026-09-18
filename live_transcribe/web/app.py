@@ -190,12 +190,15 @@ class _State:
         # Automatic mode ({"kind":"sys-moved","to","seq"}); device_notice is a one-shot "your saved
         # device is gone, we fell back to Automatic" notice ({"kind":"remembered-absent","which","wanted"}).
         # mic_mode/loopback_mode are the LIVE modes ("auto"|"named"); a NAMED source never auto-switches.
-        # audio_alert_notified_seq is the last red-alert seq a Windows notification fired for (once per seq).
+        # audio_alert_notified is the per-session set of (kind, seq) a Windows notification already
+        # fired for: a set, not a single last-seq, so two red alerts alternating priority (mic-muted
+        # vs wrong-sys-device, each keeping its own seq across a flap) can never re-notify on every
+        # transition (codex F10). One notification per distinct (kind, seq) for the life of a session.
         self.watchdog = None
         self.audio_alert: Optional[dict] = None
         self.audio_toast: Optional[dict] = None
         self.audio_toast_seq: int = 0
-        self.audio_alert_notified_seq: Optional[int] = None
+        self.audio_alert_notified: set = set()
         self.device_notice: Optional[dict] = None
         self.mic_mode: str = "auto"
         self.loopback_mode: str = "auto"
@@ -337,7 +340,7 @@ class _State:
         self.audio_alert = None
         self.audio_toast = None
         self.audio_toast_seq = 0
-        self.audio_alert_notified_seq = None
+        self.audio_alert_notified = set()
         self.device_notice = None
         self.mic_mode = "auto"
         self.loopback_mode = "auto"
@@ -1586,9 +1589,11 @@ def _publish_audio_alert(alert, session):
             STATE.sys_idle_hint = {"chosen": alert.get("chosen"), "default": alert.get("other")}
         else:
             STATE.sys_idle_hint = None
-        if alert and alert.get("severity") == "red" and alert.get("seq") != STATE.audio_alert_notified_seq:
-            STATE.audio_alert_notified_seq = alert.get("seq")
-            fire = alert
+        if alert and alert.get("severity") == "red":
+            key = (alert.get("kind"), alert.get("seq"))
+            if key not in STATE.audio_alert_notified:
+                STATE.audio_alert_notified.add(key)
+                fire = alert
     if fire is not None:
         try:
             from .. import notify
@@ -1712,7 +1717,7 @@ def _device_follow_start(cap):
     STATE.watchdog = device_policy.Watchdog()
     STATE.sys_idle_hint = None
     STATE.audio_alert = None
-    STATE.audio_alert_notified_seq = None
+    STATE.audio_alert_notified = set()
     th = threading.Thread(target=_device_follow_loop, args=(stop,), daemon=True, name="audio-watchdog")
     th.start()
     return th
@@ -4156,7 +4161,7 @@ def start(req: StartRequest):
         STATE.audio_alert = None
         STATE.audio_toast = None
         STATE.audio_toast_seq = 0
-        STATE.audio_alert_notified_seq = None
+        STATE.audio_alert_notified = set()
         _persist_selection(sel["mic_mode"], sel["mic_name"], sel["mic_id"], sel["mic_absent"],
                            sel["loop_mode"], sel["loop_name"], sel["loop_id"], sel["loop_absent"])
         STATE.chunk_seconds = chunk_seconds
