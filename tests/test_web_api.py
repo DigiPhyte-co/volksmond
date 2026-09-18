@@ -2172,7 +2172,7 @@ def _watch_state_tuple(st):
     return (st.running, st.stopping, st.source_kind, st.capture, st.engine, st.mic_device,
             st.loopback_device, st.chunk_seconds, st.record_raw_mic, st.started_at, st.mic_mode,
             st.loopback_mode, st.watchdog, st.audio_alert, st.audio_toast, st.audio_toast_seq,
-            st.audio_alert_notified_seq, st.sys_idle_hint, st.sys_switch_notice, st.sys_switch_seq,
+            st.audio_alert_notified, st.sys_idle_hint, st.sys_switch_notice, st.sys_switch_seq,
             st.device_notice)
 
 
@@ -2180,7 +2180,7 @@ def _restore_watch_state(st, saved):
     (st.running, st.stopping, st.source_kind, st.capture, st.engine, st.mic_device,
      st.loopback_device, st.chunk_seconds, st.record_raw_mic, st.started_at, st.mic_mode,
      st.loopback_mode, st.watchdog, st.audio_alert, st.audio_toast, st.audio_toast_seq,
-     st.audio_alert_notified_seq, st.sys_idle_hint, st.sys_switch_notice, st.sys_switch_seq,
+     st.audio_alert_notified, st.sys_idle_hint, st.sys_switch_notice, st.sys_switch_seq,
      st.device_notice) = saved
 
 
@@ -2194,10 +2194,11 @@ def _install_watch_session(loop_mode="auto", mic_mode="auto",
     st.mic_mode, st.loopback_mode = mic_mode, loop_mode
     st.audio_alert = st.audio_toast = st.device_notice = st.sys_idle_hint = st.sys_switch_notice = None
     st.audio_toast_seq = st.sys_switch_seq = 0
-    st.audio_alert_notified_seq = None
+    st.audio_alert_notified = set()
     st.watchdog = webapp.device_policy.Watchdog()
     st.capture = _WCapture(mic_device=mic_name, loopback_device=loop_name, t0=None)
     webapp._FOLLOW["last_frames"] = None
+    webapp._FOLLOW["last_mic_frames"] = None
     return st, st.capture
 
 
@@ -2314,6 +2315,35 @@ def test_watchdog_tick_muted_mic_alerts_red_and_notifies_once():
         _notify.show = saved_show
         _restore_watch_state(st, saved)
     print("  OK  watchdog raises a red mic-muted alert and fires one Windows notification per seq")
+
+
+def test_watchdog_tick_mic_flat_when_the_mic_goes_dead_midsession():
+    # codex F3: a mic that was delivering frames then disappears (unplugged) must raise mic-flat, via
+    # cap.mic_frames stalling and the endpoint dropping out of the capture listing. The engine is None
+    # (no energy ring), so this leans entirely on frame liveness + endpoint presence, not on any dB.
+    state = {"present": True}
+    def fake_probe(with_peak=True):
+        return [_ep("Mic", "capture", roles=["multimedia"])] if state["present"] else []
+    st = webapp.STATE
+    saved = _watch_state_tuple(st)
+    saved_probe = webapp._probe_endpoints_detailed
+    try:
+        webapp._probe_endpoints_detailed = fake_probe
+        _install_watch_session(loop_mode="auto", loop_name=None, mic_name="Mic")  # no loopback -> SYS idle
+        st.capture.mic_frames = 0
+        for now in range(0, 3):                      # phase 1: mic live, frames advancing
+            st.capture.mic_frames += 4800
+            webapp._device_follow_tick(float(now))
+        assert st.audio_alert is None, st.audio_alert
+        state["present"] = False                     # phase 2: unplugged; endpoint gone, frames frozen
+        for now in range(3, 9):
+            webapp._device_follow_tick(float(now))
+        assert st.audio_alert and st.audio_alert["kind"] == "mic-flat" \
+            and st.audio_alert["severity"] == "red", st.audio_alert
+    finally:
+        webapp._probe_endpoints_detailed = saved_probe
+        _restore_watch_state(st, saved)
+    print("  OK  watchdog raises mic-flat when a live mic goes dead mid-session (frames stall + endpoint gone) (F3)")
 
 
 def test_watchdog_tick_rebuilds_a_faulting_sys_once():
@@ -2599,6 +2629,7 @@ if __name__ == "__main__":
                test_watchdog_tick_named_mode_alerts_without_switching,
                test_watchdog_tick_quiet_call_raises_no_alert,
                test_watchdog_tick_muted_mic_alerts_red_and_notifies_once,
+               test_watchdog_tick_mic_flat_when_the_mic_goes_dead_midsession,
                test_watchdog_tick_rebuilds_a_faulting_sys_once,
                test_audio_alert_dismiss_clears_the_amber_hint,
                test_resolve_selection_auto_and_remembered_absent,

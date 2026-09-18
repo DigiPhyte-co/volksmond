@@ -291,6 +291,54 @@ def test_loudest_other_render_prefers_nonjunk_but_falls_back_to_a_playing_junk()
     print("  OK  _loudest_other_render prefers non-junk, falls back to a playing junk endpoint (F4)")
 
 
+def test_wd_mic_flat_when_a_live_mic_stops_delivering_frames():
+    # codex F3: a mic that WAS delivering frames then stops (unplugged / driver dropped) raises
+    # mic-flat, even though its energy reading is now None (unknown), not below the flat floor.
+    w = dp.Watchdog()
+    for t in range(3):
+        w.observe(float(t), base_obs(mic_frames=True, mic_present=True, mic_db=-30.0))
+    assert w._mic_ever_live is True, "frames advancing must mark the mic as having been live"
+    dead = base_obs(mic_frames=False, mic_present=True, mic_db=None)   # frames stalled, energy unknown
+    last = None
+    for t in range(3, 9):                            # confirms over 5 s, arms at t = 8
+        last = w.observe(float(t), dead)
+    alert, _ = last
+    assert alert and alert["kind"] == "mic-flat" and alert["severity"] == "red", alert
+    print("  OK  a mic that was live then stopped delivering frames raises mic-flat (F3)")
+
+
+def test_wd_mic_flat_when_the_endpoint_disappears():
+    # codex F3: the mic endpoint vanishing from the capture listing (mic_present False), after it had
+    # been live, is also mic-flat.
+    w = dp.Watchdog()
+    for t in range(3):
+        w.observe(float(t), base_obs(mic_frames=True, mic_present=True, mic_db=-30.0))
+    gone = base_obs(mic_frames=True, mic_present=False, mic_db=-30.0)
+    last = None
+    for t in range(3, 9):
+        last = w.observe(float(t), gone)
+    assert last[0] and last[0]["kind"] == "mic-flat", last[0]
+    print("  OK  a mic endpoint disappearing (was live) raises mic-flat (F3)")
+
+
+def test_wd_mic_that_never_delivered_a_frame_stays_unknown():
+    # codex F3: None means unknown. A mic that has NEVER delivered a frame (never live) must not raise
+    # mic-flat no matter how long it sits with no frames and no reading.
+    w = dp.Watchdog()
+    out = feed(w, [base_obs(mic_frames=False, mic_present=True, mic_db=None)] * 10)
+    assert all(a is None or a["kind"] != "mic-flat" for a, _ in out), out
+    assert w._mic_ever_live is False
+    print("  OK  a mic that never delivered a frame stays unknown, never mic-flat (F3)")
+
+
+def test_wd_healthy_live_mic_never_raises_mic_flat():
+    # A mic delivering frames, present, at a normal level must never trip the new liveness path.
+    w = dp.Watchdog()
+    out = feed(w, [base_obs(mic_frames=True, mic_present=True, mic_db=-30.0)] * 10)
+    assert all(a is None for a, _ in out), out
+    print("  OK  a healthy live mic never raises mic-flat from the liveness path (F3)")
+
+
 def test_wd_wrong_device_warns_when_the_call_moved_onto_hdmi():
     # codex F4: our chosen SYS is idle and the only thing playing is the HDMI monitor. In named mode
     # the watchdog must still raise wrong-sys-device naming the HDMI as `other` (no silent miss).
@@ -467,6 +515,10 @@ TESTS = (
     test_wd_wrong_device_arms_at_3s_and_disarms_instantly,
     test_loudest_other_render_prefers_nonjunk_but_falls_back_to_a_playing_junk,
     test_wd_wrong_device_warns_when_the_call_moved_onto_hdmi,
+    test_wd_mic_flat_when_a_live_mic_stops_delivering_frames,
+    test_wd_mic_flat_when_the_endpoint_disappears,
+    test_wd_mic_that_never_delivered_a_frame_stays_unknown,
+    test_wd_healthy_live_mic_never_raises_mic_flat,
     test_wd_auto_mode_switches_then_alerts_and_respects_the_rate_limit,
     test_wd_sys_capture_fault_rebuilds_once_then_alerts,
     test_wd_quiet_call_three_minutes_no_alert,

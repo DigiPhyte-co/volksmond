@@ -361,6 +361,9 @@ class Watchdog:
         self._quiet_state = "pending"
         self._mic_seen_any = False           # any real (non-None) mic reading yet
         self._mic_seen_loud = False          # any mic reading above MIC_QUIET_DB yet
+        self._mic_ever_live = False          # MIC frames have advanced at least once (codex F3): only
+                                             # then can "was live, now dead/gone" raise mic-flat; a mic
+                                             # that has never delivered a frame stays unknown, not flat
         # seq bookkeeping
         self._seq_counter = 0
         self._seq = {}                       # kind -> its current seq
@@ -380,6 +383,8 @@ class Watchdog:
             renders     [ep, ...]   every render endpoint, each with its peak_db
             mic_name    str|None    the capture endpoint we currently record as the mic
             mic_db      float|None  our mic raw dBFS (None == unreadable)
+            mic_frames  bool        did MIC frames advance this tick (device liveness, codex F3)
+            mic_present bool|None   is the mic endpoint still in the capture listing (None == unknown)
             mic_muted   bool        is the mic muted in the OS mixer
             mic_mode    "auto"|"named"
             captures    [ep, ...]   every capture endpoint, each with its peak_db (for `other`)
@@ -399,6 +404,8 @@ class Watchdog:
             renders = obs.get("renders") or []
             mic_name = obs.get("mic_name")
             mic_db = obs.get("mic_db")
+            mic_frames = bool(obs.get("mic_frames"))
+            mic_present = obs.get("mic_present")   # True / False / None(unknown)
             mic_muted = bool(obs.get("mic_muted"))
             captures = obs.get("captures") or []
 
@@ -441,7 +448,19 @@ class Watchdog:
                 self._switch_target_episode = None
 
             # ---- mic: muted, flat, or quiet ---------------------------------------
-            mic_flat_active = mic_db is not None and float(mic_db) < MIC_FLAT_DB
+            # mic-flat now covers three ways a mic delivers nothing (codex F3):
+            #   * a real energy reading below the flat-line floor (the original case);
+            #   * a mic that WAS delivering frames and has stopped (unplugged / driver dropped): a live
+            #     mic delivers blocks whatever the room volume, so a stalled frame counter is the DEVICE
+            #     going away, not silence;
+            #   * the mic endpoint disappearing from the capture listing once it had been live.
+            # A mic that has never delivered a frame stays unknown (never flat): None means unknown.
+            if mic_frames:
+                self._mic_ever_live = True
+            mic_flat_energy = mic_db is not None and float(mic_db) < MIC_FLAT_DB
+            mic_gone = (mic_present is False)
+            mic_dead = self._mic_ever_live and ((not mic_frames) or mic_gone)
+            mic_flat_active = mic_flat_energy or mic_dead
             self._muted.update(now, mic_muted)
             self._flat.update(now, mic_flat_active)
 

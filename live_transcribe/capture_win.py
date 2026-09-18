@@ -53,6 +53,11 @@ class AudioCapture(CaptureBase):
         self.sys_loopback_name = None
         self.sys_following_default = False
         self.sys_frames = 0
+        # MIC blocks delivered, the mic-side counterpart of sys_frames (codex F3): the audio watchdog
+        # reads it once a second to tell a mic that has gone dead (unplugged, driver dropped) from one
+        # that is merely quiet. A live mic delivers blocks whatever the room volume, so a stalled
+        # counter means the DEVICE stopped, not silence. GIL-atomic int increment from the audio thread.
+        self.mic_frames = 0
 
     def _open_sources(self):
         # Acquire through the lifecycle guard (role="capture"): it waits briefly for any live
@@ -236,6 +241,8 @@ class AudioCapture(CaptureBase):
                     # without a lock; it only ever needs to see whether it moved between ticks.
                     if _src == "SYS":
                         _self.sys_frames += arr.shape[0]
+                    elif _src == "MIC":
+                        _self.mic_frames += arr.shape[0]
                     # Level calc, SYS-ring feed, AEC routing and the under-lock
                     # re-check all live in the shared core.
                     _self._ingest_block(_src, arr)

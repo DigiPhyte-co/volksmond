@@ -1344,8 +1344,9 @@ AUDIO_WATCH_LOOKBACK_S = 1.5  # how far back the raw energy rings are read for t
                               # more than one tick, so a frame that landed just before the tick counts)
 LOOPBACK_SUFFIX = " [Loopback]"   # PortAudio names a WASAPI loopback = its render endpoint name + this
 # Frame-liveness state (one live session at a time) but module level so _device_follow_tick is
-# driveable from a test with no threads. Only last_frames is needed now: the Watchdog owns all timing.
-_FOLLOW = {"last_frames": None}
+# driveable from a test with no threads. last_frames tracks SYS blocks, last_mic_frames tracks MIC
+# blocks (codex F3); the Watchdog owns all timing beyond "did the counter move this tick".
+_FOLLOW = {"last_frames": None, "last_mic_frames": None}
 
 
 def _device_follow_env_on() -> bool:
@@ -1648,6 +1649,7 @@ def _device_follow_tick(now):
         sys_open_name = getattr(cap, "sys_loopback_name", None) if cap else None   # carries the suffix
         sys_state = getattr(cap, "sys_state", "active") if cap else "active"
         sys_frames_now = getattr(cap, "sys_frames", None) if cap else None
+        mic_frames_now = getattr(cap, "mic_frames", None) if cap else None
         mic_open_name = STATE.mic_device if cap else None
         t0 = getattr(cap, "_t0", None) if cap else None
     if cap is None or wd is None:
@@ -1657,6 +1659,8 @@ def _device_follow_tick(now):
     now_s = (time.monotonic() - t0) if t0 is not None else now
     frames_moved = bool(sys_frames_now is not None and sys_frames_now != _FOLLOW["last_frames"])
     _FOLLOW["last_frames"] = sys_frames_now
+    mic_frames_moved = bool(mic_frames_now is not None and mic_frames_now != _FOLLOW["last_mic_frames"])
+    _FOLLOW["last_mic_frames"] = mic_frames_now
 
     # The one COM probe of the tick, OUTSIDE the lock.
     eps = _probe_endpoints_detailed(with_peak=True)
@@ -1664,6 +1668,12 @@ def _device_follow_tick(now):
     mic_db = _ring_max_db(engine, "mic_env", now_s)
     sys_db = _ring_max_db(engine, "sys_env", now_s)
     sys_in_use = bool(sys_open_name) and sys_state != "failed"
+    # Is the mic endpoint still present in the live capture listing? None (unknown) when we have no
+    # mic name to match; the Watchdog treats None as "not gone" so an unreadable listing never alerts.
+    mic_present = None
+    if mic_open_name:
+        want = device_policy.norm_name(mic_open_name)
+        mic_present = any(device_policy.norm_name(e.get("name")) == want for e in captures)
     obs = {
         "sys_name": _strip_loopback_suffix(sys_open_name),
         "sys_frames": frames_moved,
@@ -1673,6 +1683,8 @@ def _device_follow_tick(now):
         "renders": renders,
         "mic_name": mic_open_name,
         "mic_db": mic_db,
+        "mic_frames": mic_frames_moved,
+        "mic_present": mic_present,
         "mic_muted": _muted_of(captures, mic_open_name),
         "mic_mode": mic_mode,
         "captures": captures,
@@ -1721,6 +1733,7 @@ def _device_follow_loop(stop_event):
     """The 1 Hz watchdog thread. Exits within one tick of the session ending. Every tick is fully
     guarded: a watchdog must never take the session down with it."""
     _FOLLOW["last_frames"] = None
+    _FOLLOW["last_mic_frames"] = None
     while not stop_event.wait(DEVICE_FOLLOW_TICK_S):
         try:
             _device_follow_tick(time.monotonic())
