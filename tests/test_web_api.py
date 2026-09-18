@@ -2203,6 +2203,7 @@ def _install_watch_session(loop_mode="auto", mic_mode="auto",
     st.capture = _WCapture(mic_device=mic_name, loopback_device=loop_name, t0=None)
     webapp._FOLLOW["last_frames"] = None
     webapp._FOLLOW["last_mic_frames"] = None
+    webapp._FOLLOW["key"] = None
     return st, st.capture
 
 
@@ -2378,6 +2379,81 @@ def test_switch_device_commits_mode_and_generation_atomically():
         webapp.capture.AudioCapture = saved_factory
         _restore_watch_state(st, saved)
     print("  OK  a user switch commits mode+generation atomically; a stale watchdog action is refused (F8)")
+
+
+def test_watchdog_tick_probe_failure_does_not_flag_a_healthy_mic():
+    # codex G2: a transient COM-probe failure returns [], which must NOT read as the mic being gone.
+    # A healthy live mic (frames advancing) must never raise mic-flat just because enumeration failed.
+    state = {"ok": True}
+    def fake_probe(with_peak=True):
+        return [_ep("Mic", "capture", roles=["multimedia"])] if state["ok"] else []
+    st = webapp.STATE
+    saved = _watch_state_tuple(st)
+    saved_probe = webapp._probe_endpoints_detailed
+    try:
+        webapp._probe_endpoints_detailed = fake_probe
+        _install_watch_session(loop_mode="auto", loop_name=None, mic_name="Mic")
+        st.capture.mic_frames = 0
+        for now in range(0, 12):
+            st.capture.mic_frames += 4800        # the mic keeps delivering the whole time
+            if now >= 3:
+                state["ok"] = False               # COM probe fails (empty listing) from t=3 onward
+            webapp._device_follow_tick(float(now))
+        assert st.audio_alert is None or st.audio_alert["kind"] != "mic-flat", st.audio_alert
+    finally:
+        webapp._probe_endpoints_detailed = saved_probe
+        _restore_watch_state(st, saved)
+    print("  OK  a failed COM probe (empty listing) never flags a healthy live mic as mic-flat (G2)")
+
+
+def test_watchdog_tick_sys_only_capture_never_flags_mic_flat():
+    # codex G3: a SYS-only capture never opens a mic, so cap.mic_frames stays 0. The first tick's
+    # 0-vs-None must not mark the mic as ever-live, and a stalled 0 must never raise mic-flat.
+    def fake_probe(with_peak=True):
+        return [_ep("Speakers", "render", roles=["multimedia"], peak_db=-100.0)]
+    st = webapp.STATE
+    saved = _watch_state_tuple(st)
+    saved_probe = webapp._probe_endpoints_detailed
+    try:
+        webapp._probe_endpoints_detailed = fake_probe
+        _install_watch_session(loop_mode="named", loop_name="Speakers [Loopback]", mic_name=None)
+        st.capture.mic_frames = 0                # SYS-only: never advances
+        for now in range(0, 12):
+            webapp._device_follow_tick(float(now))
+        assert st.watchdog._mic_ever_live is False, "a mic that never delivered a frame must stay unknown"
+        assert st.audio_alert is None or st.audio_alert["kind"] != "mic-flat", st.audio_alert
+    finally:
+        webapp._probe_endpoints_detailed = saved_probe
+        _restore_watch_state(st, saved)
+    print("  OK  a SYS-only capture (mic_frames stuck at 0) never raises mic-flat (G3)")
+
+
+def test_device_follow_loop_survives_tick_exceptions():
+    # The 1 Hz watchdog thread must not die from an unhandled tick error: it wraps the tick body, logs
+    # each distinct error once, and keeps ticking until the stop event fires.
+    import threading
+    import time as _time
+    calls = {"n": 0}
+    def boom(now):
+        calls["n"] += 1
+        raise RuntimeError("tick boom")
+    saved_tick = webapp._device_follow_tick
+    saved_interval = webapp.DEVICE_FOLLOW_TICK_S
+    try:
+        webapp._device_follow_tick = boom
+        webapp.DEVICE_FOLLOW_TICK_S = 0.01
+        stop = threading.Event()
+        th = threading.Thread(target=webapp._device_follow_loop, args=(stop,), daemon=True)
+        th.start()
+        _time.sleep(0.2)
+        stop.set()
+        th.join(2.0)
+        assert not th.is_alive(), "the loop did not exit on stop"
+        assert calls["n"] > 1, f"the loop stopped ticking after an error (only {calls['n']} tick)"
+    finally:
+        webapp._device_follow_tick = saved_tick
+        webapp.DEVICE_FOLLOW_TICK_S = saved_interval
+    print("  OK  the watchdog loop keeps ticking through tick exceptions and exits on stop")
 
 
 def test_watchdog_tick_record_only_wrong_sys_from_capture_levels():
@@ -2750,6 +2826,9 @@ if __name__ == "__main__":
                test_watchdog_tick_quiet_call_raises_no_alert,
                test_watchdog_tick_muted_mic_alerts_red_and_notifies_once,
                test_watchdog_tick_mic_flat_when_the_mic_goes_dead_midsession,
+               test_watchdog_tick_probe_failure_does_not_flag_a_healthy_mic,
+               test_watchdog_tick_sys_only_capture_never_flags_mic_flat,
+               test_device_follow_loop_survives_tick_exceptions,
                test_switch_device_commits_mode_and_generation_atomically,
                test_watchdog_tick_record_only_wrong_sys_from_capture_levels,
                test_watchdog_tick_rebuilds_a_faulting_sys_once,

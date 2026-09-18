@@ -1698,9 +1698,22 @@ def _device_follow_tick(now):
 
     # Session clock for the rings and the Watchdog (both must rise monotonically on the same base).
     now_s = (time.monotonic() - t0) if t0 is not None else now
-    frames_moved = bool(sys_frames_now is not None and sys_frames_now != _FOLLOW["last_frames"])
+    # Re-baseline the frame counters when the capture object or the selection changes (a device
+    # switch, or a reset+start), so a fresh capture's counters (which restart at 0) are never read as
+    # a stalled live mic (codex G3). The first tick after a (re)baseline reports NO movement.
+    follow_key = (id(cap), sel_gen)
+    if _FOLLOW.get("key") != follow_key:
+        _FOLLOW["key"] = follow_key
+        _FOLLOW["last_frames"] = None
+        _FOLLOW["last_mic_frames"] = None
+    last_sys, last_mic = _FOLLOW["last_frames"], _FOLLOW["last_mic_frames"]
+    frames_moved = bool(sys_frames_now is not None and last_sys is not None and sys_frames_now != last_sys)
     _FOLLOW["last_frames"] = sys_frames_now
-    mic_frames_moved = bool(mic_frames_now is not None and mic_frames_now != _FOLLOW["last_mic_frames"])
+    # A mic is "live" only once its counter is POSITIVE and has actually advanced since the last tick
+    # (codex G3): 0 != None on the first tick, or a SYS-only capture whose mic_frames sits at 0, must
+    # never mark the mic as having been live (which would later raise a false mic-flat).
+    mic_frames_moved = bool(mic_frames_now is not None and last_mic is not None
+                            and mic_frames_now > last_mic)
     _FOLLOW["last_mic_frames"] = mic_frames_now
 
     # The one COM probe of the tick, OUTSIDE the lock.
@@ -1716,10 +1729,12 @@ def _device_follow_tick(now):
     if sys_db is None:
         sys_db = _capture_level_db(cap, "SYS")
     sys_in_use = bool(sys_open_name) and sys_state != "failed"
-    # Is the mic endpoint still present in the live capture listing? None (unknown) when we have no
-    # mic name to match; the Watchdog treats None as "not gone" so an unreadable listing never alerts.
+    # Is the mic endpoint still present in the live capture listing? None (unknown) when we have no mic
+    # name OR the enumeration failed / returned nothing at all (codex G2): a transient COM-probe failure
+    # returns [], which must NOT be read as the mic being gone (that raised a false red mic-flat after
+    # 5 s of failures). Only a SUCCESSFUL listing (eps non-empty) that lacks the endpoint is absence.
     mic_present = None
-    if mic_open_name:
+    if mic_open_name and eps:
         want = device_policy.norm_name(mic_open_name)
         mic_present = any(device_policy.norm_name(e.get("name")) == want for e in captures)
     obs = {
@@ -1784,14 +1799,21 @@ def _device_follow_tick(now):
 
 def _device_follow_loop(stop_event):
     """The 1 Hz watchdog thread. Exits within one tick of the session ending. Every tick is fully
-    guarded: a watchdog must never take the session down with it."""
+    guarded: an unhandled tick error must never kill the thread (it would silently stop all audio
+    monitoring for the session). The tick body is wrapped and the thread keeps ticking; each DISTINCT
+    error is logged once so a persistent fault is visible without spamming the log every second."""
     _FOLLOW["last_frames"] = None
     _FOLLOW["last_mic_frames"] = None
+    _FOLLOW["key"] = None
+    seen_errors = set()
     while not stop_event.wait(DEVICE_FOLLOW_TICK_S):
         try:
             _device_follow_tick(time.monotonic())
-        except Exception:
-            pass
+        except Exception as e:
+            sig = f"{type(e).__name__}: {e}"
+            if sig not in seen_errors:
+                seen_errors.add(sig)
+                print(f"[watchdog] tick error (will keep ticking): {sig}", flush=True)
 
 
 def _device_follow_start(cap):
