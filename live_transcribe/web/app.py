@@ -4199,6 +4199,15 @@ def start(req: StartRequest):
     # Automatic with a device_notice. Off Windows this is a no-op ("auto" -> None, a name passes
     # through). The concrete names are what AudioCapture opens (capture stays name-based).
     sel = _resolve_selection(req.mic_device, req.loopback_device, req.mic_device_id, req.loopback_device_id)
+    # Drain any live enumeration helper BEFORE taking STATE.lock (codex F1), so the capture's PortAudio
+    # acquisition does its bounded poll here, off the lock, and never blocks /api/status while it waits;
+    # by the time capture starts under the lock the table is ready for a clean 0 -> 1 rebuild.
+    if sys.platform == "win32":
+        try:
+            from .. import devices_win
+            devices_win.await_capture_slot()
+        except Exception:
+            pass
     # t0-capture: the transcription model is NOT loaded here. Capture (and recording, if on) start
     # the instant Begin is clicked; the model builds on a background thread (_build_engine_async) and
     # attaches once ready, replaying everything held since t0. So /api/start returns immediately and

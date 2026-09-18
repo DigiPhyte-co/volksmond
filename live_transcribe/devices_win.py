@@ -19,9 +19,21 @@ import pyaudiowpatch as pa
 # PyAudio in this process is now created through pa_acquire / pa_release (or the pa_session context
 # manager), which counts the live instances thread-safely and records when the table was last
 # (re)built, so a capture can wait briefly for a clean rebuild and the diagnostics can log its age.
+class CapturePortAudioBusy(RuntimeError):
+    """Raised by pa_acquire("enum") when a live capture OWNS PortAudio. Creating a second PyAudio then
+    both inherits the capture's frozen device table AND breaks the locked rule "never a second PyAudio
+    while a capture owns PortAudio", so enumeration is refused and the caller serves its last-good
+    cached listing instead (see list_ui_devices). A capture acquisition (role="capture") is never
+    refused; it waits for enum helpers to drain."""
+
+
 _pa_lock = threading.Lock()
 _pa_count = 0
 _pa_built_at = None      # time.monotonic() when the count last went 0 -> 1 (the table was rebuilt)
+_capture_ids = set()     # id() of live capture-role PyAudio instances: while any is live a capture
+                         # OWNS PortAudio and no enumeration instance may be created (the locked rule)
+_last_ui_devices = None  # last successful list_ui_devices() result, served when enumeration is refused
+                         # because a capture owns PortAudio (codex F1)
 
 # How long a capture waits for live enumeration helpers to release before it builds anyway. Bounded
 # so a stuck helper can never deadlock a session start; on expiry the capture builds on the (stale)
@@ -45,31 +57,59 @@ def pa_table_age_s():
         return time.monotonic() - _pa_built_at
 
 
+def capture_owns_portaudio():
+    """True while a capture holds a PyAudio open: it OWNS the (frozen) PortAudio device table, and no
+    enumeration instance may be created until it releases."""
+    with _pa_lock:
+        return bool(_capture_ids)
+
+
+def await_capture_slot(timeout_s=_CAPTURE_WAIT_S):
+    """Wait (bounded) for every live enumeration helper to release, so a capture about to start builds
+    its device table from a clean 0 -> 1 transition (the init-count trap) rather than inheriting a
+    stale one. Meant to be called OUTSIDE any request lock (codex F1): the session start drains helpers
+    here BEFORE it takes STATE.lock, so the poll sleep never blocks /api/status. Never deadlocks; on
+    expiry it returns and the caller builds anyway. Returns True when the slot is clean (no live
+    instance), False when it timed out with one still live (a loud warning is logged then)."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        with _pa_lock:
+            live = _pa_count
+            age = None if _pa_built_at is None else time.monotonic() - _pa_built_at
+        if live == 0:
+            return True
+        if time.monotonic() >= deadline:
+            age_txt = f"{age:.1f}s" if age is not None else "unknown"
+            print(f"[devices] WARNING starting capture with {live} PyAudio instance(s) still live; "
+                  f"PortAudio keeps its {age_txt}-old device table rather than rebuild it "
+                  "(init-count trap)", flush=True)
+            return False
+        time.sleep(_CAPTURE_POLL_S)
+
+
 def pa_acquire(role="enum"):
-    """Create a PyAudio instance and account for it process-wide. role="capture" first waits briefly
-    for any live enumeration helper to release, so the capture builds its table from a clean 0 -> 1
-    transition instead of inheriting a stale one; the wait is bounded and never deadlocks, and on
-    expiry it builds anyway and logs a loud warning with the table age. role="enum" (the short-lived
-    listings) never waits. Pair every call with pa_release, or use the pa_session context manager."""
+    """Create a PyAudio instance and account for it process-wide.
+
+    role="capture" first waits (bounded) for any live enumeration helper to release, then takes
+    ownership; while it is live, every role="enum" acquire is REFUSED with CapturePortAudioBusy (a
+    second PyAudio during capture inherits the frozen table AND breaks the locked lifecycle rule).
+    role="enum" (the short-lived listings) never waits, and raises CapturePortAudioBusy when a capture
+    owns PortAudio so the caller can serve its last-good cache. The refusal check, the PyAudio create
+    and the bookkeeping all happen under _pa_lock, so capture ownership and enumeration are mutually
+    exclusive. Pair every call with pa_release, or use the pa_session context manager."""
     global _pa_count, _pa_built_at
     if role == "capture":
-        deadline = time.monotonic() + _CAPTURE_WAIT_S
-        while True:
-            with _pa_lock:
-                live = _pa_count
-                age = None if _pa_built_at is None else time.monotonic() - _pa_built_at
-            if live == 0 or time.monotonic() >= deadline:
-                if live != 0:
-                    print(f"[devices] WARNING starting capture with {live} PyAudio instance(s) still "
-                          f"live; PortAudio keeps its {age:.1f}s-old device table rather than rebuild "
-                          "it (init-count trap)", flush=True)
-                break
-            time.sleep(_CAPTURE_POLL_S)
-    p = pa.PyAudio()
+        await_capture_slot()
     with _pa_lock:
+        if role != "capture" and _capture_ids:
+            raise CapturePortAudioBusy(
+                "a live capture owns PortAudio; enumeration is refused (serve the last-good listing)")
+        p = pa.PyAudio()
         _pa_count += 1
         if _pa_count == 1:
             _pa_built_at = time.monotonic()
+        if role == "capture":
+            _capture_ids.add(id(p))
     return p
 
 
@@ -83,6 +123,7 @@ def pa_release(p):
     finally:
         with _pa_lock:
             _pa_count = max(0, _pa_count - 1)
+            _capture_ids.discard(id(p))
             if _pa_count == 0:
                 _pa_built_at = None
 
@@ -90,7 +131,8 @@ def pa_release(p):
 @contextlib.contextmanager
 def pa_session(role="enum"):
     """Context-manager form of pa_acquire / pa_release for a short-lived PyAudio: it always
-    terminates its instance, even on an exception (the enumeration helpers' try/finally)."""
+    terminates its instance, even on an exception (the enumeration helpers' try/finally). Propagates
+    CapturePortAudioBusy from pa_acquire when a capture owns PortAudio (the block never runs then)."""
     p = pa_acquire(role)
     try:
         yield p
@@ -286,8 +328,20 @@ def list_ui_devices():
     physical device, all on the modern API. If WASAPI itself misbehaves
     on a particular machine, the CLI `--list-devices` still shows every
     host API for diagnostic purposes; this function is for the UI.
+
+    While a live capture OWNS PortAudio (codex F1) enumeration is refused rather than spinning a
+    second PyAudio: this returns the last-good listing instead (or an empty shape when we have never
+    listed), so the UI still has devices and the locked lifecycle rule holds.
     """
-    p = pa_acquire()
+    global _last_ui_devices
+    try:
+        p = pa_acquire()
+    except CapturePortAudioBusy:
+        print("[devices] enumeration refused while a capture owns PortAudio; serving the last-good "
+              "listing", flush=True)
+        if _last_ui_devices is not None:
+            return dict(_last_ui_devices)
+        return {"loopbacks": [], "mics": [], "default_loopback_index": None, "default_mic_index": None}
     try:
         loopbacks = [
             {"index": info["index"], "name": _fix_name(info["name"]), "rate": int(info["defaultSampleRate"])}
@@ -352,11 +406,12 @@ def list_ui_devices():
             else:
                 default_in_idx = None
 
-        return {
+        _last_ui_devices = {
             "loopbacks": loopbacks,
             "mics": mics,
             "default_loopback_index": default_lb_idx,
             "default_mic_index": default_in_idx,
         }
+        return dict(_last_ui_devices)
     finally:
         pa_release(p)

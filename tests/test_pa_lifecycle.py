@@ -133,15 +133,18 @@ def _install(table):
     counter = _Counter()
     mod = types.SimpleNamespace(PyAudio=lambda: _FakePA(holder, counter),
                                 paWASAPI=WASAPI, paFloat32=1, paContinue=0)
-    saved = (devices_win.pa, capture_win.pa, devices_win._pa_count, devices_win._pa_built_at)
+    saved = (devices_win.pa, capture_win.pa, devices_win._pa_count, devices_win._pa_built_at,
+             set(devices_win._capture_ids), devices_win._last_ui_devices)
     devices_win.pa = mod
     capture_win.pa = mod
     devices_win._pa_count = 0
     devices_win._pa_built_at = None
+    devices_win._capture_ids = set()
+    devices_win._last_ui_devices = None
 
     def restore():
-        (devices_win.pa, capture_win.pa,
-         devices_win._pa_count, devices_win._pa_built_at) = saved
+        (devices_win.pa, capture_win.pa, devices_win._pa_count, devices_win._pa_built_at,
+         devices_win._capture_ids, devices_win._last_ui_devices) = saved
 
     return holder, counter, restore
 
@@ -265,11 +268,58 @@ def test_enumeration_helper_always_terminates_even_when_its_body_raises():
     print("  OK  enumeration helpers and pa_session always terminate their PyAudio, even on an error")
 
 
+def test_enumeration_is_refused_while_a_capture_owns_portaudio():
+    # codex F1: while a live capture OWNS PortAudio, an enumeration acquire must be REFUSED (a second
+    # PyAudio would inherit the frozen table and break the locked lifecycle rule); list_ui_devices then
+    # serves the last-good cache instead of spinning a second instance.
+    holder, counter, restore = _install([OUTPUT_ONLY, MIC, OTHER_LOOP])
+    try:
+        good = devices_win.list_ui_devices()          # seed the cache with no capture live
+        assert good["mics"], good
+        base = counter.inits
+        cap_pa = devices_win.pa_acquire("capture")     # the capture takes ownership
+        assert devices_win.capture_owns_portaudio() is True
+        try:
+            devices_win.pa_acquire("enum")
+            raise AssertionError("enumeration must be refused while a capture owns PortAudio")
+        except devices_win.CapturePortAudioBusy:
+            pass
+        assert counter.inits == base + 1, "only the capture instance may be created (no second PyAudio)"
+        served = devices_win.list_ui_devices()         # served from cache, no new PyAudio
+        assert served["mics"] == good["mics"] and served["loopbacks"] == good["loopbacks"], served
+        assert counter.inits == base + 1 and counter.live == 1, (counter.inits, counter.live)
+        devices_win.pa_release(cap_pa)                 # releasing re-opens enumeration
+        assert devices_win.capture_owns_portaudio() is False
+        p = devices_win.pa_acquire("enum")
+        devices_win.pa_release(p)
+        assert devices_win.pa_instances() == 0
+    finally:
+        restore()
+    print("  OK  enumeration is refused (last-good cache served) while a capture owns PortAudio (F1)")
+
+
+def test_await_capture_slot_is_bounded_and_never_deadlocks():
+    # codex F1: the capture acquisition wait is a bounded poll (meant to run OUTSIDE STATE.lock). It
+    # returns True immediately when no instance is live, and False (never blocks forever) when one is.
+    holder, counter, restore = _install([MIC])
+    try:
+        assert devices_win.await_capture_slot(timeout_s=0.1) is True
+        p = devices_win.pa_acquire("enum")
+        assert devices_win.await_capture_slot(timeout_s=0.05) is False, "must time out, not deadlock"
+        devices_win.pa_release(p)
+        assert devices_win.await_capture_slot(timeout_s=0.1) is True
+    finally:
+        restore()
+    print("  OK  await_capture_slot returns True when clean, False (bounded) when an instance is live (F1)")
+
+
 if __name__ == "__main__":
     tests = (test_a_leaked_capture_is_released_so_the_count_returns_to_zero,
              test_a_device_that_appears_after_a_failure_resolves_on_the_next_start,
              test_candidates_and_table_age_are_logged_on_a_resolve_failure,
-             test_enumeration_helper_always_terminates_even_when_its_body_raises)
+             test_enumeration_helper_always_terminates_even_when_its_body_raises,
+             test_enumeration_is_refused_while_a_capture_owns_portaudio,
+             test_await_capture_slot_is_bounded_and_never_deadlocks)
     failures = 0
     for fn in tests:
         try:
