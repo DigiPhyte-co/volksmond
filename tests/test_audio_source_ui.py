@@ -83,6 +83,21 @@ def test_remembered_pick_survives_and_falls_back_to_auto():
         assert needle in APP_JS, f"app.js: {why} (missing {needle!r})"
 
 
+def test_vanished_pick_preserves_the_wanted_name_so_the_saved_device_survives():
+    # codex F5: when a present named pick vanishes (unplugged before Begin), reconcileSource must
+    # record it in *Wanted before falling back to Automatic, so formDeviceValue sends null (keeping
+    # the saved device) rather than "auto" (which the backend would persist over the saved name).
+    import re
+    m = re.search(r"function reconcileSource\(dev, which, doToast\)\s*\{(.*?)\n\}", APP_JS, re.S)
+    assert m, "reconcileSource not found"
+    body = m.group(1)
+    vanish = body[body.index("is no longer available"):]
+    assert "S.form[wantedKey] = cur;" in vanish, \
+        "the vanish branch must preserve the pick in *Wanted (codex F5), else the saved device is lost"
+    assert vanish.index("S.form[wantedKey] = cur;") < vanish.index("S.form[pickKey] = DEVICE_AUTO;"), \
+        "the wanted name must be recorded before the pick is reset to Automatic"
+
+
 def test_switch_device_can_hand_back_to_automatic():
     # A live switch to "auto" hands the source back to the policy; the response modes are adopted.
     assert 'var isAuto = (value === DEVICE_AUTO);' in APP_JS, \

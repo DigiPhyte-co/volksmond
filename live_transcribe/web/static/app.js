@@ -5223,6 +5223,11 @@ function reconcileSource(dev, which, doToast) {
   }
   if (cur != null && cur !== DEVICE_AUTO && !deviceNameInList(list, cur)) {
     if (doToast) toast(trFmt("{p} is no longer available. Using Automatic.", { p: sourceDisplayName(cur, which) }));
+    // Remember the vanished pick as *Wanted so the saved preference SURVIVES: formDeviceValue then
+    // sends null (not "auto"), the backend keeps the saved device and only falls back to Automatic
+    // for this run, and the field shows the "not connected" note. Without this the intent was lost
+    // and Begin overwrote the saved device with "auto" (codex F5).
+    S.form[wantedKey] = cur;
     S.form[pickKey] = DEVICE_AUTO;
     return true;
   }
