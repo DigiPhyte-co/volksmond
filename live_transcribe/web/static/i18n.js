@@ -946,6 +946,7 @@ window.VM_I18N = {
     "Your microphone is muted": "Jou mikrofoon is stilgemaak",
     "Your microphone is muted in Windows. Nothing you say is being captured.":
       "Jou mikrofoon is in Windows stilgemaak. Niks wat jy sê word vasgelê nie.",
+    "Open sound settings": "Maak klankinstellings oop",
     "No sound from your microphone": "Geen klank van jou mikrofoon nie",
     "Your microphone is sending no sound at all. Check it is plugged in, or pick another one.":
       "Jou mikrofoon stuur glad geen klank nie. Maak seker dit is ingeprop, of kies 'n ander een.",

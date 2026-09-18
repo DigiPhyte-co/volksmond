@@ -5221,6 +5221,24 @@ def open_folder(which: str = "sessions"):
         raise HTTPException(status_code=500, detail=f"Could not open folder: {e}")
 
 
+@app.post("/api/open-sound-settings")
+def open_sound_settings():
+    """Open the Windows Sound settings page so the user can unmute or fix their microphone.
+
+    The target is the fixed system URI ms-settings:sound and nothing else: there is no
+    user-supplied string, so this cannot be steered anywhere. Windows only (the URI is a
+    Windows scheme); elsewhere it is a clear 404. Same loopback-only + CSRF protection as
+    every other POST (the middleware rejects a foreign host, origin or missing token before
+    this runs), exactly like /api/open-folder."""
+    if sys.platform != "win32":
+        raise HTTPException(status_code=404, detail="Sound settings are only available on Windows.")
+    try:
+        os.startfile("ms-settings:sound")  # type: ignore[attr-defined]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not open sound settings: {e}")
+    return {"opened": "ms-settings:sound"}
+
+
 class SettingsPatch(BaseModel):
     interface_language: Optional[str] = None
     transcription_language: Optional[str] = None
