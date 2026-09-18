@@ -26,6 +26,7 @@ from pathlib import Path
 
 # Make `import live_transcribe` work when run as a plain script.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import _isolate_settings  # noqa: F401  redirect settings to a temp copy in script mode (codex F7)
 
 import numpy as np
 from fastapi.testclient import TestClient
