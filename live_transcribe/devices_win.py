@@ -32,6 +32,8 @@ _pa_count = 0
 _pa_built_at = None      # time.monotonic() when the count last went 0 -> 1 (the table was rebuilt)
 _capture_ids = set()     # id() of live capture-role PyAudio instances: while any is live a capture
                          # OWNS PortAudio and no enumeration instance may be created (the locked rule)
+_capture_reserving = 0   # captures that have reserved ownership but not yet registered their instance
+                         # (they construct PyAudio outside _pa_lock, codex G1); enum is refused meanwhile
 _last_ui_devices = None  # last successful list_ui_devices() result, served when enumeration is refused
                          # because a capture owns PortAudio (codex F1)
 
@@ -64,23 +66,36 @@ def capture_owns_portaudio():
         return bool(_capture_ids)
 
 
+def _busy_for_enum():
+    """True (under _pa_lock) when a capture owns PortAudio or is reserving ownership: an enumeration
+    instance must not be created in either case."""
+    return bool(_capture_ids) or _capture_reserving > 0
+
+
 def await_capture_slot(timeout_s=_CAPTURE_WAIT_S):
     """Wait (bounded) for every live enumeration helper to release, so a capture about to start builds
     its device table from a clean 0 -> 1 transition (the init-count trap) rather than inheriting a
     stale one. Meant to be called OUTSIDE any request lock (codex F1): the session start drains helpers
-    here BEFORE it takes STATE.lock, so the poll sleep never blocks /api/status. Never deadlocks; on
-    expiry it returns and the caller builds anyway. Returns True when the slot is clean (no live
-    instance), False when it timed out with one still live (a loud warning is logged then)."""
+    here BEFORE it takes STATE.lock, so the poll sleep never blocks /api/status. Uses a TIMED lock
+    acquire (codex G1) so a slow native PyAudio init elsewhere can never make this wait unbounded;
+    the overall deadline always governs. Returns True when the slot is clean (no live instance), False
+    when it timed out with one still live (a loud warning is logged then)."""
     deadline = time.monotonic() + timeout_s
     while True:
-        with _pa_lock:
-            live = _pa_count
-            age = None if _pa_built_at is None else time.monotonic() - _pa_built_at
+        live = None
+        age = None
+        if _pa_lock.acquire(timeout=_CAPTURE_POLL_S):
+            try:
+                live = _pa_count
+                age = None if _pa_built_at is None else time.monotonic() - _pa_built_at
+            finally:
+                _pa_lock.release()
         if live == 0:
             return True
         if time.monotonic() >= deadline:
+            live_txt = "?" if live is None else str(live)
             age_txt = f"{age:.1f}s" if age is not None else "unknown"
-            print(f"[devices] WARNING starting capture with {live} PyAudio instance(s) still live; "
+            print(f"[devices] WARNING starting capture with {live_txt} PyAudio instance(s) still live; "
                   f"PortAudio keeps its {age_txt}-old device table rather than rebuild it "
                   "(init-count trap)", flush=True)
             return False
@@ -90,26 +105,55 @@ def await_capture_slot(timeout_s=_CAPTURE_WAIT_S):
 def pa_acquire(role="enum"):
     """Create a PyAudio instance and account for it process-wide.
 
-    role="capture" first waits (bounded) for any live enumeration helper to release, then takes
-    ownership; while it is live, every role="enum" acquire is REFUSED with CapturePortAudioBusy (a
-    second PyAudio during capture inherits the frozen table AND breaks the locked lifecycle rule).
-    role="enum" (the short-lived listings) never waits, and raises CapturePortAudioBusy when a capture
-    owns PortAudio so the caller can serve its last-good cache. The refusal check, the PyAudio create
-    and the bookkeeping all happen under _pa_lock, so capture ownership and enumeration are mutually
-    exclusive. Pair every call with pa_release, or use the pa_session context manager."""
-    global _pa_count, _pa_built_at
+    A capture (role="capture") first drains enum helpers (await_capture_slot), then RESERVES ownership
+    under a short-held lock, constructs its PyAudio OUTSIDE the lock (codex G1: never hold _pa_lock
+    across the native init, which could stall and block every other lock user), then registers it and
+    drops the reservation. While a capture owns OR is reserving, every role="enum" acquire is REFUSED
+    with CapturePortAudioBusy (a second PyAudio during capture inherits the frozen table AND breaks the
+    locked lifecycle rule). An enum likewise constructs outside the lock and BACKS OUT (terminates and
+    refuses) if a capture reserved while it was constructing, so capture and enumeration can never both
+    hold a live instance. Pair every call with pa_release, or use the pa_session context manager."""
+    global _pa_count, _pa_built_at, _capture_reserving
     if role == "capture":
         await_capture_slot()
+        with _pa_lock:
+            _capture_reserving += 1
+        try:
+            p = pa.PyAudio()
+        except Exception:
+            with _pa_lock:
+                _capture_reserving -= 1
+            raise
+        with _pa_lock:
+            _capture_reserving -= 1
+            _pa_count += 1
+            if _pa_count == 1:
+                _pa_built_at = time.monotonic()
+            _capture_ids.add(id(p))
+        return p
+
+    # Enumeration: refuse up front if a capture owns/reserves, else construct outside the lock and
+    # re-check (back out) so an enum instance never survives alongside a capture.
     with _pa_lock:
-        if role != "capture" and _capture_ids:
+        if _busy_for_enum():
             raise CapturePortAudioBusy(
                 "a live capture owns PortAudio; enumeration is refused (serve the last-good listing)")
-        p = pa.PyAudio()
-        _pa_count += 1
-        if _pa_count == 1:
-            _pa_built_at = time.monotonic()
-        if role == "capture":
-            _capture_ids.add(id(p))
+    p = pa.PyAudio()
+    with _pa_lock:
+        if _busy_for_enum():
+            backout = True
+        else:
+            _pa_count += 1
+            if _pa_count == 1:
+                _pa_built_at = time.monotonic()
+            backout = False
+    if backout:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+        raise CapturePortAudioBusy(
+            "a capture claimed PortAudio while enumerating; enumeration refused (serve the last-good listing)")
     return p
 
 

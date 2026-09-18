@@ -134,17 +134,18 @@ def _install(table):
     mod = types.SimpleNamespace(PyAudio=lambda: _FakePA(holder, counter),
                                 paWASAPI=WASAPI, paFloat32=1, paContinue=0)
     saved = (devices_win.pa, capture_win.pa, devices_win._pa_count, devices_win._pa_built_at,
-             set(devices_win._capture_ids), devices_win._last_ui_devices)
+             set(devices_win._capture_ids), devices_win._last_ui_devices, devices_win._capture_reserving)
     devices_win.pa = mod
     capture_win.pa = mod
     devices_win._pa_count = 0
     devices_win._pa_built_at = None
     devices_win._capture_ids = set()
     devices_win._last_ui_devices = None
+    devices_win._capture_reserving = 0
 
     def restore():
         (devices_win.pa, capture_win.pa, devices_win._pa_count, devices_win._pa_built_at,
-         devices_win._capture_ids, devices_win._last_ui_devices) = saved
+         devices_win._capture_ids, devices_win._last_ui_devices, devices_win._capture_reserving) = saved
 
     return holder, counter, restore
 
@@ -313,13 +314,49 @@ def test_await_capture_slot_is_bounded_and_never_deadlocks():
     print("  OK  await_capture_slot returns True when clean, False (bounded) when an instance is live (F1)")
 
 
+def test_await_capture_slot_never_blocks_on_a_stalled_native_init():
+    # codex G1: pa.PyAudio() must be constructed OUTSIDE _pa_lock, so a slow/stalled native init in a
+    # concurrent enumeration cannot make await_capture_slot() (nor a start/switch holding STATE.lock)
+    # wait unbounded. Simulate a PyAudio() that blocks for a while; await_capture_slot must still return
+    # within its own timeout, proving it does not sit behind the lock during the native init.
+    import threading
+    import time as _time
+    holder, counter, restore = _install([MIC])
+    gate = threading.Event()
+
+    class _SlowPA(_FakePA):
+        def __init__(self, h, c):
+            gate.wait(2.0)          # stall inside the constructor (native init), lock must NOT be held
+            super().__init__(h, c)
+
+    try:
+        devices_win.pa = types.SimpleNamespace(PyAudio=lambda: _SlowPA(holder, counter),
+                                               paWASAPI=WASAPI, paFloat32=1, paContinue=0)
+        t = threading.Thread(target=lambda: devices_win.pa_acquire("enum"))
+        t.start()
+        _time.sleep(0.1)            # let the enum thread enter the stalled constructor
+        t0 = _time.monotonic()
+        result = devices_win.await_capture_slot(timeout_s=0.2)   # must return promptly, not block 2 s
+        elapsed = _time.monotonic() - t0
+        assert elapsed < 1.0, f"await_capture_slot blocked on the native init for {elapsed:.2f}s (G1)"
+        assert result in (True, False)   # a verdict was reached within the timeout, not a hang
+        gate.set()
+        t.join(3.0)
+        assert not t.is_alive(), "the stalled enum acquire never completed"
+    finally:
+        gate.set()
+        restore()
+    print("  OK  await_capture_slot returns within its timeout despite a stalled native PyAudio init (G1)")
+
+
 if __name__ == "__main__":
     tests = (test_a_leaked_capture_is_released_so_the_count_returns_to_zero,
              test_a_device_that_appears_after_a_failure_resolves_on_the_next_start,
              test_candidates_and_table_age_are_logged_on_a_resolve_failure,
              test_enumeration_helper_always_terminates_even_when_its_body_raises,
              test_enumeration_is_refused_while_a_capture_owns_portaudio,
-             test_await_capture_slot_is_bounded_and_never_deadlocks)
+             test_await_capture_slot_is_bounded_and_never_deadlocks,
+             test_await_capture_slot_never_blocks_on_a_stalled_native_init)
     failures = 0
     for fn in tests:
         try:
