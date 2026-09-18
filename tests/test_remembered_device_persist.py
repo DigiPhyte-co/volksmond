@@ -65,6 +65,24 @@ def test_absent_remembered_mic_is_not_overwritten_by_a_null_request():
         f"the saved mic must survive an absent-fallback start, got {config.load().get('mic_device')!r}"
 
 
+def test_a_vanished_unsaved_pick_does_not_overwrite_a_different_saved_device():
+    # codex G4: saved mic A; the user picked B, then B was unplugged before Begin. The UI now submits
+    # B's NAME (not null), so the backend resolves B's absence (Automatic + a notice naming B) WITHOUT
+    # migrating to, or overwriting, the different saved A. The session runs Automatic, and A survives.
+    config.update({"mic_device": "Samson C01U", "mic_device_id": "id-samson"})   # saved A
+
+    def body():
+        sel = webapp._resolve_selection("Yeti X", "auto", None, "")   # the vanished, unsaved pick B
+        assert sel["mic_mode"] == "auto" and sel["mic_absent"] is True, sel
+        assert sel["notice"] == {"kind": "remembered-absent", "which": "mic", "wanted": "Yeti X"}, sel["notice"]
+        webapp._persist_selection(sel["mic_mode"], sel["mic_name"], sel["mic_id"], sel["mic_absent"],
+                                  sel["loop_mode"], sel["loop_name"], sel["loop_id"], sel["loop_absent"])
+
+    _with_win32_and_fake_probe(body)
+    assert config.load().get("mic_device") == "Samson C01U", \
+        f"the different saved mic must NOT be overwritten by a vanished unsaved pick, got {config.load().get('mic_device')!r}"
+
+
 def test_explicit_automatic_choice_does_persist_auto():
     # The user deliberately picks Automatic (an explicit "auto", not a null fallback): that DOES
     # overwrite the saved name, which is the intended distinction.

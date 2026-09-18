@@ -5233,13 +5233,16 @@ function reconcileSource(dev, which, doToast) {
   }
   return false;
 }
-// The value to send to /api/start for one source: null when a remembered pick is absent (so the
-// backend keeps the saved device and only falls back to Automatic for this run, raising its own
-// device_notice), else "auto" or the chosen device NAME.
+// The value to send to /api/start for one source. When a pick has vanished we submit its remembered
+// NAME explicitly (codex G4), NOT null: null would make the backend migrate to whatever is SAVED,
+// which is a DIFFERENT device when the user picked an unsaved one that then got unplugged. Sending
+// the wanted name makes the backend resolve THAT name's absence (fall back to Automatic + a
+// remembered-absent notice) without overwriting a different saved device, so the UI (Automatic + the
+// "not connected" note) and the backend agree. Otherwise "auto" or the chosen device NAME.
 function formDeviceValue(which) {
   var pick = which === "mic" ? S.form.mic : S.form.loopback;
   var wanted = which === "mic" ? S.form.micWanted : S.form.loopbackWanted;
-  if ((pick == null || pick === DEVICE_AUTO) && wanted) return null;
+  if ((pick == null || pick === DEVICE_AUTO) && wanted) return wanted;
   return pick == null ? DEVICE_AUTO : pick;
 }
 // Seed one start-form source from the saved mode + name the backend reports on /api/devices. A saved

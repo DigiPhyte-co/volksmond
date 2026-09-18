@@ -71,9 +71,9 @@ def test_pickers_offer_automatic_first_and_group_junk():
 def test_remembered_pick_survives_and_falls_back_to_auto():
     checks = [
         ('function formDeviceValue(which)',
-         "an absent remembered pick must submit null so the backend keeps it, not overwrite with auto"),
-        ('return null;',
-         "formDeviceValue returns null for an absent remembered pick"),
+         "an absent remembered pick must submit its NAME so the backend resolves its absence"),
+        ('return wanted;',
+         "formDeviceValue submits the vanished pick's own name, not null (codex G4)"),
         ('{p} is not connected. Using Automatic for now.',
          "the start form must show the remembered-absent note beside the field"),
         ('S.form[pickKey] = DEVICE_AUTO;',
@@ -81,6 +81,12 @@ def test_remembered_pick_survives_and_falls_back_to_auto():
     ]
     for needle, why in checks:
         assert needle in APP_JS, f"app.js: {why} (missing {needle!r})"
+    # codex G4: null would make the backend migrate to a DIFFERENT saved device; formDeviceValue must
+    # not return a bare null for the vanished-pick case any more.
+    import re
+    m = re.search(r"function formDeviceValue\(which\)\s*\{(.*?)\n\}", APP_JS, re.S)
+    assert m and "return null;" not in m.group(1), \
+        "formDeviceValue must submit the wanted name, not null, for an absent pick (codex G4)"
 
 
 def test_vanished_pick_preserves_the_wanted_name_so_the_saved_device_survives():
