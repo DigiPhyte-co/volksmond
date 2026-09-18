@@ -469,7 +469,10 @@ class Watchdog:
                 if float(mic_db) > MIC_QUIET_DB:
                     self._mic_seen_loud = True
 
-            quiet_alerting = self._update_quiet(now)
+            # The mic-quiet hint is a transcription-quality nudge; a record-only session (no engine)
+            # passes allow_quiet False so it never nags, while the mic-flat / wrong-SYS reds still run
+            # off the capture-owned levels (codex F9). Default True keeps every existing caller intact.
+            quiet_alerting = self._update_quiet(now) if obs.get("allow_quiet", True) else False
 
             mic_other = _loudest_capture(captures, mic_name)  # a live mic elsewhere, or None
             mic_other_name = mic_other["name"] if mic_other is not None else None

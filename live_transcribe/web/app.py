@@ -13,6 +13,7 @@ _sessions_dir).
 import asyncio
 import collections
 import json
+import math
 import os
 import platform
 import queue
@@ -1421,6 +1422,28 @@ def _ring_max_db(engine, attr, now_s):
         return None
 
 
+def _capture_level_db(cap, source):
+    """A coarse dBFS from the capture's OWN level meter (peak, 0..1), the fallback the watchdog uses
+    when there is no engine energy ring (codex F9): a record-only session has no engine, and a
+    transcription session has none until the model attaches. None when the source has delivered no
+    block yet (unknown, never 'silent'); a genuinely zero-filled callback reads at the floor, so a
+    wrong SYS stream delivering silence no longer masquerades as live, and a flat mic can trip
+    mic-flat. Coarser than the calibrated ring (post-AEC/AGC), but the watchdog only needs a loud/idle
+    verdict here. Never raises."""
+    try:
+        lv = cap.levels().get(source) if cap is not None else None
+    except Exception:
+        return None
+    if not lv:
+        return None
+    peak = lv.get("peak")
+    if peak is None:
+        return None
+    if peak <= 0.0:
+        return device_policy.DB_FLOOR
+    return max(device_policy.DB_FLOOR, 20.0 * math.log10(peak))
+
+
 def _split_endpoints(eps):
     """(renders, captures) from a detailed endpoint list."""
     renders = [e for e in eps if e.get("flow") == "render"]
@@ -1665,8 +1688,15 @@ def _device_follow_tick(now):
     # The one COM probe of the tick, OUTSIDE the lock.
     eps = _probe_endpoints_detailed(with_peak=True)
     renders, captures = _split_endpoints(eps)
+    # Prefer the engine's calibrated energy rings; fall back to the capture's own level meter when a
+    # ring is absent (record-only, or a transcription session before the model attaches) so a
+    # silent-frame capture failure is still caught (codex F9).
     mic_db = _ring_max_db(engine, "mic_env", now_s)
+    if mic_db is None:
+        mic_db = _capture_level_db(cap, "MIC")
     sys_db = _ring_max_db(engine, "sys_env", now_s)
+    if sys_db is None:
+        sys_db = _capture_level_db(cap, "SYS")
     sys_in_use = bool(sys_open_name) and sys_state != "failed"
     # Is the mic endpoint still present in the live capture listing? None (unknown) when we have no
     # mic name to match; the Watchdog treats None as "not gone" so an unreadable listing never alerts.
@@ -1688,6 +1718,9 @@ def _device_follow_tick(now):
         "mic_muted": _muted_of(captures, mic_open_name),
         "mic_mode": mic_mode,
         "captures": captures,
+        # The optional mic-quiet nudge is a transcription-quality hint, so keep it suppressed on a
+        # record-only session (no engine): the wrong-SYS and mic-flat reds still fire (codex F9).
+        "allow_quiet": engine is not None,
     }
     try:
         alert, action = wd.observe(now_s, obs)

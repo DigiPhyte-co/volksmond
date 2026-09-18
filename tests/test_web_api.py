@@ -2151,12 +2151,16 @@ class _WCapture:
         self.sys_loopback_name = loopback_device
         self.sys_following_default = True
         self.sys_frames = 0
+        self._levels = {}          # {source: {"peak","rms"}}; a test sets this for the record-only path
 
     def start(self):
         pass
 
     def stop(self):
         pass
+
+    def levels(self):
+        return self._levels
 
     def attach_sys_ring(self, ring):
         pass
@@ -2346,6 +2350,38 @@ def test_watchdog_tick_mic_flat_when_the_mic_goes_dead_midsession():
     print("  OK  watchdog raises mic-flat when a live mic goes dead mid-session (frames stall + endpoint gone) (F3)")
 
 
+def test_watchdog_tick_record_only_wrong_sys_from_capture_levels():
+    # codex F9: a record-only session has no engine, so the energy rings are None. A wrong SYS stream
+    # delivering zero-filled callbacks keeps sys_frames advancing (looks live by frames alone), but the
+    # capture's own level meter reads it as silent, so the watchdog can still catch it. Named mode, so
+    # it alerts (with `other`) rather than auto-switching.
+    def fake_probe(with_peak=True):
+        return [_ep("Speakers", "render", roles=["multimedia"], peak_db=-100.0),   # our SYS: idle meter
+                _ep("Headphones", "render", peak_db=-6.0),                          # the real one playing
+                _ep("Mic", "capture")]
+    st = webapp.STATE
+    saved = _watch_state_tuple(st)
+    saved_probe = webapp._probe_endpoints_detailed
+    try:
+        webapp._probe_endpoints_detailed = fake_probe
+        _install_watch_session(loop_mode="named", loop_name="Speakers [Loopback]", mic_name="Mic")
+        st.engine = None                                     # record-only: no energy ring
+        # SYS delivers frames but they are silence; the mic is fine. Levels are the only truth here.
+        st.capture._levels = {"SYS": {"peak": 0.0, "rms": 0.0}, "MIC": {"peak": 0.05, "rms": 0.02}}
+        for now in range(0, 8):
+            st.capture.sys_frames += 4800                    # frames advance (zero-filled): "looks live"
+            webapp._device_follow_tick(float(now))
+            if st.audio_alert:
+                break
+        assert st.audio_alert and st.audio_alert["kind"] == "wrong-sys-device", st.audio_alert
+        assert st.audio_alert["other"] == "Headphones", st.audio_alert
+        assert st.loopback_device == "Speakers [Loopback]", "named mode must not auto-switch"
+    finally:
+        webapp._probe_endpoints_detailed = saved_probe
+        _restore_watch_state(st, saved)
+    print("  OK  record-only wrong-SYS is caught from capture levels even with frames advancing (F9)")
+
+
 def test_watchdog_tick_rebuilds_a_faulting_sys_once():
     # WP4: our SYS device is playing (loud meter) but delivers no frames -> a capture fault. The
     # Watchdog rebuilds the SAME endpoint once (rate-limited) before it alerts. Assert the rebuild.
@@ -2425,17 +2461,24 @@ def test_resolve_selection_auto_and_remembered_absent():
 
 
 def test_resolve_one_non_windows_passthrough(monkeypatch=None):
-    # WP4 locked decision: off Windows there is no role logic. "auto"/None becomes None (the backend
-    # default), a name passes through, and nothing probes. Simulated by flipping webapp.sys.platform.
+    # WP4 + codex F6: off Windows there is no role logic. "auto"/None becomes None (the backend
+    # default). A remembered NAME is validated against the platform listing: PRESENT names pass
+    # through as "named"; an ABSENT name falls back to Automatic + absent (never handed to a backend
+    # that would raise). Simulated by flipping webapp.sys.platform and faking devices.list_ui_devices.
+    from live_transcribe import devices as _devices
     saved_platform = webapp.sys.platform
+    saved_list = _devices.list_ui_devices
     try:
         webapp.sys.platform = "darwin"
+        _devices.list_ui_devices = lambda: {"mics": [{"name": "BlackHole 2ch"}], "loopbacks": []}
         assert webapp._resolve_one("mic", "auto", "", []) == (None, "", "auto", False)
         assert webapp._resolve_one("loopback", None, "", []) == (None, "", "auto", False)
         assert webapp._resolve_one("mic", "BlackHole 2ch", "x", []) == ("BlackHole 2ch", "x", "named", False)
+        assert webapp._resolve_one("mic", "Ghost Mic", "x", []) == (None, "", "auto", True)
     finally:
         webapp.sys.platform = saved_platform
-    print("  OK  _resolve_one off Windows: auto/None -> None, a name passes through, no probe")
+        _devices.list_ui_devices = saved_list
+    print("  OK  _resolve_one off Windows: auto/None -> None; a present name passes, an absent one falls back (F6)")
 
 
 def test_devices_list_builds_detailed_from_mmdevice():
@@ -2630,6 +2673,7 @@ if __name__ == "__main__":
                test_watchdog_tick_quiet_call_raises_no_alert,
                test_watchdog_tick_muted_mic_alerts_red_and_notifies_once,
                test_watchdog_tick_mic_flat_when_the_mic_goes_dead_midsession,
+               test_watchdog_tick_record_only_wrong_sys_from_capture_levels,
                test_watchdog_tick_rebuilds_a_faulting_sys_once,
                test_audio_alert_dismiss_clears_the_amber_hint,
                test_resolve_selection_auto_and_remembered_absent,

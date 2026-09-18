@@ -339,6 +339,19 @@ def test_wd_healthy_live_mic_never_raises_mic_flat():
     print("  OK  a healthy live mic never raises mic-flat from the liveness path (F3)")
 
 
+def test_wd_mic_quiet_hint_suppressed_when_not_allowed():
+    # codex F9: a record-only session passes allow_quiet False, so the amber mic-quiet nudge never
+    # fires even though the mic stays quiet through the whole opening window.
+    w = dp.Watchdog()
+    out = feed(w, [base_obs(mic_db=-70.0, allow_quiet=False)] * 60)   # quiet, past the 45 s window
+    assert all(a is None or a["kind"] != "mic-quiet" for a, _ in out), out
+    # Control: the same quiet mic WITH allow_quiet True does raise the hint (so the gate is real).
+    w2 = dp.Watchdog()
+    got = feed(w2, [base_obs(mic_db=-70.0, allow_quiet=True)] * 60)
+    assert any(a is not None and a["kind"] == "mic-quiet" for a, _ in got), "control: quiet fires when allowed"
+    print("  OK  the mic-quiet hint is suppressed on a record-only session (allow_quiet False) (F9)")
+
+
 def test_wd_wrong_device_warns_when_the_call_moved_onto_hdmi():
     # codex F4: our chosen SYS is idle and the only thing playing is the HDMI monitor. In named mode
     # the watchdog must still raise wrong-sys-device naming the HDMI as `other` (no silent miss).
@@ -519,6 +532,7 @@ TESTS = (
     test_wd_mic_flat_when_the_endpoint_disappears,
     test_wd_mic_that_never_delivered_a_frame_stays_unknown,
     test_wd_healthy_live_mic_never_raises_mic_flat,
+    test_wd_mic_quiet_hint_suppressed_when_not_allowed,
     test_wd_auto_mode_switches_then_alerts_and_respects_the_rate_limit,
     test_wd_sys_capture_fault_rebuilds_once_then_alerts,
     test_wd_quiet_call_three_minutes_no_alert,
