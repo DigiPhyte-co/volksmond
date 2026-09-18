@@ -313,6 +313,33 @@ html, body { margin: 0; padding: 0; height: 100%; }
   background: var(--accent-soft);
 }
 
+/* ── WP5 big audio warning (live view) ────────────────────────
+ * The red audio-watchdog alerts must be BIG and unmissable: a full-width bar
+ * pinned to the top of the live view, solid deep red with white text so it
+ * reads with strong contrast in both light and dark themes. The deep-red mix
+ * keeps white body text above the 4.5:1 ratio whichever way --record lands. */
+.vm .audio-alert-wrap { position: fixed; top: 0; left: 0; right: 0; z-index: 70; }
+.vm .audio-alert {
+  box-sizing: border-box;
+  display: flex; gap: 14px; align-items: flex-start;
+  padding: 16px 20px;
+  background: color-mix(in oklch, var(--record) 72%, #000);
+  color: #fff;
+  border-bottom: 2px solid color-mix(in oklch, var(--record) 45%, #000);
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.30);
+}
+.vm .audio-alert .aa-icon {
+  flex: 0 0 auto; width: 40px; height: 40px; border-radius: 10px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: rgba(255, 255, 255, 0.18); color: #fff;
+}
+.vm .audio-alert .aa-title { font-weight: 700; font-size: 16px; line-height: 1.2; }
+.vm .audio-alert .aa-body { margin: 4px 0 0; font-size: 13.5px; line-height: 1.4; opacity: 0.96; }
+.vm .audio-alert .btn.aa-primary { background: #fff; color: color-mix(in oklch, var(--record) 72%, #000); border-color: transparent; font-weight: 600; }
+.vm .audio-alert .btn.aa-primary:hover { background: #fff; filter: brightness(0.96); }
+.vm .audio-alert .btn.aa-ghost { background: rgba(255, 255, 255, 0.14); color: #fff; border-color: rgba(255, 255, 255, 0.5); }
+.vm .audio-alert .btn.aa-ghost:hover { background: rgba(255, 255, 255, 0.24); }
+
 /* ── Typography ───────────────────────────────────────────── */
 .vm h1, .vm h2, .vm h3 { margin: 0; letter-spacing: -0.02em; font-weight: 600; }
 .vm h1 { font-size: 28px; line-height: 1.15; }

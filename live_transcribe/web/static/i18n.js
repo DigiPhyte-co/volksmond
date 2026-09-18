@@ -926,6 +926,33 @@ window.VM_I18N = {
       "Stelselklank word nie vasgevang nie, net jou mikrofoon. Die ander kant van die oproep sal nie in die transkripsie wees nie.",
     "System audio isn't being captured, so only your microphone is being recorded. The other side of the call won't be in the transcript. You can allow it in System Settings > Privacy & Security, then restart the meeting.":
       "Stelselklank word nie vasgevang nie, net jou mikrofoon. Die ander kant van die oproep sal nie in die transkripsie wees nie. Jy kan dit toelaat in Stelselinstellings > Privaatheid en sekuriteit, en dan die vergadering herbegin.",
+    // Automatic source selection + big audio warnings (1.14.2, WP5)
+    "Automatic (recommended): {d}": "Outomaties (aanbeveel): {d}",
+    "Automatic (recommended)": "Outomaties (aanbeveel)",
+    "More microphones": "Meer mikrofone",
+    "More outputs": "Meer uitgange",
+    "{p} is not connected. Using Automatic for now.": "{p} is nie gekoppel nie. Gebruik nou Outomaties.",
+    "{p} is no longer available. Using Automatic.": "{p} is nie meer beskikbaar nie. Gebruik Outomaties.",
+    "Using {p} again.": "Gebruik weer {p}.",
+    "Switch to {d}": "Skakel oor na {d}",
+    "Keep {d}": "Hou {d}",
+    "System audio moved to {d} (that is where sound is playing)": "Stelselklank het na {d} geskuif (dis waar die klank speel)",
+    "Volksmond may be on the wrong output": "Volksmond is dalk op die verkeerde uitgang",
+    "We can't hear the other side. Sound is playing on {other}, but Volksmond is listening to {chosen}.":
+      "Ons kan nie die ander kant hoor nie. Klank speel op {other}, maar Volksmond luister na {chosen}.",
+    "System audio stopped": "Stelselklank het gestop",
+    "System audio stopped arriving from {chosen}. We restarted it; if this stays, pick another output.":
+      "Stelselklank het opgehou kom van {chosen} af. Ons het dit herbegin; as dit so bly, kies 'n ander uitgang.",
+    "Your microphone is muted": "Jou mikrofoon is stilgemaak",
+    "Your microphone is muted in Windows. Nothing you say is being captured.":
+      "Jou mikrofoon is in Windows stilgemaak. Niks wat jy sê word vasgelê nie.",
+    "No sound from your microphone": "Geen klank van jou mikrofoon nie",
+    "Your microphone is sending no sound at all. Check it is plugged in, or pick another one.":
+      "Jou mikrofoon stuur glad geen klank nie. Maak seker dit is ingeprop, of kies 'n ander een.",
+    "Your microphone is very quiet": "Jou mikrofoon is baie sag",
+    "Your microphone is very quiet. Move closer or raise its level in Windows.":
+      "Jou mikrofoon is baie sag. Skuif nader of verhoog sy vlak in Windows.",
+
     // Device identity + follow-the-default (1.14.1, Windows)
     "microphone": "mikrofoon",
     "system audio": "stelselklank",
