@@ -2233,12 +2233,14 @@ def _saved_mode(v):
     return "named" if (v not in (None, "", "auto")) else "auto"
 
 
-def _live_devices_win(live=False):
+def _live_devices_win(live=False, do_sample=True):
     """The /api/devices dict built from the live MMDevice endpoint set (WP4), or None on any failure
     (the caller then falls back to PortAudio). MMDevice is the ONE source of truth here: it always
     reflects the live endpoint set, whereas during a live session PortAudio's device table is frozen
     (codex F1). Its friendly names are exactly the PortAudio WASAPI names (a loopback = its render
-    endpoint name + ' [Loopback]'; verified).
+    endpoint name + ' [Loopback]'; verified). do_sample=False skips the ~300 ms render-peak sampling
+    (the /api/devices ?sample=0 fast path); auto_loopback_name then rests on the single instantaneous
+    peak from the one probe rather than the 3-sample read.
 
     When NO capture is live, the MMDevice set is INTERSECTED with a fresh PortAudio WASAPI pool: only
     what PortAudio can actually open is offered, and anything MMDevice lists that PortAudio cannot
@@ -2287,7 +2289,7 @@ def _live_devices_win(live=False):
     if not renders and not captures:
         return None   # nothing to offer: fall back to the PortAudio path rather than an empty listing
 
-    samples = _sample_render_peaks()
+    samples = _sample_render_peaks() if do_sample else None
     mic_pick, _mrule, _mwarn = device_policy.choose_mic(captures, openable=openable_mic)
     sys_pick, _srule = device_policy.choose_sys(renders, openable=openable_loop, samples=samples)
     auto_mic_name = mic_pick.get("name") if mic_pick else None
@@ -2331,7 +2333,7 @@ def _augment_devices_fallback(d):
 
 
 @app.get("/api/devices")
-def devices_list():
+def devices_list(sample: int = 1):
     """List the mics and loopbacks the user can pick, plus the WP4 Automatic-selection context:
     {loopbacks, mics, default_loopback_index, default_mic_index, auto_mic_name, auto_loopback_name,
     mic_mode, loopback_mode, saved_mic_name, saved_loopback_name}. Each device carries `id` and `junk`.
@@ -2340,12 +2342,16 @@ def devices_list():
     intersected with the fresh PortAudio pool when nothing is capturing, MMDevice-only during a live
     session (PortAudio's table is frozen then, codex F1). If MMDevice is unavailable it falls back to
     the PortAudio enumeration (WASAPI-only, per-host-API dedupe, mojibake fix). Off Windows the
-    PortAudio path is used and augmented with the saved mode + names."""
+    PortAudio path is used and augmented with the saved mode + names.
+
+    `?sample=0` skips the ~300 ms render-peak sampling that refines auto_loopback_name, for a snappier
+    poll: the Automatic loopback pick then rests on the single instantaneous peak. Default is sampling
+    on (sample=1)."""
     from .. import devices
     with STATE.lock:
         live = STATE.running and STATE.capture is not None
     if sys.platform == "win32":
-        d = _live_devices_win(live=live)
+        d = _live_devices_win(live=live, do_sample=(sample != 0))
         if d is not None:
             return d
         # MMDevice unavailable (COM failure): fall through to PortAudio, stale during a session but

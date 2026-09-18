@@ -30,24 +30,39 @@ from live_transcribe.web.app import CSRF_TOKEN, app
 client = TestClient(app, base_url="http://localhost")
 client.headers.update({"X-Volksmond-CSRF": CSRF_TOKEN})
 
+import pathlib as _pathlib
+import shutil as _shutil
+import tempfile as _tempfile
+
 from live_transcribe import config as _config
 
-# WP4: a user-initiated device switch/start now persists the chosen mic/loopback to settings, so any
-# test that drives that path must save and restore the four device keys or it would rewrite the real
-# settings.json on the dev machine. These helpers snapshot and restore exactly those keys.
-_DEV_KEYS = ("mic_device", "loopback_device", "mic_device_id", "loopback_device_id")
+# WP4 test isolation: a user-initiated device switch/start now PERSISTS the chosen mic/loopback to
+# settings. Save/restore around each write is not safe (a crash mid-test would leave a customer-facing
+# app with a bogus remembered device), so we redirect config's settings file to a throwaway temp copy
+# for the whole of this test module. config locates the file at config._SETTINGS_PATH (a module global
+# every read/write reads), so repointing it isolates all writes; a one-time copy of the real file keeps
+# read values realistic. This runs at import, so it holds under BOTH pytest and a plain-script run.
+_REAL_SETTINGS_PATH = _config._SETTINGS_PATH
+_REAL_SETTINGS_MTIME0 = _REAL_SETTINGS_PATH.stat().st_mtime if _REAL_SETTINGS_PATH.exists() else None
+_TMP_SETTINGS_DIR = _pathlib.Path(_tempfile.mkdtemp(prefix="vm-test-settings-"))
+_TMP_SETTINGS_PATH = _TMP_SETTINGS_DIR / "settings.json"
+try:
+    if _REAL_SETTINGS_PATH.exists():
+        _shutil.copy2(_REAL_SETTINGS_PATH, _TMP_SETTINGS_PATH)
+except Exception:
+    pass
+_config._SETTINGS_PATH = _TMP_SETTINGS_PATH   # every config read/write now hits the temp copy, never the real file
 
 
-def _save_dev_settings():
-    c = _config.load()
-    return {k: c.get(k) for k in _DEV_KEYS}
+def _real_settings_mtime():
+    return _REAL_SETTINGS_PATH.stat().st_mtime if _REAL_SETTINGS_PATH.exists() else None
 
 
-def _restore_dev_settings(snap):
-    try:
-        _config.update(snap)
-    except Exception:
-        pass
+# The module-level redirect above covers a plain-script run of this file. Under pytest, tests/conftest.py
+# owns an autouse fixture that re-points config at a temp copy before EVERY test in the whole suite,
+# which survives the importlib.reload(config) that test_paths.py does (that reload resets the path back
+# to the real file for tests running afterwards). So under pytest the active temp path is conftest's,
+# not this module's; the guard below therefore only checks the path is NOT the real one.
 
 
 def test_app_info():
@@ -781,7 +796,6 @@ def test_switch_device_preserves_recording_clock():
                            aec=True, agc=True, record_raw_mic=True)
     old_cap.start()
     saved_factory = webapp.capture.AudioCapture
-    dev_snap = _save_dev_settings()   # WP4: a successful switch persists the pick
     saved = (st.running, st.stopping, st.source_kind, st.capture, st.engine,
              st.mic_device, st.loopback_device, st.chunk_seconds, st.record_raw_mic)
     try:
@@ -804,7 +818,6 @@ def test_switch_device_preserves_recording_clock():
         webapp.capture.AudioCapture = saved_factory
         (st.running, st.stopping, st.source_kind, st.capture, st.engine,
          st.mic_device, st.loopback_device, st.chunk_seconds, st.record_raw_mic) = saved
-        _restore_dev_settings(dev_snap)
     print("  OK  /api/switch-device threads t0 through the rebuild: recording clock survives a device switch")
 
 
@@ -1632,7 +1645,6 @@ def test_switch_device_resets_the_loop_history():
 
     st = webapp.STATE
     saved_factory = webapp.capture.AudioCapture
-    dev_snap = _save_dev_settings()   # WP4: a successful switch persists the pick
     saved = (st.running, st.stopping, st.source_kind, st.capture, st.engine,
              st.mic_device, st.loopback_device, st.chunk_seconds, st.record_raw_mic)
     try:
@@ -1661,7 +1673,6 @@ def test_switch_device_resets_the_loop_history():
         webapp.capture.AudioCapture = saved_factory
         (st.running, st.stopping, st.source_kind, st.capture, st.engine,
          st.mic_device, st.loopback_device, st.chunk_seconds, st.record_raw_mic) = saved
-        _restore_dev_settings(dev_snap)
     print("  OK  /api/switch-device asks the worker to clear the loop history (switch and revert)")
 
 
@@ -2204,7 +2215,6 @@ def test_watchdog_tick_auto_switches_to_the_playing_output():
     saved = _watch_state_tuple(st)
     saved_probe, saved_sample, saved_factory = (webapp._probe_endpoints_detailed,
                                                 webapp._sample_render_peaks, webapp.capture.AudioCapture)
-    dev_snap = _save_dev_settings()
     try:
         webapp._probe_endpoints_detailed = fake_probe
         webapp._sample_render_peaks = lambda *a, **k: {}
@@ -2228,7 +2238,6 @@ def test_watchdog_tick_auto_switches_to_the_playing_output():
         webapp._probe_endpoints_detailed, webapp._sample_render_peaks = saved_probe, saved_sample
         webapp.capture.AudioCapture = saved_factory
         _restore_watch_state(st, saved)
-        _restore_dev_settings(dev_snap)
     print("  OK  watchdog auto-switches SYS to the playing output in Automatic (audio_toast + no settings overwrite)")
 
 
@@ -2316,7 +2325,6 @@ def test_watchdog_tick_rebuilds_a_faulting_sys_once():
     st = webapp.STATE
     saved = _watch_state_tuple(st)
     saved_probe, saved_factory = webapp._probe_endpoints_detailed, webapp.capture.AudioCapture
-    dev_snap = _save_dev_settings()
     try:
         webapp._probe_endpoints_detailed = fake_probe
         webapp.capture.AudioCapture = _WCapture
@@ -2332,7 +2340,6 @@ def test_watchdog_tick_rebuilds_a_faulting_sys_once():
         webapp._probe_endpoints_detailed = saved_probe
         webapp.capture.AudioCapture = saved_factory
         _restore_watch_state(st, saved)
-        _restore_dev_settings(dev_snap)
     print("  OK  watchdog rebuilds a faulting SYS capture once on the same endpoint")
 
 
@@ -2369,7 +2376,6 @@ def test_resolve_selection_auto_and_remembered_absent():
                 _ep("Microphone (2- Samson C01U              )", "capture", roles=["console", "multimedia"]),
                 _ep("Microphone (FHD Camera Microphone)", "capture", roles=["communications"])]   # webcam
     saved_probe, saved_sample = webapp._probe_endpoints_detailed, webapp._sample_render_peaks
-    dev_snap = _save_dev_settings()
     try:
         webapp._probe_endpoints_detailed = fake_probe
         webapp._sample_render_peaks = lambda *a, **k: {}
@@ -2385,7 +2391,6 @@ def test_resolve_selection_auto_and_remembered_absent():
         assert sel2["mic_name"] == "Microphone (2- Samson C01U              )", "absent falls back to the auto pick"
     finally:
         webapp._probe_endpoints_detailed, webapp._sample_render_peaks = saved_probe, saved_sample
-        _restore_dev_settings(dev_snap)
     print("  OK  _resolve_selection: Automatic picks Samson+Speakers; an absent remembered pick falls back + notices")
 
 
@@ -2462,6 +2467,50 @@ def test_devices_list_intersects_with_the_portaudio_pool():
         (webapp._probe_endpoints_detailed, webapp._sample_render_peaks,
          _dw.pa_session, _dw.loopback_candidate_names, _dw.mic_candidate_names) = saved
     print("  OK  /api/devices intersects MMDevice with the PortAudio pool and drops what PortAudio cannot resolve")
+
+
+def test_devices_list_sample_flag_skips_render_peak_sampling():
+    # WP4: GET /api/devices?sample=0 must NOT call the ~300 ms render-peak sampler; the default
+    # (sample=1) does. Assert via a sampler patched to count its calls, over the idle detailed path.
+    def fake_probe(with_peak=True):
+        return [_ep("Speakers", "render", roles=["multimedia"], peak_db=-100.0),
+                _ep("Mic", "capture", roles=["multimedia"])]
+    saved_probe, saved_sample = webapp._probe_endpoints_detailed, webapp._sample_render_peaks
+    calls = []
+    try:
+        webapp._probe_endpoints_detailed = fake_probe
+        webapp._sample_render_peaks = lambda *a, **k: calls.append(1) or {}
+        webapp._live_devices_win(live=True, do_sample=False)
+        assert calls == [], "sample=0 must not sample render peaks"
+        webapp._live_devices_win(live=True, do_sample=True)
+        assert calls == [1], "the default path must sample render peaks once"
+    finally:
+        webapp._probe_endpoints_detailed, webapp._sample_render_peaks = saved_probe, saved_sample
+    print("  OK  /api/devices?sample=0 skips the render-peak sampling; the default samples once")
+
+
+def test_real_settings_file_is_never_written_by_the_device_tests():
+    # WP4 isolation guard: the device tests reach the new persistence path (start / switch / resolve),
+    # which writes settings. The module redirects config._SETTINGS_PATH to a temp copy, so the REAL
+    # settings.json must not move. This test brackets the persistence-reaching device tests with a real
+    # mtime read and FAILS if any of them wrote the real file. It is scoped to the device tests on
+    # purpose: other pre-existing tests (agc_live, mic_gate, record_sessions, aec_live) legitimately
+    # write and restore the real file, so a whole-suite mtime check would flag them, not a regression.
+    if _REAL_SETTINGS_MTIME0 is None:
+        print("  SKIP  no real settings.json on this machine to guard")
+        return
+    assert webapp.config._SETTINGS_PATH != _REAL_SETTINGS_PATH, "config settings path was not redirected off the real file"
+    before = _real_settings_mtime()
+    for fn in (test_switch_device_preserves_recording_clock,
+               test_switch_device_resets_the_loop_history,
+               test_watchdog_tick_auto_switches_to_the_playing_output,
+               test_watchdog_tick_rebuilds_a_faulting_sys_once,
+               test_resolve_selection_auto_and_remembered_absent):
+        fn()
+    assert _REAL_SETTINGS_PATH.exists(), "the real settings.json vanished during the device tests"
+    assert _real_settings_mtime() == before, \
+        "a device test wrote the real settings.json (isolation broke)"
+    print("  OK  the device tests never write the real settings.json (mtime unchanged across them)")
 
 
 def test_sys_error_unnamed_device_is_null():
@@ -2556,7 +2605,9 @@ if __name__ == "__main__":
                test_resolve_one_non_windows_passthrough,
                test_devices_list_builds_detailed_from_mmdevice,
                test_devices_list_intersects_with_the_portaudio_pool,
-               test_sys_error_unnamed_device_is_null):
+               test_devices_list_sample_flag_skips_render_peak_sampling,
+               test_sys_error_unnamed_device_is_null,
+               test_real_settings_file_is_never_written_by_the_device_tests):
         try:
             fn()
         except AssertionError as e:
