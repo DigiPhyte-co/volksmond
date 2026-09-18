@@ -2472,9 +2472,16 @@ def test_resolve_selection_auto_and_remembered_absent():
                 _ep("Microphone (2- Samson C01U              )", "capture", roles=["console", "multimedia"]),
                 _ep("Microphone (FHD Camera Microphone)", "capture", roles=["communications"])]   # webcam
     saved_probe, saved_sample = webapp._probe_endpoints_detailed, webapp._sample_render_peaks
+    saved_selectable = webapp._selectable_win
+    # Resolution now runs over the shared opener-compatible pool (codex F2); patch that seam so the
+    # test drives a known endpoint set and never intersects against the real PortAudio pool.
+    def fake_selectable(live, do_sample):
+        r, c = webapp._split_endpoints(fake_probe())
+        return r, c, None, None, {}
     try:
         webapp._probe_endpoints_detailed = fake_probe
         webapp._sample_render_peaks = lambda *a, **k: {}
+        webapp._selectable_win = fake_selectable
         _config.update({"mic_device": "auto", "mic_device_id": "", "loopback_device": "auto", "loopback_device_id": ""})
         sel = webapp._resolve_selection("auto", "auto", None, None)
         assert sel["mic_name"] == "Microphone (2- Samson C01U              )", sel
@@ -2487,7 +2494,47 @@ def test_resolve_selection_auto_and_remembered_absent():
         assert sel2["mic_name"] == "Microphone (2- Samson C01U              )", "absent falls back to the auto pick"
     finally:
         webapp._probe_endpoints_detailed, webapp._sample_render_peaks = saved_probe, saved_sample
+        webapp._selectable_win = saved_selectable
     print("  OK  _resolve_selection: Automatic picks Samson+Speakers; an absent remembered pick falls back + notices")
+
+
+def test_automatic_resolution_only_picks_opener_compatible_devices():
+    # codex F2: /api/devices and Automatic resolution share _selectable_win, so Automatic can only
+    # pick a device the PortAudio opener can actually resolve. A device MMDevice lists but PortAudio
+    # cannot open must be dropped BEFORE the pick, even when it would otherwise win (loud / default),
+    # so a start never lands on an unopenable device and continues SYS-only.
+    if sys.platform != "win32":
+        print("  SKIP  opener-compatible resolution (Windows-only)")
+        return
+    import contextlib as _ctx
+    from live_transcribe import devices_win
+    def fake_probe(with_peak=True):
+        return [_ep("Real Speakers", "render", roles=["console"], peak_db=-100.0),
+                _ep("Ghost Render", "render", roles=["multimedia"], peak_db=-3.0),   # loud+default, NOT openable
+                _ep("Real Mic", "capture", roles=["communications"]),
+                _ep("Ghost Mic", "capture", roles=["multimedia"])]                    # default, NOT openable
+    @_ctx.contextmanager
+    def fake_session(role="enum"):
+        yield object()
+    st = webapp.STATE
+    saved = (webapp._probe_endpoints_detailed, webapp._sample_render_peaks, devices_win.pa_session,
+             devices_win.loopback_candidate_names, devices_win.mic_candidate_names, st.running, st.capture)
+    try:
+        st.running, st.capture = False, None         # not live -> intersect with the PortAudio pool
+        webapp._probe_endpoints_detailed = fake_probe
+        webapp._sample_render_peaks = lambda *a, **k: {}
+        devices_win.pa_session = fake_session
+        devices_win.loopback_candidate_names = lambda p: ["Real Speakers [Loopback]"]   # ghost absent
+        devices_win.mic_candidate_names = lambda p: ["Real Mic"]                          # ghost absent
+        _config.update({"mic_device": "auto", "mic_device_id": "", "loopback_device": "auto", "loopback_device_id": ""})
+        sel = webapp._resolve_selection("auto", "auto", None, None)
+        assert sel["mic_name"] == "Real Mic", f"Automatic must skip the unopenable Ghost Mic, got {sel['mic_name']!r}"
+        assert sel["loop_name"] == "Real Speakers [Loopback]", \
+            f"Automatic must skip the unopenable Ghost Render, got {sel['loop_name']!r}"
+    finally:
+        (webapp._probe_endpoints_detailed, webapp._sample_render_peaks, devices_win.pa_session,
+         devices_win.loopback_candidate_names, devices_win.mic_candidate_names, st.running, st.capture) = saved
+    print("  OK  Automatic resolution drops opener-incompatible devices via the shared pool (F2)")
 
 
 def test_resolve_one_non_windows_passthrough(monkeypatch=None):
@@ -2708,6 +2755,7 @@ if __name__ == "__main__":
                test_watchdog_tick_rebuilds_a_faulting_sys_once,
                test_audio_alert_dismiss_clears_the_amber_hint,
                test_resolve_selection_auto_and_remembered_absent,
+               test_automatic_resolution_only_picks_opener_compatible_devices,
                test_resolve_one_non_windows_passthrough,
                test_devices_list_builds_detailed_from_mmdevice,
                test_devices_list_intersects_with_the_portaudio_pool,

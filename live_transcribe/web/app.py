@@ -1555,9 +1555,18 @@ def _resolve_selection(req_mic, req_loop, req_mic_id, req_loop_id):
     elif req_loop_id is None and req_loop == cfg.get("loopback_device"):
         req_loop_id = cfg.get("loopback_device_id", "")
 
-    eps = _probe_endpoints_detailed(with_peak=True) if sys.platform == "win32" else []
-    mic_name, mic_id, mic_mode, mic_absent = _resolve_one("mic", req_mic, req_mic_id, eps)
-    loop_name, loop_id, loop_mode, loop_absent = _resolve_one("loopback", req_loop, req_loop_id, eps)
+    # Resolve over the SAME opener-compatible, sampled pool /api/devices lists (codex F2), so Automatic
+    # (and a remembered pick) can never land on a device PortAudio cannot open (which would leave the
+    # session SYS-only or fail the mic). Intersect with the PortAudio pool only when no capture owns it
+    # (a start), never during a live session (that would spin a second PyAudio, codex F1).
+    eps, samples = [], None
+    if sys.platform == "win32":
+        with STATE.lock:
+            live = STATE.running and STATE.capture is not None
+        renders, captures, _ol, _om, samples = _selectable_win(live=live, do_sample=True)
+        eps = renders + captures
+    mic_name, mic_id, mic_mode, mic_absent = _resolve_one("mic", req_mic, req_mic_id, eps, samples=samples)
+    loop_name, loop_id, loop_mode, loop_absent = _resolve_one("loopback", req_loop, req_loop_id, eps, samples=samples)
 
     notice = None
     if mic_absent:
@@ -2318,28 +2327,21 @@ def _saved_mode(v):
     return "named" if (v not in (None, "", "auto")) else "auto"
 
 
-def _live_devices_win(live=False, do_sample=True):
-    """The /api/devices dict built from the live MMDevice endpoint set (WP4), or None on any failure
-    (the caller then falls back to PortAudio). MMDevice is the ONE source of truth here: it always
-    reflects the live endpoint set, whereas during a live session PortAudio's device table is frozen
-    (codex F1). Its friendly names are exactly the PortAudio WASAPI names (a loopback = its render
-    endpoint name + ' [Loopback]'; verified). do_sample=False skips the ~300 ms render-peak sampling
-    (the /api/devices ?sample=0 fast path); auto_loopback_name then rests on the single instantaneous
-    peak from the one probe rather than the 3-sample read.
+def _selectable_win(live, do_sample):
+    """The opener-compatible endpoint pools + render-peak samples that BOTH /api/devices AND Automatic
+    resolution share (codex F2), so the listing and the pick can never disagree and Automatic can only
+    land on a device the opener can actually resolve. Returns
+    (renders, captures, openable_loop, openable_mic, samples).
 
-    When NO capture is live, the MMDevice set is INTERSECTED with a fresh PortAudio WASAPI pool: only
-    what PortAudio can actually open is offered, and anything MMDevice lists that PortAudio cannot
-    resolve is dropped and logged. During a live session PortAudio is frozen, so MMDevice stands alone.
-
-    Each device carries `id` (the stable endpoint id) and `junk` (a deprioritised HDMI/virtual/webcam
-    endpoint, flagged never hidden). Top-level `auto_mic_name` / `auto_loopback_name` are what
-    Automatic would pick right now (choose_mic / choose_sys with a quick sampled render-peak read),
-    plus the saved `mic_mode` / `loopback_mode` and saved names, so the UI can show the live default
-    and the remembered choice. default_*_index (the multimedia-default highlight) is kept for the
-    current UI; rates come from the cached PortAudio enumeration by name (display only)."""
+    When NO capture is live the MMDevice set is INTERSECTED with a fresh PortAudio WASAPI pool: only
+    what PortAudio can open is kept, and anything MMDevice lists that PortAudio cannot resolve is
+    dropped and logged (openable_* then carry the exact opener NAMES). During a live session PortAudio
+    is frozen (its table cannot rebuild, codex F1), so MMDevice stands alone and openable_* are None
+    (its friendly names ARE the PortAudio WASAPI names, so what is listed is what opens). samples is
+    the sampled render peaks for choose_sys's "is it playing" test, or None when do_sample is False."""
     eps = _probe_endpoints_detailed(with_peak=True)
     if not eps:
-        return None
+        return [], [], None, None, None
     renders, captures = _split_endpoints(eps)
 
     openable_loop = openable_mic = None
@@ -2371,10 +2373,32 @@ def _live_devices_win(live=False, do_sample=True):
             if dropped:
                 print(f"[devices] dropped (PortAudio cannot resolve): {dropped}", flush=True)
 
+    samples = _sample_render_peaks() if do_sample else None
+    return renders, captures, openable_loop, openable_mic, samples
+
+
+def _live_devices_win(live=False, do_sample=True):
+    """The /api/devices dict built from the live MMDevice endpoint set (WP4), or None on any failure
+    (the caller then falls back to PortAudio). MMDevice is the ONE source of truth here: it always
+    reflects the live endpoint set, whereas during a live session PortAudio's device table is frozen
+    (codex F1). Its friendly names are exactly the PortAudio WASAPI names (a loopback = its render
+    endpoint name + ' [Loopback]'; verified). do_sample=False skips the ~300 ms render-peak sampling
+    (the /api/devices ?sample=0 fast path); auto_loopback_name then rests on the single instantaneous
+    peak from the one probe rather than the 3-sample read.
+
+    The opener-compatible pools come from _selectable_win, the SAME helper Automatic resolution uses
+    (codex F2), so what the picker shows and what a start/switch resolves can never diverge.
+
+    Each device carries `id` (the stable endpoint id) and `junk` (a deprioritised HDMI/virtual/webcam
+    endpoint, flagged never hidden). Top-level `auto_mic_name` / `auto_loopback_name` are what
+    Automatic would pick right now (choose_mic / choose_sys with a quick sampled render-peak read),
+    plus the saved `mic_mode` / `loopback_mode` and saved names, so the UI can show the live default
+    and the remembered choice. default_*_index (the multimedia-default highlight) is kept for the
+    current UI; rates come from the cached PortAudio enumeration by name (display only)."""
+    renders, captures, openable_loop, openable_mic, samples = _selectable_win(live, do_sample)
     if not renders and not captures:
         return None   # nothing to offer: fall back to the PortAudio path rather than an empty listing
 
-    samples = _sample_render_peaks() if do_sample else None
     mic_pick, _mrule, _mwarn = device_policy.choose_mic(captures, openable=openable_mic)
     sys_pick, _srule = device_policy.choose_sys(renders, openable=openable_loop, samples=samples)
     auto_mic_name = mic_pick.get("name") if mic_pick else None
@@ -2483,9 +2507,10 @@ def switch_device(req: SwitchDeviceRequest):
     if device is None or str(device).strip().lower() == "auto":
         mode, open_name, dev_id = "auto", None, ""
         if sys.platform == "win32":
-            eps = _probe_endpoints_detailed(with_peak=True)
-            samples = _sample_render_peaks()
-            open_name, dev_id, mode, _absent = _resolve_one(which, "auto", "", eps, samples=samples)
+            # A live session owns PortAudio, so live=True: MMDevice-only, no second PyAudio (codex F1),
+            # through the same shared resolver /api/start uses so listing and pick agree (codex F2).
+            renders, captures, _ol, _om, samples = _selectable_win(live=True, do_sample=True)
+            open_name, dev_id, mode, _absent = _resolve_one(which, "auto", "", renders + captures, samples=samples)
     # Commit the capture, the new mode and the selection generation together under one lock (codex
     # F8), so the watchdog never sees the new capture paired with the old mode. Raises on a failed
     # switch, so nothing below persists.
