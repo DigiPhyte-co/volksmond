@@ -12,7 +12,6 @@ import pyaudiowpatch as pa
 from .capture_core import BLOCK_SECONDS, CaptureBase
 from .devices_win import (
     _fix_name,
-    default_loopback_name,
     loopback_candidate_names,
     mic_candidate_names,
     pa_acquire,
@@ -132,17 +131,14 @@ class AudioCapture(CaptureBase):
                 "Run --list-devices from the CLI to enumerate what is available."
             )
 
-        # Follow-the-default bookkeeping: record the cleaned name of the loopback we actually opened
-        # and whether it matches the Windows default output at open time. The watcher (WP-4) reads
-        # both to decide between auto-following a later default change and warning that an explicitly
-        # chosen loopback is idle. Only meaningful when a loopback stream opened; on a failed loopback
-        # the name stays None and following stays False so the watcher leaves it to the banner.
+        # Record the cleaned name of the loopback we actually opened, so the WP4 audio watchdog can
+        # reason over what SYS is on. sys_following_default is no longer computed by a name-equality
+        # against the OS default at open time: whether SYS auto-follows is now decided by the SESSION'S
+        # MODE ("auto" vs "named"), which web/app.py holds and the watchdog reads. Left initialised to
+        # False for any lingering getattr; nothing consults it now. Only meaningful when a loopback
+        # stream opened; on a failed loopback the name stays None so the watchdog leaves it to the banner.
         if "SYS" in self._buffers and loopback_info is not None:
             self.sys_loopback_name = _fix_name(loopback_info["name"]).strip()
-            default_name = default_loopback_name(self._pa)
-            self.sys_following_default = (
-                default_name is not None and self.sys_loopback_name == default_name
-            )
 
     def _candidate_names(self, lister):
         """The PortAudio candidate names `lister` would search, for a resolve-failure log line. Never
