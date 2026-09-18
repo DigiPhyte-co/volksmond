@@ -2613,6 +2613,34 @@ def test_automatic_resolution_only_picks_opener_compatible_devices():
     print("  OK  Automatic resolution drops opener-incompatible devices via the shared pool (F2)")
 
 
+def test_devices_list_serves_stale_cache_when_enumeration_unavailable():
+    # codex G5: a successful listing primes one shared last-good cache; when live enumeration is
+    # unavailable (MMDevice fails AND PortAudio is refused/empty, e.g. a capture owns PortAudio),
+    # /api/devices serves that last-good listing marked "stale": true instead of empty dropdowns.
+    from live_transcribe import devices as _devices
+    good = {"loopbacks": [{"index": 0, "name": "Real Spk [Loopback]", "id": "r1", "junk": False, "rate": 48000}],
+            "mics": [{"index": 0, "name": "Real Mic", "id": "c1", "junk": False, "rate": 48000}],
+            "default_loopback_index": 0, "default_mic_index": 0}
+    saved_live, saved_list, saved_cache = (webapp._live_devices_win, _devices.list_ui_devices,
+                                           webapp._LAST_GOOD_DEVICES)
+    try:
+        webapp._live_devices_win = lambda live, do_sample: None      # force the PortAudio/cache path
+        _devices.list_ui_devices = lambda: dict(good)                # a good listing primes the cache
+        r1 = client.get("/api/devices").json()
+        assert r1["mics"][0]["name"] == "Real Mic" and not r1.get("stale"), r1
+        # Enumeration now unavailable: empty listing -> serve the last-good, marked stale.
+        _devices.list_ui_devices = lambda: {"loopbacks": [], "mics": [],
+                                            "default_loopback_index": None, "default_mic_index": None}
+        r2 = client.get("/api/devices").json()
+        assert r2.get("stale") is True, r2
+        assert r2["mics"][0]["name"] == "Real Mic", "the stale listing must be the last good one"
+    finally:
+        webapp._live_devices_win = saved_live
+        _devices.list_ui_devices = saved_list
+        webapp._LAST_GOOD_DEVICES = saved_cache
+    print("  OK  /api/devices serves the last-good listing marked stale when enumeration is unavailable (G5)")
+
+
 def test_resolve_one_non_windows_passthrough(monkeypatch=None):
     # WP4 + codex F6: off Windows there is no role logic. "auto"/None becomes None (the backend
     # default). A remembered NAME is validated against the platform listing: PRESENT names pass
@@ -2835,6 +2863,7 @@ if __name__ == "__main__":
                test_audio_alert_dismiss_clears_the_amber_hint,
                test_resolve_selection_auto_and_remembered_absent,
                test_automatic_resolution_only_picks_opener_compatible_devices,
+               test_devices_list_serves_stale_cache_when_enumeration_unavailable,
                test_resolve_one_non_windows_passthrough,
                test_devices_list_builds_detailed_from_mmdevice,
                test_devices_list_intersects_with_the_portaudio_pool,

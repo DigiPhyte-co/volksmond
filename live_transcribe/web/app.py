@@ -2337,6 +2337,11 @@ def status():
 # here never affects what is opened.
 _DEVICE_RATE_CACHE = {}
 
+# One shared last-good /api/devices listing (codex G5): primed on every successful listing (MMDevice
+# or PortAudio) and served, marked "stale": true, when live enumeration is unavailable (MMDevice fails
+# AND PortAudio is refused/empty, e.g. while a capture owns PortAudio), so the dropdowns never empty.
+_LAST_GOOD_DEVICES = None
+
 
 def _cache_device_rates(d):
     for entry in (d.get("mics") or []) + (d.get("loopbacks") or []):
@@ -2479,17 +2484,26 @@ def devices_list(sample: int = 1):
     poll: the Automatic loopback pick then rests on the single instantaneous peak. Default is sampling
     on (sample=1)."""
     from .. import devices
+    global _LAST_GOOD_DEVICES
     with STATE.lock:
         live = STATE.running and STATE.capture is not None
+    d = None
     if sys.platform == "win32":
         d = _live_devices_win(live=live, do_sample=(sample != 0))
-        if d is not None:
-            return d
-        # MMDevice unavailable (COM failure): fall through to PortAudio, stale during a session but
-        # better than an empty list.
-    d = devices.list_ui_devices()
-    _cache_device_rates(d)
-    return _augment_devices_fallback(d)
+        # MMDevice unavailable (COM failure): fall through to PortAudio (may itself be refused while a
+        # capture owns PortAudio, codex F1), then to the shared last-good cache below.
+    if d is None:
+        d = _augment_devices_fallback(devices.list_ui_devices())
+        _cache_device_rates(d)
+    # Prime one shared last-good cache on every successful listing, and serve it (marked stale) when
+    # live enumeration is unavailable, so the dropdowns never go empty if MMDevice fails during a
+    # capture (codex G5).
+    if d and (d.get("mics") or d.get("loopbacks")):
+        _LAST_GOOD_DEVICES = d
+        return d
+    if _LAST_GOOD_DEVICES is not None:
+        return {**_LAST_GOOD_DEVICES, "stale": True}
+    return d
 
 
 @app.get("/api/levels")
