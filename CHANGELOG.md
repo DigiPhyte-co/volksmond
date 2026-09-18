@@ -1,5 +1,14 @@
 # Changelog, SA-Live-Transcribe
 
+## Unreleased, v1.14.2 (2026-09-18)
+
+`licensing.APP_VERSION` 1.14.1 -> 1.14.2. Volksmond now sets up your audio for you: it picks the microphone and the "everyone else" system audio automatically, warns you loudly when your microphone is muted or silent, and warns when sound is playing somewhere it is not listening.
+
+- **Volksmond chooses your microphone and system audio for you.** Both source pickers now default to "Automatic (recommended)", and Automatic does the sensible thing: for system audio it captures the output where sound is actually playing, and for the microphone it prefers your Windows default mic. Webcam microphones, monitor speakers and virtual (loopback) devices are kept, but grouped at the bottom of the list so the real device is easy to find. If you pick a device yourself, Volksmond remembers it for next time.
+- **A device that cannot be opened is never offered.** The picker only lists devices Volksmond can actually open right now, so a stale entry can no longer be chosen and then fail. This fixes picks that used to fail after the app had been left open for days and Windows had quietly renumbered the audio devices underneath it.
+- **System audio follows the call to another output.** If your meeting audio moves to a different output (you plug in headphones, or Windows changes the default), Volksmond moves the system-audio capture to follow it on its own and tells you it did.
+- **A big warning when your microphone or system audio is wrong.** A large red banner appears when your microphone is muted or sending no sound at all, or when sound is playing on an output Volksmond is not listening to, so a meeting can no longer record silence without you knowing. A quiet call, or a session where you only want your own microphone, is left alone.
+
 ## Unreleased, v1.14.1 (2026-09-15)
 
 `licensing.APP_VERSION` 1.14.0 -> 1.14.1. Windows audio device fixes (a device selection now survives Windows renumbering its audio endpoints, and system-audio failures are shown instead of hidden), a live GPU/CPU processor switch, and a GPU usage line in the log when the engine struggles.
