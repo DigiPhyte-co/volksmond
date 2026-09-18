@@ -48,6 +48,10 @@ DEFAULTS = {
     "summary_model": "",              # installed summary model: a .gguf filename in <_DIR>/models/ (or an absolute path)
     "setup_complete": False,          # first-run wizard done; persisted here so it survives WebView storage resets
     "device": "auto",                 # transcription device: "auto"/"gpu" use the GPU when ready, "cpu" forces CPU
+    "mic_device": "auto",             # chosen microphone: "auto" (the selection policy picks) or a cleaned device NAME
+    "loopback_device": "auto",        # chosen system-audio (loopback) source: "auto" (policy picks) or a cleaned device NAME
+    "mic_device_id": "",              # stable device id for the chosen mic, disambiguates duplicate names; "" while Automatic
+    "loopback_device_id": "",         # stable device id for the chosen loopback, disambiguates duplicate names; "" while Automatic
     "engine": "auto",                 # model family override: "auto" (by language) | "fluister" | "whisper"
     "summary_device": "auto",         # summary device: "auto" uses the GPU when the build supports it and the model fits VRAM, "cpu" forces CPU
     "aec": False,                     # echo cancellation when re-transcribing (off by default: it cleans echo-only/you-listening audio well, but can garble YOUR words during sustained double-talk, so it is opt-in)

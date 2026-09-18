@@ -395,6 +395,8 @@ _SETTINGS_ALLOW = frozenset({
     "tier", "device", "engine", "summary_device", "summary_model", "ai_backend",
     # audio switches (the first questions a "it heard nothing" case asks)
     "aec", "aec_live", "agc_live", "mic_gate", "record_sessions", "recording_format",
+    # which audio sources are chosen (a "it heard nothing / wrong device" case needs these)
+    "mic_device", "loopback_device", "mic_device_id", "loopback_device_id",
     # where files go, and what is installed here
     "save_location", "save_location_migrated", "installed_models",
     # notifications and nudges
