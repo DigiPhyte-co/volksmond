@@ -2350,6 +2350,36 @@ def test_watchdog_tick_mic_flat_when_the_mic_goes_dead_midsession():
     print("  OK  watchdog raises mic-flat when a live mic goes dead mid-session (frames stall + endpoint gone) (F3)")
 
 
+def test_switch_device_commits_mode_and_generation_atomically():
+    # codex F8: a user switch commits the new capture, mode and selection generation TOGETHER (one
+    # lock), and a watchdog action snapshotted at an older generation is refused, so a background
+    # auto-switch can never override the device the user just picked.
+    st = webapp.STATE
+    saved = _watch_state_tuple(st)
+    saved_factory = webapp.capture.AudioCapture
+    try:
+        webapp.capture.AudioCapture = _WCapture
+        _install_watch_session(loop_mode="auto", loop_name="Speakers [Loopback]")
+        gen0 = st.selection_gen
+        webapp._switch_device("loopback", "Headphones [Loopback]", commit_mode="named")
+        assert st.loopback_mode == "named", st.loopback_mode
+        assert st.selection_gen == gen0 + 1, (gen0, st.selection_gen)
+        assert st.loopback_device == "Headphones [Loopback]", st.loopback_device
+        # A watchdog action snapshotted at the OLD generation is refused (409), even though the capture
+        # and session it names are current.
+        try:
+            webapp._switch_device("loopback", "Speakers [Loopback]", expect_capture=st.capture,
+                                  expect_session=st.started_at, expect_gen=gen0)
+            raise AssertionError("a stale-generation switch must be refused")
+        except webapp.HTTPException as e:
+            assert e.status_code == 409, e.status_code
+        assert st.loopback_device == "Headphones [Loopback]", "the user's pick must be untouched"
+    finally:
+        webapp.capture.AudioCapture = saved_factory
+        _restore_watch_state(st, saved)
+    print("  OK  a user switch commits mode+generation atomically; a stale watchdog action is refused (F8)")
+
+
 def test_watchdog_tick_record_only_wrong_sys_from_capture_levels():
     # codex F9: a record-only session has no engine, so the energy rings are None. A wrong SYS stream
     # delivering zero-filled callbacks keeps sys_frames advancing (looks live by frames alone), but the
@@ -2673,6 +2703,7 @@ if __name__ == "__main__":
                test_watchdog_tick_quiet_call_raises_no_alert,
                test_watchdog_tick_muted_mic_alerts_red_and_notifies_once,
                test_watchdog_tick_mic_flat_when_the_mic_goes_dead_midsession,
+               test_switch_device_commits_mode_and_generation_atomically,
                test_watchdog_tick_record_only_wrong_sys_from_capture_levels,
                test_watchdog_tick_rebuilds_a_faulting_sys_once,
                test_audio_alert_dismiss_clears_the_amber_hint,

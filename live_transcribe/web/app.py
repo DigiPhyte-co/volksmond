@@ -203,6 +203,13 @@ class _State:
         self.device_notice: Optional[dict] = None
         self.mic_mode: str = "auto"
         self.loopback_mode: str = "auto"
+        # Selection generation (codex F8): bumped whenever capture + mode + selection are committed
+        # together for a USER action (start, or a user switch), all under one STATE.lock hold. The
+        # watchdog snapshots this with the capture and mode, and validates it before an auto-switch or
+        # rebuild, so a background action can never act on a device the user has just re-picked (a
+        # user switch commits the new capture and mode atomically, so the watchdog never sees the new
+        # capture paired with the old "auto" mode).
+        self.selection_gen: int = 0
         # "Model struggling to keep up" nudge. struggle_nudge is the outstanding warning the UI
         # renders as a banner, or None. It carries a "reason" discriminator plus "recording" (the
         # session's recording state when it was raised):
@@ -345,6 +352,7 @@ class _State:
         self.device_notice = None
         self.mic_mode = "auto"
         self.loopback_mode = "auto"
+        self.selection_gen = 0
         self.struggle_nudge = None
         self.struggle_notified = False
         self.processor_switch = None
@@ -1669,6 +1677,7 @@ def _device_follow_tick(now):
         engine = STATE.engine
         mic_mode = STATE.mic_mode or "auto"
         loop_mode = STATE.loopback_mode or "auto"
+        sel_gen = STATE.selection_gen   # validated before any auto-switch/rebuild (codex F8)
         sys_open_name = getattr(cap, "sys_loopback_name", None) if cap else None   # carries the suffix
         sys_state = getattr(cap, "sys_state", "active") if cap else "active"
         sys_frames_now = getattr(cap, "sys_frames", None) if cap else None
@@ -1735,7 +1744,8 @@ def _device_follow_tick(now):
             # announce_follow keeps the legacy sys_switch_notice correct inside the switch's lock; the
             # new audio_toast is published right after, both naming the device we committed to.
             _switch_device("loopback", target_clean + LOOPBACK_SUFFIX,
-                           expect_capture=cap, expect_session=session, announce_follow=True)
+                           expect_capture=cap, expect_session=session, expect_gen=sel_gen,
+                           announce_follow=True)
             with STATE.lock:
                 if STATE.capture is not None and STATE.started_at is session:
                     _publish_audio_toast(target_clean)
@@ -1748,7 +1758,8 @@ def _device_follow_tick(now):
     elif action and action.get("do") == "rebuild":
         # Re-open SYS on the SAME endpoint once (the Watchdog rate-limits to one rebuild per fault).
         try:
-            _switch_device("loopback", sys_open_name, expect_capture=cap, expect_session=session)
+            _switch_device("loopback", sys_open_name, expect_capture=cap, expect_session=session,
+                           expect_gen=sel_gen)
             tag = "rebuilt"
         except HTTPException:
             tag = "rebuild-rejected"
@@ -2475,13 +2486,11 @@ def switch_device(req: SwitchDeviceRequest):
             eps = _probe_endpoints_detailed(with_peak=True)
             samples = _sample_render_peaks()
             open_name, dev_id, mode, _absent = _resolve_one(which, "auto", "", eps, samples=samples)
-    res = _switch_device(which, open_name)   # raises on a failed switch, so nothing below persists
+    # Commit the capture, the new mode and the selection generation together under one lock (codex
+    # F8), so the watchdog never sees the new capture paired with the old mode. Raises on a failed
+    # switch, so nothing below persists.
+    res = _switch_device(which, open_name, commit_mode=mode)
     with STATE.lock:
-        if which == "mic":
-            STATE.mic_mode = mode
-        else:
-            STATE.loopback_mode = mode
-        STATE.device_notice = None
         res["device_notice"] = None
         res["mic_mode"], res["loopback_mode"] = STATE.mic_mode, STATE.loopback_mode
     if which == "mic":
@@ -2491,19 +2500,29 @@ def switch_device(req: SwitchDeviceRequest):
     return res
 
 
-def _switch_device(which, device, expect_capture=None, expect_session=None, announce_follow=False):
+def _switch_device(which, device, expect_capture=None, expect_session=None, announce_follow=False,
+                   commit_mode=None, expect_gen=None):
     """Core of the device switch, callable by the API handler and by the device-follow watcher.
 
     expect_capture / expect_session (codex F2): when given, the switch runs ONLY if STATE.capture is
     still that exact object AND STATE.started_at is still that session, checked under STATE.lock that
     is held across the whole rebuild. This is how a background watcher can switch without clobbering a
     user switch that landed since it sampled, or acting on a session that has since been reset+started.
-    The API handler passes neither (any live session is a valid target)."""
+    The API handler passes neither (any live session is a valid target).
+
+    commit_mode / expect_gen (codex F8): a USER switch passes commit_mode ("auto"|"named"), so the new
+    capture, its device names, the live mode for `which` and the selection generation are all committed
+    together under this ONE lock, and the watchdog can never observe the new capture paired with the old
+    mode. The watchdog passes expect_gen (the generation it snapshotted): the action is refused if the
+    selection has changed since, so a background switch or rebuild can never override a device the user
+    just picked. The watchdog never passes commit_mode (an auto-follow keeps the mode as-is)."""
     with STATE.lock:
         if not STATE.running or STATE.stopping or STATE.source_kind != "live" or STATE.capture is None:
             raise HTTPException(status_code=409, detail="Switching devices is only available during a live session.")
         if expect_capture is not None and (STATE.capture is not expect_capture or STATE.started_at is not expect_session):
             raise HTTPException(status_code=409, detail="The device changed since the follow check.")
+        if expect_gen is not None and STATE.selection_gen != expect_gen:
+            raise HTTPException(status_code=409, detail="The selection changed since the follow check.")
         old_cap = STATE.capture
         prev_mic, prev_loop = STATE.mic_device, STATE.loopback_device
         mic = device if which == "mic" else prev_mic
@@ -2586,6 +2605,16 @@ def _switch_device(which, device, expect_capture=None, expect_session=None, anno
         STATE.capture = new_cap
         STATE.record_raw_mic = new_cap.has_raw_mic()   # AEC may re-engage (or not) on the new device
         STATE.mic_device, STATE.loopback_device = mic, loop
+        # A USER switch commits the mode + selection generation in the SAME lock as the capture (codex
+        # F8), so the watchdog can never observe the new capture with the old mode and auto-switch off
+        # the just-picked device. The watcher passes no commit_mode, so its auto-follow leaves both be.
+        if commit_mode is not None:
+            if which == "mic":
+                STATE.mic_mode = commit_mode
+            else:
+                STATE.loopback_mode = commit_mode
+            STATE.device_notice = None      # a user switch answers any outstanding remembered-absent notice
+            STATE.selection_gen += 1
         _reset_loop_history()
         _silence_after_switch()
         # Publish the auto-follow toast INSIDE this lock scope (codex G5), naming the device we just
@@ -2595,7 +2624,8 @@ def _switch_device(which, device, expect_capture=None, expect_session=None, anno
         if announce_follow:
             _raise_sys_switch_notice(loop)
             STATE.sys_idle_hint = None
-        return {"which": which, "device": device, "mic_device": mic, "loopback_device": loop}
+        return {"which": which, "device": device, "mic_device": mic, "loopback_device": loop,
+                "mic_mode": STATE.mic_mode, "loopback_mode": STATE.loopback_mode}
 
 
 class SilenceNudgeRequest(BaseModel):
@@ -4226,6 +4256,7 @@ def start(req: StartRequest):
         STATE.loopback_device = sel["loop_name"]
         STATE.mic_mode = sel["mic_mode"]
         STATE.loopback_mode = sel["loop_mode"]
+        STATE.selection_gen += 1   # a fresh committed selection (codex F8); the watchdog validates it
         STATE.device_notice = sel["notice"]
         STATE.audio_alert = None
         STATE.audio_toast = None

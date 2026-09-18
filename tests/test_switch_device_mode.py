@@ -34,10 +34,20 @@ client = TestClient(app, base_url="http://localhost")
 client.headers.update({"X-Volksmond-CSRF": CSRF_TOKEN})
 
 
-def _fake_switch(which, device, **kw):
-    """Stand in for the real capture rebuild: record the opener target and report a clean switch."""
+def _fake_switch(which, device, commit_mode=None, **kw):
+    """Stand in for the real capture rebuild: record the opener target and report a clean switch. The
+    real _switch_device now commits the mode + selection generation itself (codex F8), so the fake
+    mirrors that so the handler's response carries the right modes."""
     _fake_switch.calls.append((which, device))
-    return {}
+    st = webapp.STATE
+    if commit_mode is not None:
+        if which == "mic":
+            st.mic_mode = commit_mode
+        else:
+            st.loopback_mode = commit_mode
+        st.device_notice = None
+        st.selection_gen += 1
+    return {"mic_mode": st.mic_mode, "loopback_mode": st.loopback_mode}
 
 
 _fake_switch.calls = []
