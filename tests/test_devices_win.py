@@ -267,6 +267,49 @@ def test_list_ui_devices_includes_the_cleaned_name_and_dedupes():
     print("  OK  list_ui_devices carries cleaned names, dedupes per-host-API duplicates, keeps defaults")
 
 
+def test_candidate_name_helpers_list_the_searched_cleaned_names():
+    # 1.14.2: the resolve-failure diagnostic logs the PortAudio names each resolver actually searched
+    # (device names only, safe to log). mic_candidate_names is the WASAPI-first mic pool with loopbacks
+    # excluded; loopback_candidate_names is the loopback set. Both cleaned, so they match the UI values.
+    p = FakePyAudio()
+    mics = devices_win.mic_candidate_names(p)
+    loops = devices_win.loopback_candidate_names(p)
+    assert "Microphone (2- Samson C01U              )" in mics, mics
+    assert "Café Mic" in mics, mics                          # mojibake cleaned on the way out
+    assert all("[Loopback]" not in m for m in mics), mics    # a mic pool never lists loopbacks
+    assert "Speakers (Realtek(R) Audio) [Loopback]" in loops, loops
+    assert "Café Mic" not in loops, loops
+    print("  OK  the candidate-name helpers list the cleaned names each resolver searches")
+
+
+def test_pa_session_tracks_live_instances_and_table_age():
+    # The lifecycle guard: pa_session accounts for every PyAudio process-wide, so a capture can tell
+    # how stale the shared PortAudio device table is (the init-count trap). Count and age track the
+    # live instances; age is None when none are live.
+    saved = (devices_win.pa, devices_win._pa_count, devices_win._pa_built_at)
+    try:
+        devices_win.pa = _fake_pa_module()
+        devices_win._pa_count = 0
+        devices_win._pa_built_at = None
+        assert devices_win.pa_instances() == 0
+        assert devices_win.pa_table_age_s() is None
+        with devices_win.pa_session() as p1:
+            assert isinstance(p1, FakePyAudio)
+            assert devices_win.pa_instances() == 1
+            age1 = devices_win.pa_table_age_s()
+            assert age1 is not None and age1 >= 0.0, age1
+            with devices_win.pa_session() as p2:            # a second helper: the trap, 2 live at once
+                assert p2 is not p1
+                assert devices_win.pa_instances() == 2
+            assert devices_win.pa_instances() == 1
+            assert p1.terminated is False, "the outer session was terminated when the inner one exited"
+        assert devices_win.pa_instances() == 0
+        assert devices_win.pa_table_age_s() is None
+    finally:
+        devices_win.pa, devices_win._pa_count, devices_win._pa_built_at = saved
+    print("  OK  pa_session tracks the live PyAudio count and table age (both zero/None when none live)")
+
+
 if __name__ == "__main__":
     tests = (test_stale_numeric_index_pointing_at_a_render_device_raises,
              test_name_resolution_is_exact_first_then_substring,
@@ -276,7 +319,9 @@ if __name__ == "__main__":
              test_a_numeric_device_name_resolves_as_a_name_not_an_index,
              test_positional_flag_gates_index_resolution,
              test_default_loopback_name_is_cleaned,
-             test_list_ui_devices_includes_the_cleaned_name_and_dedupes)
+             test_list_ui_devices_includes_the_cleaned_name_and_dedupes,
+             test_candidate_name_helpers_list_the_searched_cleaned_names,
+             test_pa_session_tracks_live_instances_and_table_age)
     failures = 0
     for fn in tests:
         try:

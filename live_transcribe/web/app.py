@@ -3740,6 +3740,16 @@ def start(req: StartRequest):
         try:
             cap.start()
         except Exception as e:
+            # start() may have opened one source (e.g. the loopback stream and its PyAudio) before
+            # the other failed. stop() closes any open stream and terminates PortAudio, exactly as
+            # _switch_device does on a failed switch; without it the leaked PyAudio holds the process
+            # init count above zero, so PortAudio never rebuilds its device table and the NEXT start
+            # offers a stale device list (the "wrong source" field report). Swallow stop()'s own
+            # error so it cannot mask the start failure the user needs to see.
+            try:
+                cap.stop()
+            except Exception:
+                pass
             if md_sink is not None:
                 md_sink.close()
             if recorder is not None:

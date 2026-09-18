@@ -4,7 +4,98 @@ pyaudiowpatch is a PyAudio fork that exposes WASAPI loopback devices as
 first-class PortAudio devices. Default soundcard/sounddevice don't support
 WASAPI loopback at all on Windows, pyaudiowpatch is the right tool.
 """
+import contextlib
+import threading
+import time
+
 import pyaudiowpatch as pa
+
+
+# --- PortAudio lifecycle guard ------------------------------------------------
+# PortAudio builds its device table exactly once, when Pa_Initialize takes the init count from 0 to
+# 1, and only rebuilds it after EVERY PyAudio instance has terminated (the init-count trap, see the
+# mmdevice_win header). So a capture that starts while a short-lived enumeration helper still holds a
+# PyAudio open inherits that helper's table and cannot see an endpoint plugged in since. Every
+# PyAudio in this process is now created through pa_acquire / pa_release (or the pa_session context
+# manager), which counts the live instances thread-safely and records when the table was last
+# (re)built, so a capture can wait briefly for a clean rebuild and the diagnostics can log its age.
+_pa_lock = threading.Lock()
+_pa_count = 0
+_pa_built_at = None      # time.monotonic() when the count last went 0 -> 1 (the table was rebuilt)
+
+# How long a capture waits for live enumeration helpers to release before it builds anyway. Bounded
+# so a stuck helper can never deadlock a session start; on expiry the capture builds on the (stale)
+# table and logs a loud warning with its age rather than fail the start.
+_CAPTURE_WAIT_S = 1.5
+_CAPTURE_POLL_S = 0.02
+
+
+def pa_instances():
+    """The number of live PyAudio instances in this process (PortAudio's init count)."""
+    with _pa_lock:
+        return _pa_count
+
+
+def pa_table_age_s():
+    """Seconds since PortAudio last (re)built its device table (the count went 0 -> 1), or None when
+    no PyAudio instance is live. This is the age of the device view every live PyAudio() shares."""
+    with _pa_lock:
+        if _pa_count == 0 or _pa_built_at is None:
+            return None
+        return time.monotonic() - _pa_built_at
+
+
+def pa_acquire(role="enum"):
+    """Create a PyAudio instance and account for it process-wide. role="capture" first waits briefly
+    for any live enumeration helper to release, so the capture builds its table from a clean 0 -> 1
+    transition instead of inheriting a stale one; the wait is bounded and never deadlocks, and on
+    expiry it builds anyway and logs a loud warning with the table age. role="enum" (the short-lived
+    listings) never waits. Pair every call with pa_release, or use the pa_session context manager."""
+    global _pa_count, _pa_built_at
+    if role == "capture":
+        deadline = time.monotonic() + _CAPTURE_WAIT_S
+        while True:
+            with _pa_lock:
+                live = _pa_count
+                age = None if _pa_built_at is None else time.monotonic() - _pa_built_at
+            if live == 0 or time.monotonic() >= deadline:
+                if live != 0:
+                    print(f"[devices] WARNING starting capture with {live} PyAudio instance(s) still "
+                          f"live; PortAudio keeps its {age:.1f}s-old device table rather than rebuild "
+                          "it (init-count trap)", flush=True)
+                break
+            time.sleep(_CAPTURE_POLL_S)
+    p = pa.PyAudio()
+    with _pa_lock:
+        _pa_count += 1
+        if _pa_count == 1:
+            _pa_built_at = time.monotonic()
+    return p
+
+
+def pa_release(p):
+    """Terminate a PyAudio instance from pa_acquire / pa_session and update the live-instance count.
+    The count is decremented even when terminate() raises (in a finally), and the exception is
+    re-raised so a caller that reports teardown success (capture._release_backend) still sees it."""
+    global _pa_count, _pa_built_at
+    try:
+        p.terminate()
+    finally:
+        with _pa_lock:
+            _pa_count = max(0, _pa_count - 1)
+            if _pa_count == 0:
+                _pa_built_at = None
+
+
+@contextlib.contextmanager
+def pa_session(role="enum"):
+    """Context-manager form of pa_acquire / pa_release for a short-lived PyAudio: it always
+    terminates its instance, even on an exception (the enumeration helpers' try/finally)."""
+    p = pa_acquire(role)
+    try:
+        yield p
+    finally:
+        pa_release(p)
 
 
 def _fix_name(s):
@@ -32,7 +123,7 @@ def _as_index(spec):
 
 def print_devices():
     """Print available loopback (system audio) and mic devices."""
-    p = pa.PyAudio()
+    p = pa_acquire()
     try:
         try:
             default_lb = p.get_default_wasapi_loopback()
@@ -62,7 +153,7 @@ def print_devices():
         print("  --loopback-device <index>   or   --loopback-device 'name substring'")
         print("  --mic-device <index>        or   --mic-device 'name substring'")
     finally:
-        p.terminate()
+        pa_release(p)
 
 
 def _wasapi_host_index(p):
@@ -155,22 +246,29 @@ def resolve_mic(p, spec, positional=True):
     raise ValueError(f"No mic matching {spec!r}. Run --list-devices.")
 
 
+def loopback_candidate_names(p):
+    """Cleaned names resolve_loopback searches, in order, for the resolve-failure diagnostic. Device
+    names only (never audio), so it is safe to log."""
+    return [_fix_name(info["name"]).strip() for info in p.get_loopback_device_info_generator()]
+
+
+def mic_candidate_names(p):
+    """Cleaned names resolve_mic searches (the WASAPI-first pool), for the resolve-failure diagnostic.
+    Device names only (never audio), so it is safe to log."""
+    return [_fix_name(info["name"]).strip() for info in _mic_pool(p)]
+
+
 def default_loopback_name(p=None):
     """Cleaned name of the current default WASAPI loopback, or None when there is none.
 
     Opens and terminates its OWN PyAudio when not given one, so the follow-the-default watcher can
     read the default each tick without holding a PyAudio handle open between ticks (holding one is
     what the task brief forbids: a stale handle would not see the endpoint the OS just switched to)."""
-    own = p is None
-    if own:
-        p = pa.PyAudio()
-    try:
-        return _fix_name(p.get_default_wasapi_loopback()["name"]).strip()
-    except Exception:
-        return None
-    finally:
-        if own:
-            p.terminate()
+    with (contextlib.nullcontext(p) if p is not None else pa_session()) as p:
+        try:
+            return _fix_name(p.get_default_wasapi_loopback()["name"]).strip()
+        except Exception:
+            return None
 
 
 def list_ui_devices():
@@ -189,7 +287,7 @@ def list_ui_devices():
     on a particular machine, the CLI `--list-devices` still shows every
     host API for diagnostic purposes; this function is for the UI.
     """
-    p = pa.PyAudio()
+    p = pa_acquire()
     try:
         loopbacks = [
             {"index": info["index"], "name": _fix_name(info["name"]), "rate": int(info["defaultSampleRate"])}
@@ -261,4 +359,4 @@ def list_ui_devices():
             "default_mic_index": default_in_idx,
         }
     finally:
-        p.terminate()
+        pa_release(p)

@@ -10,7 +10,19 @@ import numpy as np
 import pyaudiowpatch as pa
 
 from .capture_core import BLOCK_SECONDS, CaptureBase
-from .devices_win import _fix_name, default_loopback_name, resolve_loopback, resolve_mic
+from .devices_win import (
+    _fix_name,
+    default_loopback_name,
+    loopback_candidate_names,
+    mic_candidate_names,
+    pa_acquire,
+    pa_instances,
+    pa_release,
+    pa_table_age_s,
+    resolve_loopback,
+    resolve_mic,
+)
+from .licensing import APP_VERSION
 
 
 class AudioCapture(CaptureBase):
@@ -44,7 +56,13 @@ class AudioCapture(CaptureBase):
         self.sys_frames = 0
 
     def _open_sources(self):
-        self._pa = pa.PyAudio()
+        # Acquire through the lifecycle guard (role="capture"): it waits briefly for any live
+        # enumeration helper to release so PortAudio rebuilds a FRESH device table (the init-count
+        # trap), and never deadlocks. The device view every source below resolves against is only as
+        # current as this table, so log its age at each session open for the field diagnostics.
+        self._pa = pa_acquire("capture")
+        print(f"[devices] table age={pa_table_age_s()}s pa_instances={pa_instances()} "
+              f"build={APP_VERSION}", flush=True)
         self.sys_state = "active"   # optimistic; flipped to "failed" below if the loopback cannot open
         self.sys_error = None
         self.sys_error_reason = None
@@ -57,16 +75,21 @@ class AudioCapture(CaptureBase):
             # Resolution failed (a stale index, or a chosen device that was unplugged/renumbered). Do
             # NOT abort: the mic below may still open, and a mic-only session is better than no
             # session. Record it so /api/status can raise the banner (H1) and the user knows the far
-            # side of the call is missing from the transcript.
+            # side of the call is missing from the transcript. Log the candidate names the resolver
+            # searched, so a "wrong source" report can be read straight off the log.
             self.sys_state = "failed"
             self._set_sys_error(self.loopback_device_spec, reason="not_found")
             print(f"[SYS] cannot resolve loopback: {e}", flush=True)
+            print(f"[SYS] resolve FAILED want={self.loopback_device_spec!r} "
+                  f"candidates={self._candidate_names(loopback_candidate_names)}", flush=True)
 
         mic_info = None
         try:
             mic_info = resolve_mic(self._pa, self.mic_device_spec, positional=self.positional)
         except Exception as e:
             print(f"[MIC] cannot resolve mic: {e}", flush=True)
+            print(f"[MIC] resolve FAILED want={self.mic_device_spec!r} "
+                  f"candidates={self._candidate_names(mic_candidate_names)}", flush=True)
 
         # Wrap each open so the failing source identifies itself in the error the FastAPI layer
         # surfaces. The raw PyAudio message (e.g. `[Errno -9996] Invalid device`) by itself does not
@@ -91,6 +114,12 @@ class AudioCapture(CaptureBase):
             try:
                 self._open_stream("MIC", mic_info)
             except Exception as e:
+                # A SYS (loopback) stream may already be open and running on its own audio thread.
+                # Close it before re-raising so a mic that will not open can never strand the
+                # loopback stream (and its thread) for the life of the process. Idempotent: the
+                # streams are removed from the list so a caller's later stop() will not double-close.
+                self._close_sources()
+                self._streams = []
                 raise RuntimeError(
                     f"could not open microphone #{mic_info['index']} "
                     f"'{mic_info['name']}': {e}. Try a different option in the "
@@ -114,6 +143,15 @@ class AudioCapture(CaptureBase):
             self.sys_following_default = (
                 default_name is not None and self.sys_loopback_name == default_name
             )
+
+    def _candidate_names(self, lister):
+        """The PortAudio candidate names `lister` would search, for a resolve-failure log line. Never
+        raises: a diagnostic must not mask the resolution error it is annotating, so an enumeration
+        that itself fails just logs an empty list."""
+        try:
+            return lister(self._pa)
+        except Exception:
+            return []
 
     def _set_sys_error(self, name, reason):
         """Record a system-audio failure in both forms: the structured (reason code + device name)
@@ -152,12 +190,13 @@ class AudioCapture(CaptureBase):
         return ok
 
     def _release_backend(self):
-        """Terminate PortAudio; True on success, or when there is nothing left to release."""
+        """Terminate PortAudio through the lifecycle guard (which keeps the process-wide instance
+        count honest); True on success, or when there is nothing left to release."""
         if self._pa is None:
             return True
         ok = True
         try:
-            self._pa.terminate()
+            pa_release(self._pa)
         except Exception as e:
             ok = False
             print(f"[capture] could not terminate the audio backend: {e}", flush=True)
