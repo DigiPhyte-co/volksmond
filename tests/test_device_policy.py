@@ -278,6 +278,33 @@ def test_wd_wrong_device_arms_at_3s_and_disarms_instantly():
     print("  OK  wrong-sys-device arms at 3 s (not 2 s), names the other device, disarms instantly")
 
 
+def test_loudest_other_render_prefers_nonjunk_but_falls_back_to_a_playing_junk():
+    # codex F4: prefer a playing non-junk endpoint over a louder junk one...
+    r = [render("Speakers", peak=-30.0), render("HDMI Monitor", peak=-10.0, ff=9)]
+    got = dp._loudest_other_render(r, "SYS-A")
+    assert got is not None and got["name"] == "Speakers", got
+    # ...but when nothing non-junk is playing, a playing junk endpoint (the HDMI the call moved onto)
+    # is still returned, so a switch or warning can follow instead of silence.
+    r2 = [render("Speakers", peak=-72.0), render("HDMI Monitor", peak=-12.0, ff=9)]
+    got2 = dp._loudest_other_render(r2, "SYS-A")
+    assert got2 is not None and got2["name"] == "HDMI Monitor", got2
+    print("  OK  _loudest_other_render prefers non-junk, falls back to a playing junk endpoint (F4)")
+
+
+def test_wd_wrong_device_warns_when_the_call_moved_onto_hdmi():
+    # codex F4: our chosen SYS is idle and the only thing playing is the HDMI monitor. In named mode
+    # the watchdog must still raise wrong-sys-device naming the HDMI as `other` (no silent miss).
+    w = dp.Watchdog()
+    bad = base_obs(sys_mode="named", sys_name="Speakers", sys_db=-70.0,
+                   renders=[render("Speakers", peak=-70.0), render("HDMI Monitor", peak=-14.0, ff=9)])
+    feed(w, [bad] * 3)                               # t = 0, 1, 2: confirming
+    alert, action = w.observe(3.0, bad)              # t = 3: armed
+    assert alert and alert["kind"] == "wrong-sys-device", alert
+    assert alert["other"] == "HDMI Monitor", alert
+    assert action is None, "named mode never auto-switches"
+    print("  OK  a call moved onto the HDMI monitor still warns (other=HDMI) mid-session (F4)")
+
+
 def test_wd_auto_mode_switches_then_alerts_and_respects_the_rate_limit():
     w = dp.Watchdog()
 
@@ -438,6 +465,8 @@ TESTS = (
     test_norm_name_tolerates_padding_and_case_everywhere,
     test_config_defaults_and_old_files_migrate_to_automatic,
     test_wd_wrong_device_arms_at_3s_and_disarms_instantly,
+    test_loudest_other_render_prefers_nonjunk_but_falls_back_to_a_playing_junk,
+    test_wd_wrong_device_warns_when_the_call_moved_onto_hdmi,
     test_wd_auto_mode_switches_then_alerts_and_respects_the_rate_limit,
     test_wd_sys_capture_fault_rebuilds_once_then_alerts,
     test_wd_quiet_call_three_minutes_no_alert,

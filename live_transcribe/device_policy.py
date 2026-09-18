@@ -547,16 +547,23 @@ def _find_by_name(endpoints, name):
 
 
 def _loudest_other_render(renders, sys_name):
-    """The loudest NON-junk render endpoint that is not our own SYS device and is above
-    OTHER_LOUD_DB, or None. This is "the real one that is actually playing" the watchdog would
-    switch to."""
-    best = None
-    for e in renders:
-        if _same_name(e.get("name"), sys_name) or is_junk(e):
-            continue
-        if _peak(e) > OTHER_LOUD_DB and (best is None or _peak(e) > _peak(best)):
-            best = e
-    return best
+    """The loudest render endpoint that is not our own SYS device and is above OTHER_LOUD_DB, or
+    None. This is "the real one that is actually playing" the watchdog would switch to (auto) or warn
+    about (named). Non-junk is preferred, but a PLAYING junk endpoint is still returned when nothing
+    non-junk is playing, so a call moved onto the HDMI monitor speakers mid-session still earns a
+    switch or warning (codex F4). Mirrors choose_sys, which likewise picks a junk endpoint when it is
+    the only thing playing."""
+    def loudest(include_junk):
+        best = None
+        for e in renders:
+            if _same_name(e.get("name"), sys_name):
+                continue
+            if not include_junk and is_junk(e):
+                continue
+            if _peak(e) > OTHER_LOUD_DB and (best is None or _peak(e) > _peak(best)):
+                best = e
+        return best
+    return loudest(False) or loudest(True)
 
 
 def _loudest_capture(captures, mic_name):
