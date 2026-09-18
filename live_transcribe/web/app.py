@@ -1441,6 +1441,23 @@ def _muted_of(captures, mic_name):
 
 # --- resolving "auto" / a remembered pick into a concrete device NAME ----------
 
+def _platform_named_present(which, name):
+    """Off Windows, is a remembered NAMED device currently connected? Answered from the platform's
+    own /api/devices listing (mac/linux have no role policy, so the listing is all there is to check
+    against). Returns True when the listing cannot be read (no backend, enumeration failure), so a
+    machine whose devices cannot be enumerated is never wrongly told its saved device is gone; the
+    name then passes through exactly as before. Names compared with the same norm_name tolerance used
+    everywhere; a loopback carries the ' [Loopback]' suffix on Windows only, so strip it defensively."""
+    try:
+        from .. import devices
+        listing = devices.list_ui_devices()
+    except Exception:
+        return True
+    entries = listing.get("mics" if which == "mic" else "loopbacks") or []
+    want = device_policy.norm_name(name if which == "mic" else _strip_loopback_suffix(name))
+    return any(device_policy.norm_name(e.get("name")) == want for e in entries)
+
+
 def _resolve_one(which, requested_name, requested_id, eps, samples=None):
     """Resolve one source (mic or loopback) to a concrete opener NAME.
 
@@ -1456,9 +1473,15 @@ def _resolve_one(which, requested_name, requested_id, eps, samples=None):
     named = bool(requested_name) and str(requested_name).strip().lower() != "auto"
 
     if sys.platform != "win32":
-        if named:
+        # No role policy off Windows, so "auto"/None is just the backend default. A remembered NAMED
+        # pick is validated against the platform's current listing: if it is absent, fall back to
+        # Automatic (None) with the remembered-absent notice, never pass it through unchecked (which
+        # made capture_mac raise and Begin fail when the saved mic was unplugged, codex F6).
+        if not named:
+            return None, "", "auto", False
+        if _platform_named_present(which, requested_name):
             return requested_name, (requested_id or ""), "named", False
-        return None, "", "auto", False
+        return None, "", "auto", True
 
     renders, captures = _split_endpoints(eps or [])
 
